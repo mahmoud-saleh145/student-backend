@@ -6,7 +6,7 @@ export class LoginDto {
   @ApiProperty({ example: '01001234567' })
   @IsString()
   @MaxLength(20)
-  @Matches(/^(?:\+?20|0020)?1[0125]\d{8}$/, {
+  @Matches(/^(?:\+?20|0020|0)?1[0125]\d{8}$/, {
     message: 'phone must be a valid Egyptian mobile number',
   })
   @Transform(({ value }) => (typeof value === 'string' ? value.replace(/[\s()-]/g, '') : value))
