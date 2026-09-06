@@ -1,0 +1,125 @@
+# Local development stack. NOT a production deployment — see docs/DEPLOYMENT.md.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: edu-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: edu
+      POSTGRES_PASSWORD: edu_dev_password
+      POSTGRES_DB: edu_platform
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U edu -d edu_platform']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: edu-redis
+    restart: unless-stopped
+    # appendonly keeps queued jobs across a restart; playback concurrency keys
+    # are short-lived so losing them is harmless.
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # S3-compatible stand-in for Cloudflare R2 so the storage layer can be
+  # exercised locally without a Cloudflare account.
+  minio:
+    image: minio/minio:latest
+    container_name: edu-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: eduminio
+      MINIO_ROOT_PASSWORD: eduminio_dev_password
+    ports:
+      - '9000:9000'
+      - '9001:9001'
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ['CMD', 'mc', 'ready', 'local']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 eduminio eduminio_dev_password; do sleep 2; done;
+      mc mb --ignore-existing local/edu-media-dev;
+      mc mb --ignore-existing local/edu-uploads-dev;
+      echo 'buckets ready';
+      "
+
+  api:
+    build:
+      context: .
+      target: development
+    container_name: edu-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://edu:edu_dev_password@postgres:5432/edu_platform?schema=public
+      REDIS_URL: redis://redis:6379
+      R2_ENDPOINT: http://minio:9000
+      R2_ACCESS_KEY_ID: eduminio
+      R2_SECRET_ACCESS_KEY: eduminio_dev_password
+    env_file:
+      - .env
+    ports:
+      - '3000:3000'
+    volumes:
+      - .:/app
+      - /app/node_modules
+    command: sh -c "npx prisma migrate deploy && npm run start:dev"
+
+  worker:
+    build:
+      context: .
+      target: development
+    container_name: edu-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://edu:edu_dev_password@postgres:5432/edu_platform?schema=public
+      REDIS_URL: redis://redis:6379
+      R2_ENDPOINT: http://minio:9000
+      R2_ACCESS_KEY_ID: eduminio
+      R2_SECRET_ACCESS_KEY: eduminio_dev_password
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - /app/node_modules
+    command: npm run worker:dev
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:

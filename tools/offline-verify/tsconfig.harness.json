@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "outDir": "./out",
+    "rootDir": "../..",
+    "strict": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": false,
+    "noImplicitAny": false,
+    "declaration": false,
+    "sourceMap": false,
+    "types": [],
+    "ignoreDeprecations": "6.0"
+  },
+  "include": [
+    "../../src/modules/courses/course.serializer.ts",
+    "../../src/modules/courses/course-access.service.ts",
+    "../../src/common/errors/error-codes.ts",
+    "../../src/common/errors/app.exception.ts",
+    "../../src/modules/storage/storage.service.ts",
+    "../../src/modules/playback/media-origin.controller.ts",
+    "../../src/common/middleware/request-context.middleware.ts"
+  ]
+}

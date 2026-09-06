@@ -1,0 +1,1451 @@
+// =============================================================================
+// EduPlatform — database schema
+//
+// Design rules enforced throughout:
+//
+//  1. Business history is immutable. Payments, revenue, redemptions, watch
+//     events and audit logs are never mutated or cascade-deleted by content
+//     lifecycle operations. Course archival flips a status; it never removes a
+//     financial row. Every FK from a financial record to content uses
+//     onDelete: Restrict so a destructive delete is impossible at the DB level.
+//
+//  2. Content is soft-deleted (`deletedAt`), never hard-deleted through the
+//     API. Only an offline maintenance script may purge.
+//
+//  3. Prices are versioned. A Payment stores the exact amount charged AND a
+//     pointer to the CoursePrice version used, so revenue can never be
+//     recomputed from a course's current price.
+//
+//  4. Course structure is fully dynamic: sections are rows with an explicit
+//     sortOrder, with no assumption about their number or naming.
+//
+//  5. Anything security-sensitive (tickets, sessions, devices) carries an
+//     explicit revocation column rather than relying on deletion.
+// =============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["relationJoins"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+// Enums
+// =============================================================================
+
+enum UserRole {
+  MASTER
+  ADMIN
+  TEACHER
+  STUDENT
+}
+
+enum AccountStatus {
+  ACTIVE
+  PENDING
+  SUSPENDED
+  DISABLED
+}
+
+enum Gender {
+  MALE
+  FEMALE
+}
+
+enum CourseStatus {
+  DRAFT
+  PUBLISHED
+  SUSPENDED
+  ARCHIVED
+  HIDDEN
+}
+
+enum ContentStatus {
+  DRAFT
+  PUBLISHED
+  HIDDEN
+  ARCHIVED
+}
+
+enum EnrollmentMethod {
+  FREE
+  PAYMENT
+  CODE
+  ADMIN_APPROVAL
+}
+
+/// Mirrors the AccessState union in the mobile app's domain types.
+enum EnrollmentState {
+  PENDING_APPROVAL
+  PENDING_PAYMENT
+  ACTIVE
+  EXPIRED
+  REVOKED
+  ARCHIVED
+}
+
+enum AccessDurationType {
+  LIFETIME
+  FIXED_DAYS
+  UNTIL_DATE
+}
+
+enum LessonKind {
+  VIDEO
+  DOCUMENT
+  QUIZ
+  LIVE
+}
+
+enum CompletionRuleType {
+  WATCH_PERCENT
+  WATCH_FULL
+  MANUAL
+}
+
+enum VideoStatus {
+  UPLOADING
+  QUEUED
+  PROCESSING
+  READY
+  FAILED
+  ARCHIVED
+}
+
+enum AttachmentKind {
+  PDF
+  IMAGE
+  DOC
+  SHEET
+  LINK
+  OTHER
+}
+
+enum PaymentStatus {
+  PENDING
+  AUTHORIZED
+  PAID
+  FAILED
+  CANCELLED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum PaymentProvider {
+  MANUAL
+  PAYMOB
+  STRIPE
+  CODE
+  FREE
+}
+
+enum CodeStatus {
+  ACTIVE
+  EXHAUSTED
+  EXPIRED
+  REVOKED
+}
+
+enum DeviceStatus {
+  ACTIVE
+  PENDING_APPROVAL
+  REVOKED
+  BLOCKED
+}
+
+enum DeviceChangeStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum SessionStatus {
+  ACTIVE
+  EXPIRED
+  REVOKED
+}
+
+enum PlaybackTicketStatus {
+  ACTIVE
+  EXPIRED
+  RELEASED
+  REVOKED
+}
+
+enum NotificationKind {
+  NEW_COURSE
+  NEW_SECTION
+  NEW_LESSON
+  NEW_VIDEO
+  ANNOUNCEMENT
+  PAYMENT
+  ENROLLMENT
+  COURSE_UPDATE
+  ADMIN
+  SECURITY
+}
+
+enum SecurityEventType {
+  LOGIN_FAILED
+  LOGIN_SUCCESS
+  DEVICE_MISMATCH
+  DEVICE_REGISTERED
+  DEVICE_REVOKED
+  INTEGRITY_FAILED
+  SCREENSHOT
+  RECORDING_STARTED
+  RECORDING_STOPPED
+  EXTERNAL_DISPLAY
+  TICKET_DENIED
+  TICKET_ABUSE
+  CONCURRENT_STREAM_BLOCKED
+  TOKEN_REUSE
+  UNAUTHORIZED_ACCESS
+}
+
+enum SecuritySeverity {
+  INFO
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  ARCHIVE
+  RESTORE
+  PUBLISH
+  UNPUBLISH
+  LOGIN
+  LOGOUT
+  PASSWORD_RESET
+  PRICE_CHANGE
+  ROLE_CHANGE
+  ACCESS_GRANT
+  ACCESS_REVOKE
+  DEVICE_APPROVE
+  DEVICE_REVOKE
+  CODE_ISSUE
+  CODE_REVOKE
+  CODE_REDEEM
+  PAYMENT_CONFIRM
+  PAYMENT_REFUND
+  ENROLLMENT_CREATE
+  ENROLLMENT_UPDATE
+  SETTINGS_CHANGE
+}
+
+enum WatchEventType {
+  STARTED
+  PROGRESS
+  PAUSED
+  COMPLETED
+  SEEKED
+  ENDED
+}
+
+// =============================================================================
+// Academic structure
+// =============================================================================
+
+model University {
+  id        String   @id @default(cuid())
+  name      String
+  nameAr    String
+  code      String?  @unique
+  logoUrl   String?
+  isActive  Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  faculties Faculty[]
+  students  StudentProfile[]
+  courses   Course[]
+
+  @@index([isActive, sortOrder])
+  @@map("universities")
+}
+
+model Faculty {
+  id           String   @id @default(cuid())
+  universityId String
+  name         String
+  nameAr       String
+  isActive     Boolean  @default(true)
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  deletedAt    DateTime?
+
+  university  University       @relation(fields: [universityId], references: [id], onDelete: Restrict)
+  departments Department[]
+  students    StudentProfile[]
+  courses     Course[]
+
+  @@unique([universityId, name])
+  @@index([universityId, isActive])
+  @@map("faculties")
+}
+
+model Department {
+  id        String   @id @default(cuid())
+  facultyId String
+  name      String
+  nameAr    String
+  isActive  Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  faculty  Faculty          @relation(fields: [facultyId], references: [id], onDelete: Restrict)
+  students StudentProfile[]
+
+  @@unique([facultyId, name])
+  @@index([facultyId, isActive])
+  @@map("departments")
+}
+
+model AcademicYear {
+  id        String   @id @default(cuid())
+  /// Display/sort order (1 = first year). Never assume a fixed maximum.
+  order     Int      @unique
+  name      String
+  nameAr    String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  students StudentProfile[]
+  courses  Course[]
+
+  @@map("academic_years")
+}
+
+// =============================================================================
+// Users
+// =============================================================================
+
+model User {
+  id           String        @id @default(cuid())
+  /// Canonical Egyptian mobile form 01XXXXXXXXX. Unique across all roles.
+  phone        String        @unique
+  passwordHash String
+  fullName     String
+  role         UserRole
+  status       AccountStatus @default(ACTIVE)
+  gender       Gender?
+  avatarUrl    String?
+  email        String?       @unique
+  locale       String        @default("en")
+
+  /// Bumped on password change / forced logout: any refresh token issued
+  /// before this timestamp is rejected without needing a DB sweep.
+  credentialsChangedAt DateTime @default(now())
+  lastLoginAt          DateTime?
+  failedLoginCount     Int      @default(0)
+  lockedUntil          DateTime?
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  createdBy User?  @relation("UserCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdUsers User[] @relation("UserCreatedBy")
+
+  studentProfile StudentProfile?
+  teacherProfile TeacherProfile?
+
+  sessions       Session[]
+  refreshTokens  RefreshToken[]
+  devices        Device[]
+  deviceRequests DeviceChangeRequest[]
+
+  enrollments      Enrollment[]
+  payments         Payment[]
+  codeRedemptions  AccessCodeRedemption[]
+  watchProgress    WatchProgress[]
+  watchEvents      WatchEvent[]
+  playbackTickets  PlaybackTicket[]
+  notifications    Notification[]
+  pushTokens       PushToken[]
+  notificationPrefs NotificationPreference?
+  securityEvents   SecurityEvent[]
+  auditLogs        AuditLog[]            @relation("AuditActor")
+  issuedCodes      AccessCode[]          @relation("CodeIssuer")
+  courseTeachers   CourseTeacher[]
+  authoredCourses  Course[]              @relation("CourseCreatedBy")
+  priceChanges     CoursePrice[]         @relation("PriceChangedBy")
+  revenueShares    RevenueLedger[]       @relation("RevenueTeacher")
+
+  @@index([role, status])
+  @@index([status, deletedAt])
+  @@index([fullName])
+  @@map("users")
+}
+
+/// Academic details. Split from User so admins/teachers don't carry null
+/// columns and so a student's academic record can evolve independently.
+model StudentProfile {
+  id             String   @id @default(cuid())
+  userId         String   @unique
+  universityId   String?
+  facultyId      String?
+  departmentId   String?
+  academicYearId String?
+  /// Institution-issued student number, when the platform is given one.
+  studentNumber  String?
+  notes          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  university   University?   @relation(fields: [universityId], references: [id], onDelete: SetNull)
+  faculty      Faculty?      @relation(fields: [facultyId], references: [id], onDelete: SetNull)
+  department   Department?   @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  academicYear AcademicYear? @relation(fields: [academicYearId], references: [id], onDelete: SetNull)
+
+  @@index([universityId, facultyId, academicYearId])
+  @@map("student_profiles")
+}
+
+model TeacherProfile {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  title     String?
+  titleAr   String?
+  bio       String?
+  bioAr     String?
+  /// Default share of revenue for this teacher's courses, 0..100.
+  revenueSharePercent Decimal @default(0) @db.Decimal(5, 2)
+  isPublic  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("teacher_profiles")
+}
+
+// =============================================================================
+// Sessions, refresh tokens, devices
+// =============================================================================
+
+model Session {
+  id        String        @id @default(cuid())
+  userId    String
+  deviceId  String?
+  status    SessionStatus @default(ACTIVE)
+  ipAddress String?
+  userAgent String?
+  appVersion String?
+  platform  String?
+  createdAt DateTime      @default(now())
+  lastSeenAt DateTime     @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+  revokedReason String?
+
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device          Device?          @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  refreshTokens   RefreshToken[]
+  playbackTickets PlaybackTicket[]
+
+  @@index([userId, status])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+/// Refresh tokens are stored hashed and rotated on every use. `replacedById`
+/// forms a chain so reuse of an already-rotated token is detectable — the
+/// classic refresh-token-theft signal — and triggers revocation of the family.
+model RefreshToken {
+  id           String    @id @default(cuid())
+  userId       String
+  sessionId    String
+  tokenHash    String    @unique
+  familyId     String
+  replacedById String?   @unique
+  usedAt       DateTime?
+  revokedAt    DateTime?
+  revokedReason String?
+  expiresAt    DateTime
+  createdAt    DateTime  @default(now())
+
+  user       User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session    Session       @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  replacedBy RefreshToken? @relation("TokenRotation", fields: [replacedById], references: [id], onDelete: SetNull)
+  replaces   RefreshToken? @relation("TokenRotation")
+
+  @@index([userId, revokedAt])
+  @@index([familyId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+model Device {
+  id        String       @id @default(cuid())
+  userId    String
+  /// Opaque hash generated on-device and kept in the Keychain/Keystore.
+  deviceKey String
+  name      String
+  platform  String
+  model     String?
+  osVersion String?
+  appVersion String?
+  status    DeviceStatus @default(ACTIVE)
+
+  /// Client-reported integrity signal. A hint only — server-side attestation
+  /// is the authority (see docs/SECURITY.md).
+  integritySuspect Boolean @default(false)
+  attestationVerifiedAt DateTime?
+
+  firstSeenAt DateTime  @default(now())
+  lastSeenAt  DateTime  @default(now())
+  approvedAt  DateTime?
+  approvedById String?
+  revokedAt   DateTime?
+  revokedReason String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  user            User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessions        Session[]
+  playbackTickets PlaybackTicket[]
+  changeRequests  DeviceChangeRequest[]
+
+  /// One row per (user, physical device). A second account on the same handset
+  /// gets its own row, which is what lets us spot handset sharing.
+  @@unique([userId, deviceKey])
+  @@index([deviceKey])
+  @@index([userId, status])
+  @@map("devices")
+}
+
+model DeviceChangeRequest {
+  id           String             @id @default(cuid())
+  userId       String
+  /// The device the student wants authorized.
+  requestedDeviceId String?
+  requestedDeviceKey String
+  requestedDeviceName String
+  reason       String?
+  status       DeviceChangeStatus @default(PENDING)
+  reviewedById String?
+  reviewedAt   DateTime?
+  reviewNote   String?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  user            User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  requestedDevice Device? @relation(fields: [requestedDeviceId], references: [id], onDelete: SetNull)
+
+  @@index([status, createdAt])
+  @@index([userId, status])
+  @@map("device_change_requests")
+}
+
+// =============================================================================
+// Courses
+// =============================================================================
+
+model Course {
+  id               String       @id @default(cuid())
+  slug             String       @unique
+  title            String
+  titleAr          String?
+  shortDescription String       @default("")
+  description      String       @default("")
+  thumbnailKey     String?
+  status           CourseStatus @default(DRAFT)
+
+  universityId   String?
+  facultyId      String?
+  academicYearId String?
+
+  /// Which join methods the student may use. Rendered verbatim by the app.
+  enrollmentMethods EnrollmentMethod[] @default([])
+  isFree            Boolean            @default(false)
+
+  accessDurationType AccessDurationType @default(LIFETIME)
+  /// Used when accessDurationType = FIXED_DAYS.
+  accessDurationDays Int?
+  /// Used when accessDurationType = UNTIL_DATE.
+  accessEndsAt       DateTime?
+
+  /// Completion rule applied to every lesson unless the lesson overrides it.
+  completionRuleType      CompletionRuleType @default(WATCH_PERCENT)
+  completionThreshold     Int                @default(90)
+  completionRequireContiguous Boolean        @default(true)
+
+  requirements String[] @default([])
+  outcomes     String[] @default([])
+
+  /// Denormalised counters, maintained transactionally. They exist because the
+  /// catalogue lists them on every card and recomputing per row is an N+1.
+  lessonCount          Int @default(0)
+  sectionCount         Int @default(0)
+  totalDurationSeconds Int @default(0)
+  studentCount         Int @default(0)
+  ratingSum            Int @default(0)
+  ratingCount          Int @default(0)
+
+  createdById String?
+  publishedAt DateTime?
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  university   University?   @relation(fields: [universityId], references: [id], onDelete: SetNull)
+  faculty      Faculty?      @relation(fields: [facultyId], references: [id], onDelete: SetNull)
+  academicYear AcademicYear? @relation(fields: [academicYearId], references: [id], onDelete: SetNull)
+  createdBy    User?         @relation("CourseCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  teachers    CourseTeacher[]
+  sections    CourseSection[]
+  lessons     Lesson[]
+  videos      Video[]
+  attachments Attachment[]
+  prices      CoursePrice[]
+  enrollments Enrollment[]
+
+  // Restrict: financial and analytics history pins the course row in place.
+  payments        Payment[]
+  codes           AccessCode[]
+  watchProgress   WatchProgress[]
+  watchEvents     WatchEvent[]
+  playbackTickets PlaybackTicket[]
+  revenue         RevenueLedger[]
+  archiveRecords  ArchiveRecord[]
+
+  @@index([status, publishedAt])
+  @@index([universityId, academicYearId, status])
+  @@index([deletedAt])
+  @@index([title])
+  @@map("courses")
+}
+
+/// Many-to-many so a course can be co-taught without duplicating the course.
+model CourseTeacher {
+  id        String   @id @default(cuid())
+  courseId  String
+  teacherId String
+  /// The lead teacher is the one shown on cards when space allows one name.
+  isLead    Boolean  @default(false)
+  /// Per-assignment override of the teacher's default revenue share.
+  revenueSharePercent Decimal? @db.Decimal(5, 2)
+  canEditContent  Boolean @default(true)
+  canEditPricing  Boolean @default(false)
+  canPublish      Boolean @default(false)
+  canViewStudents Boolean @default(true)
+  canViewRevenue  Boolean @default(false)
+  assignedById String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  course  Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  teacher User   @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+
+  @@unique([courseId, teacherId])
+  @@index([teacherId])
+  @@map("course_teachers")
+}
+
+/// Versioned pricing. A new row is appended on every change; the previous row
+/// gets `effectiveTo`. Payments reference the exact version they used, so
+/// historical revenue can never be recomputed from the current price.
+model CoursePrice {
+  id           String   @id @default(cuid())
+  courseId     String
+  amount       Decimal  @db.Decimal(12, 2)
+  currency     String   @default("EGP")
+  /// Optional strike-through price for a promotion.
+  compareAtAmount Decimal? @db.Decimal(12, 2)
+  version      Int
+  isCurrent    Boolean  @default(true)
+  effectiveFrom DateTime @default(now())
+  effectiveTo   DateTime?
+  changedById  String?
+  reason       String?
+  createdAt    DateTime @default(now())
+
+  course    Course    @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  changedBy User?     @relation("PriceChangedBy", fields: [changedById], references: [id], onDelete: SetNull)
+  payments  Payment[]
+
+  @@unique([courseId, version])
+  @@index([courseId, isCurrent])
+  @@map("course_prices")
+}
+
+/// Dynamic course structure. No assumption is made anywhere about how many
+/// sections exist or what they are called.
+model CourseSection {
+  id          String        @id @default(cuid())
+  courseId    String
+  title       String
+  titleAr     String?
+  description String?
+  sortOrder   Int
+  status      ContentStatus @default(PUBLISHED)
+  /// Drip release: hidden until this timestamp.
+  unlocksAt   DateTime?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  deletedAt   DateTime?
+
+  course  Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  lessons Lesson[]
+
+  @@unique([courseId, sortOrder])
+  @@index([courseId, status, sortOrder])
+  @@map("course_sections")
+}
+
+model Lesson {
+  id          String        @id @default(cuid())
+  courseId    String
+  sectionId   String
+  title       String
+  titleAr     String?
+  description String?
+  kind        LessonKind    @default(VIDEO)
+  sortOrder   Int
+  status      ContentStatus @default(PUBLISHED)
+  /// Free preview lessons are playable before enrolling.
+  isPreview   Boolean       @default(false)
+  durationSeconds Int       @default(0)
+
+  /// Per-lesson override of the course completion rule.
+  completionRuleType          CompletionRuleType?
+  completionThreshold         Int?
+  completionRequireContiguous Boolean?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  course  Course        @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  section CourseSection @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+
+  video       Video?
+  attachments Attachment[]
+
+  watchProgress WatchProgress[]
+  watchEvents   WatchEvent[]
+  playbackTickets PlaybackTicket[]
+
+  @@unique([sectionId, sortOrder])
+  @@index([courseId, status])
+  @@index([sectionId, status, sortOrder])
+  @@index([title])
+  @@map("lessons")
+}
+
+// =============================================================================
+// Video
+// =============================================================================
+
+/// Metadata only. The bytes live in Cloudflare R2; nothing here is a playable
+/// URL. A playable URL only ever comes from a PlaybackTicket.
+model Video {
+  id       String      @id @default(cuid())
+  lessonId String      @unique
+  courseId String
+  status   VideoStatus @default(UPLOADING)
+
+  /// R2 object key of the master/source upload. Never exposed to students.
+  sourceKey     String?
+  sourceSizeBytes BigInt?
+  sourceMimeType String?
+  /// R2 prefix under which the HLS output lives, e.g. "hls/<videoId>/".
+  hlsPrefix     String?
+  /// Object key of the master playlist inside hlsPrefix.
+  masterPlaylistKey String?
+  thumbnailKey  String?
+
+  durationSeconds Int    @default(0)
+  width           Int?
+  height          Int?
+  frameRate       Float?
+  videoCodec      String?
+  audioCodec      String?
+
+  /// AES-128 HLS key material. `encryptionKeyId` names a key derived from
+  /// HLS_KEY_ROOT; the key bytes are never stored in the database.
+  isEncrypted     Boolean @default(false)
+  encryptionKeyId String?
+
+  processingJobId String?
+  processingError String?
+  processingStartedAt DateTime?
+  processedAt     DateTime?
+  uploadedById    String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  lesson     Lesson           @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  course     Course           @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  renditions VideoRendition[]
+  captions   CaptionTrack[]
+  tickets    PlaybackTicket[]
+  watchEvents WatchEvent[]
+
+  @@index([courseId, status])
+  @@index([status, createdAt])
+  @@map("videos")
+}
+
+model VideoRendition {
+  id        String   @id @default(cuid())
+  videoId   String
+  /// 360 | 480 | 720 | 1080 …
+  height    Int
+  width     Int
+  bitrateKbps Int
+  playlistKey String
+  sizeBytes BigInt?
+  createdAt DateTime @default(now())
+
+  video Video @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@unique([videoId, height])
+  @@index([videoId])
+  @@map("video_renditions")
+}
+
+model CaptionTrack {
+  id        String   @id @default(cuid())
+  videoId   String
+  language  String
+  label     String
+  objectKey String
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  video Video @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@unique([videoId, language])
+  @@map("caption_tracks")
+}
+
+// =============================================================================
+// Attachments
+// =============================================================================
+
+model Attachment {
+  id       String         @id @default(cuid())
+  courseId String
+  lessonId String?
+  title    String
+  titleAr  String?
+  kind     AttachmentKind @default(PDF)
+  objectKey String
+  mimeType String?
+  sizeBytes BigInt?
+  pageCount Int?
+  /// Protected attachments are served through a ticket and never downloadable.
+  isProtected  Boolean @default(true)
+  isDownloadable Boolean @default(false)
+  /// Available to non-enrolled students (syllabus, sample chapter).
+  isPreview    Boolean @default(false)
+  sortOrder    Int     @default(0)
+  uploadedById String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  course Course  @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  lesson Lesson? @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  @@index([courseId, deletedAt])
+  @@index([lessonId])
+  @@map("attachments")
+}
+
+// =============================================================================
+// Enrollment & access
+// =============================================================================
+
+model Enrollment {
+  id       String          @id @default(cuid())
+  userId   String
+  courseId String
+  state    EnrollmentState
+  method   EnrollmentMethod
+
+  accessStartsAt DateTime  @default(now())
+  /// Null = lifetime access.
+  accessEndsAt   DateTime?
+
+  approvedById String?
+  approvedAt   DateTime?
+  revokedById  String?
+  revokedAt    DateTime?
+  revokedReason String?
+
+  /// Progress snapshot, maintained on completion transitions so the course
+  /// list doesn't have to aggregate watch_progress per row.
+  completedLessons Int      @default(0)
+  lastLessonId     String?
+  lastAccessedAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  course Course @relation(fields: [courseId], references: [id], onDelete: Restrict)
+
+  payments    Payment[]
+  redemptions AccessCodeRedemption[]
+
+  /// A student has at most one enrollment row per course; re-joining after
+  /// expiry updates this row and appends a new payment/redemption.
+  @@unique([userId, courseId])
+  @@index([courseId, state])
+  @@index([userId, state])
+  @@index([accessEndsAt, state])
+  @@map("enrollments")
+}
+
+// =============================================================================
+// Payments & revenue
+// =============================================================================
+
+model Payment {
+  id           String          @id @default(cuid())
+  userId       String
+  courseId     String
+  enrollmentId String?
+  /// The exact price version charged. Immutable evidence of what was owed.
+  coursePriceId String?
+
+  /// The exact amount charged, frozen at purchase time. Never derived from
+  /// the course's current price.
+  amount   Decimal       @db.Decimal(12, 2)
+  currency String        @default("EGP")
+  status   PaymentStatus @default(PENDING)
+  provider PaymentProvider @default(MANUAL)
+
+  /// Provider-side identifier, unique per provider.
+  providerReference String?
+  /// Our own idempotency key, echoed to the provider where supported.
+  idempotencyKey    String  @unique
+  checkoutUrl       String?
+
+  paidAt      DateTime?
+  failedAt    DateTime?
+  failureCode String?
+  refundedAmount Decimal @default(0) @db.Decimal(12, 2)
+  refundedAt  DateTime?
+
+  metadata Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Restrict)
+  course      Course       @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  enrollment  Enrollment?  @relation(fields: [enrollmentId], references: [id], onDelete: SetNull)
+  coursePrice CoursePrice? @relation(fields: [coursePriceId], references: [id], onDelete: Restrict)
+
+  transactions PaymentTransaction[]
+  revenue      RevenueLedger[]
+
+  @@index([userId, status])
+  @@index([courseId, status])
+  @@index([status, createdAt])
+  @@index([providerReference])
+  @@map("payments")
+}
+
+/// Append-only provider event log. Webhooks land here before mutating the
+/// Payment, so a replayed or out-of-order webhook is diagnosable.
+model PaymentTransaction {
+  id        String   @id @default(cuid())
+  paymentId String
+  /// authorize | capture | fail | refund | webhook | manual_confirm
+  type      String
+  status    String
+  amount    Decimal? @db.Decimal(12, 2)
+  currency  String?
+  providerReference String?
+  /// Raw provider payload, redacted of card data before storage.
+  rawPayload Json?
+  createdAt DateTime @default(now())
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
+  @@index([paymentId, createdAt])
+  @@index([providerReference])
+  @@map("payment_transactions")
+}
+
+/// Immutable revenue lines, written once when a payment is captured.
+/// Archiving or repricing a course never touches these rows.
+model RevenueLedger {
+  id        String   @id @default(cuid())
+  paymentId String
+  courseId  String
+  teacherId String?
+
+  grossAmount    Decimal @db.Decimal(12, 2)
+  platformAmount Decimal @db.Decimal(12, 2)
+  teacherAmount  Decimal @db.Decimal(12, 2)
+  sharePercent   Decimal @db.Decimal(5, 2)
+  currency       String  @default("EGP")
+
+  /// Denormalised for reporting after a course is renamed or archived.
+  courseTitleSnapshot String
+  recognizedAt        DateTime @default(now())
+  createdAt           DateTime @default(now())
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  course  Course  @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  teacher User?   @relation("RevenueTeacher", fields: [teacherId], references: [id], onDelete: SetNull)
+
+  @@index([courseId, recognizedAt])
+  @@index([teacherId, recognizedAt])
+  @@index([recognizedAt])
+  @@map("revenue_ledger")
+}
+
+// =============================================================================
+// Access codes
+// =============================================================================
+
+model AccessCode {
+  id       String     @id @default(cuid())
+  /// Stored uppercase; unique platform-wide so a code can be redeemed without
+  /// the student first selecting the right course.
+  code     String     @unique
+  courseId String?
+  status   CodeStatus @default(ACTIVE)
+
+  /// Null = any student may redeem it.
+  reservedForUserId String?
+
+  maxRedemptions Int @default(1)
+  redemptionCount Int @default(0)
+
+  /// Access granted by redeeming. Falls back to the course policy when null.
+  accessDurationType AccessDurationType?
+  accessDurationDays Int?
+  accessEndsAt       DateTime?
+
+  /// The code itself stops working after this date.
+  expiresAt DateTime?
+
+  batchId   String?
+  note      String?
+  issuedById String?
+  revokedAt DateTime?
+  revokedById String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  course      Course?                @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  issuedBy    User?                  @relation("CodeIssuer", fields: [issuedById], references: [id], onDelete: SetNull)
+  redemptions AccessCodeRedemption[]
+
+  @@index([courseId, status])
+  @@index([batchId])
+  @@index([status, expiresAt])
+  @@map("access_codes")
+}
+
+/// Append-only. One row per successful redemption; the unique constraint is
+/// what makes a single-use code genuinely single-use under concurrency.
+model AccessCodeRedemption {
+  id           String   @id @default(cuid())
+  codeId       String
+  userId       String
+  enrollmentId String?
+  courseId     String
+  redeemedAt   DateTime @default(now())
+  ipAddress    String?
+  deviceKey    String?
+
+  code       AccessCode  @relation(fields: [codeId], references: [id], onDelete: Restrict)
+  user       User        @relation(fields: [userId], references: [id], onDelete: Restrict)
+  enrollment Enrollment? @relation(fields: [enrollmentId], references: [id], onDelete: SetNull)
+
+  /// A student cannot redeem the same code twice, ever.
+  @@unique([codeId, userId])
+  @@index([userId, redeemedAt])
+  @@index([courseId])
+  @@map("access_code_redemptions")
+}
+
+// =============================================================================
+// Playback authorization
+// =============================================================================
+
+/// One row per issued playback grant. Kept after expiry as the audit trail of
+/// who was authorized to watch what, from where, and when.
+model PlaybackTicket {
+  id        String               @id @default(cuid())
+  userId    String
+  videoId   String
+  lessonId  String
+  courseId  String
+  sessionId String?
+  deviceId  String?
+  status    PlaybackTicketStatus @default(ACTIVE)
+
+  /// Opaque forensic tag embedded in the watermark payload.
+  watermarkTag String
+  /// Server-chosen quality ceiling for this grant (null = full ladder).
+  maxHeight    Int?
+
+  issuedAt      DateTime  @default(now())
+  expiresAt     DateTime
+  lastHeartbeatAt DateTime @default(now())
+  releasedAt    DateTime?
+  revokedAt     DateTime?
+  revokedReason String?
+
+  /// Rotation chain, so a long lesson's successive grants stay linked.
+  rotatedFromId String?  @unique
+
+  startPositionSeconds Int @default(0)
+  lastPositionSeconds  Int @default(0)
+  watchedSeconds       Int @default(0)
+  captureAttempts      Int @default(0)
+
+  ipAddress String?
+  userAgent String?
+
+  user        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  video       Video           @relation(fields: [videoId], references: [id], onDelete: Cascade)
+  lesson      Lesson          @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  course      Course          @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  session     Session?        @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  device      Device?         @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  rotatedFrom PlaybackTicket? @relation("TicketRotation", fields: [rotatedFromId], references: [id], onDelete: SetNull)
+  rotatedTo   PlaybackTicket? @relation("TicketRotation")
+  securityEvents SecurityEvent[]
+
+  @@index([userId, status, expiresAt])
+  @@index([videoId, issuedAt])
+  @@index([status, expiresAt])
+  @@map("playback_tickets")
+}
+
+// =============================================================================
+// Progress & analytics
+// =============================================================================
+
+model WatchProgress {
+  id       String @id @default(cuid())
+  userId   String
+  lessonId String
+  courseId String
+
+  positionSeconds Int @default(0)
+  durationSeconds Int @default(0)
+  /// 0..100. Monotonic — the service never lets it decrease.
+  percent         Int @default(0)
+  /// Contiguous seconds actually watched, ignoring seeks. Drives the
+  /// requireContiguous completion rule.
+  watchedSeconds  Int @default(0)
+
+  completed   Boolean   @default(false)
+  completedAt DateTime?
+  firstWatchedAt DateTime @default(now())
+  lastWatchedAt  DateTime @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lesson Lesson @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  course Course @relation(fields: [courseId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, lessonId])
+  @@index([userId, courseId])
+  @@index([userId, lastWatchedAt])
+  @@index([courseId, completed])
+  @@map("watch_progress")
+}
+
+/// Coarse analytics events. Deliberately NOT one row per second — the service
+/// writes STARTED / COMPLETED plus a throttled PROGRESS heartbeat.
+model WatchEvent {
+  id       String         @id @default(cuid())
+  userId   String
+  lessonId String
+  courseId String
+  videoId  String?
+  ticketId String?
+  type     WatchEventType
+
+  positionSeconds Int @default(0)
+  /// New contiguous seconds since the previous event.
+  deltaSeconds    Int @default(0)
+  qualityHeight   Int?
+  platform        String?
+  occurredAt      DateTime @default(now())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lesson Lesson @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  course Course @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  video  Video? @relation(fields: [videoId], references: [id], onDelete: SetNull)
+
+  @@index([courseId, occurredAt])
+  @@index([lessonId, occurredAt])
+  @@index([userId, occurredAt])
+  @@index([type, occurredAt])
+  @@map("watch_events")
+}
+
+/// Nightly rollup so dashboards never scan watch_events.
+model DailyCourseStat {
+  id       String   @id @default(cuid())
+  courseId String
+  day      DateTime @db.Date
+
+  uniqueViewers   Int @default(0)
+  watchSeconds    Int @default(0)
+  lessonsStarted  Int @default(0)
+  lessonsCompleted Int @default(0)
+  newEnrollments  Int @default(0)
+  revenueAmount   Decimal @default(0) @db.Decimal(12, 2)
+  currency        String  @default("EGP")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([courseId, day])
+  @@index([day])
+  @@map("daily_course_stats")
+}
+
+// =============================================================================
+// Notifications
+// =============================================================================
+
+model Notification {
+  id     String           @id @default(cuid())
+  userId String
+  kind   NotificationKind
+
+  title   String
+  titleAr String?
+  body    String
+  bodyAr  String?
+  /// Validated in-app path, e.g. "/course/abc". Never an external URL.
+  route   String?
+  imageUrl String?
+  data    Json?
+
+  read   Boolean   @default(false)
+  readAt DateTime?
+
+  /// Set when this notification came from a broadcast announcement.
+  announcementId String?
+
+  createdAt DateTime @default(now())
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  announcement Announcement? @relation(fields: [announcementId], references: [id], onDelete: SetNull)
+
+  @@index([userId, read, createdAt])
+  @@index([userId, createdAt])
+  @@map("notifications")
+}
+
+/// A single admin-authored message fanned out into per-user notifications.
+model Announcement {
+  id      String @id @default(cuid())
+  title   String
+  titleAr String?
+  body    String
+  bodyAr  String?
+  route   String?
+
+  /// Targeting. All null = every active student.
+  courseId       String?
+  universityId   String?
+  academicYearId String?
+
+  sendPush  Boolean   @default(true)
+  publishedAt DateTime?
+  createdById String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  notifications Notification[]
+
+  @@index([publishedAt])
+  @@map("announcements")
+}
+
+model NotificationPreference {
+  id     String @id @default(cuid())
+  userId String @unique
+
+  newCourse     Boolean @default(true)
+  newLesson     Boolean @default(true)
+  announcements Boolean @default(true)
+  payments      Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("notification_preferences")
+}
+
+model PushToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  platform  String
+  provider  String   @default("expo")
+  /// Ties the token to the physical device so unbinding kills its pushes.
+  deviceKey String?
+  isActive  Boolean  @default(true)
+  lastUsedAt DateTime?
+  failureCount Int    @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isActive])
+  @@map("push_tokens")
+}
+
+// =============================================================================
+// Security & audit
+// =============================================================================
+
+model SecurityEvent {
+  id       String            @id @default(cuid())
+  userId   String?
+  type     SecurityEventType
+  severity SecuritySeverity  @default(INFO)
+
+  courseId  String?
+  lessonId  String?
+  videoId   String?
+  ticketId  String?
+  deviceKey String?
+  sessionId String?
+
+  ipAddress String?
+  userAgent String?
+  message   String?
+  metadata  Json?
+
+  occurredAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+
+  // Optional: some events (a failed login with an unknown phone) have no user.
+  user   User?           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ticket PlaybackTicket? @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+
+  @@index([userId, occurredAt])
+  @@index([type, occurredAt])
+  @@index([severity, occurredAt])
+  @@map("security_events")
+}
+
+/// Append-only administrative trail. No update or delete path exists in the
+/// application layer.
+model AuditLog {
+  id       String      @id @default(cuid())
+  actorId  String?
+  actorRole UserRole?
+  action   AuditAction
+  /// e.g. "course", "user", "access_code"
+  entity   String
+  entityId String?
+
+  /// Redacted before/after snapshots for diffing.
+  before Json?
+  after  Json?
+
+  ipAddress String?
+  userAgent String?
+  requestId String?
+  note      String?
+
+  createdAt DateTime @default(now())
+
+  actor User? @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([entity, entityId, createdAt])
+  @@index([actorId, createdAt])
+  @@index([action, createdAt])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+/// Why and when content was archived, and by whom. The content row itself
+/// keeps its data; this explains the state transition.
+model ArchiveRecord {
+  id       String   @id @default(cuid())
+  entity   String
+  entityId String
+  courseId String?
+  reason   String?
+  /// Counts frozen at archive time so reports stay meaningful afterwards.
+  snapshot Json?
+  archivedById String?
+  archivedAt   DateTime  @default(now())
+  restoredById String?
+  restoredAt   DateTime?
+
+  course Course? @relation(fields: [courseId], references: [id], onDelete: Restrict)
+
+  @@index([entity, entityId])
+  @@index([courseId])
+  @@map("archive_records")
+}
+
+// =============================================================================
+// Platform configuration
+// =============================================================================
+
+model PlatformSetting {
+  key         String   @id
+  value       Json
+  description String?
+  updatedById String?
+  updatedAt   DateTime @updatedAt
+  createdAt   DateTime @default(now())
+
+  @@map("platform_settings")
+}
+
+/// Idempotency guard for webhooks and retried mutations.
+model IdempotencyRecord {
+  key        String   @id
+  scope      String
+  statusCode Int
+  response   Json
+  createdAt  DateTime @default(now())
+  expiresAt  DateTime
+
+  @@index([expiresAt])
+  @@map("idempotency_records")
+}

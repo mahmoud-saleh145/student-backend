@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+/uploads
+/tmp
+/media-cache
+prisma/*.db
+.idea/
+.vscode/
+
+# compiled output of the offline verification harness
+tools/offline-verify/out/
