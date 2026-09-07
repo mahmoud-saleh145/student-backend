@@ -64,7 +64,7 @@ const ARGON_OPTIONS: argon2.Options = {
   // Deliberately cheaper than production: the seed hashes a dozen passwords
   // and there is no threat model for a local database.
   memoryCost: 8192,
-  timeCost: 1,
+  timeCost: 2,
   parallelism: 1,
 };
 

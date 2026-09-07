@@ -40,7 +40,7 @@ class TeacherProfileDto {
 
 class CreateStaffDto {
   @IsString() @MaxLength(20)
-  @Matches(/^(?:\+?20|0020)?1[0125]\d{8}$/, { message: 'phone must be a valid Egyptian mobile' })
+  @Matches(/^(?:\+?20|0020|0)?1[0125]\d{8}$/, { message: 'phone must be a valid Egyptian mobile' })
   phone!: string;
 
   @IsString() @MinLength(8) @MaxLength(128) password!: string;
