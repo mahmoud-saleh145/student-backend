@@ -1,10 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
 import {
   AuditAction,
+  CourseStatus,
   EnrollmentMethod,
   EnrollmentState,
   NotificationKind,
   type Prisma,
+  SectionGrantSource,
   UserRole,
 } from '@prisma/client';
 
@@ -273,10 +275,19 @@ export class EnrollmentsService {
       userId: params.userId,
       courseId: params.courseId,
     });
+
+    // "Already enrolled" now has to be a question about *coverage*, not just
+    // state. A student holding a section-scoped grant is ACTIVE on the course
+    // yet must still be able to buy the next section; refusing them here would
+    // make section codes unsellable to exactly the people most likely to want
+    // one. Full-coverage holders are still refused, as before.
     if (current.state === 'ACTIVE') {
-      throw new AppException(ErrorCode.ALREADY_ENROLLED, {
-        message: 'You already have access to this course',
-      });
+      const allowed = await this.access.allowedSectionIds(params.userId, params.courseId);
+      if (allowed === null) {
+        throw new AppException(ErrorCode.ALREADY_ENROLLED, {
+          message: 'You already have access to this course',
+        });
+      }
     }
 
     // Code consumption and access grant share one Serializable transaction:
@@ -290,17 +301,56 @@ export class EnrollmentsService {
         deviceKey: params.deviceKey,
       });
 
+      const durationOverride = {
+        // A code may override the course's default access window.
+        type: validation.code.accessDurationType,
+        days: validation.code.accessDurationDays,
+        endsAt: validation.code.accessEndsAt,
+      };
+
       const granted = await this.grantAccess(tx, {
         userId: params.userId,
         course,
         method: EnrollmentMethod.CODE,
-        // A code may override the course's default access window.
-        durationOverride: {
-          type: validation.code.accessDurationType,
-          days: validation.code.accessDurationDays,
-          endsAt: validation.code.accessEndsAt,
-        },
+        durationOverride,
+        sectionScope: validation.scope.sectionIds,
+        codeId: validation.code.id,
       });
+
+      // A teacher-scoped card unlocks every course frozen into it, not only
+      // the one the student happened to redeem from. Those extra courses are
+      // granted with the same window and the same code id, so the audit trail
+      // shows one redemption producing several enrollments.
+      const extraCourseIds = validation.scope.courseIds.filter(
+        (id) => id !== params.courseId,
+      );
+
+      if (extraCourseIds.length > 0) {
+        const others = await tx.course.findMany({
+          where: {
+            id: { in: extraCourseIds },
+            deletedAt: null,
+            status: { notIn: [CourseStatus.ARCHIVED, CourseStatus.SUSPENDED] },
+          },
+          select: {
+            id: true,
+            accessDurationType: true,
+            accessDurationDays: true,
+            accessEndsAt: true,
+          },
+        });
+
+        for (const other of others) {
+          await this.grantAccess(tx, {
+            userId: params.userId,
+            course: other,
+            method: EnrollmentMethod.CODE,
+            durationOverride,
+            sectionScope: null,
+            codeId: validation.code.id,
+          });
+        }
+      }
 
       await tx.accessCodeRedemption.updateMany({
         where: { codeId: validation.code.id, userId: params.userId },
@@ -314,7 +364,13 @@ export class EnrollmentsService {
           action: AuditAction.CODE_REDEEM,
           entity: 'access_code',
           entityId: validation.code.id,
-          after: { courseId: params.courseId, enrollmentId: granted.id },
+          after: {
+            courseId: params.courseId,
+            enrollmentId: granted.id,
+            targetType: validation.scope.targetType,
+            courseIds: validation.scope.courseIds,
+            sectionIds: validation.scope.sectionIds,
+          },
           ipAddress: params.ip ?? null,
         },
       });
@@ -359,10 +415,30 @@ export class EnrollmentsService {
         endsAt: Date | null;
       };
       approvedById?: string;
+      /**
+       * `null` (the default) means "the whole course" — every path that
+       * existed before section codes passes nothing and therefore keeps its
+       * exact previous behaviour. An array restricts the grant to those
+       * sections.
+       */
+      sectionScope?: string[] | null;
+      codeId?: string;
     },
   ) {
     const now = new Date();
     const accessEndsAt = this.computeAccessEnd(params.course, params.durationOverride, now);
+    const scope = params.sectionScope ?? null;
+
+    const existing = await tx.enrollment.findUnique({
+      where: { userId_courseId: { userId: params.userId, courseId: params.course.id } },
+      select: { id: true, coversAllSections: true },
+    });
+
+    // Access is only ever widened here, never narrowed: a student who already
+    // holds the whole course keeps it even if the grant being applied is
+    // section-scoped. The only way to reduce access is an explicit revoke.
+    const coversAllSections =
+      scope === null || (existing?.coversAllSections ?? false) ? true : false;
 
     const enrollment = await tx.enrollment.upsert({
       where: { userId_courseId: { userId: params.userId, courseId: params.course.id } },
@@ -375,6 +451,7 @@ export class EnrollmentsService {
         accessEndsAt,
         approvedById: params.approvedById,
         approvedAt: params.approvedById ? now : null,
+        coversAllSections,
       },
       update: {
         state: EnrollmentState.ACTIVE,
@@ -386,8 +463,23 @@ export class EnrollmentsService {
         revokedAt: null,
         revokedById: null,
         revokedReason: null,
+        coversAllSections,
       },
     });
+
+    if (scope !== null && scope.length > 0) {
+      // Append-only: buying a second section adds a row rather than replacing
+      // the first, so what the student paid for stays reconstructible.
+      await tx.enrollmentSectionGrant.createMany({
+        data: scope.map((sectionId) => ({
+          enrollmentId: enrollment.id,
+          sectionId,
+          source: SectionGrantSource.CODE,
+          codeId: params.codeId ?? null,
+        })),
+        skipDuplicates: true,
+      });
+    }
 
     const studentCount = await tx.enrollment.count({
       where: { courseId: params.course.id, state: EnrollmentState.ACTIVE },
@@ -462,11 +554,36 @@ export class EnrollmentsService {
     courseId?: string;
     userId?: string;
     state?: EnrollmentState;
+    /**
+     * Restricts to students whose access covers this section — either because
+     * they hold the whole course or because a section grant names it. This is
+     * what backs the per-section purchaser exports.
+     */
+    sectionId?: string;
+    q?: string;
   }) {
     const where: Prisma.EnrollmentWhereInput = {
       ...(params.courseId ? { courseId: params.courseId } : {}),
       ...(params.userId ? { userId: params.userId } : {}),
       ...(params.state ? { state: params.state } : {}),
+      ...(params.sectionId
+        ? {
+            OR: [
+              { coversAllSections: true },
+              { sectionGrants: { some: { sectionId: params.sectionId } } },
+            ],
+          }
+        : {}),
+      ...(params.q
+        ? {
+            user: {
+              OR: [
+                { fullName: { contains: params.q, mode: 'insensitive' } },
+                { phone: { contains: params.q.replace(/\D/g, '') } },
+              ],
+            },
+          }
+        : {}),
     };
 
     const [rows, total] = await this.prisma.$transaction([
@@ -476,36 +593,100 @@ export class EnrollmentsService {
         skip: (params.page - 1) * params.pageSize,
         take: params.pageSize,
         include: {
-          user: { select: { id: true, fullName: true, phone: true } },
+          user: {
+            select: {
+              id: true,
+              fullName: true,
+              phone: true,
+              email: true,
+              gender: true,
+              status: true,
+              studentProfile: {
+                select: {
+                  university: { select: { id: true, name: true, nameAr: true } },
+                  faculty: { select: { id: true, name: true, nameAr: true } },
+                  department: { select: { id: true, name: true, nameAr: true } },
+                  academicYear: { select: { id: true, name: true, nameAr: true, order: true } },
+                },
+              },
+            },
+          },
           course: { select: { id: true, title: true } },
           payments: {
             where: { status: 'PAID' },
             select: { id: true, amount: true, currency: true, paidAt: true },
           },
+          redemptions: {
+            orderBy: { redeemedAt: 'desc' },
+            take: 1,
+            select: {
+              redeemedAt: true,
+              code: {
+                select: {
+                  id: true,
+                  code: true,
+                  targetType: true,
+                  priceAmount: true,
+                  currency: true,
+                },
+              },
+            },
+          },
+          sectionGrants: { select: { sectionId: true } },
         },
       }),
       this.prisma.enrollment.count({ where }),
     ]);
 
     return paginated(
-      rows.map((e) => ({
-        id: e.id,
-        state: e.state,
-        method: e.method,
-        user: e.user,
-        course: e.course,
-        accessStartsAt: e.accessStartsAt.toISOString(),
-        accessEndsAt: e.accessEndsAt?.toISOString() ?? null,
-        completedLessons: e.completedLessons,
-        lastAccessedAt: e.lastAccessedAt?.toISOString() ?? null,
-        createdAt: e.createdAt.toISOString(),
-        payments: e.payments.map((p) => ({
-          id: p.id,
-          amount: Number(p.amount),
-          currency: p.currency,
-          paidAt: p.paidAt?.toISOString() ?? null,
-        })),
-      })),
+      rows.map((e) => {
+        const redemption = e.redemptions[0];
+
+        return {
+          id: e.id,
+          state: e.state,
+          method: e.method,
+          user: {
+            id: e.user.id,
+            fullName: e.user.fullName,
+            phone: e.user.phone,
+            email: e.user.email,
+            gender: e.user.gender ?? 'MALE',
+            status: e.user.status,
+            university: e.user.studentProfile?.university ?? null,
+            faculty: e.user.studentProfile?.faculty ?? null,
+            department: e.user.studentProfile?.department ?? null,
+            academicYear: e.user.studentProfile?.academicYear ?? null,
+          },
+          course: e.course,
+          coversAllSections: e.coversAllSections,
+          sectionIds: e.coversAllSections ? null : e.sectionGrants.map((g) => g.sectionId),
+          accessStartsAt: e.accessStartsAt.toISOString(),
+          accessEndsAt: e.accessEndsAt?.toISOString() ?? null,
+          completedLessons: e.completedLessons,
+          lastAccessedAt: e.lastAccessedAt?.toISOString() ?? null,
+          createdAt: e.createdAt.toISOString(),
+          payments: e.payments.map((p) => ({
+            id: p.id,
+            amount: Number(p.amount),
+            currency: p.currency,
+            paidAt: p.paidAt?.toISOString() ?? null,
+          })),
+          redemption: redemption
+            ? {
+                codeId: redemption.code.id,
+                code: redemption.code.code,
+                targetType: redemption.code.targetType,
+                amount:
+                  redemption.code.priceAmount === null
+                    ? null
+                    : Number(redemption.code.priceAmount),
+                currency: redemption.code.currency,
+                redeemedAt: redemption.redeemedAt.toISOString(),
+              }
+            : null,
+        };
+      }),
       total,
       params.page,
       params.pageSize,

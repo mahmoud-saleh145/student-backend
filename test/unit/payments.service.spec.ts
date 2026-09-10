@@ -56,7 +56,12 @@ function payment(overrides: Record<string, unknown> = {}) {
 }
 
 function buildService(row: ReturnType<typeof payment>) {
-  const revenueCreate = jest.fn(async (args: never) => args);
+  // `args: never` made every `revenueCreate.mock.calls[0][0].data` read fail
+  // to compile. The ledger assertions are the point of this file, so the mock
+  // is typed loosely but concretely enough to index into.
+  const revenueCreate = jest.fn(
+    async (args: { data: Record<string, unknown> }) => args,
+  );
   const paymentUpdate = jest.fn(async ({ data }: { data: Record<string, unknown> }) => ({
     ...row,
     ...data,
@@ -71,7 +76,7 @@ function buildService(row: ReturnType<typeof payment>) {
     },
     paymentTransaction: { create: jest.fn(async () => ({})) },
     enrollment: {
-      update: jest.fn(async () => ({})),
+      update: jest.fn(async (_args: { data: Record<string, unknown> }) => ({})),
       count: jest.fn(async () => 12),
     },
     revenueLedger: { create: revenueCreate },

@@ -130,6 +130,7 @@ export class PlaybackService {
             status: true,
             isPreview: true,
             courseId: true,
+            sectionId: true,
             section: { select: { unlocksAt: true, status: true } },
           },
         },
@@ -167,6 +168,22 @@ export class PlaybackService {
       allowPreview: true,
       isPreviewContent: video.lesson.isPreview,
     });
+
+    // Section-scoped entitlement, enforced at the point a playable URL would
+    // be minted. This is the gate that matters: the lesson read above can be
+    // skipped by a client, the ticket cannot.
+    if (user.role === UserRole.STUDENT && !video.lesson.isPreview) {
+      try {
+        await this.access.assertSectionAccessible({
+          userId: user.id,
+          courseId: video.courseId,
+          sectionId: video.lesson.sectionId,
+        });
+      } catch (error) {
+        await this.denied(user, videoId, video.courseId, 'section not covered by access');
+        throw error;
+      }
+    }
 
     // Drip release is enforced here too, not only in the lesson read.
     const unlocksAt = video.lesson.section.unlocksAt;

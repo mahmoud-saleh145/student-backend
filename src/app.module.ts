@@ -33,7 +33,10 @@ import { SearchModule } from './modules/search/search.module';
 import { SectionsModule } from './modules/sections/sections.module';
 import { SecurityModule } from './modules/security/security.module';
 import { SessionsModule } from './modules/sessions/sessions.module';
+import { SettingsModule } from './modules/settings/settings.module';
 import { StorageModule } from './modules/storage/storage.module';
+import { SubjectsModule } from './modules/subjects/subjects.module';
+import { SupportModule } from './modules/support/support.module';
 import { UsersModule } from './modules/users/users.module';
 import { VideosModule } from './modules/videos/videos.module';
 import { RedisModule } from './redis/redis.module';
@@ -106,6 +109,7 @@ import { RedisModule } from './redis/redis.module';
     // --- cross-cutting domains ----------------------------------------------
     AuditModule,
     SecurityModule,
+    SettingsModule,
     StorageModule,
 
     // --- identity ------------------------------------------------------------
@@ -116,6 +120,7 @@ import { RedisModule } from './redis/redis.module';
 
     // --- academic structure ---------------------------------------------------
     CatalogModule,
+    SubjectsModule,
 
     // --- content --------------------------------------------------------------
     CoursesModule,
@@ -133,6 +138,7 @@ import { RedisModule } from './redis/redis.module';
     // --- engagement -----------------------------------------------------------
     ProgressModule,
     NotificationsModule,
+    SupportModule,
     HomeModule,
     SearchModule,
 

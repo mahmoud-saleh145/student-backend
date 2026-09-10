@@ -1,6 +1,6 @@
 import { Body, Controller, Get, HttpCode, HttpStatus, Param, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
-import { CodeStatus } from '@prisma/client';
+import { CodeStatus, CodeTargetType } from '@prisma/client';
 import { Transform, Type } from 'class-transformer';
 import {
   IsEnum,
@@ -25,7 +25,19 @@ import type { AuthenticatedUser } from '../../common/types/request-context';
 import { CodesService } from './codes.service';
 
 class GenerateCodesDto {
+  @IsOptional() @IsEnum(CodeTargetType) targetType?: CodeTargetType;
+
   @IsOptional() @IsString() @MaxLength(32) courseId?: string;
+  @IsOptional() @IsString() @MaxLength(32) sectionId?: string;
+  @IsOptional() @IsString() @MaxLength(32) teacherId?: string;
+
+  /** Optional human label for the generated batch. */
+  @IsOptional() @IsString() @MaxLength(120) batchName?: string;
+
+  /** Face value printed on the card, for reporting only. */
+  @IsOptional() @Type(() => Number) @IsInt() @Min(0) @Max(1_000_000) priceAmount?: number;
+  @IsOptional() @IsString() @MaxLength(8) currency?: string;
+
   @Type(() => Number) @IsInt() @Min(1) @Max(5000) count!: number;
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(10000) maxRedemptions?: number;
   @IsOptional() @IsString() @MaxLength(32) reservedForUserId?: string;
@@ -43,8 +55,15 @@ class GenerateCodesDto {
 
 class ListCodesDto extends SearchablePaginationDto {
   @IsOptional() @IsString() @MaxLength(32) courseId?: string;
+  @IsOptional() @IsString() @MaxLength(32) sectionId?: string;
+  @IsOptional() @IsString() @MaxLength(32) teacherId?: string;
+  @IsOptional() @IsEnum(CodeTargetType) targetType?: CodeTargetType;
   @IsOptional() @IsEnum(CodeStatus) status?: CodeStatus;
   @IsOptional() @IsString() @MaxLength(64) batchId?: string;
+}
+
+class ListBatchesDto extends SearchablePaginationDto {
+  @IsOptional() @IsEnum(CodeTargetType) targetType?: CodeTargetType;
 }
 
 class ValidateCodeDto {
@@ -103,10 +122,40 @@ export class CodesController {
       page: query.page,
       pageSize: query.pageSize,
       courseId: query.courseId,
+      sectionId: query.sectionId,
+      teacherId: query.teacherId,
+      targetType: query.targetType,
       status: query.status,
       batchId: query.batchId,
       q: query.q,
     });
+  }
+
+  @Get('admin/code-batches')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Browse generated batches',
+    description:
+      'One row per generation run, with its target frozen at creation time so an archived or renamed target still reads correctly.',
+  })
+  batches(@Query() query: ListBatchesDto) {
+    return this.codes.listBatches({
+      page: query.page,
+      pageSize: query.pageSize,
+      targetType: query.targetType,
+      q: query.q,
+    });
+  }
+
+  @Get('admin/code-batches/:batchId/codes')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Every card in a batch',
+    description:
+      'Unpaginated by design — this backs the Excel export, and half an export is worse than none. The 5 000-per-batch generation cap bounds the response.',
+  })
+  batchCodes(@Param('batchId') batchId: string) {
+    return this.codes.batchCodes(batchId);
   }
 
   @Get('admin/codes/:id/redemptions')

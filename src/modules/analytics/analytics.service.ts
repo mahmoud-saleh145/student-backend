@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { Prisma, UserRole } from '@prisma/client';
 
+import { AppException } from '../../common/errors/app.exception';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { CourseAccessService } from '../courses/course-access.service';
 
@@ -242,5 +243,302 @@ export class AnalyticsService {
       net: Number(r.net),
       transactions: Number(r.transactions),
     }));
+  }
+
+  /**
+   * The Statistics screen, in one round trip.
+   *
+   * `/analytics/overview` stays exactly as it was — it is what the existing
+   * clients call. This adds the counts the dashboard's tiles need (courses by
+   * status, codes by status, purchases) without changing that response, and
+   * without the dashboard having to fire eight list requests with pageSize=1
+   * just to read their totals.
+   *
+   * Money still comes only from `revenue_ledger`, never from a course's
+   * current price.
+   */
+  async dashboard(params: { from?: Date; to?: Date }) {
+    const from = params.from ?? new Date(Date.now() - 30 * 24 * 3600 * 1000);
+    const to = params.to ?? new Date();
+    const prismaAny = this.prisma as any;
+
+    const [
+      students,
+      blockedStudents,
+      teachers,
+      admins,
+      coursesByStatus,
+      codesByStatus,
+      codeTotal,
+      paidPayments,
+      revenueAll,
+      revenueWindow,
+      refundsAll,
+      enrollmentsWindow,
+      activeEnrollments,
+      supportOpen,
+      pendingDeviceRequests,
+    ] = await this.prisma.$transaction([
+      this.prisma.user.count({ where: { role: UserRole.STUDENT, ...notDeleted } }),
+      this.prisma.user.count({
+        where: {
+          role: UserRole.STUDENT,
+          ...notDeleted,
+          status: { in: ['SUSPENDED', 'DISABLED'] },
+        },
+      }),
+      this.prisma.user.count({ where: { role: UserRole.TEACHER, ...notDeleted } }),
+      this.prisma.user.count({
+        where: { role: { in: [UserRole.ADMIN, UserRole.MASTER] }, ...notDeleted },
+      }),
+      this.prisma.course.groupBy({
+        by: ['status'],
+        where: notDeleted,
+        _count: { _all: true },
+        orderBy: { status: 'asc' },
+      }),
+      this.prisma.accessCode.groupBy({
+        by: ['status'],
+        _count: { _all: true },
+        orderBy: { status: 'asc' },
+      }),
+      this.prisma.accessCode.count(),
+      this.prisma.payment.count({ where: { status: 'PAID' } }),
+      this.prisma.revenueLedger.aggregate({
+        where: { grossAmount: { gt: 0 } },
+        _sum: { grossAmount: true },
+        _count: { _all: true },
+      }),
+      this.prisma.revenueLedger.aggregate({
+        where: { recognizedAt: { gte: from, lte: to }, grossAmount: { gt: 0 } },
+        _sum: { grossAmount: true, platformAmount: true, teacherAmount: true },
+        _count: { _all: true },
+      }),
+      this.prisma.revenueLedger.aggregate({
+        where: { grossAmount: { lt: 0 } },
+        _sum: { grossAmount: true },
+      }),
+      this.prisma.enrollment.count({ where: { createdAt: { gte: from, lte: to } } }),
+      this.prisma.enrollment.count({ where: { state: 'ACTIVE' } }),
+      prismaAny.supportTicket.count({ where: { status: { in: ['OPEN', 'PENDING'] } } }),
+      prismaAny.deviceChangeRequest.count({ where: { status: 'PENDING' } }),
+    ]);
+
+    // Prisma types groupBy's `_count` as `true | {...}` depending on the
+    // argument shape, so it is narrowed here rather than asserted away.
+    const tally = (count: unknown): number =>
+      typeof count === 'object' && count !== null && '_all' in count
+        ? Number((count as { _all?: number })._all ?? 0)
+        : 0;
+
+    const courseCounts = Object.fromEntries(
+      coursesByStatus.map((row) => [row.status, tally(row._count)]),
+    ) as Record<string, number>;
+
+    const codeCounts = Object.fromEntries(
+      codesByStatus.map((row) => [row.status, tally(row._count)]),
+    ) as Record<string, number>;
+
+    const grossAll = Number(revenueAll._sum.grossAmount ?? 0);
+    const refundedAll = Math.abs(Number(refundsAll._sum.grossAmount ?? 0));
+
+    return {
+      period: { from: from.toISOString(), to: to.toISOString() },
+
+      users: {
+        students,
+        blockedStudents,
+        activeStudents: students - blockedStudents,
+        teachers,
+        admins,
+      },
+
+      courses: {
+        total: Object.values(courseCounts).reduce((sum, n) => sum + n, 0),
+        // Named for the dashboard's tiles; the enum names are kept alongside
+        // so a new CourseStatus does not silently vanish from the response.
+        published: courseCounts.PUBLISHED ?? 0,
+        draft: courseCounts.DRAFT ?? 0,
+        hidden: courseCounts.HIDDEN ?? 0,
+        suspended: courseCounts.SUSPENDED ?? 0,
+        archived: courseCounts.ARCHIVED ?? 0,
+        byStatus: courseCounts,
+      },
+
+      codes: {
+        total: codeTotal,
+        // CodeStatus is ACTIVE / EXHAUSTED / EXPIRED / REVOKED. The dashboard
+        // labels EXHAUSTED as "used" and REVOKED as "cancelled"; the mapping
+        // is done here so it exists in exactly one place.
+        active: codeCounts.ACTIVE ?? 0,
+        used: codeCounts.EXHAUSTED ?? 0,
+        expired: codeCounts.EXPIRED ?? 0,
+        cancelled: codeCounts.REVOKED ?? 0,
+        byStatus: codeCounts,
+      },
+
+      purchases: {
+        paidPayments,
+        transactionsAllTime: revenueAll._count._all,
+        transactionsInPeriod: revenueWindow._count._all,
+        enrollmentsInPeriod: enrollmentsWindow,
+        activeEnrollments,
+      },
+
+      revenue: {
+        currency: 'EGP',
+        grossAllTime: grossAll,
+        refundedAllTime: refundedAll,
+        netAllTime: Math.round((grossAll - refundedAll) * 100) / 100,
+        grossInPeriod: Number(revenueWindow._sum.grossAmount ?? 0),
+        platformInPeriod: Number(revenueWindow._sum.platformAmount ?? 0),
+        teachersInPeriod: Number(revenueWindow._sum.teacherAmount ?? 0),
+      },
+
+      queues: { supportOpen, pendingDeviceRequests },
+    };
+  }
+
+  /**
+   * Per-student viewing data for one lecture.
+   *
+   * The completion rule is the course's own — the platform default is 90 %,
+   * configurable per course and per lesson — and it is read from the stored
+   * `WatchProgress.completed` flag rather than recomputed here, so this screen
+   * and the student's own progress can never disagree.
+   */
+  async lessonViewers(params: {
+    lessonId: string;
+    actorId: string;
+    role: UserRole;
+    page: number;
+    pageSize: number;
+    q?: string;
+  }) {
+    const lesson = await this.prisma.lesson.findFirst({
+      where: { id: params.lessonId, deletedAt: null },
+      select: {
+        id: true,
+        title: true,
+        courseId: true,
+        durationSeconds: true,
+        completionRuleType: true,
+        completionThreshold: true,
+        video: { select: { id: true, durationSeconds: true } },
+        course: {
+          select: {
+            id: true,
+            title: true,
+            completionRuleType: true,
+            completionThreshold: true,
+          },
+        },
+      },
+    });
+    if (!lesson) throw AppException.notFound('Lesson', params.lessonId);
+
+    await this.access.assertCanManageCourse(
+      params.actorId,
+      params.role,
+      lesson.courseId,
+      'students',
+    );
+
+    const where: Prisma.WatchProgressWhereInput = {
+      lessonId: lesson.id,
+      ...(params.q
+        ? {
+          user: {
+            OR: [
+              { fullName: { contains: params.q, mode: 'insensitive' } },
+              { phone: { contains: params.q.replace(/\D/g, '') } },
+            ],
+          },
+        }
+        : {}),
+    };
+
+    const [rows, total, aggregate] = await this.prisma.$transaction([
+      this.prisma.watchProgress.findMany({
+        where,
+        orderBy: { lastWatchedAt: 'desc' },
+        skip: (params.page - 1) * params.pageSize,
+        take: params.pageSize,
+        include: {
+          user: {
+            select: {
+              id: true,
+              fullName: true,
+              phone: true,
+              studentProfile: {
+                select: {
+                  university: { select: { name: true, nameAr: true } },
+                  faculty: { select: { name: true, nameAr: true } },
+                  academicYear: { select: { name: true, nameAr: true, order: true } },
+                },
+              },
+            },
+          },
+        },
+      }),
+      this.prisma.watchProgress.count({ where }),
+      this.prisma.watchProgress.aggregate({
+        where: { lessonId: lesson.id },
+        _avg: { percent: true },
+        _sum: { watchedSeconds: true },
+        _count: { _all: true },
+      }),
+    ]);
+
+    const completedCount = await this.prisma.watchProgress.count({
+      where: { lessonId: lesson.id, completed: true },
+    });
+
+    return {
+      lesson: {
+        id: lesson.id,
+        title: lesson.title,
+        courseId: lesson.courseId,
+        courseTitle: lesson.course.title,
+        videoId: lesson.video?.id ?? null,
+        durationSeconds: lesson.durationSeconds || lesson.video?.durationSeconds || 0,
+        completionRule: {
+          type: lesson.completionRuleType ?? lesson.course.completionRuleType,
+          threshold: lesson.completionThreshold ?? lesson.course.completionThreshold,
+        },
+      },
+      summary: {
+        viewers: aggregate._count._all,
+        completed: completedCount,
+        averagePercent: Math.round(aggregate._avg.percent ?? 0),
+        totalWatchSeconds: aggregate._sum.watchedSeconds ?? 0,
+      },
+      items: rows.map((row) => ({
+        student: {
+          id: row.user.id,
+          fullName: row.user.fullName,
+          phone: row.user.phone,
+          university: row.user.studentProfile?.university ?? null,
+          faculty: row.user.studentProfile?.faculty ?? null,
+          academicYear: row.user.studentProfile?.academicYear ?? null,
+        },
+        firstWatchedAt: row.firstWatchedAt.toISOString(),
+        lastWatchedAt: row.lastWatchedAt.toISOString(),
+        positionSeconds: row.positionSeconds,
+        watchedSeconds: row.watchedSeconds,
+        durationSeconds: row.durationSeconds,
+        percent: row.percent,
+        completed: row.completed,
+        completedAt: row.completedAt?.toISOString() ?? null,
+      })),
+      meta: {
+        page: params.page,
+        pageSize: params.pageSize,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / params.pageSize)),
+        hasNext: params.page * params.pageSize < total,
+        hasPrevious: params.page > 1,
+      },
+    };
   }
 }

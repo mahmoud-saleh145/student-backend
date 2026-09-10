@@ -8,6 +8,8 @@ import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
 import type { AuthenticatedUser } from '../../common/types/request-context';
 
+import { SearchablePaginationDto } from '../../common/dto/pagination.dto';
+
 import { AnalyticsService } from './analytics.service';
 
 class PeriodDto {
@@ -18,6 +20,8 @@ class PeriodDto {
 class RevenueSeriesDto extends PeriodDto {
   @IsOptional() @IsString() @MaxLength(32) courseId?: string;
 }
+
+class LessonViewersDto extends SearchablePaginationDto {}
 
 @ApiTags('analytics')
 @ApiBearerAuth('access-token')
@@ -82,6 +86,42 @@ export class AnalyticsController {
       teacherId,
       from: query.from ? new Date(query.from) : undefined,
       to: query.to ? new Date(query.to) : undefined,
+    });
+  }
+
+  @Get('dashboard')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Everything the Statistics screen shows, in one request',
+    description:
+      'Students, teachers, courses by status, codes by status, purchases and revenue. `/analytics/overview` is unchanged and remains what existing clients call.',
+  })
+  dashboard(@Query() query: PeriodDto) {
+    return this.analytics.dashboard({
+      from: query.from ? new Date(query.from) : undefined,
+      to: query.to ? new Date(query.to) : undefined,
+    });
+  }
+
+  @Get('lessons/:lessonId/students')
+  @StaffOnly()
+  @ApiOperation({
+    summary: 'Who watched a lecture, how much, and whether they finished',
+    description:
+      'Completion is read from stored progress using the course’s own rule, so this screen can never disagree with what the student sees. Teachers may only read their own courses.',
+  })
+  lessonViewers(
+    @Param('lessonId') lessonId: string,
+    @Query() query: LessonViewersDto,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    return this.analytics.lessonViewers({
+      lessonId,
+      actorId: actor.id,
+      role: actor.role,
+      page: query.page,
+      pageSize: query.pageSize,
+      q: query.q,
     });
   }
 

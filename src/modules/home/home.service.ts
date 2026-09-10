@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
-import { CourseStatus, EnrollmentState, NotificationKind } from '@prisma/client';
+import { EnrollmentState, NotificationKind } from '@prisma/client';
 
-import { PrismaService, notDeleted } from '../../database/prisma.service';
+import { PrismaService } from '../../database/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { CoursesService } from '../courses/courses.service';
 import { NotificationsService } from '../notifications/notifications.service';

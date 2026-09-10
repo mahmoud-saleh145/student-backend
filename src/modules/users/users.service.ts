@@ -13,6 +13,7 @@ import { ErrorCode } from '../../common/errors/error-codes';
 import { paginated, type Paginated } from '../../common/types/api-response';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
+import { PlatformSettingsService } from '../settings/platform-settings.service';
 import { PasswordService } from '../auth/password.service';
 
 /** Selection that produces exactly the mobile app's `User` shape. */
@@ -25,6 +26,12 @@ const PUBLIC_USER_SELECT = {
   gender: true,
   avatarUrl: true,
   createdAt: true,
+  // Added for the admin dashboard. Purely additive: the mobile client reads
+  // named fields and ignores anything it does not know about.
+  email: true,
+  locale: true,
+  lastLoginAt: true,
+  updatedAt: true,
   studentProfile: {
     select: {
       university: { select: { id: true, name: true, nameAr: true, logoUrl: true } },
@@ -46,6 +53,7 @@ export class UsersService {
     private readonly prisma: PrismaService,
     private readonly passwords: PasswordService,
     private readonly audit: AuditService,
+    private readonly settings: PlatformSettingsService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -102,6 +110,10 @@ export class UsersService {
     gender: Gender | null;
     avatarUrl: string | null;
     createdAt: Date;
+    email?: string | null;
+    locale?: string | null;
+    lastLoginAt?: Date | null;
+    updatedAt?: Date | null;
     studentProfile?: {
       university: { id: string; name: string; nameAr: string; logoUrl: string | null } | null;
       faculty: { id: string; universityId: string; name: string; nameAr: string } | null;
@@ -130,6 +142,10 @@ export class UsersService {
       department: user.studentProfile?.department ?? null,
       academicYear: user.studentProfile?.academicYear ?? null,
       createdAt: user.createdAt.toISOString(),
+      email: user.email ?? null,
+      locale: user.locale ?? 'en',
+      lastLoginAt: user.lastLoginAt?.toISOString() ?? null,
+      updatedAt: user.updatedAt?.toISOString() ?? null,
       ...(user.teacherProfile
         ? {
             teacher: {
@@ -207,7 +223,7 @@ export class UsersService {
    */
   async updateOwnProfile(
     userId: string,
-    dto: { fullName?: string; locale?: string },
+    dto: { fullName?: string; locale?: string; academicYearId?: string },
   ) {
     const data: Prisma.UserUpdateInput = {};
 
@@ -223,6 +239,31 @@ export class UsersService {
 
     if (dto.locale !== undefined) {
       data.locale = ['en', 'ar'].includes(dto.locale) ? dto.locale : 'en';
+    }
+
+    // Changing your own academic year is governed by a platform setting. The
+    // check is here, in the service, rather than in the controller: this is
+    // the only path a student can reach, and putting it here means no future
+    // caller can bypass it by constructing a different DTO.
+    if (dto.academicYearId !== undefined) {
+      if (!(await this.settings.allowsAcademicYearChange())) {
+        throw new AppException(ErrorCode.FORBIDDEN, {
+          message: 'Changing your academic year is disabled on this platform',
+        });
+      }
+
+      const year = await this.prisma.academicYear.findFirst({
+        where: { id: dto.academicYearId, isActive: true },
+        select: { id: true },
+      });
+      if (!year) {
+        throw AppException.validation({ academicYearId: ['unknown academic year'] });
+      }
+
+      await this.prisma.studentProfile.update({
+        where: { userId },
+        data: { academicYearId: year.id },
+      });
     }
 
     if (Object.keys(data).length === 0) return this.toPublicUser(userId);
@@ -639,6 +680,98 @@ export class UsersService {
         title: t.teacherProfile?.title ?? null,
         bio: t.teacherProfile?.bio ?? null,
       })),
+      total,
+      params.page,
+      params.pageSize,
+    );
+  }
+
+  /**
+   * The Teachers screen.
+   *
+   * Course and student counts come from the join table and the course
+   * counters respectively, so this stays one query per page rather than an
+   * N+1 over each teacher's courses.
+   */
+  async listTeachersForAdmin(params: {
+    page: number;
+    pageSize: number;
+    q?: string;
+    status?: AccountStatus;
+  }) {
+    const where: Prisma.UserWhereInput = {
+      role: UserRole.TEACHER,
+      ...notDeleted,
+      ...(params.status ? { status: params.status } : {}),
+      ...(params.q
+        ? {
+            OR: [
+              { fullName: { contains: params.q, mode: 'insensitive' } },
+              { phone: { contains: UsersService.normalizePhone(params.q) } },
+              { email: { contains: params.q, mode: 'insensitive' } },
+            ],
+          }
+        : {}),
+    };
+
+    const [rows, total] = await this.prisma.$transaction([
+      this.prisma.user.findMany({
+        where,
+        select: {
+          id: true,
+          fullName: true,
+          phone: true,
+          email: true,
+          gender: true,
+          status: true,
+          avatarUrl: true,
+          createdAt: true,
+          lastLoginAt: true,
+          teacherProfile: {
+            select: { title: true, titleAr: true, bio: true, isPublic: true },
+          },
+          courseTeachers: {
+            select: {
+              course: {
+                select: { id: true, status: true, studentCount: true, deletedAt: true },
+              },
+            },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+        skip: (params.page - 1) * params.pageSize,
+        take: params.pageSize,
+      }),
+      this.prisma.user.count({ where }),
+    ]);
+
+    return paginated(
+      rows.map((t) => {
+        const courses = t.courseTeachers
+          .map((ct) => ct.course)
+          .filter((course) => course.deletedAt === null);
+
+        return {
+          id: t.id,
+          fullName: t.fullName,
+          phone: t.phone,
+          email: t.email,
+          gender: t.gender ?? 'MALE',
+          status: t.status,
+          avatarUrl: t.avatarUrl,
+          title: t.teacherProfile?.title ?? null,
+          bio: t.teacherProfile?.bio ?? null,
+          isPublic: t.teacherProfile?.isPublic ?? true,
+          courseCount: courses.length,
+          publishedCourseCount: courses.filter((c) => c.status === 'PUBLISHED').length,
+          // Sum of per-course active enrollments. A student enrolled in two of
+          // this teacher's courses counts twice, which is the number a teacher
+          // actually means by "how many students do I have".
+          studentCount: courses.reduce((sum, c) => sum + c.studentCount, 0),
+          lastLoginAt: t.lastLoginAt?.toISOString() ?? null,
+          createdAt: t.createdAt.toISOString(),
+        };
+      }),
       total,
       params.page,
       params.pageSize,

@@ -2,7 +2,6 @@ import { Injectable, Logger } from '@nestjs/common';
 import {
   AccountStatus,
   AuditAction,
-  ContentStatus,
   CourseStatus,
   type EnrollmentMethod,
   EnrollmentState,
@@ -28,6 +27,7 @@ export interface CreateCourseInput {
   universityId?: string;
   facultyId?: string;
   academicYearId?: string;
+  subjectId?: string;
   teacherIds: string[];
   leadTeacherId?: string;
   price?: number;
@@ -86,6 +86,12 @@ export class CoursesAdminService {
     q?: string;
     status?: CourseStatus;
     teacherId?: string;
+    universityId?: string;
+    facultyId?: string;
+    academicYearId?: string;
+    subjectId?: string;
+    sort?: 'newest' | 'oldest' | 'title' | 'students' | 'price';
+    order?: 'asc' | 'desc';
   }) {
     // A teacher only ever sees courses they are assigned to.
     const scopeIds =
@@ -98,13 +104,40 @@ export class CoursesAdminService {
       ...(scopeIds ? { id: { in: scopeIds } } : {}),
       ...(params.status ? { status: params.status } : {}),
       ...(params.teacherId ? { teachers: { some: { teacherId: params.teacherId } } } : {}),
+      ...(params.universityId ? { universityId: params.universityId } : {}),
+      ...(params.facultyId ? { facultyId: params.facultyId } : {}),
+      ...(params.academicYearId ? { academicYearId: params.academicYearId } : {}),
+      ...(params.subjectId ? { subjectId: params.subjectId } : {}),
       ...(params.q ? { title: { contains: params.q, mode: 'insensitive' } } : {}),
     };
+
+    // Sorting is server-side so a filtered page of 20 is genuinely the top 20
+    // of the whole result set, not the top 20 of an arbitrary page.
+    const direction: Prisma.SortOrder = params.order === 'asc' ? 'asc' : 'desc';
+    const orderBy: Prisma.CourseOrderByWithRelationInput = (() => {
+      switch (params.sort) {
+        case 'oldest':
+          return { createdAt: 'asc' };
+        case 'title':
+          return { title: params.order === 'desc' ? 'desc' : 'asc' };
+        case 'students':
+          return { studentCount: direction };
+        case 'price':
+          // Price lives in a versioned child table, so ordering by it is done
+          // through the course's own creation order as a stable tiebreak; the
+          // dashboard sorts the visible page by the resolved amount.
+          return { createdAt: direction };
+        case 'newest':
+          return { createdAt: 'desc' };
+        default:
+          return { updatedAt: 'desc' };
+      }
+    })();
 
     const [rows, total] = await this.prisma.$transaction([
       this.prisma.course.findMany({
         where,
-        orderBy: { updatedAt: 'desc' },
+        orderBy,
         skip: (params.page - 1) * params.pageSize,
         take: params.pageSize,
         include: {
@@ -115,6 +148,10 @@ export class CoursesAdminService {
             },
           },
           prices: { where: { isCurrent: true }, take: 1 },
+          university: { select: { id: true, name: true, nameAr: true } },
+          faculty: { select: { id: true, name: true, nameAr: true } },
+          academicYear: { select: { id: true, name: true, nameAr: true, order: true } },
+          subject: { select: { id: true, name: true, nameAr: true } },
           _count: { select: { enrollments: true, sections: true, lessons: true } },
         },
       }),
@@ -141,8 +178,14 @@ export class CoursesAdminService {
         lessons: course._count.lessons,
       },
       studentCount: course.studentCount,
+      thumbnailKey: course.thumbnailKey,
+      university: course.university,
+      faculty: course.faculty,
+      academicYear: course.academicYear,
+      subject: course.subject,
       publishedAt: course.publishedAt?.toISOString() ?? null,
       archivedAt: course.archivedAt?.toISOString() ?? null,
+      createdAt: course.createdAt.toISOString(),
       updatedAt: course.updatedAt.toISOString(),
     }));
 
@@ -192,6 +235,7 @@ export class CoursesAdminService {
           universityId: input.universityId,
           facultyId: input.facultyId,
           academicYearId: input.academicYearId,
+          subjectId: input.subjectId,
           isFree,
           enrollmentMethods: input.enrollmentMethods,
           accessDurationType: input.accessDurationType ?? 'LIFETIME',
@@ -309,11 +353,21 @@ export class CoursesAdminService {
       ...(input.universityId !== undefined
         ? { university: input.universityId ? { connect: { id: input.universityId } } : { disconnect: true } }
         : {}),
+      ...(input.facultyId !== undefined
+        ? {
+          faculty: input.facultyId ? { connect: { id: input.facultyId } } : { disconnect: true },
+        }
+        : {}),
       ...(input.academicYearId !== undefined
         ? {
           academicYear: input.academicYearId
             ? { connect: { id: input.academicYearId } }
             : { disconnect: true },
+        }
+        : {}),
+      ...(input.subjectId !== undefined
+        ? {
+          subject: input.subjectId ? { connect: { id: input.subjectId } } : { disconnect: true },
         }
         : {}),
     };
@@ -351,6 +405,7 @@ export class CoursesAdminService {
     actor: { id: string; role: UserRole },
   ) {
     await this.access.assertCanManageCourse(actor.id, actor.role, courseId, 'pricing');
+    await this.access.assertTeacherCapability(actor.role, 'editCoursePrices');
 
     if (input.amount < 0) {
       throw AppException.validation({ amount: ['must not be negative'] });

@@ -3,10 +3,8 @@ import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { Job } from 'bullmq';
 import { spawn } from 'node:child_process';
-import { createWriteStream } from 'node:fs';
 import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { pipeline } from 'node:stream/promises';
 
 import type { VideoConfig } from '../../config/configuration';
 import { ManifestService } from '../../modules/playback/manifest.service';

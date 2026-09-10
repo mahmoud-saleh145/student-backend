@@ -13,8 +13,6 @@
     ],
     "sourceMap": true,
     "outDir": "./dist",
-    "baseUrl": "./",
-    "ignoreDeprecations": "5.0",
     "incremental": true,
     "skipLibCheck": true,
     "strict": true,
@@ -30,10 +28,10 @@
     "resolveJsonModule": true,
     "paths": {
       "src/*": [
-        "src/*"
+        "./src/*"
       ],
       "test/*": [
-        "test/*"
+        "./test/*"
       ]
     }
   },

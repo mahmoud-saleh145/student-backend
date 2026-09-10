@@ -3,13 +3,11 @@ import { ConfigService } from '@nestjs/config';
 import {
   type AttachmentKind,
   AuditAction,
-  SecurityEventType,
-  type UserRole,
+  UserRole,
 } from '@prisma/client';
 import { createHash, randomBytes } from 'node:crypto';
 
 import { AppException } from '../../common/errors/app.exception';
-import { ErrorCode } from '../../common/errors/error-codes';
 import type { AuthenticatedUser } from '../../common/types/request-context';
 import type { PlaybackConfig } from '../../config/configuration';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
@@ -87,6 +85,27 @@ export class AttachmentsService {
       isPreviewContent: attachment.isPreview,
     });
 
+    // Material hanging off a lesson inherits that lesson's section scope, so a
+    // section-scoped student cannot pull the PDF from a section they did not
+    // buy. Course-level material (no lessonId) is unaffected.
+    if (
+      params.user.role === UserRole.STUDENT &&
+      !attachment.isPreview &&
+      attachment.lessonId
+    ) {
+      const lesson = await this.prisma.lesson.findUnique({
+        where: { id: attachment.lessonId },
+        select: { sectionId: true },
+      });
+      if (lesson) {
+        await this.access.assertSectionAccessible({
+          userId: params.user.id,
+          courseId: attachment.courseId,
+          sectionId: lesson.sectionId,
+        });
+      }
+    }
+
     // Protected material is device-bound exactly like video. Un-protected
     // handouts (a syllabus) are not, because they are meant to be shareable.
     if (attachment.isProtected) {
@@ -101,8 +120,6 @@ export class AttachmentsService {
 
     const ttl = this.cfg.ticketTtl;
     const expiresAt = new Date(Date.now() + ttl * 1000);
-
-    const bucket = attachment.objectKey.startsWith('attachments/') ? 'uploads' : 'media';
 
     const url = await this.storage.signMediaUrl({
       objectKey: attachment.objectKey,

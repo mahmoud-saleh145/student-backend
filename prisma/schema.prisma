@@ -150,6 +150,48 @@ enum CodeStatus {
   REVOKED
 }
 
+/// What an access code unlocks.
+///
+/// COURSE and TEACHER codes freeze their scope at creation time: the sections
+/// (or courses) that existed when the code was generated are copied into
+/// `grantedSectionIds` / `grantedCourseIds`. Content added afterwards is
+/// deliberately NOT unlocked by an older code — see docs/API_CONTRACT.md.
+enum CodeTargetType {
+  COURSE
+  SECTION
+  TEACHER
+}
+
+/// How an enrollment's section entitlement was produced.
+enum SectionGrantSource {
+  CODE
+  PAYMENT
+  ADMIN
+}
+
+enum SupportTicketStatus {
+  OPEN
+  PENDING
+  RESOLVED
+  CLOSED
+}
+
+enum SupportTicketPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum SupportTicketCategory {
+  GENERAL
+  TECHNICAL
+  PAYMENT
+  ACCESS
+  CONTENT
+  OTHER
+}
+
 enum DeviceStatus {
   ACTIVE
   PENDING_APPROVAL
@@ -384,6 +426,11 @@ model User {
   securityEvents   SecurityEvent[]
   auditLogs        AuditLog[]            @relation("AuditActor")
   issuedCodes      AccessCode[]          @relation("CodeIssuer")
+  targetedByCodes  AccessCode[]          @relation("TeacherCodes")
+  createdCodeBatches CodeBatch[]         @relation("BatchCreator")
+  supportTickets   SupportTicket[]       @relation("TicketStudent")
+  assignedTickets  SupportTicket[]       @relation("TicketAssignee")
+  supportMessages  SupportMessage[]      @relation("SupportAuthor")
   courseTeachers   CourseTeacher[]
   authoredCourses  Course[]              @relation("CourseCreatedBy")
   priceChanges     CoursePrice[]         @relation("PriceChangedBy")
@@ -573,6 +620,9 @@ model Course {
   universityId   String?
   facultyId      String?
   academicYearId String?
+  /// Optional subject/category grouping, surfaced in the dashboard's
+  /// "Other data" section. Nullable so every existing course stays valid.
+  subjectId      String?
 
   /// Which join methods the student may use. Rendered verbatim by the app.
   enrollmentMethods EnrollmentMethod[] @default([])
@@ -611,6 +661,7 @@ model Course {
   university   University?   @relation(fields: [universityId], references: [id], onDelete: SetNull)
   faculty      Faculty?      @relation(fields: [facultyId], references: [id], onDelete: SetNull)
   academicYear AcademicYear? @relation(fields: [academicYearId], references: [id], onDelete: SetNull)
+  subject      Subject?      @relation(fields: [subjectId], references: [id], onDelete: SetNull)
   createdBy    User?         @relation("CourseCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
 
   teachers    CourseTeacher[]
@@ -634,7 +685,26 @@ model Course {
   @@index([universityId, academicYearId, status])
   @@index([deletedAt])
   @@index([title])
+  @@index([subjectId])
   @@map("courses")
+}
+
+/// Subject / category. Purely an organisational grouping over courses — it
+/// grants nothing and gates nothing, so adding it cannot affect access.
+model Subject {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  nameAr    String
+  isActive  Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  courses Course[]
+
+  @@index([isActive, sortOrder])
+  @@map("subjects")
 }
 
 /// Many-to-many so a course can be co-taught without duplicating the course.
@@ -708,6 +778,9 @@ model CourseSection {
 
   course  Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
   lessons Lesson[]
+
+  codes  AccessCode[]             @relation("SectionCodes")
+  grants EnrollmentSectionGrant[]
 
   @@unique([courseId, sortOrder])
   @@index([courseId, status, sortOrder])
@@ -908,11 +981,17 @@ model Enrollment {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  /// True (the historical and default behaviour) means this enrollment covers
+  /// every section of the course. It is only set false by a SECTION-scoped
+  /// code, in which case `sectionGrants` lists exactly what is unlocked.
+  coversAllSections Boolean @default(true)
+
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
   course Course @relation(fields: [courseId], references: [id], onDelete: Restrict)
 
-  payments    Payment[]
-  redemptions AccessCodeRedemption[]
+  payments      Payment[]
+  redemptions   AccessCodeRedemption[]
+  sectionGrants EnrollmentSectionGrant[]
 
   /// A student has at most one enrollment row per course; re-joining after
   /// expiry updates this row and appends a new payment/redemption.
@@ -921,6 +1000,27 @@ model Enrollment {
   @@index([userId, state])
   @@index([accessEndsAt, state])
   @@map("enrollments")
+}
+
+/// Section-level entitlement.
+///
+/// Only meaningful when `Enrollment.coversAllSections` is false. Rows are
+/// append-only: buying a second section adds a row, it never rewrites one, so
+/// what a student paid for stays reconstructible.
+model EnrollmentSectionGrant {
+  id           String             @id @default(cuid())
+  enrollmentId String
+  sectionId    String
+  source       SectionGrantSource @default(CODE)
+  codeId       String?
+  createdAt    DateTime           @default(now())
+
+  enrollment Enrollment    @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  section    CourseSection @relation(fields: [sectionId], references: [id], onDelete: Restrict)
+
+  @@unique([enrollmentId, sectionId])
+  @@index([sectionId])
+  @@map("enrollment_section_grants")
 }
 
 // =============================================================================
@@ -1057,17 +1157,81 @@ model AccessCode {
   revokedAt DateTime?
   revokedById String?
 
+  // --- targeting (added for the admin dashboard) -----------------------------
+
+  /// COURSE is the historical behaviour and therefore the default, so every
+  /// pre-existing row keeps meaning exactly what it meant before.
+  targetType CodeTargetType @default(COURSE)
+
+  /// Set when targetType = SECTION.
+  sectionId String?
+  /// Set when targetType = TEACHER.
+  teacherId String?
+
+  /// Scope frozen at generation time. Empty means "no snapshot was taken",
+  /// which is how legacy rows are distinguished from a genuinely empty scope;
+  /// those fall back to the whole course, preserving old behaviour.
+  grantedSectionIds String[] @default([])
+  grantedCourseIds  String[] @default([])
+
+  /// Face value recorded on the card, for reporting. This is NOT the money
+  /// authority — revenue always comes from revenue_ledger.
+  priceAmount Decimal? @db.Decimal(12, 2)
+  currency    String   @default("EGP")
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   course      Course?                @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  section     CourseSection?         @relation("SectionCodes", fields: [sectionId], references: [id], onDelete: Restrict)
+  teacher     User?                  @relation("TeacherCodes", fields: [teacherId], references: [id], onDelete: Restrict)
+  batch       CodeBatch?             @relation(fields: [batchId], references: [id], onDelete: SetNull)
   issuedBy    User?                  @relation("CodeIssuer", fields: [issuedById], references: [id], onDelete: SetNull)
   redemptions AccessCodeRedemption[]
 
   @@index([courseId, status])
   @@index([batchId])
   @@index([status, expiresAt])
+  @@index([targetType, status])
+  @@index([sectionId])
+  @@index([teacherId])
   @@map("access_codes")
+}
+
+/// A generated batch of cards.
+///
+/// `AccessCode.batchId` already existed as a loose uuid; this promotes it to a
+/// real row so a batch can carry a human name, its target and its size without
+/// re-deriving them by scanning thousands of codes.
+model CodeBatch {
+  id   String  @id @default(cuid())
+  /// Optional human label ("Term 2 — Pharmacy cards").
+  name String?
+
+  targetType CodeTargetType
+  courseId   String?
+  sectionId  String?
+  teacherId  String?
+  /// Denormalised so an archived or renamed target still reads correctly.
+  targetNameSnapshot String
+
+  quantity    Int
+  prefix      String?
+  priceAmount Decimal? @db.Decimal(12, 2)
+  currency    String   @default("EGP")
+  expiresAt   DateTime?
+  note        String?
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  createdBy User?        @relation("BatchCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  codes     AccessCode[]
+
+  @@index([createdAt])
+  @@index([targetType])
+  @@map("code_batches")
 }
 
 /// Append-only. One row per successful redemption; the unique constraint is
@@ -1420,6 +1584,68 @@ model ArchiveRecord {
   @@index([entity, entityId])
   @@index([courseId])
   @@map("archive_records")
+}
+
+// =============================================================================
+// Support
+// =============================================================================
+
+/// A student-raised support conversation.
+///
+/// Nothing here is ever hard-deleted: closing a ticket is a status change, so
+/// the history stays available for dispute resolution.
+model SupportTicket {
+  id        String                @id @default(cuid())
+  /// Short human-facing reference shown to the student ("TK-000123").
+  reference String                @unique
+  userId    String
+  subject   String
+  category  SupportTicketCategory @default(GENERAL)
+  status    SupportTicketStatus   @default(OPEN)
+  priority  SupportTicketPriority @default(NORMAL)
+
+  /// Optional context the student was looking at when they wrote in.
+  courseId String?
+
+  assignedToId String?
+  /// Denormalised for cheap inbox sorting without joining messages.
+  lastMessageAt DateTime  @default(now())
+  lastMessageBy String?
+  /// Unread-for-staff counter, maintained on write.
+  unreadForStaff Int      @default(0)
+  resolvedAt    DateTime?
+  closedAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user       User             @relation("TicketStudent", fields: [userId], references: [id], onDelete: Restrict)
+  assignedTo User?            @relation("TicketAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  messages   SupportMessage[]
+
+  @@index([status, lastMessageAt])
+  @@index([userId, createdAt])
+  @@index([assignedToId, status])
+  @@map("support_tickets")
+}
+
+/// Append-only message log. There is no update or delete path in the API.
+model SupportMessage {
+  id       String @id @default(cuid())
+  ticketId String
+  authorId String?
+  /// Snapshotted so a message still reads correctly if the author is removed.
+  authorRole UserRole
+  body     String
+  /// Staff-only note, never shown to the student.
+  isInternal Boolean @default(false)
+  createdAt  DateTime @default(now())
+
+  ticket SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  author User?         @relation("SupportAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+
+  @@index([ticketId, createdAt])
+  @@map("support_messages")
 }
 
 // =============================================================================

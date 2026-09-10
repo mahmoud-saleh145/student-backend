@@ -15,6 +15,7 @@ import type { DeviceContext } from '../../common/types/request-context';
 import type { DeviceConfig } from '../../config/configuration';
 import { PrismaService } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
+import { PlatformSettingsService } from '../settings/platform-settings.service';
 import { SecurityEventService } from '../security/security-event.service';
 
 export interface DeviceResolution {
@@ -62,9 +63,22 @@ export class DevicesService {
     private readonly prisma: PrismaService,
     private readonly security: SecurityEventService,
     private readonly audit: AuditService,
+    private readonly settings: PlatformSettingsService,
     config: ConfigService,
   ) {
     this.cfg = config.getOrThrow<DeviceConfig>('device');
+  }
+
+  /**
+   * How many devices this account may bind.
+   *
+   * The administrator-editable platform setting is authoritative; the
+   * DEVICE_LIMIT_PER_STUDENT environment variable remains the fallback, so an
+   * existing deployment that never touches the dashboard keeps its configured
+   * limit unchanged.
+   */
+  private async deviceLimit(): Promise<number> {
+    return this.settings.deviceLimit();
   }
 
   // ---------------------------------------------------------------------------
@@ -167,7 +181,7 @@ export class DevicesService {
       where: { userId, status: DeviceStatus.ACTIVE },
     });
 
-    const withinLimit = activeCount < this.cfg.limitPerStudent;
+    const withinLimit = activeCount < (await this.deviceLimit());
     const shouldAutoBind = withinLimit && (activeCount === 0 ? this.cfg.autoBindFirst : true);
 
     const created = await this.prisma.device.create({

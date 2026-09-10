@@ -220,7 +220,7 @@ async function bootstrap(): Promise<void> {
 void bootstrap().catch((error) => {
   // The config layer throws here when a required secret is missing. Failing
   // loudly at boot is the intended behaviour.
-  // eslint-disable-next-line no-console
+   
   console.error('Fatal startup error:', error);
   process.exit(1);
 });

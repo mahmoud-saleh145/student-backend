@@ -4,7 +4,6 @@ import {
   AccountStatus,
   AuditAction,
   DeviceStatus,
-  Prisma,
   SecurityEventType,
   SecuritySeverity,
   SessionStatus,

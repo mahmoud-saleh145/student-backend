@@ -47,6 +47,12 @@ export class CoursesAdminController {
       q: query.q,
       status: query.status,
       teacherId: query.teacherId,
+      universityId: query.universityId,
+      facultyId: query.facultyId,
+      academicYearId: query.academicYearId,
+      subjectId: query.subjectId,
+      sort: query.sort,
+      order: query.order,
     });
   }
 

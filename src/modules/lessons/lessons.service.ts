@@ -84,6 +84,17 @@ export class LessonsService {
       isPreviewContent: lesson.isPreview,
     });
 
+    // Section-scoped entitlement. A student holding only a section code may
+    // reach a lesson id in another section by guessing it; this is where that
+    // is refused. Preview lessons stay open, as they are everywhere else.
+    if (role === UserRole.STUDENT && !lesson.isPreview) {
+      await this.access.assertSectionAccessible({
+        userId,
+        courseId: lesson.courseId,
+        sectionId: lesson.sectionId,
+      });
+    }
+
     // Drip release is enforced server-side too, not just hidden in the UI.
     if (
       lesson.section.unlocksAt &&
@@ -455,6 +466,8 @@ export class LessonsService {
   async remove(lessonId: string, actor: { id: string; role: UserRole }) {
     const lesson = await this.requireLesson(lessonId);
     await this.access.assertCanManageCourse(actor.id, actor.role, lesson.courseId, 'content');
+    // Platform-wide switch, on top of the per-course assignment above.
+    await this.access.assertTeacherCapability(actor.role, 'deleteLectures');
 
     const watched = await this.prisma.watchProgress.count({ where: { lessonId } });
     const now = new Date();

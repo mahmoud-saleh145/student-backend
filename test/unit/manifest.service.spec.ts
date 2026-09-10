@@ -1,3 +1,5 @@
+import { createHmac } from 'node:crypto';
+
 import { ManifestService } from '../../src/modules/playback/manifest.service';
 
 /**
@@ -61,7 +63,6 @@ describe('ManifestService.deriveContentKey', () => {
 
     // Recompute the expectation the same way the implementation documents it:
     // HMAC-SHA256(root, "hls-key:<videoId>"), first 16 bytes.
-    const { createHmac } = require('node:crypto') as typeof import('node:crypto');
     const expected = createHmac('sha256', 'fixed-root')
       .update('hls-key:fixed-video')
       .digest()

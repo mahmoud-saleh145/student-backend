@@ -17,8 +17,8 @@ import type { Request } from 'express';
 
 import { CodeThrottle } from '../../common/decorators/throttle.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
-import { AdminOnly, StaffOnly, StudentOnly } from '../../common/decorators/roles.decorator';
-import { PaginationDto } from '../../common/dto/pagination.dto';
+import { StaffOnly, StudentOnly } from '../../common/decorators/roles.decorator';
+import { SearchablePaginationDto } from '../../common/dto/pagination.dto';
 import type { AuthenticatedUser } from '../../common/types/request-context';
 
 import { EnrollmentsService } from './enrollments.service';
@@ -39,10 +39,11 @@ class RedeemCodeDto {
   code!: string;
 }
 
-class ListEnrollmentsDto extends PaginationDto {
+class ListEnrollmentsDto extends SearchablePaginationDto {
   @IsOptional() @IsString() @MaxLength(32) courseId?: string;
   @IsOptional() @IsString() @MaxLength(32) userId?: string;
   @IsOptional() @IsEnum(EnrollmentState) state?: EnrollmentState;
+  @IsOptional() @IsString() @MaxLength(32) sectionId?: string;
 }
 
 class GrantAccessDto {
@@ -143,6 +144,8 @@ export class EnrollmentsController {
       courseId: query.courseId,
       userId: query.userId,
       state: query.state,
+      sectionId: query.sectionId,
+      q: query.q,
     });
   }
 

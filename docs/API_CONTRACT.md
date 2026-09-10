@@ -491,3 +491,136 @@ Recorded here so a client author does not rediscover them.
    concurrency slot.
 5. **`X-Device-Id` on every request.** Not only on login. Protected content is
    refused without it, and the refusal is recorded as a security event.
+
+---
+
+# Appendix — Admin dashboard additions (phase 4)
+
+Everything in this appendix was added for the Admin & Teacher Dashboard. All of
+it is **additive**: no existing route changed shape, no existing field was
+removed or retyped, and the mobile app needs no change to keep working.
+
+## New endpoints
+
+### Platform settings
+
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/admin/settings` | ADMIN, MASTER | Returns every known key, defaults filled in |
+| `PUT` | `/admin/settings` | ADMIN, MASTER | Partial update; unknown keys and out-of-range values are rejected per field |
+
+`PUT /master/settings` is unchanged and remains master-only for arbitrary keys
+(`minimumAppVersion`, `maintenanceMode`, `supportContacts`). The new controller
+exposes only the curated, validated subset the dashboard renders.
+
+Keys, with the default that reproduces pre-settings behaviour:
+
+```
+student.deviceLimit               1       (falls back to DEVICE_LIMIT_PER_STUDENT)
+student.allowAcademicYearChange   false
+teacher.canDeleteLectures         false
+teacher.canDeleteVideos           false
+teacher.canEditVideoUrls          false
+teacher.canEditCoursePrices       false
+contact.phone / whatsapp / facebook / email   ""
+```
+
+### Access codes
+
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/admin/code-batches` | ADMIN, MASTER | One row per generation run |
+| `GET` | `/admin/code-batches/:batchId/codes` | ADMIN, MASTER | Every card in a batch, unpaginated (backs the Excel export) |
+
+`POST /admin/codes/generate` accepts new optional fields — `targetType`
+(`COURSE` \| `SECTION` \| `TEACHER`), `sectionId`, `teacherId`, `batchName`,
+`priceAmount`, `currency`. Omitting them behaves exactly as before.
+
+`GET /admin/codes` accepts new optional filters `sectionId`, `teacherId`,
+`targetType`, and each row gained `serial`, `targetType`, `targetName`,
+`section`, `teacher`, `batchName`, `amount`, `currency`.
+
+### Support
+
+| Method | Path | Roles |
+| --- | --- | --- |
+| `POST` | `/support/tickets` | STUDENT |
+| `GET` | `/support/tickets` | STUDENT |
+| `GET` | `/support/tickets/:id` | STUDENT (own only) |
+| `POST` | `/support/tickets/:id/messages` | STUDENT (own only) |
+| `GET` | `/admin/support/counters` | ADMIN, MASTER |
+| `GET` | `/admin/support/tickets` | ADMIN, MASTER |
+| `GET` | `/admin/support/tickets/:id` | ADMIN, MASTER |
+| `POST` | `/admin/support/tickets/:id/reply` | ADMIN, MASTER |
+| `PATCH` | `/admin/support/tickets/:id` | ADMIN, MASTER |
+
+Messages are append-only. Internal notes (`isInternal`) are stripped from every
+student-facing read.
+
+### Subjects
+
+| Method | Path | Roles |
+| --- | --- | --- |
+| `GET` | `/subjects` | public |
+| `GET` | `/subjects/:id` | ADMIN, MASTER |
+| `POST` | `/subjects` | ADMIN, MASTER |
+| `PATCH` | `/subjects/:id` | ADMIN, MASTER |
+| `DELETE` | `/subjects/:id` | ADMIN, MASTER (deactivates; never a hard delete) |
+
+### Analytics
+
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/analytics/dashboard` | ADMIN, MASTER | Everything the Statistics screen shows, in one request |
+| `GET` | `/analytics/lessons/:lessonId/students` | staff | Per-student viewing data for one lecture |
+
+`/analytics/overview` is unchanged.
+
+### Users and logs
+
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/admin/users/teachers` | ADMIN, MASTER | Teachers with course and student counts |
+| `GET` | `/audit/logins` | ADMIN, MASTER | Successful student sign-ins |
+
+`GET /audit` was widened from MASTER to ADMIN + MASTER. The log itself remains
+append-only — there is still no write, update or delete path for anyone.
+
+`GET /admin/enrollments` accepts `q` and `sectionId`, and each row gained the
+student's academic details, `coversAllSections`, `sectionIds` and `redemption`.
+
+`GET /admin/courses` accepts `universityId`, `facultyId`, `academicYearId`,
+`subjectId`, `sort` and `order`.
+
+## Changed response shapes (additive only)
+
+- `PublicUser` (every `/auth/me`, `/profile`, `/admin/users` response) gained
+  `email`, `locale`, `lastLoginAt`, `updatedAt`. No field was removed.
+- `POST /codes/validate` gained `targetType`, `section`, `teacher`.
+- `GET /meta/app-config` gained `features.academicYearSelfService`,
+  `features.supportTickets` and a `teacher` block with the four switches.
+  `device.limitPerStudent` now reads from platform settings, so the number the
+  app is told matches the number login actually enforces. `support` merges the
+  dashboard-managed contact fields with the existing `supportContacts` key,
+  which still wins where it is set.
+
+## Business rules introduced
+
+**Code scope is frozen at generation.** A `COURSE` code records the sections
+that exist at that moment; a `TEACHER` code records that teacher's courses at
+that moment. Content added later is not unlocked by an older card. A `SECTION`
+code unlocks exactly one section.
+
+A code row with an empty `grantedSectionIds` is a **legacy** row issued before
+snapshots existed and unlocks the whole course — an empty snapshot means "not
+recorded", never "nothing". `test/code-scope.spec.ts` pins this down.
+
+**Section-level entitlement.** `Enrollment.coversAllSections` defaults to
+`true`, so every pre-existing enrolment is unchanged. Only a section-scoped
+grant sets it false, and then `EnrollmentSectionGrant` lists what is unlocked.
+Enforced in section listing, lesson detail, playback ticket issuance and
+attachment tickets. Access is only ever widened by a new grant, never narrowed.
+
+**Teacher capability switches** are checked *in addition to* the per-course
+`CourseTeacher` flags: both must allow an action. Admin and master are never
+subject to them.

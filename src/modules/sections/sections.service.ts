@@ -2,7 +2,6 @@ import { Injectable } from '@nestjs/common';
 import { AuditAction, ContentStatus, type UserRole } from '@prisma/client';
 
 import { AppException } from '../../common/errors/app.exception';
-import { ErrorCode } from '../../common/errors/error-codes';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { CourseAccessService } from '../courses/course-access.service';

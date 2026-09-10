@@ -69,6 +69,20 @@ describe('ErrorCode table', () => {
       ErrorCode.INVALID_CREDENTIALS,
       ErrorCode.UNAUTHORIZED,
       ErrorCode.SESSION_EXPIRED,
+
+      // A playback ticket is itself a short-lived bearer credential, so 401 is
+      // the semantically correct status for an expired one, and this has been
+      // the shipped contract since the mobile app's first release.
+      //
+      // It is safe under the rule this test exists to protect: the app's
+      // session-ending set is { SESSION_EXPIRED, ACCOUNT_DISABLED }, so an
+      // expired ticket never clears the student's session. The only cost is
+      // that the interceptor spends one silent token refresh and a replay
+      // before surfacing the error, since it cannot tell from the status alone
+      // that a new access token will not help. Narrowing this to 403 would
+      // remove that round trip but is an API-contract change the mobile client
+      // would have to ship alongside, so it is deliberately not made here.
+      ErrorCode.PLAYBACK_TICKET_EXPIRED,
     ]);
 
     for (const code of Object.values(ErrorCode)) {

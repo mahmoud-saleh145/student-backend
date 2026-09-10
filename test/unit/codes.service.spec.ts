@@ -32,8 +32,13 @@ function code(overrides: Record<string, unknown> = {}) {
 }
 
 function buildService(row: ReturnType<typeof code> | null, alreadyRedeemed = false) {
-  const codeUpdate = jest.fn(async () => ({}));
-  const redemptionCreate = jest.fn(async () => ({}));
+  // Typed argument, not `jest.fn(async () => …)`: an untyped mock infers its
+  // parameter list as `[]`, and `mock.calls[0][0].data` then fails to compile
+  // under `strict`. The shape only has to be as precise as the assertions.
+  type PrismaWriteArgs = { data: Record<string, unknown> };
+
+  const codeUpdate = jest.fn(async (_args: PrismaWriteArgs) => ({}));
+  const redemptionCreate = jest.fn(async (_args: PrismaWriteArgs) => ({}));
 
   const tx = {
     accessCode: {

@@ -30,6 +30,10 @@ class ListUsersDto extends SearchablePaginationDto {
   @IsOptional() @IsString() @MaxLength(32) academicYearId?: string;
 }
 
+class ListTeachersDto extends SearchablePaginationDto {
+  @IsOptional() @IsEnum(AccountStatus) status?: AccountStatus;
+}
+
 class TeacherProfileDto {
   @IsOptional() @IsString() @MaxLength(120) title?: string;
   @IsOptional() @IsString() @MaxLength(120) titleAr?: string;
@@ -93,6 +97,22 @@ export class UsersController {
       q: query.q,
       universityId: query.universityId,
       academicYearId: query.academicYearId,
+    });
+  }
+
+  @Get('teachers')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Teachers, with course and student counts',
+    description:
+      'Declared before the :id route so "teachers" is not read as a user id. Counts come from the assignment table and the maintained course counters, so the page costs one query rather than one per teacher.',
+  })
+  teachers(@Query() query: ListTeachersDto) {
+    return this.users.listTeachersForAdmin({
+      page: query.page,
+      pageSize: query.pageSize,
+      q: query.q,
+      status: query.status,
     });
   }
 

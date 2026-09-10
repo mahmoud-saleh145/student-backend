@@ -110,6 +110,7 @@ export class AuditService {
     entity?: string;
     entityId?: string;
     action?: AuditAction;
+    q?: string;
     from?: Date;
     to?: Date;
   }): Promise<Paginated<unknown>> {
@@ -118,6 +119,16 @@ export class AuditService {
       ...(params.entity ? { entity: params.entity } : {}),
       ...(params.entityId ? { entityId: params.entityId } : {}),
       ...(params.action ? { action: params.action } : {}),
+      ...(params.q
+        ? {
+            OR: [
+              { entity: { contains: params.q, mode: 'insensitive' } },
+              { entityId: { contains: params.q } },
+              { note: { contains: params.q, mode: 'insensitive' } },
+              { actor: { fullName: { contains: params.q, mode: 'insensitive' } } },
+            ],
+          }
+        : {}),
       ...(params.from || params.to
         ? { createdAt: { ...(params.from ? { gte: params.from } : {}), ...(params.to ? { lte: params.to } : {}) } }
         : {}),
@@ -172,5 +183,95 @@ export class AuditService {
     if (typeof value === 'bigint') return value.toString();
 
     return value;
+  }
+
+  /**
+   * Successful student sign-ins.
+   *
+   * Sourced from `security_events` (LOGIN_SUCCESS), which is where the auth
+   * path already records them — there is no second, parallel log to keep in
+   * sync. Device and IP come off the same row.
+   */
+  async loginLog(params: {
+    page: number;
+    pageSize: number;
+    q?: string;
+    from?: Date;
+    to?: Date;
+  }): Promise<Paginated<unknown>> {
+    const where: Prisma.SecurityEventWhereInput = {
+      type: 'LOGIN_SUCCESS',
+      user: { role: 'STUDENT' },
+      ...(params.q
+        ? {
+            user: {
+              role: 'STUDENT',
+              OR: [
+                { fullName: { contains: params.q, mode: 'insensitive' } },
+                { phone: { contains: params.q.replace(/\D/g, '') } },
+              ],
+            },
+          }
+        : {}),
+      ...(params.from || params.to
+        ? {
+            occurredAt: {
+              ...(params.from ? { gte: params.from } : {}),
+              ...(params.to ? { lte: params.to } : {}),
+            },
+          }
+        : {}),
+    };
+
+    const [rows, total] = await this.prisma.$transaction([
+      this.prisma.securityEvent.findMany({
+        where,
+        orderBy: { occurredAt: 'desc' },
+        skip: (params.page - 1) * params.pageSize,
+        take: params.pageSize,
+        include: {
+          user: {
+            select: {
+              id: true,
+              fullName: true,
+              phone: true,
+              createdAt: true,
+              studentProfile: {
+                select: {
+                  university: { select: { name: true, nameAr: true } },
+                  academicYear: { select: { name: true, nameAr: true } },
+                },
+              },
+            },
+          },
+        },
+      }),
+      this.prisma.securityEvent.count({ where }),
+    ]);
+
+    const items = rows.map((row) => {
+      const devices = row.metadata as { platform?: string; model?: string } | null;
+      return {
+        id: row.id,
+        student: row.user
+          ? {
+              id: row.user.id,
+              fullName: row.user.fullName,
+              phone: row.user.phone,
+              university: row.user.studentProfile?.university ?? null,
+              academicYear: row.user.studentProfile?.academicYear ?? null,
+              registeredAt: row.user.createdAt.toISOString(),
+            }
+          : null,
+        deviceKey: row.deviceKey,
+        platform: devices?.platform ?? null,
+        model: devices?.model ?? null,
+        ipAddress: row.ipAddress,
+        userAgent: row.userAgent,
+        occurredAt: row.occurredAt.toISOString(),
+      };
+    });
+
+    return paginated(items, total, params.page, params.pageSize);
   }
 }

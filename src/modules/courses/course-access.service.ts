@@ -10,6 +10,10 @@ import {
 import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
+import {
+  PlatformSettingsService,
+  type TeacherCapability,
+} from '../settings/platform-settings.service';
 
 /** Mirrors the mobile app's `AccessState` union exactly. */
 export type AccessState =
@@ -64,7 +68,10 @@ export interface AccessDecision {
 export class CourseAccessService {
   private readonly logger = new Logger(CourseAccessService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly settings: PlatformSettingsService,
+  ) {}
 
   // ---------------------------------------------------------------------------
   // Resolution
@@ -400,6 +407,31 @@ export class CourseAccessService {
    * Throws NOT_COURSE_TEACHER rather than a generic 403 so the dashboard can
    * explain the difference between "not yours" and "not permitted".
    */
+  /**
+   * Platform-wide teacher switches, set by an administrator in Settings.
+   *
+   * These are separate from the per-course `CourseTeacher` flags and are
+   * checked *in addition* to them: a teacher assigned with `canEditContent`
+   * still cannot delete a lecture while the platform switch is off. Both must
+   * allow it.
+   *
+   * Admin and master are never subject to these — the switches exist to
+   * constrain delegation to teachers, not to constrain the platform owner.
+   */
+  async assertTeacherCapability(
+    role: UserRole,
+    capability: TeacherCapability,
+  ): Promise<void> {
+    if (role !== UserRole.TEACHER) return;
+
+    if (!(await this.settings.teacherMay(capability))) {
+      throw new AppException(ErrorCode.FORBIDDEN, {
+        message: `Teachers are not permitted to perform '${capability}' on this platform`,
+        details: { capability, setting: `teacher.${capability}` },
+      });
+    }
+  }
+
   async assertCanManageCourse(
     userId: string,
     role: UserRole,
@@ -445,5 +477,52 @@ export class CourseAccessService {
       select: { courseId: true },
     });
     return rows.map((r) => r.courseId);
+  }
+
+  /**
+   * Which sections of a course a student is entitled to.
+   *
+   * Returns `null` for "all of them", which is what every enrollment created
+   * before section-scoped codes existed means and what every course-scoped
+   * grant still means. Only a SECTION code produces a restricted enrollment,
+   * and only then does this return an explicit list.
+   *
+   * Callers must treat `null` and "restricted" differently rather than
+   * flattening one into the other: an empty array is a real answer (a
+   * restricted enrollment whose sections were all archived) and must not be
+   * confused with unrestricted access.
+   */
+  async allowedSectionIds(userId: string, courseId: string): Promise<string[] | null> {
+    const enrollment = await this.prisma.enrollment.findUnique({
+      where: { userId_courseId: { userId, courseId } },
+      select: {
+        id: true,
+        coversAllSections: true,
+        sectionGrants: { select: { sectionId: true } },
+      },
+    });
+
+    if (!enrollment || enrollment.coversAllSections) return null;
+    return enrollment.sectionGrants.map((grant) => grant.sectionId);
+  }
+
+  /**
+   * Section-level gate for a single lesson. Course-level access is assumed to
+   * have been decided already by `decide()`/`resolve()`; this only narrows it.
+   */
+  async assertSectionAccessible(params: {
+    userId: string;
+    courseId: string;
+    sectionId: string;
+  }): Promise<void> {
+    const allowed = await this.allowedSectionIds(params.userId, params.courseId);
+    if (allowed === null) return;
+
+    if (!allowed.includes(params.sectionId)) {
+      throw new AppException(ErrorCode.NOT_ENROLLED, {
+        message: 'Your access to this course does not include this section',
+        details: { sectionId: params.sectionId },
+      });
+    }
   }
 }

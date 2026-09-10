@@ -47,6 +47,23 @@ export class ListStaffCoursesDto extends SearchablePaginationDto {
   status?: CourseStatus;
 
   @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) teacherId?: string;
+
+  // Dashboard filters. All optional and all additive — omitting them gives
+  // exactly the result set this endpoint returned before they existed.
+  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) universityId?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) facultyId?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) academicYearId?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) subjectId?: string;
+
+  @ApiPropertyOptional({ enum: ['newest', 'oldest', 'title', 'students', 'price'] })
+  @IsOptional()
+  @IsIn(['newest', 'oldest', 'title', 'students', 'price'])
+  sort?: 'newest' | 'oldest' | 'title' | 'students' | 'price';
+
+  @ApiPropertyOptional({ enum: ['asc', 'desc'] })
+  @IsOptional()
+  @IsIn(['asc', 'desc'])
+  order?: 'asc' | 'desc';
 }
 
 class SectionSeedDto {
@@ -63,6 +80,7 @@ export class CreateCourseDto {
   @IsOptional() @IsString() @MaxLength(32) universityId?: string;
   @IsOptional() @IsString() @MaxLength(32) facultyId?: string;
   @IsOptional() @IsString() @MaxLength(32) academicYearId?: string;
+  @IsOptional() @IsString() @MaxLength(32) subjectId?: string;
 
   @IsArray()
   @ArrayMinSize(1)
@@ -118,7 +136,9 @@ export class UpdateCourseDto {
   @IsOptional() @IsString() @MaxLength(500) shortDescription?: string;
   @IsOptional() @IsString() @MaxLength(20000) description?: string;
   @IsOptional() @IsString() @MaxLength(32) universityId?: string;
+  @IsOptional() @IsString() @MaxLength(32) facultyId?: string;
   @IsOptional() @IsString() @MaxLength(32) academicYearId?: string;
+  @IsOptional() @IsString() @MaxLength(32) subjectId?: string;
   @IsOptional() @IsString() @MaxLength(400) thumbnailKey?: string;
   @IsOptional() @IsArray() @IsString({ each: true }) requirements?: string[];
   @IsOptional() @IsArray() @IsString({ each: true }) outcomes?: string[];

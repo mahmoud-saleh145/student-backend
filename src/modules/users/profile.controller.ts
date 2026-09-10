@@ -21,6 +21,17 @@ class UpdateProfileDto {
   @IsOptional()
   @IsIn(['en', 'ar'])
   locale?: string;
+
+  /**
+   * Only accepted while the `student.allowAcademicYearChange` platform setting
+   * is on; the service refuses it otherwise. Kept out of the other academic
+   * fields deliberately — university/faculty/department still stay
+   * administrative, because they determine course eligibility.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(32)
+  academicYearId?: string;
 }
 
 class SetAvatarDto {
@@ -52,7 +63,7 @@ export class ProfileController {
   @ApiOperation({
     summary: 'Update your profile',
     description:
-      'Only the display name and locale are self-editable. Phone identifies the account and the academic fields drive course eligibility, so both are administrative.',
+      'Display name and locale are always self-editable. Academic year is self-editable only while the student.allowAcademicYearChange setting is on. Phone identifies the account and the remaining academic fields drive course eligibility, so both stay administrative.',
   })
   update(@CurrentUser() user: AuthenticatedUser, @Body() dto: UpdateProfileDto) {
     return this.users.updateOwnProfile(user.id, dto);

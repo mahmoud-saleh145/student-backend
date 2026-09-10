@@ -346,10 +346,19 @@ export class CoursesService {
       : [];
     const progressByLesson = new Map(progressRows.map((p) => [p.lessonId, p]));
 
+    // Section-scoped access. `null` — which is what every course-wide grant and
+    // every enrollment predating section codes returns — leaves the previous
+    // behaviour exactly as it was.
+    const allowedSections = params.userId
+      ? await this.access.allowedSectionIds(params.userId, course.id)
+      : null;
+
     return sections.map((section) =>
       toSection({
         section,
-        hasCourseAccess: decision.canAccessContent,
+        hasCourseAccess:
+          decision.canAccessContent &&
+          (allowedSections === null || allowedSections.includes(section.id)),
         progressByLesson,
       }),
     );

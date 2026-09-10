@@ -102,6 +102,14 @@ export class VideosService {
 
     await this.access.assertCanManageCourse(actor.id, actor.role, lesson.courseId, 'content');
 
+    // Uploading over an existing video replaces the source a student streams.
+    // That is the operation the "edit video URLs" switch governs; a first
+    // upload onto an empty lesson is ordinary content authoring and is not
+    // gated by it.
+    if (lesson.video) {
+      await this.access.assertTeacherCapability(actor.role, 'editVideoUrls');
+    }
+
     // Replacing a video: reuse the row so the lesson↔video relation and every
     // watch event that references it survive.
     const video = lesson.video
@@ -468,6 +476,7 @@ export class VideosService {
     if (!video) throw AppException.notFound('Video', videoId);
 
     await this.access.assertCanManageCourse(actor.id, actor.role, video.courseId, 'content');
+    await this.access.assertTeacherCapability(actor.role, 'deleteVideos');
 
     await this.prisma.video.update({
       where: { id: videoId },

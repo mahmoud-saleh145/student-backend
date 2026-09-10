@@ -47,15 +47,30 @@ interface StoredProgress {
 function buildService(existing: StoredProgress | null) {
   let stored = existing;
 
-  const upsert = jest.fn(async ({ create, update }: { create: never; update: never }) => {
-    const next = stored
-      ? { ...stored, ...(update as object) }
-      : { ...(create as object) };
+  // The assertions read `upsert.mock.calls[0][0].create.percent`, so the
+  // argument has to carry a real shape. `create: never` compiled to nothing
+  // usable and made every one of those reads a type error.
+  type UpsertArgs = {
+    create: Partial<StoredProgress>;
+    update: Partial<StoredProgress>;
+  };
+
+  const upsert = jest.fn(async ({ create, update }: UpsertArgs) => {
+    const next = stored ? { ...stored, ...update } : { ...create };
     stored = next as StoredProgress;
     return stored;
   });
 
-  const prisma = {
+  // Declared before assignment so `$transaction` can hand the callback this
+  // same object without the initialiser referring to itself — a self-reference
+  // inside the literal makes the whole thing implicitly `any` under `strict`.
+  const prisma: {
+    lesson: { findFirst: jest.Mock; count: jest.Mock };
+    watchProgress: { findUnique: jest.Mock; count: jest.Mock; upsert: typeof upsert };
+    enrollment: { updateMany: jest.Mock };
+    watchEvent: { create: jest.Mock };
+    $transaction: jest.Mock;
+  } = {
     lesson: {
       findFirst: jest.fn(async () => LESSON),
       count: jest.fn(async () => 10),
@@ -68,8 +83,12 @@ function buildService(existing: StoredProgress | null) {
     enrollment: { updateMany: jest.fn(async () => ({ count: 1 })) },
     watchEvent: { create: jest.fn(async () => ({})) },
     // The service's transaction callback receives the same shape.
-    $transaction: jest.fn(async (fn: (tx: unknown) => unknown) => fn(prisma)),
+    $transaction: jest.fn(),
   };
+
+  prisma.$transaction.mockImplementation(async (fn: (tx: unknown) => unknown) =>
+    fn(prisma),
+  );
 
   const access = { assertContentAccess: jest.fn(async () => ({ canAccessContent: true })) };
   const storage = { publicAssetUrl: jest.fn(async () => null) };

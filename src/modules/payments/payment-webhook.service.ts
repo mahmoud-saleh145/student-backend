@@ -16,7 +16,7 @@ import { PaymentsService } from './payments.service';
  *
  *  1. **Verify the signature before trusting anything**, using the RAW body.
  *     Re-serializing the parsed JSON changes key order and whitespace, and the
- *     HMAC stops matching — which is why main.ts enables `rawBody`.
+ *     HMAC stops matching — which is why main.ts enables `_rawBody`.
  *
  *  2. **De-duplicate.** Providers retry aggressively and deliver out of order.
  *     Every delivery is fingerprinted into IdempotencyRecord, so a replay is a
@@ -39,7 +39,7 @@ export class PaymentWebhookService {
     this.cfg = config.getOrThrow<PaymentConfig>('payment');
   }
 
-  async handlePaymob(body: Record<string, unknown>, hmac: string, rawBody?: Buffer) {
+  async handlePaymob(body: Record<string, unknown>, hmac: string, _rawBody?: Buffer) {
     if (!this.cfg.paymob.hmacSecret) {
       this.logger.error('Paymob webhook received but PAYMOB_HMAC_SECRET is not set');
       throw new AppException(ErrorCode.FORBIDDEN, { message: 'Webhook not configured' });
@@ -121,15 +121,15 @@ export class PaymentWebhookService {
     return { ok: true };
   }
 
-  async handleStripe(body: Record<string, unknown>, signature: string, rawBody?: Buffer) {
+  async handleStripe(body: Record<string, unknown>, signature: string, _rawBody?: Buffer) {
     if (!this.cfg.stripe.webhookSecret) {
       throw new AppException(ErrorCode.FORBIDDEN, { message: 'Webhook not configured' });
     }
-    if (!rawBody) {
+    if (!_rawBody) {
       throw new AppException(ErrorCode.VALIDATION_ERROR, { message: 'Raw body unavailable' });
     }
 
-    // Stripe's scheme: t=<timestamp>,v1=<hmac of "timestamp.rawBody">.
+    // Stripe's scheme: t=<timestamp>,v1=<hmac of "timestamp._rawBody">.
     const parts = Object.fromEntries(
       signature.split(',').map((p) => {
         const [k, v] = p.split('=');
@@ -151,7 +151,7 @@ export class PaymentWebhookService {
     }
 
     const expected = createHmac('sha256', this.cfg.stripe.webhookSecret)
-      .update(`${timestamp}.${rawBody.toString('utf8')}`)
+      .update(`${timestamp}.${_rawBody.toString('utf8')}`)
       .digest('hex');
 
     if (!this.safeCompare(expected, provided)) {

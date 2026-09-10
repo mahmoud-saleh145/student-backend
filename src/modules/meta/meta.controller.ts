@@ -3,13 +3,9 @@ import { ConfigService } from '@nestjs/config';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 
 import { Public } from '../../common/decorators/public.decorator';
-import type {
-  AppConfig,
-  DeviceConfig,
-  PlaybackConfig,
-  VideoConfig,
-} from '../../config/configuration';
+import type { AppConfig, PlaybackConfig, VideoConfig } from '../../config/configuration';
 import { PrismaService } from '../../database/prisma.service';
+import { PlatformSettingsService } from '../settings/platform-settings.service';
 
 /**
  * Client configuration.
@@ -28,6 +24,7 @@ export class MetaController {
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
+    private readonly platformSettings: PlatformSettingsService,
   ) {}
 
   @Get('app-config')
@@ -40,7 +37,6 @@ export class MetaController {
   async appConfig(@Headers('x-app-version') appVersion?: string) {
     const app = this.config.getOrThrow<AppConfig>('app');
     const playback = this.config.getOrThrow<PlaybackConfig>('playback');
-    const device = this.config.getOrThrow<DeviceConfig>('device');
     const video = this.config.getOrThrow<VideoConfig>('video');
 
     const settings = await this.prisma.platformSetting.findMany({
@@ -48,6 +44,12 @@ export class MetaController {
     });
 
     const byKey = new Map(settings.map((s) => [s.key, s.value]));
+
+    const [deviceLimit, contacts, allowAcademicYearChange] = await Promise.all([
+      this.platformSettings.deviceLimit(),
+      this.platformSettings.contacts(),
+      this.platformSettings.allowsAcademicYearChange(),
+    ]);
 
     return {
       environment: app.env,
@@ -63,7 +65,9 @@ export class MetaController {
       },
 
       device: {
-        limitPerStudent: device.limitPerStudent,
+        // Read through the settings service so the number the app is told
+        // matches the number the login path actually enforces.
+        limitPerStudent: deviceLimit,
         // Tells the app whether to refuse protected playback when its native
         // protection module is unavailable.
         requiresSecureSurface: true,
@@ -73,9 +77,19 @@ export class MetaController {
         selfServicePasswordReset: false,
         otpRegistration: false,
         codeRedemption: true,
+        // New capability flags. The shipped app ignores unknown keys, so this
+        // is additive; a future build can gate its UI on them.
+        academicYearSelfService: allowAcademicYearChange,
+        supportTickets: true,
       },
 
-      support: (byKey.get('supportContacts') as Record<string, string>) ?? {},
+      // `supportContacts` (the original master-only free-form key) still wins
+      // when it is set, so nothing an operator configured earlier is lost. The
+      // dashboard-managed contact fields fill in whatever it does not cover.
+      support: {
+        ...contacts,
+        ...((byKey.get('supportContacts') as Record<string, string>) ?? {}),
+      },
 
       // Echoed so a client can confirm the header reached us intact.
       callerAppVersion: appVersion ?? null,

@@ -30,6 +30,12 @@ function buildService(
     prisma as never,
     { record } as never,
     { record: jest.fn(async () => undefined) } as never,
+    // PlatformSettingsService. The administrator-editable device limit is
+    // authoritative over the environment value, so it answers with the same
+    // number this case is configured for.
+    {
+      deviceLimit: async () => config.limitPerStudent ?? 1,
+    } as never,
     {
       getOrThrow: () => ({
         limitPerStudent: config.limitPerStudent ?? 1,
