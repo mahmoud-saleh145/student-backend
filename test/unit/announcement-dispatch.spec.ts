@@ -1,4 +1,18 @@
-import { AnnouncementFrequency, AnnouncementStatus, Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
+
+const AnnouncementStatus = {
+  SCHEDULED: 'SCHEDULED',
+  SENT: 'SENT',
+} as const;
+
+type AnnouncementStatus = (typeof AnnouncementStatus)[keyof typeof AnnouncementStatus];
+
+const AnnouncementFrequency = {
+  DAILY: 'DAILY',
+  ONCE: 'ONCE',
+} as const;
+
+type AnnouncementFrequency = (typeof AnnouncementFrequency)[keyof typeof AnnouncementFrequency];
 
 import { AnnouncementsService } from '../../src/modules/notifications/announcements.service';
 

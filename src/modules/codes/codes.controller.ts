@@ -34,6 +34,17 @@ class GenerateCodesDto {
   @IsOptional() @IsString() @MaxLength(32) sectionId?: string;
   @IsOptional() @IsString() @MaxLength(32) teacherId?: string;
 
+  /**
+   * Required when `targetType` is `PART`.
+   *
+   * `CodesService.generateBatch` has always accepted and validated this — it
+   * checks the part exists, is on sale, and has at least one section, since a
+   * card for a part that unlocks nothing is worse than no card. The field was
+   * simply absent from this DTO, so the value was stripped by the validation
+   * pipe before it arrived and part cards could not be issued at all.
+   */
+  @IsOptional() @IsString() @MaxLength(32) coursePartId?: string;
+
   /** Optional human label for the generated batch. */
   @IsOptional() @IsString() @MaxLength(120) batchName?: string;
 
@@ -60,6 +71,8 @@ class ListCodesDto extends SearchablePaginationDto {
   @IsOptional() @IsString() @MaxLength(32) courseId?: string;
   @IsOptional() @IsString() @MaxLength(32) sectionId?: string;
   @IsOptional() @IsString() @MaxLength(32) teacherId?: string;
+  /** `CodesService.list` already filters on this; the DTO did not carry it. */
+  @IsOptional() @IsString() @MaxLength(32) coursePartId?: string;
   @IsOptional() @IsEnum(CodeTargetType) targetType?: CodeTargetType;
   @IsOptional() @IsEnum(CodeStatus) status?: CodeStatus;
   @IsOptional() @IsString() @MaxLength(64) batchId?: string;
@@ -199,6 +212,7 @@ export class CodesController {
       courseId: query.courseId,
       sectionId: query.sectionId,
       teacherId: query.teacherId,
+      coursePartId: query.coursePartId,
       targetType: query.targetType,
       status: query.status,
       batchId: query.batchId,

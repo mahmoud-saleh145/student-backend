@@ -1,4 +1,9 @@
-import { AnnouncementFrequency } from '@prisma/client';
+const AnnouncementFrequency = {
+  DAILY: 'DAILY',
+  WEEKLY: 'WEEKLY',
+  MONTHLY: 'MONTHLY',
+  ONCE: 'ONCE',
+} as const;
 
 import {
   assertValidRecurrence,
