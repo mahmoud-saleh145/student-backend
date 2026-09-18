@@ -38,6 +38,7 @@ import {
   AccountStatus,
   AttachmentKind,
   CodeStatus,
+  CodeTargetType,
   CompletionRuleType,
   ContentStatus,
   CourseStatus,
@@ -796,6 +797,24 @@ async function seedCommerce(
       method: EnrollmentMethod.FREE,
       accessStartsAt: new Date(Date.now() - 400 * 86_400_000),
       accessEndsAt: new Date(Date.now() - 30 * 86_400_000),
+    },
+  });
+
+  // The batch the multi-use code below belongs to. AccessCode.batchId is a real
+  // foreign key, so the batch has to exist first or the insert is rejected.
+  await prisma.codeBatch.upsert({
+    where: { id: 'seed-batch-1' },
+    update: {},
+    create: {
+      id: 'seed-batch-1',
+      name: 'Seeded batch',
+      targetType: CodeTargetType.COURSE,
+      courseId: courses.dataStructures.id,
+      targetNameSnapshot: courses.dataStructures.title,
+      quantity: 1,
+      note: 'Seeded 25-use batch code',
+      expiresAt: new Date(Date.now() + 90 * 86_400_000),
+      createdById: users.admin.id,
     },
   });
 
