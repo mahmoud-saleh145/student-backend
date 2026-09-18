@@ -18,11 +18,13 @@ import { AuditModule } from './modules/audit/audit.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { CatalogModule } from './modules/catalog/catalog.module';
 import { CodesModule } from './modules/codes/codes.module';
+import { CoursePartsModule } from './modules/course-parts/course-parts.module';
 import { CoursesModule } from './modules/courses/courses.module';
 import { DevicesModule } from './modules/devices/devices.module';
 import { EnrollmentsModule } from './modules/enrollments/enrollments.module';
 import { HomeModule } from './modules/home/home.module';
 import { LessonsModule } from './modules/lessons/lessons.module';
+import { LibraryModule } from './modules/library/library.module';
 import { MasterModule } from './modules/master/master.module';
 import { MetaModule } from './modules/meta/meta.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
@@ -39,6 +41,7 @@ import { SubjectsModule } from './modules/subjects/subjects.module';
 import { SupportModule } from './modules/support/support.module';
 import { UsersModule } from './modules/users/users.module';
 import { VideosModule } from './modules/videos/videos.module';
+import { WalletModule } from './modules/wallet/wallet.module';
 import { RedisModule } from './redis/redis.module';
 
 /**
@@ -134,6 +137,16 @@ import { RedisModule } from './redis/redis.module';
     EnrollmentsModule,
     PaymentsModule,
     CodesModule,
+    // Registered after CodesModule: recharge codes are generated there and
+    // spent here, and keeping the credit ledger in one module means every
+    // paid feature debits through the same audited path.
+    WalletModule,
+    // After WalletModule and EnrollmentsModule, both of which it uses: a part
+    // is granted through the ordinary enrollment path, not a parallel one.
+    CoursePartsModule,
+    // The Library is the one subsystem that spends wallet credits. It is
+    // deliberately independent of every course module above it.
+    LibraryModule,
 
     // --- engagement -----------------------------------------------------------
     ProgressModule,

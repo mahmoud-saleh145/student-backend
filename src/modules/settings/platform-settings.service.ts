@@ -26,6 +26,9 @@ export interface SettingShape {
   'contact.whatsapp': string;
   'contact.facebook': string;
   'contact.email': string;
+  'wallet.minimumRecharge': number;
+  'wallet.maximumRecharge': number;
+  'wallet.allowAdminOverrideMinimum': boolean;
 }
 
 export const SETTING_DEFAULTS: SettingShape = {
@@ -39,6 +42,13 @@ export const SETTING_DEFAULTS: SettingShape = {
   'contact.whatsapp': '',
   'contact.facebook': '',
   'contact.email': '',
+  // The platform's stated floor for a recharge card. 50 EGP is the launch
+  // value; it is a setting precisely because it is a commercial decision.
+  'wallet.minimumRecharge': 50,
+  'wallet.maximumRecharge': 100_000,
+  // When on, an administrator may issue a card below the minimum by asking
+  // for it explicitly. Off by default, so the floor means what it says.
+  'wallet.allowAdminOverrideMinimum': false,
 };
 
 export type SettingKey = keyof SettingShape;
@@ -77,6 +87,10 @@ const SETTING_DESCRIPTIONS: Record<SettingKey, string> = {
   'contact.whatsapp': 'Public WhatsApp number.',
   'contact.facebook': 'Public Facebook page URL.',
   'contact.email': 'Public support email address.',
+  'wallet.minimumRecharge': 'Smallest face value a recharge code may carry, in EGP.',
+  'wallet.maximumRecharge': 'Largest face value a recharge code may carry, in EGP.',
+  'wallet.allowAdminOverrideMinimum':
+    'Whether an administrator may deliberately issue a recharge code below the minimum.',
 };
 
 /** Guard rails applied server-side, so a bad PUT cannot brick the platform. */
@@ -94,7 +108,22 @@ const VALIDATORS: Partial<Record<SettingKey, (value: unknown) => string | null>>
   'contact.whatsapp': stringCheck(40),
   'contact.facebook': stringCheck(300),
   'contact.email': stringCheck(160),
+  'wallet.minimumRecharge': moneyCheck(0, 1_000_000),
+  'wallet.maximumRecharge': moneyCheck(1, 1_000_000),
+  'wallet.allowAdminOverrideMinimum': booleanCheck,
 };
+
+/**
+ * A whole number of EGP. Fractional minimums are rejected rather than rounded:
+ * a floor of 49.995 is a typo, and silently accepting it would make the error
+ * message on a rejected card impossible to explain.
+ */
+function moneyCheck(min: number, max: number) {
+  return (value: unknown): string | null =>
+    typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max
+      ? null
+      : `must be a whole number of EGP between ${min} and ${max}`;
+}
 
 function booleanCheck(value: unknown): string | null {
   return typeof value === 'boolean' ? null : 'must be true or false';
@@ -172,6 +201,25 @@ export class PlatformSettingsService {
 
   async teacherMay(capability: TeacherCapability): Promise<boolean> {
     return this.get(TEACHER_CAPABILITY_KEYS[capability]);
+  }
+
+  /**
+   * The recharge-card bounds, read together because every card-creation path
+   * needs both and a half-applied pair would be worse than neither.
+   */
+  async rechargeBounds(): Promise<{
+    minimum: number;
+    maximum: number;
+    allowOverride: boolean;
+  }> {
+    const [minimum, maximum, allowOverride] = await Promise.all([
+      this.get('wallet.minimumRecharge'),
+      this.get('wallet.maximumRecharge'),
+      this.get('wallet.allowAdminOverrideMinimum'),
+    ]);
+    // A maximum below the minimum would make every card invalid. Defend
+    // against a hand-edited pair by widening rather than refusing everything.
+    return { minimum, maximum: Math.max(minimum, maximum), allowOverride };
   }
 
   /** Public contact block, surfaced through GET /meta/app-config. */

@@ -47,6 +47,14 @@ export enum ErrorCode {
   INVALID_CODE = 'INVALID_CODE',
   CODE_ALREADY_USED = 'CODE_ALREADY_USED',
 
+  // --- wallet / credits ------------------------------------------------------
+  // The student app renders these, so each one needs an entry in both locale
+  // bundles. Without it the app falls back to a generic message.
+  INSUFFICIENT_CREDIT = 'INSUFFICIENT_CREDIT',
+  WALLET_LOCKED = 'WALLET_LOCKED',
+  AMOUNT_BELOW_MINIMUM = 'AMOUNT_BELOW_MINIMUM',
+  CODE_NOT_RECHARGEABLE = 'CODE_NOT_RECHARGEABLE',
+
   // --- playback --------------------------------------------------------------
   PLAYBACK_DENIED = 'PLAYBACK_DENIED',
   PLAYBACK_TICKET_EXPIRED = 'PLAYBACK_TICKET_EXPIRED',
@@ -103,6 +111,11 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   [ErrorCode.INVALID_CODE]: 400,
   [ErrorCode.CODE_ALREADY_USED]: 409,
 
+  [ErrorCode.INSUFFICIENT_CREDIT]: 402,
+  [ErrorCode.WALLET_LOCKED]: 403,
+  [ErrorCode.AMOUNT_BELOW_MINIMUM]: 422,
+  [ErrorCode.CODE_NOT_RECHARGEABLE]: 400,
+
   [ErrorCode.PLAYBACK_DENIED]: 403,
   [ErrorCode.PLAYBACK_TICKET_EXPIRED]: 401,
   [ErrorCode.CONCURRENT_STREAM_LIMIT]: 429,
@@ -154,6 +167,11 @@ export const ERROR_MESSAGE: Record<ErrorCode, string> = {
   [ErrorCode.PAYMENT_FAILED]: 'Payment could not be completed',
   [ErrorCode.INVALID_CODE]: 'Access code is not valid',
   [ErrorCode.CODE_ALREADY_USED]: 'Access code has already been used',
+
+  [ErrorCode.INSUFFICIENT_CREDIT]: 'Not enough credit in the wallet',
+  [ErrorCode.WALLET_LOCKED]: 'Wallet is not available for this account',
+  [ErrorCode.AMOUNT_BELOW_MINIMUM]: 'Amount is below the configured minimum',
+  [ErrorCode.CODE_NOT_RECHARGEABLE]: 'This code does not add credit to a wallet',
 
   [ErrorCode.PLAYBACK_DENIED]: 'Playback is not authorized',
   [ErrorCode.PLAYBACK_TICKET_EXPIRED]: 'Playback authorization expired',

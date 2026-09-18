@@ -54,6 +54,14 @@ function buildService(row: ReturnType<typeof code> | null, alreadyRedeemed = fal
   const service = new CodesService(
     { $transaction: jest.fn() } as never,
     { record: jest.fn(async () => undefined) } as never,
+    // PlatformSettingsService, added with the wallet. Only the recharge-card
+    // paths read it, and nothing in this file goes near them — but answering
+    // with the shipped defaults is honest about what the service depends on,
+    // and means a future recharge test fails on its own assertion rather than
+    // on a TypeError from an empty object.
+    {
+      rechargeBounds: async () => ({ minimum: 50, maximum: 100_000, allowOverride: false }),
+    } as never,
   );
 
   return { service, tx, codeUpdate, redemptionCreate };

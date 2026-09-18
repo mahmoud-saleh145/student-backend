@@ -10,6 +10,7 @@ import {
 } from '@prisma/client';
 
 import { AppException } from '../../common/errors/app.exception';
+import { assertPriceChangeKeepsAllocationValid } from '../course-parts/part-allocation.guard';
 import { ErrorCode } from '../../common/errors/error-codes';
 import { paginated } from '../../common/types/api-response';
 import { MONEY_TX_OPTIONS, PrismaService, notDeleted } from '../../database/prisma.service';
@@ -412,6 +413,17 @@ export class CoursesAdminService {
     }
 
     const result = await this.prisma.$transaction(async (tx) => {
+      // Fixed-price parts do not float with the course price, which is the
+      // whole point of choosing them — and that means a price change can
+      // silently strand them: 300 + 400 + 300 was the course price yesterday
+      // and is 50 EGP short of it today. Rather than leave the course in a
+      // state where buying every part does not buy the course, the change is
+      // refused and the admin is told the exact shortfall so they can adjust
+      // the parts first. Percentage parts always still total 100%, so they
+      // pass this untouched. Existing purchases carry their own frozen price
+      // and are unaffected either way.
+      await assertPriceChangeKeepsAllocationValid(tx, courseId, input.amount);
+
       const current = await tx.coursePrice.findFirst({
         where: { courseId, isCurrent: true },
         orderBy: { version: 'desc' },

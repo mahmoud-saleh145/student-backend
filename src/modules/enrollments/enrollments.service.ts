@@ -16,6 +16,7 @@ import { paginated } from '../../common/types/api-response';
 import { MONEY_TX_OPTIONS, PrismaService, notDeleted } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { CodesService } from '../codes/codes.service';
+import { grantPartFromCode } from '../course-parts/grant-part-from-code';
 import { CourseAccessService } from '../courses/course-access.service';
 import { CoursesService } from '../courses/courses.service';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -315,7 +316,22 @@ export class EnrollmentsService {
         durationOverride,
         sectionScope: validation.scope.sectionIds,
         codeId: validation.code.id,
+        partId: validation.code.coursePartId ?? undefined,
       });
+
+      // A part-scoped card additionally records the part entitlement, in this
+      // same transaction — so a card can never be burned without the
+      // entitlement it bought, nor an entitlement created without the card.
+      // Course parts never touch the wallet; the money changed hands offline
+      // when the card was sold, exactly as for course and section cards.
+      if (validation.code.coursePartId) {
+        await grantPartFromCode(tx, {
+          userId: params.userId,
+          coursePartId: validation.code.coursePartId,
+          accessCodeId: validation.code.id,
+          sectionIds: validation.scope.sectionIds ?? [],
+        });
+      }
 
       // A teacher-scoped card unlocks every course frozen into it, not only
       // the one the student happened to redeem from. Those extra courses are
@@ -398,7 +414,20 @@ export class EnrollmentsService {
    * Free joins, code redemptions, payment captures and administrative grants
    * all funnel through here, so the access-window calculation exists once.
    */
-  private async grantAccess(
+  /**
+   * Creates or widens a student's access to a course.
+   *
+   * Public because course-part purchases grant access through exactly this
+   * path rather than a parallel one: a part purchase writes the same
+   * `enrollment_section_grants` rows a section-scoped code writes, so the
+   * lesson gate, playback ticket and attachment ticket all keep working
+   * unchanged. Everything this method already guaranteed — widen-never-narrow,
+   * append-only grants, the student-count recount — applies to parts too.
+   *
+   * Must be called inside a transaction the caller controls, so the grant and
+   * whatever paid for it commit or roll back together.
+   */
+  async grantAccess(
     tx: Prisma.TransactionClient,
     params: {
       userId: string;
@@ -423,6 +452,13 @@ export class EnrollmentsService {
        */
       sectionScope?: string[] | null;
       codeId?: string;
+      /**
+       * Why the sections are being granted. Defaults to CODE so every existing
+       * caller keeps writing exactly the rows it wrote before.
+       */
+      grantSource?: SectionGrantSource;
+      /** Set when a course-part purchase paid for these sections. */
+      partId?: string;
     },
   ) {
     const now = new Date();
@@ -474,8 +510,9 @@ export class EnrollmentsService {
         data: scope.map((sectionId) => ({
           enrollmentId: enrollment.id,
           sectionId,
-          source: SectionGrantSource.CODE,
+          source: params.grantSource ?? SectionGrantSource.CODE,
           codeId: params.codeId ?? null,
+          partId: params.partId ?? null,
         })),
         skipDuplicates: true,
       });

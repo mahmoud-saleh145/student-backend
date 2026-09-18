@@ -1,9 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
 import {
   AuditAction,
+  CodeKind,
   CodeStatus,
   CodeTargetType,
   CourseStatus,
+  DiscountType,
   type Prisma,
   UserRole,
 } from '@prisma/client';
@@ -14,11 +16,16 @@ import { ErrorCode } from '../../common/errors/error-codes';
 import { paginated } from '../../common/types/api-response';
 import { PrismaService } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
+import { PlatformSettingsService } from '../settings/platform-settings.service';
+import { resolveDiscount } from '../wallet/discount';
+import { toEgpNumber, toPiastres } from '../wallet/money';
 
 export interface CodeValidation {
   code: {
     id: string;
     courseId: string | null;
+    /// Set for a PART card. The caller records the part entitlement.
+    coursePartId: string | null;
     accessDurationType: string | null;
     accessDurationDays: number | null;
     accessEndsAt: Date | null;
@@ -67,6 +74,7 @@ export class CodesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    private readonly settings: PlatformSettingsService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -92,6 +100,7 @@ export class CodesService {
       courseId?: string;
       sectionId?: string;
       teacherId?: string;
+      coursePartId?: string;
       batchName?: string;
       count: number;
       maxRedemptions?: number;
@@ -133,6 +142,7 @@ export class CodesService {
           courseId: target.courseId,
           sectionId: target.sectionId,
           teacherId: target.teacherId,
+          coursePartId: target.coursePartId,
           targetNameSnapshot: target.name,
           quantity: input.count,
           prefix: prefix || null,
@@ -151,6 +161,7 @@ export class CodesService {
           courseId: target.courseId,
           sectionId: target.sectionId,
           teacherId: target.teacherId,
+          coursePartId: target.coursePartId,
           grantedSectionIds: target.grantedSectionIds,
           grantedCourseIds: target.grantedCourseIds,
           batchId: batch.id,
@@ -185,6 +196,7 @@ export class CodesService {
         courseId: target.courseId,
         sectionId: target.sectionId,
         teacherId: target.teacherId,
+        coursePartId: target.coursePartId,
         frozenSections: target.grantedSectionIds.length,
         frozenCourses: target.grantedCourseIds.length,
         maxRedemptions: input.maxRedemptions ?? 1,
@@ -215,15 +227,63 @@ export class CodesService {
    */
   private async resolveTarget(
     targetType: CodeTargetType,
-    input: { courseId?: string; sectionId?: string; teacherId?: string },
+    input: {
+      courseId?: string;
+      sectionId?: string;
+      teacherId?: string;
+      coursePartId?: string;
+    },
   ): Promise<{
     name: string;
     courseId: string | null;
     sectionId: string | null;
     teacherId: string | null;
+    coursePartId: string | null;
     grantedSectionIds: string[];
     grantedCourseIds: string[];
   }> {
+    if (targetType === CodeTargetType.PART) {
+      if (!input.coursePartId) {
+        throw AppException.validation({ coursePartId: ['is required for a part code'] });
+      }
+      const part = await this.prisma.coursePart.findFirst({
+        where: { id: input.coursePartId, deletedAt: null },
+        select: {
+          id: true,
+          title: true,
+          courseId: true,
+          course: { select: { title: true } },
+          sections: {
+            where: { deletedAt: null },
+            orderBy: { sortOrder: 'asc' },
+            select: { id: true },
+          },
+        },
+      });
+      if (!part) throw AppException.notFound('Course part', input.coursePartId);
+
+      if (part.sections.length === 0) {
+        // A card that unlocks nothing is worse than no card: the student pays,
+        // redeems, and receives an empty part with no error to point at.
+        throw AppException.validation({
+          coursePartId: ['this part has no sections yet, so a card for it would unlock nothing'],
+        });
+      }
+
+      return {
+        name: `${part.course.title} — ${part.title}`,
+        courseId: part.courseId,
+        sectionId: null,
+        teacherId: null,
+        coursePartId: part.id,
+        // Frozen here, exactly as a course card freezes its sections. A card
+        // sold in October must not start unlocking a section added to the part
+        // in December, because the buyer did not pay for it.
+        grantedSectionIds: part.sections.map((s) => s.id),
+        grantedCourseIds: [part.courseId],
+      };
+    }
+
     if (targetType === CodeTargetType.SECTION) {
       if (!input.sectionId) {
         throw AppException.validation({ sectionId: ['is required for a section code'] });
@@ -239,6 +299,7 @@ export class CodesService {
         courseId: section.courseId,
         sectionId: section.id,
         teacherId: null,
+        coursePartId: null,
         grantedSectionIds: [section.id],
         grantedCourseIds: [section.courseId],
       };
@@ -274,6 +335,7 @@ export class CodesService {
         courseId: null,
         sectionId: null,
         teacherId: teacher.id,
+        coursePartId: null,
         grantedSectionIds: [],
         grantedCourseIds: courseIds,
       };
@@ -298,6 +360,7 @@ export class CodesService {
       courseId: course.id,
       sectionId: null,
       teacherId: null,
+      coursePartId: null,
       grantedSectionIds: course.sections.map((s) => s.id),
       grantedCourseIds: [course.id],
     };
@@ -338,6 +401,13 @@ export class CodesService {
     const invalid = () => new AppException(ErrorCode.INVALID_CODE);
 
     if (!code) throw invalid();
+    // A recharge card carries no entitlement, and its `courseId` is null —
+    // which the course path below would otherwise read as "unlocks anything".
+    // This check is what stops a 50 EGP top-up card opening every course on
+    // the platform, so it comes before any scope resolution.
+    if (code.kind === CodeKind.RECHARGE) {
+      throw new AppException(ErrorCode.CODE_NOT_RECHARGEABLE);
+    }
     if (code.status === CodeStatus.REVOKED) throw invalid();
     if (code.expiresAt && code.expiresAt.getTime() <= Date.now()) throw invalid();
     if (code.redemptionCount >= code.maxRedemptions) {
@@ -396,6 +466,12 @@ export class CodesService {
     const invalid = () => new AppException(ErrorCode.INVALID_CODE);
 
     if (!code) throw invalid();
+    // Same guard as validate(), repeated rather than shared because this is
+    // the path that actually grants access: it must not depend on an earlier
+    // call having been made.
+    if (code.kind === CodeKind.RECHARGE) {
+      throw new AppException(ErrorCode.CODE_NOT_RECHARGEABLE);
+    }
     if (code.status === CodeStatus.REVOKED) throw invalid();
     if (code.expiresAt && code.expiresAt.getTime() <= Date.now()) throw invalid();
     if (code.reservedForUserId && code.reservedForUserId !== params.userId) throw invalid();
@@ -440,6 +516,7 @@ export class CodesService {
       code: {
         id: code.id,
         courseId: code.courseId,
+        coursePartId: code.coursePartId,
         accessDurationType: code.accessDurationType,
         accessDurationDays: code.accessDurationDays,
         accessEndsAt: code.accessEndsAt,
@@ -463,6 +540,7 @@ export class CodesService {
       courseId: string | null;
       sectionId: string | null;
       teacherId: string | null;
+      coursePartId?: string | null;
       grantedSectionIds: string[];
       grantedCourseIds: string[];
     },
@@ -481,15 +559,20 @@ export class CodesService {
     courseId?: string;
     sectionId?: string;
     teacherId?: string;
+    coursePartId?: string;
     targetType?: CodeTargetType;
     status?: CodeStatus;
     batchId?: string;
     q?: string;
   }) {
     const where: Prisma.AccessCodeWhereInput = {
+      // Access cards only. Recharge cards have their own endpoint with the
+      // financial columns this view has no place for.
+      kind: CodeKind.ACCESS,
       ...(params.courseId ? { courseId: params.courseId } : {}),
       ...(params.sectionId ? { sectionId: params.sectionId } : {}),
       ...(params.teacherId ? { teacherId: params.teacherId } : {}),
+      ...(params.coursePartId ? { coursePartId: params.coursePartId } : {}),
       ...(params.targetType ? { targetType: params.targetType } : {}),
       ...(params.status ? { status: params.status } : {}),
       ...(params.batchId ? { batchId: params.batchId } : {}),
@@ -506,6 +589,7 @@ export class CodesService {
           course: { select: { id: true, title: true } },
           section: { select: { id: true, title: true, courseId: true } },
           teacher: { select: { id: true, fullName: true } },
+          coursePart: { select: { id: true, title: true } },
           batch: { select: { id: true, name: true, targetNameSnapshot: true } },
           issuedBy: { select: { id: true, fullName: true } },
           _count: { select: { redemptions: true } },
@@ -529,6 +613,7 @@ export class CodesService {
         course: c.course,
         section: c.section,
         teacher: c.teacher,
+        coursePart: c.coursePart,
         batchId: c.batchId,
         batchName: c.batch?.name ?? null,
         amount: c.priceAmount === null ? null : Number(c.priceAmount),
@@ -553,9 +638,14 @@ export class CodesService {
     course: { title: string } | null;
     section: { title: string } | null;
     teacher: { fullName: string } | null;
+    coursePart?: { title: string } | null;
     batch: { targetNameSnapshot: string } | null;
   }): string {
     switch (code.targetType) {
+      case CodeTargetType.PART:
+        return code.coursePart
+          ? `${code.course?.title ?? ''} — ${code.coursePart.title}`.trim()
+          : (code.batch?.targetNameSnapshot ?? '—');
       case CodeTargetType.SECTION:
         return code.section
           ? `${code.course?.title ?? ''} — ${code.section.title}`.trim()
@@ -578,6 +668,7 @@ export class CodesService {
     q?: string;
   }) {
     const where: Prisma.CodeBatchWhereInput = {
+      kind: CodeKind.ACCESS,
       ...(params.targetType ? { targetType: params.targetType } : {}),
       ...(params.q
         ? {
@@ -758,6 +849,397 @@ export class CodesService {
     return count;
   }
 
+  // ---------------------------------------------------------------------------
+  // Recharge codes (wallet top-up)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Generates a batch of wallet recharge cards.
+   *
+   * A recharge card is not an access card wearing a different hat: it carries
+   * no course, no section and no entitlement at all. It carries money, and the
+   * four numbers that describe that money are computed **once, here** and
+   * frozen onto every card in the batch:
+   *
+   *     faceValue        what is printed on the card
+   *     discountAmount   derived from the type, never supplied directly
+   *     actualPaidAmount face value minus discount — THE REVENUE
+   *     creditAmount     what lands in the wallet
+   *
+   * Freezing them at generation is what makes the financial history immutable.
+   * Changing the minimum-recharge setting, or the discount policy, next month
+   * cannot retroactively change what a card already in a student's hand is
+   * worth, because nothing recomputes these values at redemption time.
+   *
+   * A 100% discount is supported and yields a giveaway card: 0 paid, 0 credits,
+   * 0 revenue. It still redeems, and it still writes a revenue row, so the
+   * giveaway appears in the report rather than being invisible.
+   */
+  async generateRechargeBatch(
+    input: {
+      faceValue: number;
+      discountType?: DiscountType;
+      discountPercent?: number;
+      discountAmount?: number;
+      count: number;
+      batchName?: string;
+      expiresAt?: string;
+      reservedForUserId?: string;
+      note?: string;
+      prefix?: string;
+      /**
+       * Deliberately issues a card below the configured minimum. Honoured only
+       * when the platform setting allows it; otherwise the request is refused
+       * rather than quietly downgraded.
+       */
+      overrideMinimum?: boolean;
+    },
+    actor: { id: string; role: UserRole },
+  ) {
+    if (input.count < 1 || input.count > 5000) {
+      throw AppException.validation({ count: ['must be between 1 and 5000'] });
+    }
+
+    // All validation and arithmetic happens server-side. The dashboard shows a
+    // preview of these same numbers, but nothing it sends is trusted: the
+    // request carries a face value and a discount, never a computed total.
+    const money = resolveDiscount({
+      faceValue: input.faceValue,
+      discountType: input.discountType,
+      discountPercent: input.discountPercent,
+      discountAmount: input.discountAmount,
+    });
+
+    const bounds = await this.settings.rechargeBounds();
+    const minPiastres = bounds.minimum * 100;
+    const maxPiastres = bounds.maximum * 100;
+
+    if (money.faceValuePiastres > maxPiastres) {
+      throw AppException.validation({
+        faceValue: [`must not exceed the configured maximum of ${bounds.maximum} EGP`],
+      });
+    }
+
+    if (money.faceValuePiastres < minPiastres) {
+      // The override exists for the genuine exception (a 10 EGP promotional
+      // card). It is off by default and gated on a setting, so the floor is a
+      // real floor rather than a suggestion the dashboard can talk its way past.
+      if (!(input.overrideMinimum && bounds.allowOverride)) {
+        throw new AppException(ErrorCode.AMOUNT_BELOW_MINIMUM, {
+          message: `Recharge codes must be at least ${bounds.minimum} EGP`,
+          fields: {
+            faceValue: [`must be at least ${bounds.minimum} EGP`],
+          },
+          details: { minimum: bounds.minimum, provided: toEgpNumber(money.faceValuePiastres) },
+        });
+      }
+    }
+
+    const prefix = (input.prefix ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+
+    const codes = new Set<string>();
+    while (codes.size < input.count) {
+      codes.add(this.formatCode(prefix));
+    }
+
+    const expiresAt = input.expiresAt ? new Date(input.expiresAt) : null;
+
+    const financial = {
+      kind: CodeKind.RECHARGE,
+      faceValue: money.faceValue,
+      discountType: money.discountType,
+      discountPercent: money.discountPercent,
+      discountAmount: money.discountAmount,
+      actualPaidAmount: money.actualPaidAmount,
+      creditAmount: money.creditAmount,
+    };
+
+    const { batch, created } = await this.prisma.$transaction(async (tx) => {
+      const batch = await tx.codeBatch.create({
+        data: {
+          name: input.batchName ?? null,
+          // A recharge card has no target. The columns are required on the
+          // batch for the access-card case, so they carry a self-describing
+          // placeholder rather than a course that does not exist.
+          targetType: CodeTargetType.COURSE,
+          targetNameSnapshot: 'Wallet recharge',
+          quantity: input.count,
+          prefix: prefix || null,
+          priceAmount: money.faceValue,
+          currency: 'EGP',
+          expiresAt,
+          note: input.note ?? null,
+          createdById: actor.id,
+          ...financial,
+        },
+      });
+
+      const created = await tx.accessCode.createMany({
+        data: [...codes].map((code) => ({
+          code,
+          // No courseId, no sectionId, no teacherId, no granted* snapshot:
+          // there is nothing for this card to unlock.
+          targetType: CodeTargetType.COURSE,
+          batchId: batch.id,
+          maxRedemptions: 1,
+          reservedForUserId: input.reservedForUserId ?? null,
+          priceAmount: money.faceValue,
+          currency: 'EGP',
+          expiresAt,
+          note: input.note ?? null,
+          issuedById: actor.id,
+          ...financial,
+        })),
+        skipDuplicates: true,
+      });
+
+      return { batch, created: created.count };
+    });
+
+    await this.audit.record({
+      actorId: actor.id,
+      actorRole: actor.role,
+      action: AuditAction.CODE_ISSUE,
+      entity: 'recharge_code_batch',
+      entityId: batch.id,
+      after: {
+        requested: input.count,
+        created,
+        faceValue: toEgpNumber(money.faceValuePiastres),
+        discountType: money.discountType,
+        discountPercent: money.discountPercent,
+        discountAmount: toEgpNumber(money.discountPiastres),
+        actualPaidAmount: toEgpNumber(money.actualPaidPiastres),
+        creditAmount: toEgpNumber(money.creditPiastres),
+        expectedRevenue: toEgpNumber(money.actualPaidPiastres * created),
+        belowMinimum: money.faceValuePiastres < minPiastres,
+      },
+      note: input.note,
+    });
+
+    return {
+      batchId: batch.id,
+      batchName: batch.name,
+      requested: input.count,
+      created,
+      faceValue: toEgpNumber(money.faceValuePiastres),
+      discountType: money.discountType,
+      discountPercent: money.discountPercent,
+      discountAmount: toEgpNumber(money.discountPiastres),
+      actualPaidAmount: toEgpNumber(money.actualPaidPiastres),
+      creditAmount: toEgpNumber(money.creditPiastres),
+      /** What the whole batch is worth if every card sells and redeems. */
+      expectedRevenue: toEgpNumber(money.actualPaidPiastres * created),
+      expectedCredits: toEgpNumber(money.creditPiastres * created),
+      // Returned once, at creation, for the same reason access codes are:
+      // somebody has to be able to print or read them out.
+      codes: [...codes],
+    };
+  }
+
+  /**
+   * Previews the money for a recharge card without creating anything.
+   *
+   * Exists so the dashboard can show "student pays 800, receives 800 credits"
+   * as the administrator types, while the authoritative calculation stays on
+   * the server. The dashboard never computes these numbers itself.
+   */
+  async previewRecharge(input: {
+    faceValue: number;
+    discountType?: DiscountType;
+    discountPercent?: number;
+    discountAmount?: number;
+    count?: number;
+  }) {
+    const money = resolveDiscount(input);
+    const bounds = await this.settings.rechargeBounds();
+    const count = input.count ?? 1;
+
+    return {
+      faceValue: toEgpNumber(money.faceValuePiastres),
+      discountType: money.discountType,
+      discountPercent: money.discountPercent,
+      discountAmount: toEgpNumber(money.discountPiastres),
+      actualPaidAmount: toEgpNumber(money.actualPaidPiastres),
+      creditAmount: toEgpNumber(money.creditPiastres),
+      count,
+      expectedRevenue: toEgpNumber(money.actualPaidPiastres * count),
+      expectedCredits: toEgpNumber(money.creditPiastres * count),
+      minimumRecharge: bounds.minimum,
+      maximumRecharge: bounds.maximum,
+      belowMinimum: money.faceValuePiastres < bounds.minimum * 100,
+      overrideAllowed: bounds.allowOverride,
+    };
+  }
+
+  /** Recharge cards for the admin table, with their frozen financials. */
+  async listRechargeCodes(params: {
+    page: number;
+    pageSize: number;
+    status?: CodeStatus;
+    batchId?: string;
+    redeemedByUserId?: string;
+    from?: Date;
+    to?: Date;
+    q?: string;
+    order?: 'asc' | 'desc';
+  }) {
+    const where: Prisma.AccessCodeWhereInput = {
+      kind: CodeKind.RECHARGE,
+      ...(params.status ? { status: params.status } : {}),
+      ...(params.batchId ? { batchId: params.batchId } : {}),
+      ...(params.redeemedByUserId ? { redeemedByUserId: params.redeemedByUserId } : {}),
+      ...(params.from || params.to
+        ? {
+            createdAt: {
+              ...(params.from ? { gte: params.from } : {}),
+              ...(params.to ? { lte: params.to } : {}),
+            },
+          }
+        : {}),
+      ...(params.q ? { code: { contains: params.q.toUpperCase() } } : {}),
+    };
+
+    const [rows, total] = await this.prisma.$transaction([
+      this.prisma.accessCode.findMany({
+        where,
+        orderBy: { createdAt: params.order ?? 'desc' },
+        skip: (params.page - 1) * params.pageSize,
+        take: params.pageSize,
+        select: {
+          id: true,
+          code: true,
+          status: true,
+          faceValue: true,
+          discountType: true,
+          discountPercent: true,
+          discountAmount: true,
+          actualPaidAmount: true,
+          creditAmount: true,
+          currency: true,
+          expiresAt: true,
+          redeemedAt: true,
+          note: true,
+          createdAt: true,
+          batch: { select: { id: true, name: true } },
+          issuedBy: { select: { id: true, fullName: true } },
+          rechargeRevenue: { select: { id: true, recognizedAt: true } },
+          redemptions: {
+            select: { user: { select: { id: true, fullName: true, phone: true } } },
+            take: 1,
+          },
+        },
+      }),
+      this.prisma.accessCode.count({ where }),
+    ]);
+
+    return paginated(
+      rows.map((row) => ({
+        id: row.id,
+        code: row.code,
+        status: row.status,
+        faceValue: row.faceValue === null ? null : Number(row.faceValue),
+        discountType: row.discountType,
+        discountPercent: row.discountPercent === null ? null : Number(row.discountPercent),
+        discountAmount: row.discountAmount === null ? null : Number(row.discountAmount),
+        actualPaidAmount: row.actualPaidAmount === null ? null : Number(row.actualPaidAmount),
+        creditAmount: row.creditAmount === null ? null : Number(row.creditAmount),
+        currency: row.currency,
+        batch: row.batch,
+        issuedBy: row.issuedBy,
+        redeemedAt: row.redeemedAt?.toISOString() ?? null,
+        redeemedBy: row.redemptions[0]?.user ?? null,
+        revenueRecognizedAt: row.rechargeRevenue?.recognizedAt.toISOString() ?? null,
+        expiresAt: row.expiresAt?.toISOString() ?? null,
+        note: row.note,
+        createdAt: row.createdAt.toISOString(),
+      })),
+      total,
+      params.page,
+      params.pageSize,
+    );
+  }
+
+  /**
+   * Recharge revenue: what was actually collected.
+   *
+   * The total is a sum of `actualPaidAmount`, never of face values. The two
+   * differ by exactly the discount given, and reporting the face value as
+   * revenue is the single most expensive mistake this subsystem could make —
+   * so the difference is returned alongside, as `discountGiven`, rather than
+   * left for a reader to infer.
+   */
+  async rechargeRevenue(params: {
+    page: number;
+    pageSize: number;
+    batchId?: string;
+    userId?: string;
+    from?: Date;
+    to?: Date;
+    order?: 'asc' | 'desc';
+  }) {
+    const where: Prisma.RechargeRevenueWhereInput = {
+      ...(params.batchId ? { batchId: params.batchId } : {}),
+      ...(params.userId ? { userId: params.userId } : {}),
+      ...(params.from || params.to
+        ? {
+            recognizedAt: {
+              ...(params.from ? { gte: params.from } : {}),
+              ...(params.to ? { lte: params.to } : {}),
+            },
+          }
+        : {}),
+    };
+
+    const [rows, total, totals] = await this.prisma.$transaction([
+      this.prisma.rechargeRevenue.findMany({
+        where,
+        orderBy: { recognizedAt: params.order ?? 'desc' },
+        skip: (params.page - 1) * params.pageSize,
+        take: params.pageSize,
+        include: { user: { select: { id: true, fullName: true, phone: true } } },
+      }),
+      this.prisma.rechargeRevenue.count({ where }),
+      this.prisma.rechargeRevenue.aggregate({
+        where,
+        _sum: { faceValue: true, discountAmount: true, actualPaidAmount: true, creditAmount: true },
+      }),
+    ]);
+
+    const page = paginated(
+      rows.map((row) => ({
+        id: row.id,
+        code: row.codeSnapshot,
+        batchId: row.batchId,
+        batchName: row.batchNameSnapshot,
+        student: row.user,
+        faceValue: Number(row.faceValue),
+        discountType: row.discountType,
+        discountPercent: row.discountPercent === null ? null : Number(row.discountPercent),
+        discountAmount: Number(row.discountAmount),
+        actualPaidAmount: Number(row.actualPaidAmount),
+        creditAmount: Number(row.creditAmount),
+        currency: row.currency,
+        recognizedAt: row.recognizedAt.toISOString(),
+      })),
+      total,
+      params.page,
+      params.pageSize,
+    );
+
+    return {
+      ...page,
+      totals: {
+        faceValue: toEgpNumber(toPiastres(totals._sum.faceValue ?? 0, 'faceValue')),
+        discountGiven: toEgpNumber(toPiastres(totals._sum.discountAmount ?? 0, 'discountAmount')),
+        /** The real money collected. This is the revenue figure. */
+        revenue: toEgpNumber(toPiastres(totals._sum.actualPaidAmount ?? 0, 'actualPaidAmount')),
+        creditsIssued: toEgpNumber(toPiastres(totals._sum.creditAmount ?? 0, 'creditAmount')),
+        count: total,
+      },
+    };
+  }
+
   private normalize(code: string): string {
     return code.trim().toUpperCase().replace(/\s+/g, '');
   }
@@ -782,6 +1264,7 @@ export function resolveRedemptionScope(
     courseId: string | null;
     sectionId: string | null;
     teacherId: string | null;
+    coursePartId?: string | null;
     // Both columns are NOT NULL DEFAULT '{}' in the database, so a full row
     // always carries an array. They are optional here because a caller may
     // hand this function a narrowed `select`, and a missing snapshot has to
@@ -804,6 +1287,20 @@ export function resolveRedemptionScope(
       targetType: CodeTargetType.SECTION,
       courseIds: [requestedCourseId],
       sectionIds: [code.sectionId],
+    };
+  }
+
+  if (code.targetType === CodeTargetType.PART) {
+    // A part card unlocks exactly the sections frozen onto it at generation.
+    // An empty snapshot here means "not recorded", and for a part that is a
+    // corrupt row rather than "the whole course" — granting the course would
+    // hand over everything for the price of one part.
+    if (code.courseId && code.courseId !== requestedCourseId) throw invalid();
+    if (grantedSectionIds.length === 0) throw invalid();
+    return {
+      targetType: CodeTargetType.PART,
+      courseIds: [requestedCourseId],
+      sectionIds: grantedSectionIds,
     };
   }
 

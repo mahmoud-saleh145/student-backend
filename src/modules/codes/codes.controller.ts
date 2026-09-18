@@ -1,12 +1,14 @@
 import { Body, Controller, Get, HttpCode, HttpStatus, Param, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
-import { CodeStatus, CodeTargetType } from '@prisma/client';
+import { CodeStatus, CodeTargetType, DiscountType } from '@prisma/client';
 import { Transform, Type } from 'class-transformer';
 import {
+  IsBoolean,
   IsEnum,
   IsISO8601,
   IsIn,
   IsInt,
+  IsNumber,
   IsOptional,
   IsString,
   Matches,
@@ -19,8 +21,9 @@ import {
 import { CodeThrottle } from '../../common/decorators/throttle.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { AdminOnly, StudentOnly } from '../../common/decorators/roles.decorator';
-import { SearchablePaginationDto } from '../../common/dto/pagination.dto';
+import { SearchablePaginationDto, SortablePaginationDto } from '../../common/dto/pagination.dto';
 import type { AuthenticatedUser } from '../../common/types/request-context';
+import { MAX_MONEY_EGP } from '../wallet/money';
 
 import { CodesService } from './codes.service';
 
@@ -78,6 +81,78 @@ class ValidateCodeDto {
 
 class ReasonDto {
   @IsString() @MinLength(3) @MaxLength(500) reason!: string;
+}
+
+/**
+ * Creating recharge cards.
+ *
+ * The request carries a face value and a discount — never a computed total.
+ * `actualPaidAmount` and `creditAmount` are derived on the server and there is
+ * no field to post them into, so a tampered client cannot mint credit.
+ */
+class GenerateRechargeDto {
+  @Type(() => Number)
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0)
+  @Max(MAX_MONEY_EGP)
+  faceValue!: number;
+
+  @IsOptional() @IsEnum(DiscountType) discountType?: DiscountType;
+
+  /** 0-100. Required for a PERCENTAGE discount; 100 is legal and means free. */
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0)
+  @Max(100)
+  discountPercent?: number;
+
+  /** Absolute EGP off. Required for a FIXED discount; never above face value. */
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0)
+  @Max(MAX_MONEY_EGP)
+  discountAmount?: number;
+
+  @Type(() => Number) @IsInt() @Min(1) @Max(5000) count!: number;
+
+  @IsOptional() @IsString() @MaxLength(120) batchName?: string;
+  @IsOptional() @IsISO8601() expiresAt?: string;
+  @IsOptional() @IsString() @MaxLength(32) reservedForUserId?: string;
+  @IsOptional() @IsString() @MaxLength(500) note?: string;
+  @IsOptional() @IsString() @MaxLength(6) @Matches(/^[A-Za-z0-9]*$/) prefix?: string;
+
+  /** Honoured only when the platform setting permits it. */
+  @IsOptional() @IsBoolean() overrideMinimum?: boolean;
+}
+
+class PreviewRechargeDto {
+  @Type(() => Number)
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0)
+  @Max(MAX_MONEY_EGP)
+  faceValue!: number;
+
+  @IsOptional() @IsEnum(DiscountType) discountType?: DiscountType;
+  @IsOptional() @Type(() => Number) @IsNumber({ maxDecimalPlaces: 2 }) @Min(0) @Max(100) discountPercent?: number;
+  @IsOptional() @Type(() => Number) @IsNumber({ maxDecimalPlaces: 2 }) @Min(0) @Max(MAX_MONEY_EGP) discountAmount?: number;
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(5000) count?: number;
+}
+
+class ListRechargeCodesDto extends SortablePaginationDto {
+  @IsOptional() @IsEnum(CodeStatus) status?: CodeStatus;
+  @IsOptional() @IsString() @MaxLength(64) batchId?: string;
+  @IsOptional() @IsString() @MaxLength(32) redeemedByUserId?: string;
+  @IsOptional() @IsISO8601() from?: string;
+  @IsOptional() @IsISO8601() to?: string;
+}
+
+class RechargeRevenueDto extends SortablePaginationDto {
+  @IsOptional() @IsString() @MaxLength(64) batchId?: string;
+  @IsOptional() @IsString() @MaxLength(32) userId?: string;
+  @IsOptional() @IsISO8601() from?: string;
+  @IsOptional() @IsISO8601() to?: string;
 }
 
 @ApiTags('codes')
@@ -178,6 +253,67 @@ export class CodesController {
     @CurrentUser() actor: AuthenticatedUser,
   ) {
     return this.codes.revoke(id, actor, dto.reason);
+  }
+
+  // --- recharge codes (wallet top-up) ---------------------------------------
+
+  @Post('admin/recharge-codes/preview')
+  @AdminOnly()
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Preview what a recharge card is worth',
+    description:
+      'Creates nothing. Lets the dashboard show "pays 800, receives 800 credits" while the authoritative arithmetic stays on the server.',
+  })
+  previewRecharge(@Body() dto: PreviewRechargeDto) {
+    return this.codes.previewRecharge(dto);
+  }
+
+  @Post('admin/recharge-codes/generate')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Generate wallet recharge cards',
+    description:
+      'The face value, discount, amount actually paid and credits granted are computed once and frozen onto every card. A later change to pricing or to the minimum-recharge setting never alters a card already issued.',
+  })
+  generateRecharge(@Body() dto: GenerateRechargeDto, @CurrentUser() actor: AuthenticatedUser) {
+    return this.codes.generateRechargeBatch(dto, actor);
+  }
+
+  @Get('admin/recharge-codes')
+  @AdminOnly()
+  @ApiOperation({ summary: 'Browse recharge cards with their frozen financials' })
+  listRecharge(@Query() query: ListRechargeCodesDto) {
+    return this.codes.listRechargeCodes({
+      page: query.page,
+      pageSize: query.pageSize,
+      status: query.status,
+      batchId: query.batchId,
+      redeemedByUserId: query.redeemedByUserId,
+      from: query.from ? new Date(query.from) : undefined,
+      to: query.to ? new Date(query.to) : undefined,
+      q: query.q,
+      order: query.order,
+    });
+  }
+
+  @Get('admin/recharge-revenue')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Cash collected from redeemed recharge cards',
+    description:
+      'Totals sum the amount actually paid, never the face value. The difference is reported separately as discountGiven.',
+  })
+  rechargeRevenue(@Query() query: RechargeRevenueDto) {
+    return this.codes.rechargeRevenue({
+      page: query.page,
+      pageSize: query.pageSize,
+      batchId: query.batchId,
+      userId: query.userId,
+      from: query.from ? new Date(query.from) : undefined,
+      to: query.to ? new Date(query.to) : undefined,
+      order: query.order,
+    });
   }
 
   @Post('admin/codes/batches/:batchId/revoke')

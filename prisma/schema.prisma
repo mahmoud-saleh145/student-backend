@@ -160,6 +160,59 @@ enum CodeTargetType {
   COURSE
   SECTION
   TEACHER
+  /// One sellable course part. The card unlocks exactly the sections inside it.
+  PART
+}
+
+/// What redeeming a code actually does.
+///
+/// ACCESS is the historical behaviour — the code grants course/section access
+/// directly — and is therefore the default, so every pre-existing row keeps
+/// meaning exactly what it meant before the wallet existed.
+///
+/// RECHARGE is the new model: the code carries no entitlement at all. It adds
+/// credits to the student's wallet, and the student then spends those credits
+/// on course parts, library parts and library packages.
+enum CodeKind {
+  ACCESS
+  RECHARGE
+}
+
+/// How a recharge code's face value was discounted when it was sold.
+enum DiscountType {
+  NONE
+  PERCENTAGE
+  FIXED
+}
+
+/// Why credits moved.
+///
+/// The ledger is append-only, so a mistake is corrected by writing a
+/// compensating entry (REVERSAL / ADMIN_ADJUSTMENT), never by editing history.
+enum WalletTxType {
+  CREDIT_RECHARGE
+  PURCHASE
+  REFUND
+  ADMIN_ADJUSTMENT
+  REVERSAL
+}
+
+/// Sign of a ledger entry. `amount` is always stored positive; this says which
+/// way it moved, so a SUM over the ledger cannot be wrong about direction.
+enum WalletTxDirection {
+  CREDIT
+  DEBIT
+}
+
+/// What originated a ledger entry. Kept separate from WalletTxType because the
+/// same type (PURCHASE) arrives from several subsystems.
+enum WalletTxSource {
+  PAYMENT_CODE
+  COURSE_PART
+  LIBRARY_PART
+  LIBRARY_PACKAGE
+  ADMIN
+  SYSTEM
 }
 
 /// How an enrollment's section entitlement was produced.
@@ -167,6 +220,47 @@ enum SectionGrantSource {
   CODE
   PAYMENT
   ADMIN
+  /// The grant came from buying a course part with wallet credits.
+  PART_PURCHASE
+}
+
+/// How a course part's price is expressed.
+///
+/// Every active part of one course must use the SAME model. Mixing them makes
+/// "does the allocation add up?" unanswerable: a 40% part plus a 300 EGP part
+/// only sums to the course total for one particular course price, and would
+/// silently stop summing the moment that price changed.
+enum PartPricingModel {
+  /// A share of the course's current price. Floats with it.
+  PERCENTAGE
+  /// An absolute EGP amount. Fixed regardless of the course price.
+  FIXED
+}
+
+/// What a library purchase bought.
+enum LibraryPurchaseKind {
+  PART
+  PACKAGE
+}
+
+/// Why a student holds a library part.
+enum LibraryEntitlementSource {
+  /// Bought that part on its own.
+  PURCHASE
+  /// Came inside a package.
+  PACKAGE
+  /// Granted by an administrator.
+  ADMIN
+}
+
+/// Why a student holds a part.
+enum PartEntitlementSource {
+  /// Historical. Course parts are acquired by code, not bought in the app.
+  PURCHASE
+  /// Redeemed a part-scoped access card.
+  CODE
+  ADMIN
+  MIGRATION
 }
 
 enum SupportTicketStatus {
@@ -278,6 +372,10 @@ enum AuditAction {
   CODE_ISSUE
   CODE_REVOKE
   CODE_REDEEM
+  WALLET_CREDIT
+  WALLET_DEBIT
+  WALLET_ADJUST
+  PART_PURCHASE
   PAYMENT_CONFIRM
   PAYMENT_REFUND
   ENROLLMENT_CREATE
@@ -298,6 +396,235 @@ enum WatchEventType {
 // Academic structure
 // =============================================================================
 
+// =============================================================================
+// Library
+//
+// A separate top-level system, deliberately NOT a course:
+//
+//  1. **Documents only.** PDFs, papers, handouts. No videos, no lessons, no
+//     enrollment. A student may buy a library part while owning no course at
+//     all, and owning a course grants nothing here.
+//  2. **This is what the wallet is for.** Library parts and packages are the
+//     only things credits buy. Courses never debit the wallet.
+//  3. **Entitlements are always at PART level.** Buying a package writes one
+//     entitlement per included part. That makes the access check a single
+//     lookup, and it means the package's membership is frozen by construction
+//     — editing the package later cannot reach backwards and change what
+//     somebody already owns.
+//  4. **Nothing is ever public.** A part's `objectKey` is served only through a
+//     short-lived, user- and device-bound signed URL, minted after the
+//     entitlement is checked, exactly as protected course attachments already
+//     are.
+// =============================================================================
+
+/// A publication: "Physics Revision Papers". Sold as its parts, or as packages.
+model LibraryMaterial {
+  id          String        @id @default(cuid())
+  title       String
+  titleAr     String?
+  description String?
+  /// Thumbnail in object storage. Never the document itself.
+  coverKey    String?
+  status      ContentStatus @default(DRAFT)
+  isActive    Boolean       @default(true)
+  sortOrder   Int           @default(0)
+
+  /// Optional catalogue placement, mirroring how courses are filed, so the
+  /// same browse filters work. All nullable: a material need belong to nothing.
+  universityId   String?
+  facultyId      String?
+  academicYearId String?
+  subjectId      String?
+
+  createdById String?
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  university   University?   @relation(fields: [universityId], references: [id], onDelete: SetNull)
+  faculty      Faculty?      @relation(fields: [facultyId], references: [id], onDelete: SetNull)
+  academicYear AcademicYear? @relation(fields: [academicYearId], references: [id], onDelete: SetNull)
+  subject      Subject?      @relation(fields: [subjectId], references: [id], onDelete: SetNull)
+  createdBy    User?         @relation("MaterialCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  parts    LibraryPart[]
+  packages LibraryPackage[]
+
+  @@index([status, sortOrder])
+  @@index([universityId, facultyId, academicYearId])
+  @@index([subjectId])
+  @@index([deletedAt])
+  @@index([title])
+  @@map("library_materials")
+}
+
+/// One sellable document within a material.
+model LibraryPart {
+  id          String        @id @default(cuid())
+  materialId  String
+  title       String
+  titleAr     String?
+  description String?
+  sortOrder   Int
+  status      ContentStatus @default(PUBLISHED)
+  isActive    Boolean       @default(true)
+
+  /// An absolute amount in credits. Library parts are priced individually —
+  /// there is no whole-material price to take a percentage of, which is what
+  /// makes this simpler than course parts.
+  price    Decimal @db.Decimal(12, 2)
+  currency String  @default("EGP")
+
+  /// The document in object storage. NEVER served directly; see the header.
+  objectKey String
+  mimeType  String?
+  sizeBytes BigInt?
+  pageCount Int?
+
+  /// A free sample, readable without buying anything. The one documented way
+  /// to get library content without an entitlement.
+  isPreview Boolean @default(false)
+
+  uploadedById String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  material     LibraryMaterial      @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  packageItems LibraryPackageItem[]
+  entitlements LibraryEntitlement[]
+  purchases    LibraryPurchase[]    @relation("LibraryPartPurchases")
+
+  @@unique([materialId, sortOrder])
+  @@index([materialId, isActive, sortOrder])
+  @@index([deletedAt])
+  @@map("library_parts")
+}
+
+/// A bundle of parts at one price. Usually cheaper than buying them separately.
+model LibraryPackage {
+  id          String        @id @default(cuid())
+  /// Usually one material's parts, but a package may span materials.
+  materialId  String?
+  title       String
+  titleAr     String?
+  description String?
+  status      ContentStatus @default(PUBLISHED)
+  isActive    Boolean       @default(true)
+  sortOrder   Int           @default(0)
+
+  price    Decimal @db.Decimal(12, 2)
+  currency String  @default("EGP")
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  material  LibraryMaterial?     @relation(fields: [materialId], references: [id], onDelete: SetNull)
+  items     LibraryPackageItem[]
+  purchases LibraryPurchase[]    @relation("LibraryPackagePurchases")
+
+  @@index([materialId, isActive, sortOrder])
+  @@index([deletedAt])
+  @@map("library_packages")
+}
+
+/// Membership. Editing this never reaches backwards into a past purchase,
+/// because a purchase writes entitlements per part at the moment it happens.
+model LibraryPackageItem {
+  id            String   @id @default(cuid())
+  packageId     String
+  libraryPartId String
+  sortOrder     Int      @default(0)
+  createdAt     DateTime @default(now())
+
+  package LibraryPackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  part    LibraryPart    @relation(fields: [libraryPartId], references: [id], onDelete: Restrict)
+
+  @@unique([packageId, libraryPartId])
+  @@index([libraryPartId])
+  @@map("library_package_items")
+}
+
+/// Immutable record of one library purchase paid for with wallet credits.
+model LibraryPurchase {
+  id     String              @id @default(cuid())
+  userId String
+  kind   LibraryPurchaseKind
+
+  /// Exactly one is set, per `kind`, enforced by a CHECK constraint.
+  libraryPartId    String?
+  libraryPackageId String?
+
+  /// What was actually spent. Frozen; never recomputed from a current price.
+  priceAtPurchase Decimal @db.Decimal(12, 2)
+  currency        String  @default("EGP")
+
+  /// Denormalised so a report still reads correctly after a rename.
+  titleSnapshot         String
+  materialTitleSnapshot String?
+
+  /// Exactly which parts this bought. For a package that is its membership at
+  /// purchase time — the second, explicit record of what the entitlements
+  /// already encode.
+  partIdsSnapshot String[] @default([])
+
+  /// The ledger entry that paid for it. Required and unique: a library
+  /// purchase without a debit, or a debit without a purchase, is the failure
+  /// this design exists to prevent.
+  walletTransactionId String @unique
+
+  /// `libpart:<id>:<userId>` or `libpkg:<id>:<userId>`. Makes a retried
+  /// request return the original purchase instead of buying twice.
+  idempotencyKey String @unique
+
+  purchasedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  user              User                 @relation("LibraryPurchaseStudent", fields: [userId], references: [id], onDelete: Restrict)
+  part              LibraryPart?         @relation("LibraryPartPurchases", fields: [libraryPartId], references: [id], onDelete: Restrict)
+  package           LibraryPackage?      @relation("LibraryPackagePurchases", fields: [libraryPackageId], references: [id], onDelete: Restrict)
+  walletTransaction WalletTransaction    @relation(fields: [walletTransactionId], references: [id], onDelete: Restrict)
+  entitlements      LibraryEntitlement[]
+
+  @@index([userId, purchasedAt])
+  @@index([kind, purchasedAt])
+  @@index([libraryPartId])
+  @@index([libraryPackageId])
+  @@index([purchasedAt])
+  @@map("library_purchases")
+}
+
+/// What a student may open. Always per part, whatever they bought.
+model LibraryEntitlement {
+  id            String                   @id @default(cuid())
+  userId        String
+  libraryPartId String
+  source        LibraryEntitlementSource @default(PURCHASE)
+  purchaseId    String?
+
+  grantedAt     DateTime  @default(now())
+  revokedAt     DateTime?
+  revokedById   String?
+  revokedReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User             @relation("LibraryEntitlementStudent", fields: [userId], references: [id], onDelete: Restrict)
+  part     LibraryPart      @relation(fields: [libraryPartId], references: [id], onDelete: Restrict)
+  purchase LibraryPurchase? @relation(fields: [purchaseId], references: [id], onDelete: Restrict)
+
+  /// A student holds a part once. Two concurrent purchases cannot both create
+  /// the row, and a package overlapping one already owned cannot duplicate it.
+  @@unique([userId, libraryPartId])
+  @@index([userId, revokedAt])
+  @@index([libraryPartId, revokedAt])
+  @@index([purchaseId])
+  @@map("library_entitlements")
+}
+
 model University {
   id        String   @id @default(cuid())
   name      String
@@ -313,6 +640,7 @@ model University {
   faculties Faculty[]
   students  StudentProfile[]
   courses   Course[]
+  libraryMaterials LibraryMaterial[]
 
   @@index([isActive, sortOrder])
   @@map("universities")
@@ -333,6 +661,7 @@ model Faculty {
   departments Department[]
   students    StudentProfile[]
   courses     Course[]
+  libraryMaterials LibraryMaterial[]
 
   @@unique([universityId, name])
   @@index([universityId, isActive])
@@ -370,6 +699,7 @@ model AcademicYear {
 
   students StudentProfile[]
   courses  Course[]
+  libraryMaterials LibraryMaterial[]
 
   @@map("academic_years")
 }
@@ -435,6 +765,23 @@ model User {
   authoredCourses  Course[]              @relation("CourseCreatedBy")
   priceChanges     CoursePrice[]         @relation("PriceChangedBy")
   revenueShares    RevenueLedger[]       @relation("RevenueTeacher")
+
+  // --- wallet ---------------------------------------------------------------
+  wallet             Wallet?
+  walletTransactions WalletTransaction[]   @relation("WalletTxUser")
+  walletAdjustments  WalletTransaction[]   @relation("WalletTxAdmin")
+  rechargeRevenues   RechargeRevenue[]     @relation("RechargeRedeemer")
+
+  // --- course parts ---------------------------------------------------------
+  partEntitlements   CoursePartEntitlement[] @relation("PartEntitlementStudent")
+  partPurchases      CoursePartPurchase[]    @relation("PartPurchaseStudent")
+  partRevenueShares  CoursePartPurchase[]    @relation("PartPurchaseTeacher")
+  createdParts       CoursePart[]            @relation("PartCreatedBy")
+
+  // --- library --------------------------------------------------------------
+  libraryPurchases    LibraryPurchase[]    @relation("LibraryPurchaseStudent")
+  libraryEntitlements LibraryEntitlement[] @relation("LibraryEntitlementStudent")
+  createdMaterials    LibraryMaterial[]    @relation("MaterialCreatedBy")
 
   @@index([role, status])
   @@index([status, deletedAt])
@@ -665,6 +1012,7 @@ model Course {
   createdBy    User?         @relation("CourseCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
 
   teachers    CourseTeacher[]
+  parts       CoursePart[]
   sections    CourseSection[]
   lessons     Lesson[]
   videos      Video[]
@@ -680,6 +1028,8 @@ model Course {
   playbackTickets PlaybackTicket[]
   revenue         RevenueLedger[]
   archiveRecords  ArchiveRecord[]
+  partPurchases   CoursePartPurchase[]
+  partEntitlements CoursePartEntitlement[]
 
   @@index([status, publishedAt])
   @@index([universityId, academicYearId, status])
@@ -702,6 +1052,7 @@ model Subject {
   deletedAt DateTime?
 
   courses Course[]
+  libraryMaterials LibraryMaterial[]
 
   @@index([isActive, sortOrder])
   @@map("subjects")
@@ -765,6 +1116,13 @@ model CoursePrice {
 model CourseSection {
   id          String        @id @default(cuid())
   courseId    String
+  /// The part this section belongs to, if the course is divided into parts.
+  ///
+  /// Nullable, and null for every section that existed before parts did — a
+  /// course with no parts keeps behaving exactly as it always has. A section
+  /// belongs to at most one part, because a section in two parts would have
+  /// two prices and no answer to "what did the student buy?".
+  partId      String?
   title       String
   titleAr     String?
   description String?
@@ -776,7 +1134,10 @@ model CourseSection {
   updatedAt   DateTime      @updatedAt
   deletedAt   DateTime?
 
-  course  Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  course  Course      @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  // SetNull, not Cascade: deleting a part must never delete the teaching
+  // material inside it. The sections simply become unassigned.
+  part    CoursePart? @relation(fields: [partId], references: [id], onDelete: SetNull)
   lessons Lesson[]
 
   codes  AccessCode[]             @relation("SectionCodes")
@@ -784,6 +1145,7 @@ model CourseSection {
 
   @@unique([courseId, sortOrder])
   @@index([courseId, status, sortOrder])
+  @@index([partId])
   @@map("course_sections")
 }
 
@@ -1013,13 +1375,18 @@ model EnrollmentSectionGrant {
   sectionId    String
   source       SectionGrantSource @default(CODE)
   codeId       String?
+  /// Set when the grant came from a part purchase, so "why can this student
+  /// see this section?" has an answer without joining through purchases.
+  partId       String?
   createdAt    DateTime           @default(now())
 
   enrollment Enrollment    @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
   section    CourseSection @relation(fields: [sectionId], references: [id], onDelete: Restrict)
+  part       CoursePart?   @relation(fields: [partId], references: [id], onDelete: SetNull)
 
   @@unique([enrollmentId, sectionId])
   @@index([sectionId])
+  @@index([partId])
   @@map("enrollment_section_grants")
 }
 
@@ -1167,6 +1534,8 @@ model AccessCode {
   sectionId String?
   /// Set when targetType = TEACHER.
   teacherId String?
+  /// Set when targetType = PART.
+  coursePartId String?
 
   /// Scope frozen at generation time. Empty means "no snapshot was taken",
   /// which is how legacy rows are distinguished from a genuinely empty scope;
@@ -1179,15 +1548,45 @@ model AccessCode {
   priceAmount Decimal? @db.Decimal(12, 2)
   currency    String   @default("EGP")
 
+  // --- wallet recharge (added with the credit system) ------------------------
+
+  /// ACCESS is the pre-wallet behaviour and therefore the default: every row
+  /// that existed before this column keeps granting course access exactly as
+  /// it did. Only rows explicitly created as RECHARGE touch the wallet.
+  kind CodeKind @default(ACCESS)
+
+  /// The four numbers that make a recharge code auditable. All are frozen at
+  /// creation and never recomputed:
+  ///   faceValue        — what is printed on the card
+  ///   discountAmount   — the absolute discount, derived once from the type
+  ///   actualPaidAmount — what the student actually handed over: THE REVENUE
+  ///   creditAmount     — what lands in the wallet (equal to actualPaidAmount)
+  /// A 100% discount is legal and yields 0 / 0 / 0 for the last three.
+  faceValue        Decimal?     @db.Decimal(12, 2)
+  discountType     DiscountType @default(NONE)
+  discountPercent  Decimal?     @db.Decimal(5, 2)
+  discountAmount   Decimal?     @db.Decimal(12, 2)
+  actualPaidAmount Decimal?     @db.Decimal(12, 2)
+  creditAmount     Decimal?     @db.Decimal(12, 2)
+
+  /// Denormalised for the admin list, which sorts and filters on them. The
+  /// authority remains access_code_redemptions.
+  redeemedAt     DateTime?
+  redeemedByUserId String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   course      Course?                @relation(fields: [courseId], references: [id], onDelete: Restrict)
   section     CourseSection?         @relation("SectionCodes", fields: [sectionId], references: [id], onDelete: Restrict)
   teacher     User?                  @relation("TeacherCodes", fields: [teacherId], references: [id], onDelete: Restrict)
+  coursePart  CoursePart?            @relation("PartCodes", fields: [coursePartId], references: [id], onDelete: Restrict)
   batch       CodeBatch?             @relation(fields: [batchId], references: [id], onDelete: SetNull)
   issuedBy    User?                  @relation("CodeIssuer", fields: [issuedById], references: [id], onDelete: SetNull)
   redemptions AccessCodeRedemption[]
+
+  rechargeRevenue RechargeRevenue?
+  partAcquisition CoursePartPurchase? @relation("PartAcquiredByCode")
 
   @@index([courseId, status])
   @@index([batchId])
@@ -1195,6 +1594,10 @@ model AccessCode {
   @@index([targetType, status])
   @@index([sectionId])
   @@index([teacherId])
+  @@index([kind, status])
+  @@index([kind, createdAt])
+  @@index([redeemedAt])
+  @@index([coursePartId])
   @@map("access_codes")
 }
 
@@ -1208,10 +1611,11 @@ model CodeBatch {
   /// Optional human label ("Term 2 — Pharmacy cards").
   name String?
 
-  targetType CodeTargetType
-  courseId   String?
-  sectionId  String?
-  teacherId  String?
+  targetType   CodeTargetType
+  courseId     String?
+  sectionId    String?
+  teacherId    String?
+  coursePartId String?
   /// Denormalised so an archived or renamed target still reads correctly.
   targetNameSnapshot String
 
@@ -1222,15 +1626,30 @@ model CodeBatch {
   expiresAt   DateTime?
   note        String?
 
+  // --- wallet recharge -------------------------------------------------------
+  /// The configuration every card in this batch was stamped with. Stored on
+  /// the batch as well as the card so an admin can see what was sold without
+  /// opening a card, and so a later change to the cards is detectable.
+  kind             CodeKind     @default(ACCESS)
+  faceValue        Decimal?     @db.Decimal(12, 2)
+  discountType     DiscountType @default(NONE)
+  discountPercent  Decimal?     @db.Decimal(5, 2)
+  discountAmount   Decimal?     @db.Decimal(12, 2)
+  actualPaidAmount Decimal?     @db.Decimal(12, 2)
+  creditAmount     Decimal?     @db.Decimal(12, 2)
+
   createdById String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  createdBy User?        @relation("BatchCreator", fields: [createdById], references: [id], onDelete: SetNull)
-  codes     AccessCode[]
+  createdBy  User?              @relation("BatchCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  coursePart CoursePart?        @relation("PartCodeBatches", fields: [coursePartId], references: [id], onDelete: Restrict)
+  codes      AccessCode[]
+  revenue    RechargeRevenue[]
 
   @@index([createdAt])
   @@index([targetType])
+  @@index([kind, createdAt])
   @@map("code_batches")
 }
 
@@ -1241,14 +1660,23 @@ model AccessCodeRedemption {
   codeId       String
   userId       String
   enrollmentId String?
-  courseId     String
+  /// Null for a RECHARGE code: it buys credits, not a course. Every row that
+  /// existed before the wallet keeps its course, so nothing historical moves.
+  courseId     String?
   redeemedAt   DateTime @default(now())
   ipAddress    String?
   deviceKey    String?
 
-  code       AccessCode  @relation(fields: [codeId], references: [id], onDelete: Restrict)
-  user       User        @relation(fields: [userId], references: [id], onDelete: Restrict)
-  enrollment Enrollment? @relation(fields: [enrollmentId], references: [id], onDelete: SetNull)
+  /// Set when redeeming credited a wallet. Links the redemption to the exact
+  /// ledger entry it produced, which is what makes the credit traceable in
+  /// both directions.
+  walletTransactionId String?  @unique
+  creditedAmount      Decimal? @db.Decimal(12, 2)
+
+  code              AccessCode         @relation(fields: [codeId], references: [id], onDelete: Restrict)
+  user              User               @relation(fields: [userId], references: [id], onDelete: Restrict)
+  enrollment        Enrollment?        @relation(fields: [enrollmentId], references: [id], onDelete: SetNull)
+  walletTransaction WalletTransaction? @relation(fields: [walletTransactionId], references: [id], onDelete: Restrict)
 
   /// A student cannot redeem the same code twice, ever.
   @@unique([codeId, userId])
@@ -1651,6 +2079,332 @@ model SupportMessage {
 // =============================================================================
 // Platform configuration
 // =============================================================================
+
+// =============================================================================
+// Wallet / credits
+//
+// Money rules, stated once here because every method in the wallet service
+// depends on them:
+//
+//  1. `wallet_transactions` is the source of truth. `wallets.balance` is a
+//     maintained cache kept for read performance; it is only ever changed in
+//     the same transaction as the ledger row that explains the change, and
+//     `SUM(credits) - SUM(debits)` must always reproduce it. The consistency
+//     check endpoint asserts exactly that.
+//  2. The ledger is append-only. There is no update or delete path. A mistake
+//     is corrected by a compensating REVERSAL / ADMIN_ADJUSTMENT entry.
+//  3. A balance can never go negative. Three independent mechanisms enforce
+//     it: a conditional `UPDATE ... WHERE balance >= amount`, a Serializable
+//     transaction, and a CHECK constraint in the database as the backstop.
+//  4. Cash enters the system exactly once, at recharge, and is recognised as
+//     `recharge_revenue.actualPaidAmount`. Spending credits on a course part
+//     or a library item is an *allocation* of cash already recognised, not new
+//     revenue — counting both would double-count every pound.
+// =============================================================================
+
+/// One wallet per user, created lazily on first use.
+model Wallet {
+  id     String @id @default(cuid())
+  userId String @unique
+
+  /// Cached balance. Authority is the ledger; see the header note above.
+  balance  Decimal @default(0) @db.Decimal(12, 2)
+  currency String  @default("EGP")
+
+  /// Lifetime totals, maintained alongside the balance for the admin view so
+  /// a student row does not require two aggregate queries to render.
+  totalRecharged Decimal @default(0) @db.Decimal(12, 2)
+  totalSpent     Decimal @default(0) @db.Decimal(12, 2)
+
+  /// Incremented on every mutation. Not used for locking (the conditional
+  /// UPDATE does that) but it makes a lost update visible after the fact.
+  version Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user         User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions WalletTransaction[]
+
+  @@index([balance])
+  @@map("wallets")
+}
+
+/// Append-only credit ledger. Every movement of credit has exactly one row.
+model WalletTransaction {
+  id       String @id @default(cuid())
+  walletId String
+  userId   String
+
+  type      WalletTxType
+  direction WalletTxDirection
+  source    WalletTxSource    @default(SYSTEM)
+
+  /// Always positive. `direction` carries the sign.
+  amount   Decimal @db.Decimal(12, 2)
+  currency String  @default("EGP")
+
+  /// The balance either side of this entry, frozen at write time. This is what
+  /// lets an auditor replay the ledger and prove the cached balance, and what
+  /// lets the student app show a running balance without recomputing.
+  balanceBefore Decimal @db.Decimal(12, 2)
+  balanceAfter  Decimal @db.Decimal(12, 2)
+
+  /// What this entry was for. `referenceType` / `referenceId` is a deliberate
+  /// loose coupling: course-part and library purchases arrive in later phases
+  /// and must not each require a new nullable FK column on this table.
+  accessCodeId  String?
+  referenceType String?
+  referenceId   String?
+
+  /// Set when an administrator moved credit by hand. Required by the service
+  /// for ADMIN_ADJUSTMENT, together with `note`.
+  performedByAdminId String?
+  note               String?
+  metadata           Json?
+
+  /// Guards against a retried request crediting twice. Scoped per operation,
+  /// e.g. `recharge:<codeId>:<userId>`.
+  idempotencyKey String? @unique
+
+  createdAt DateTime @default(now())
+
+  wallet             Wallet                @relation(fields: [walletId], references: [id], onDelete: Restrict)
+  user               User                  @relation("WalletTxUser", fields: [userId], references: [id], onDelete: Restrict)
+  performedByAdmin   User?                 @relation("WalletTxAdmin", fields: [performedByAdminId], references: [id], onDelete: SetNull)
+  codeRedemption     AccessCodeRedemption?
+  coursePartPurchase CoursePartPurchase?
+  libraryPurchase    LibraryPurchase?
+
+  @@index([walletId, createdAt])
+  @@index([userId, createdAt])
+  @@index([type, createdAt])
+  @@index([source, createdAt])
+  @@index([referenceType, referenceId])
+  @@index([accessCodeId])
+  @@map("wallet_transactions")
+}
+
+/// Immutable cash-in record for one redeemed recharge code.
+///
+/// Separate from `revenue_ledger` on purpose: that table recognises *course*
+/// revenue and carries a teacher share, which a wallet top-up has neither of.
+/// Platform cash collected = SUM(actualPaidAmount) here.
+model RechargeRevenue {
+  id           String  @id @default(cuid())
+  accessCodeId String  @unique
+  batchId      String?
+  userId       String
+
+  faceValue        Decimal      @db.Decimal(12, 2)
+  discountType     DiscountType @default(NONE)
+  discountPercent  Decimal?     @db.Decimal(5, 2)
+  discountAmount   Decimal      @default(0) @db.Decimal(12, 2)
+  /// The revenue. Face value minus discount — never the face value itself.
+  actualPaidAmount Decimal      @db.Decimal(12, 2)
+  creditAmount     Decimal      @db.Decimal(12, 2)
+  currency         String       @default("EGP")
+
+  /// Denormalised so the report still reads correctly after a batch is renamed.
+  batchNameSnapshot String?
+  codeSnapshot      String
+
+  recognizedAt DateTime @default(now())
+  createdAt    DateTime @default(now())
+
+  accessCode AccessCode @relation(fields: [accessCodeId], references: [id], onDelete: Restrict)
+  batch      CodeBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  user       User       @relation("RechargeRedeemer", fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([recognizedAt])
+  @@index([userId, recognizedAt])
+  @@index([batchId, recognizedAt])
+  @@map("recharge_revenue")
+}
+
+// =============================================================================
+// Course parts
+//
+// A part is a sellable slice of a course: "Before Mid + revision" at 60% of the
+// course price, say. The rules that shape every model below:
+//
+//  1. **A part is a group of sections.** It is not a new content type and not a
+//     new authorization system. Buying a part writes ordinary
+//     `enrollment_section_grants` rows for the sections inside it, which is
+//     what the lesson, playback and attachment gates already read. Nothing in
+//     the access path changes.
+//  2. **Parts are optional.** A course with no parts sells and behaves exactly
+//     as it did before this feature existed. `course_sections.partId` is null
+//     for every section that predates it.
+//  3. **Course parts never touch the wallet.** The wallet is for the Library
+//     only. A part is unlocked by redeeming a part-scoped access card, and the
+//     money changes hands offline when that card is sold — exactly as the
+//     course-scoped and section-scoped cards already work. Like those,
+//     redemption writes no `payment` and no `revenue_ledger` row; the card's
+//     face value is the reporting figure. `course_part_purchases` is the
+//     acquisition record the specification requires, not a cash record.
+//  4. **A purchase is frozen.** Price, pricing model, titles, teacher share and
+//     the exact sections unlocked are all snapshotted at purchase. A later
+//     price change, retitle or restructure cannot rewrite what someone paid.
+// =============================================================================
+
+/// One sellable slice of a course.
+model CoursePart {
+  id          String        @id @default(cuid())
+  courseId    String
+  title       String
+  titleAr     String?
+  description String?
+  sortOrder   Int
+  status      ContentStatus @default(PUBLISHED)
+
+  /// Inactive parts stay visible to admins and keep their purchase history,
+  /// but cannot be bought. Deactivating is how a part is retired without
+  /// destroying what students already own.
+  isActive Boolean @default(true)
+
+  /// Exactly one of `pricePercent` / `priceAmount` is set, per `pricingModel`.
+  /// The service validates the whole course's allocation on every write; the
+  /// CHECK constraints in the migration stop a hand-edited row being nonsense.
+  pricingModel PartPricingModel @default(PERCENTAGE)
+  pricePercent Decimal?         @db.Decimal(5, 2)
+  priceAmount  Decimal?         @db.Decimal(12, 2)
+  currency     String           @default("EGP")
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  course       Course                   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  createdBy    User?                    @relation("PartCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  sections     CourseSection[]
+  grants       EnrollmentSectionGrant[]
+  entitlements CoursePartEntitlement[]
+  purchases    CoursePartPurchase[]
+  codes        AccessCode[]             @relation("PartCodes")
+  codeBatches  CodeBatch[]              @relation("PartCodeBatches")
+
+  @@unique([courseId, sortOrder])
+  @@index([courseId, isActive, sortOrder])
+  @@index([deletedAt])
+  @@map("course_parts")
+}
+
+/// What a student owns.
+///
+/// The unique `(userId, coursePartId)` index is the double-purchase guarantee:
+/// two concurrent buy requests for the same part cannot both create a row,
+/// whatever the application does, and whichever loses the race rolls its wallet
+/// debit back with it.
+model CoursePartEntitlement {
+  id           String @id @default(cuid())
+  userId       String
+  coursePartId String
+  /// Denormalised so "which parts of course X does this student own?" is one
+  /// indexed read rather than a join through parts.
+  courseId     String
+
+  source     PartEntitlementSource @default(PURCHASE)
+  purchaseId String?               @unique
+
+  grantedAt     DateTime  @default(now())
+  /// Revocation is additive: the row stays, so the history of what was owned
+  /// and when it was withdrawn survives.
+  revokedAt     DateTime?
+  revokedById   String?
+  revokedReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User                @relation("PartEntitlementStudent", fields: [userId], references: [id], onDelete: Restrict)
+  part     CoursePart          @relation(fields: [coursePartId], references: [id], onDelete: Restrict)
+  course   Course              @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  purchase CoursePartPurchase? @relation(fields: [purchaseId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, coursePartId])
+  @@index([userId, courseId])
+  @@index([courseId, grantedAt])
+  @@index([coursePartId, revokedAt])
+  @@map("course_part_entitlements")
+}
+
+/// Immutable record of one part bought with wallet credits.
+///
+/// This is an ALLOCATION record, not a revenue record. The money was recognised
+/// as cash when the student bought their credits; this says which course and
+/// teacher it was ultimately spent on. Summing these alongside
+/// `recharge_revenue` would double-count every pound.
+model CoursePartPurchase {
+  id           String @id @default(cuid())
+  userId       String
+  courseId     String
+  coursePartId String
+
+  /// What the student actually paid. Frozen. Never recomputed from the part's
+  /// current price, which is the entire point of storing it.
+  priceAtPurchase Decimal @db.Decimal(12, 2)
+  currency        String  @default("EGP")
+
+  /// The configuration that produced that number, kept so the figure can be
+  /// explained years later without guessing.
+  pricingModelAtPurchase PartPricingModel
+  pricePercentAtPurchase Decimal?         @db.Decimal(5, 2)
+  coursePriceAtPurchase  Decimal?         @db.Decimal(12, 2)
+
+  /// Denormalised titles, so a report still reads correctly after a rename.
+  partTitleSnapshot   String
+  courseTitleSnapshot String
+
+  /// Teacher attribution computed at purchase time from the course assignment.
+  /// Stored rather than derived because the share percentage can change.
+  teacherId      String?
+  sharePercent   Decimal? @db.Decimal(5, 2)
+  teacherAmount  Decimal  @default(0) @db.Decimal(12, 2)
+  platformAmount Decimal  @default(0) @db.Decimal(12, 2)
+
+  /// Exactly which sections this unlocked. A part restructured later does not
+  /// change what this purchase bought.
+  sectionIdsSnapshot String[] @default([])
+
+  /// How the part was acquired. Exactly one of these is set, enforced by a
+  /// CHECK constraint.
+  ///
+  /// `accessCodeId` is the live path: course parts are unlocked by redeeming a
+  /// part-scoped card, and the money changes hands offline when the card is
+  /// sold. `walletTransactionId` is nullable history from the build in which
+  /// parts were briefly bought with wallet credits; the wallet is now for the
+  /// Library only and nothing new is ever written to this column.
+  ///
+  /// The `@relation` on each is not decoration. Declaring a column and its
+  /// unique index without one leaves Prisma unaware of the foreign key, which
+  /// it then removes as drift the next time a migration runs.
+  walletTransactionId String? @unique
+  accessCodeId        String? @unique
+
+  /// `part:<partId>:<userId>`. Makes a retried request return the original
+  /// purchase instead of buying twice.
+  idempotencyKey String @unique
+
+  purchasedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  user        User                   @relation("PartPurchaseStudent", fields: [userId], references: [id], onDelete: Restrict)
+  teacher     User?                  @relation("PartPurchaseTeacher", fields: [teacherId], references: [id], onDelete: SetNull)
+  course            Course                 @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  part              CoursePart             @relation(fields: [coursePartId], references: [id], onDelete: Restrict)
+  walletTransaction WalletTransaction?     @relation(fields: [walletTransactionId], references: [id], onDelete: Restrict)
+  accessCode        AccessCode?            @relation("PartAcquiredByCode", fields: [accessCodeId], references: [id], onDelete: Restrict)
+  entitlement       CoursePartEntitlement?
+
+  @@index([userId, purchasedAt])
+  @@index([courseId, purchasedAt])
+  @@index([coursePartId, purchasedAt])
+  @@index([teacherId, purchasedAt])
+  @@index([purchasedAt])
+  @@map("course_part_purchases")
+}
 
 model PlatformSetting {
   key         String   @id
