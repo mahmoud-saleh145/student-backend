@@ -71,6 +71,7 @@ export const MAINTENANCE_JOBS = {
   pruneSessions: 'prune-sessions',
   pruneIdempotency: 'prune-idempotency',
   courseExpiryReminders: 'course-expiry-reminders',
+  dispatchAnnouncements: 'dispatch-announcements',
 } as const;
 
 export interface MaintenanceJobData {

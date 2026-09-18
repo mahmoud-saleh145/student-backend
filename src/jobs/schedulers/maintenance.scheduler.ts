@@ -61,6 +61,15 @@ export class MaintenanceScheduler implements OnModuleInit {
       );
     };
 
+    // Every minute, because a send scheduled for 19:00 should happen at 19:00
+    // and not at 19:09. The job is a single indexed query when nothing is due,
+    // which is almost always — cheap enough to run at this rate.
+    await schedule(
+      this.maintenance as never,
+      MAINTENANCE_JOBS.dispatchAnnouncements,
+      '* * * * *',
+    );
+
     // Frequent, cheap: reclaim streaming slots so a crashed client doesn't
     // block the student's next video for long.
     await schedule(this.maintenance as never, MAINTENANCE_JOBS.reclaimStreamSlots, '*/2 * * * *');

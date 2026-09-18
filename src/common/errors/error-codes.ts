@@ -55,6 +55,13 @@ export enum ErrorCode {
   AMOUNT_BELOW_MINIMUM = 'AMOUNT_BELOW_MINIMUM',
   CODE_NOT_RECHARGEABLE = 'CODE_NOT_RECHARGEABLE',
 
+  // --- announcements ---------------------------------------------------------
+  // Dashboard-only. The student app never receives these, so unlike the wallet
+  // block above they need no locale bundle entries.
+  AUDIENCE_RULE_INVALID = 'AUDIENCE_RULE_INVALID',
+  AUDIENCE_TOO_LARGE = 'AUDIENCE_TOO_LARGE',
+  ANNOUNCEMENT_NOT_EDITABLE = 'ANNOUNCEMENT_NOT_EDITABLE',
+
   // --- playback --------------------------------------------------------------
   PLAYBACK_DENIED = 'PLAYBACK_DENIED',
   PLAYBACK_TICKET_EXPIRED = 'PLAYBACK_TICKET_EXPIRED',
@@ -116,6 +123,10 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   [ErrorCode.AMOUNT_BELOW_MINIMUM]: 422,
   [ErrorCode.CODE_NOT_RECHARGEABLE]: 400,
 
+  [ErrorCode.AUDIENCE_RULE_INVALID]: 422,
+  [ErrorCode.AUDIENCE_TOO_LARGE]: 422,
+  [ErrorCode.ANNOUNCEMENT_NOT_EDITABLE]: 409,
+
   [ErrorCode.PLAYBACK_DENIED]: 403,
   [ErrorCode.PLAYBACK_TICKET_EXPIRED]: 401,
   [ErrorCode.CONCURRENT_STREAM_LIMIT]: 429,
@@ -172,6 +183,10 @@ export const ERROR_MESSAGE: Record<ErrorCode, string> = {
   [ErrorCode.WALLET_LOCKED]: 'Wallet is not available for this account',
   [ErrorCode.AMOUNT_BELOW_MINIMUM]: 'Amount is below the configured minimum',
   [ErrorCode.CODE_NOT_RECHARGEABLE]: 'This code does not add credit to a wallet',
+
+  [ErrorCode.AUDIENCE_RULE_INVALID]: 'Audience rule is not valid',
+  [ErrorCode.AUDIENCE_TOO_LARGE]: 'Audience is larger than the permitted limit',
+  [ErrorCode.ANNOUNCEMENT_NOT_EDITABLE]: 'Announcement can no longer be edited',
 
   [ErrorCode.PLAYBACK_DENIED]: 'Playback is not authorized',
   [ErrorCode.PLAYBACK_TICKET_EXPIRED]: 'Playback authorization expired',

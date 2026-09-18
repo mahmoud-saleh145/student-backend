@@ -6,6 +6,7 @@ import type { Job } from 'bullmq';
 import { PrismaService } from '../../database/prisma.service';
 import { CodesService } from '../../modules/codes/codes.service';
 import { EnrollmentsService } from '../../modules/enrollments/enrollments.service';
+import { AnnouncementsService } from '../../modules/notifications/announcements.service';
 import { NotificationsService } from '../../modules/notifications/notifications.service';
 import { PlaybackService } from '../../modules/playback/playback.service';
 import { MAINTENANCE_JOBS, QUEUE_NAMES, type MaintenanceJobData } from '../queue.constants';
@@ -32,6 +33,7 @@ export class MaintenanceProcessor extends WorkerHost {
     private readonly codes: CodesService,
     private readonly playback: PlaybackService,
     private readonly notifications: NotificationsService,
+    private readonly announcements: AnnouncementsService,
   ) {
     super();
   }
@@ -58,6 +60,12 @@ export class MaintenanceProcessor extends WorkerHost {
 
       case MAINTENANCE_JOBS.courseExpiryReminders:
         return this.sendExpiryReminders();
+
+      // The only job here that sends something people see. It is safe to run
+      // every minute because each occurrence is claimed by a unique row before
+      // any message is written, so a duplicate tick dispatches nothing.
+      case MAINTENANCE_JOBS.dispatchAnnouncements:
+        return this.announcements.dispatchDue(new Date());
 
       default:
         this.logger.warn(`unknown maintenance job: ${job.name}`);

@@ -326,6 +326,21 @@ enum NotificationKind {
   SECURITY
 }
 
+enum AnnouncementStatus {
+  DRAFT
+  SCHEDULED
+  SENDING
+  SENT
+  CANCELLED
+}
+
+enum AnnouncementFrequency {
+  ONCE
+  DAILY
+  WEEKLY
+  MONTHLY
+}
+
 enum SecurityEventType {
   LOGIN_FAILED
   LOGIN_SUCCESS
@@ -1872,10 +1887,42 @@ model Announcement {
   bodyAr  String?
   route   String?
 
-  /// Targeting. All null = every active student.
+  /// Legacy flat targeting, kept so announcements created before the audience
+  /// builder keep working unchanged. Read only when `audienceRule` is null.
   courseId       String?
   universityId   String?
   academicYearId String?
+
+  /// The audience rule, re-evaluated at every send. Validated against
+  /// `AudienceRule` before storage — never interpolated into a query.
+  /// Null means: fall back to the three columns above.
+  audienceRule Json?
+
+  status AnnouncementStatus @default(DRAFT)
+
+  // --- scheduling ------------------------------------------------------------
+  /// The wall-clock time of day occurrences fire, as "HH:MM" in `timezone`.
+  /// Stored as local time rather than UTC on purpose: "every Sunday at 19:00"
+  /// must stay 19:00 for the student when Egypt's clocks change.
+  sendAtLocal String?
+  timezone    String  @default("Africa/Cairo")
+
+  frequency  AnnouncementFrequency @default(ONCE)
+  /// WEEKLY only. ISO weekdays, 1 = Monday … 7 = Sunday.
+  weekdays   Int[]
+  /// MONTHLY only. 1–31; a month shorter than this clamps to its last day.
+  dayOfMonth Int?
+
+  startsOn DateTime?
+  endsOn   DateTime?
+  /// Stop after this many sends, whatever `endsOn` says. Null = unlimited.
+  maxOccurrences Int?
+  occurrenceCount Int @default(0)
+
+  /// The next instant this should fire, in UTC. The dispatcher's only index.
+  /// Null means nothing further is due — sent, cancelled or exhausted.
+  nextOccurrenceAt DateTime?
+  lastOccurrenceAt DateTime?
 
   sendPush  Boolean   @default(true)
   publishedAt DateTime?
@@ -1884,9 +1931,38 @@ model Announcement {
   updatedAt DateTime  @updatedAt
 
   notifications Notification[]
+  dispatches    AnnouncementDispatch[]
 
   @@index([publishedAt])
+  @@index([status, nextOccurrenceAt])
   @@map("announcements")
+}
+
+/// One row per occurrence actually dispatched.
+///
+/// The unique constraint is the concurrency control, not a report: a worker
+/// claims an occurrence by inserting this row and only then fans out, so two
+/// workers racing on the same minute produce one send and one `P2002`. A push
+/// cannot be recalled, which is why the claim has to precede the send.
+model AnnouncementDispatch {
+  id             String   @id @default(cuid())
+  announcementId String
+  /// The scheduled instant this row claims — not when the work ran.
+  occurrenceAt   DateTime
+
+  recipientCount Int      @default(0)
+  createdCount   Int      @default(0)
+  startedAt      DateTime @default(now())
+  finishedAt     DateTime?
+  /// Set when the fan-out threw. The claim is kept either way, so a failure
+  /// is visible rather than silently retried into a duplicate send.
+  error          String?
+
+  announcement Announcement @relation(fields: [announcementId], references: [id], onDelete: Cascade)
+
+  @@unique([announcementId, occurrenceAt])
+  @@index([occurrenceAt])
+  @@map("announcement_dispatches")
 }
 
 model NotificationPreference {
