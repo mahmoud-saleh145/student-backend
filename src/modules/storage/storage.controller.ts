@@ -38,8 +38,12 @@ class PresignCourseThumbnailDto {
  * while enrolled in nothing. That is the whole reason this DTO exists rather
  * than reusing `PresignAttachmentDto`, whose `courseId` is required and
  * decides the storage prefix.
+ *
+ * Exported for `test/unit/storage-library-upload.spec.ts`, which runs the real
+ * validation pipe against it rather than restating the rules in a second
+ * place where they could drift.
  */
-class PresignLibraryDocumentDto {
+export class PresignLibraryDocumentDto {
   @IsString() @MaxLength(200)
   @Matches(/^[\w .()\-؀-ۿ]+\.[A-Za-z0-9]{1,8}$/, {
     message: 'filename contains unsupported characters',
