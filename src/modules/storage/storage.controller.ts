@@ -4,7 +4,7 @@ import { IsIn, IsInt, IsOptional, IsString, Matches, Max, MaxLength, Min } from 
 import { Type } from 'class-transformer';
 
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
-import { StaffOnly } from '../../common/decorators/roles.decorator';
+import { AdminOnly, StaffOnly } from '../../common/decorators/roles.decorator';
 import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
 import type { AuthenticatedUser } from '../../common/types/request-context';
@@ -29,6 +29,25 @@ class PresignCourseThumbnailDto {
   @IsString() @MaxLength(32) courseId!: string;
   @IsIn(IMAGE_TYPES) contentType!: string;
   @Type(() => Number) @IsInt() @Min(1) @Max(10 * 1024 * 1024) sizeBytes!: number;
+}
+
+/**
+ * A library document.
+ *
+ * Carries no `courseId` because the Library has none: a student may buy here
+ * while enrolled in nothing. That is the whole reason this DTO exists rather
+ * than reusing `PresignAttachmentDto`, whose `courseId` is required and
+ * decides the storage prefix.
+ */
+class PresignLibraryDocumentDto {
+  @IsString() @MaxLength(200)
+  @Matches(/^[\w .()\-؀-ۿ]+\.[A-Za-z0-9]{1,8}$/, {
+    message: 'filename contains unsupported characters',
+  })
+  filename!: string;
+
+  @IsIn([...DOC_TYPES, ...IMAGE_TYPES]) contentType!: string;
+  @Type(() => Number) @IsInt() @Min(1) @Max(200 * 1024 * 1024) sizeBytes!: number;
 }
 
 class PresignAttachmentDto {
@@ -103,6 +122,28 @@ export class StorageController {
     return this.storage.presignUpload({
       bucket: 'uploads',
       objectKey: StorageService.keys.attachment(dto.courseId, dto.filename),
+      contentType: dto.contentType,
+      expiresIn: 3600,
+    });
+  }
+
+  @Post('uploads/library-document')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Presign a library document upload',
+    description:
+      'Returns an object key. Register it with POST /admin/library/materials/:id/parts, or PATCH a part to replace its file. The bucket is private and the key is never served to a student — reading is always through a short-lived, viewer-bound signed URL.',
+  })
+  async libraryDocument(@Body() dto: PresignLibraryDocumentDto) {
+    if (dto.filename.includes('..') || dto.filename.includes('/')) {
+      throw new AppException(ErrorCode.VALIDATION_ERROR, {
+        fields: { filename: ['must not contain path separators'] },
+      });
+    }
+
+    return this.storage.presignUpload({
+      bucket: 'uploads',
+      objectKey: StorageService.keys.libraryDocument(dto.filename),
       contentType: dto.contentType,
       expiresIn: 3600,
     });

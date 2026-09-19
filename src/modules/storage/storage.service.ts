@@ -103,6 +103,16 @@ export class StorageService {
     avatar: (userId: string, ext: string) => `avatars/${userId}/${randomUUID()}${ext}`,
     attachment: (courseId: string, filename: string) =>
       `attachments/${courseId}/${randomUUID()}${extname(filename).toLowerCase() || '.bin'}`,
+    /**
+     * Library documents live in their own namespace, not under a course.
+     *
+     * The Library is independent of courses in both directions, so filing a
+     * paid library document under `attachments/<courseId>/` would tie its
+     * lifecycle to a course it has nothing to do with — deleting that course's
+     * prefix would take the document with it.
+     */
+    libraryDocument: (filename: string) =>
+      `library/${randomUUID()}${extname(filename).toLowerCase() || '.bin'}`,
     caption: (videoId: string, language: string) =>
       `captions/${videoId}/${language}.vtt`,
   };
