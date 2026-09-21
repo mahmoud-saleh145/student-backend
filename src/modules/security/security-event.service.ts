@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import {
-  type Prisma,
+  Prisma,
   SecurityEventType,
   SecuritySeverity,
 } from '@prisma/client';
@@ -69,42 +69,161 @@ export class SecurityEventService {
     private readonly redis: RedisService,
   ) {}
 
-  /** Never throws — telemetry must not break the request it describes. */
+  /**
+   * Never throws — telemetry must not break the request it describes.
+   *
+   * The outer guard makes that a property of the method rather than something
+   * a reader has to verify by tracing every branch. Callers await this on
+   * paths that are already failing — an expired session, a reused token — and
+   * a throw here would replace a deliberate 401 with an accidental 500. That
+   * is a worse outcome than losing the event, so nothing escapes.
+   */
   async record(input: SecurityEventInput): Promise<void> {
+    try {
+      await this.write(input);
+    } catch (e) {
+      this.logger.error(`security event recording failed: ${(e as Error).message}`);
+    }
+  }
+
+  private async write(input: SecurityEventInput): Promise<void> {
     const severity = input.severity ?? DEFAULT_SEVERITY[input.type] ?? SecuritySeverity.INFO;
+    const data = this.toCreateData(input, severity);
 
     try {
-      await this.prisma.securityEvent.create({
-        data: {
-          type: input.type,
-          severity,
-          userId: input.userId ?? null,
-          courseId: input.courseId ?? null,
-          lessonId: input.lessonId ?? null,
-          videoId: input.videoId ?? null,
-          ticketId: input.ticketId ?? null,
-          deviceKey: input.deviceKey ?? null,
-          sessionId: input.sessionId ?? null,
-          ipAddress: input.ipAddress ?? null,
-          userAgent: input.userAgent?.slice(0, 500) ?? null,
-          message: input.message ?? null,
-          metadata: (input.metadata ?? undefined) as Prisma.InputJsonValue | undefined,
-        },
-      });
+      await this.prisma.securityEvent.create({ data });
 
       if (input.userId) {
         await this.bumpCounters(input.userId, input.type, severity);
       }
 
-      if (severity === SecuritySeverity.CRITICAL || severity === SecuritySeverity.HIGH) {
-        this.logger.warn(
-          `security ${input.type} severity=${severity} user=${input.userId ?? '-'} ${
-            input.message ?? ''
-          }`,
-        );
-      }
+      this.warnIfSevere(input, severity);
     } catch (e) {
+      // A reference that no longer resolves must not cost us the event.
+      //
+      // The clearest case is a refresh token whose signature still verifies
+      // but whose account is gone: the token carries a `sub` that was never
+      // checked against `users`, so the insert trips
+      // `security_events_userId_fkey`. That event is precisely the one worth
+      // keeping — a valid signature for a non-existent user is either a stale
+      // client or a leaked secret — and the schema already allows it, since
+      // `userId` is nullable for events with no user behind them.
+      //
+      // So the dangling reference is detached and the row is written again
+      // with the claimed id preserved in `metadata`. The retry costs nothing
+      // in the normal case: it runs only after the database has actually
+      // refused the write.
+      const detached = this.detachDanglingReference(e, data);
+
+      if (detached) {
+        try {
+          await this.prisma.securityEvent.create({ data: detached });
+          // Counters are deliberately not bumped. They feed a risk score for
+          // an account, and there is no account here to score.
+          this.logger.warn(
+            `security ${input.type} recorded without its dangling reference: ${
+              (e as Error).message.split('\n')[0] ?? ''
+            }`,
+          );
+          this.warnIfSevere(input, severity);
+          return;
+        } catch (retryError) {
+          this.logger.error(
+            `security event retry failed: ${(retryError as Error).message}`,
+          );
+          return;
+        }
+      }
+
       this.logger.error(`security event write failed: ${(e as Error).message}`);
+    }
+  }
+
+  private toCreateData(
+    input: SecurityEventInput,
+    severity: SecuritySeverity,
+  ): Prisma.SecurityEventUncheckedCreateInput {
+    return {
+      type: input.type,
+      severity,
+      userId: input.userId ?? null,
+      courseId: input.courseId ?? null,
+      lessonId: input.lessonId ?? null,
+      videoId: input.videoId ?? null,
+      ticketId: input.ticketId ?? null,
+      deviceKey: input.deviceKey ?? null,
+      sessionId: input.sessionId ?? null,
+      ipAddress: input.ipAddress ?? null,
+      userAgent: input.userAgent?.slice(0, 500) ?? null,
+      message: input.message ?? null,
+      metadata: (input.metadata ?? undefined) as Prisma.InputJsonValue | undefined,
+    };
+  }
+
+  /**
+   * Rewrites the row so a foreign key that no longer resolves becomes null.
+   *
+   * Returns null when the failure was not a foreign-key violation, or when
+   * there is no reference left to detach — in both cases the caller should
+   * report the original error rather than retry a write that will fail again.
+   *
+   * `userId` and `ticketId` are the only relations on this model; the other
+   * id columns carry no constraint, so a violation can only be one of these.
+   */
+  private detachDanglingReference(
+    error: unknown,
+    data: Prisma.SecurityEventUncheckedCreateInput,
+  ): Prisma.SecurityEventUncheckedCreateInput | null {
+    if (
+      !(error instanceof Prisma.PrismaClientKnownRequestError) ||
+      error.code !== 'P2003'
+    ) {
+      return null;
+    }
+
+    // Postgres names the constraint; Prisma surfaces it as `field_name`.
+    // Matching on the substring rather than the exact string keeps this
+    // working across the formats Prisma has used for it.
+    const field = String(error.meta?.['field_name'] ?? '');
+    const hitsUser = field.includes('userId') && data.userId != null;
+    const hitsTicket = field.includes('ticketId') && data.ticketId != null;
+
+    // An unrecognised constraint name: detach whichever relations are set, so
+    // a future relation on this model still degrades to a recorded event
+    // rather than a lost one.
+    const blind = !hitsUser && !hitsTicket;
+    const dropUser = hitsUser || (blind && data.userId != null);
+    const dropTicket = hitsTicket || (blind && data.ticketId != null);
+
+    if (!dropUser && !dropTicket) return null;
+
+    const existing =
+      data.metadata && typeof data.metadata === 'object' && !Array.isArray(data.metadata)
+        ? (data.metadata as Record<string, unknown>)
+        : {};
+
+    return {
+      ...data,
+      ...(dropUser ? { userId: null } : {}),
+      ...(dropTicket ? { ticketId: null } : {}),
+      metadata: {
+        ...existing,
+        // The id is kept as plain data so the trail still names who the
+        // client claimed to be, without asserting a relationship the
+        // database cannot vouch for.
+        ...(dropUser ? { orphanedUserId: data.userId } : {}),
+        ...(dropTicket ? { orphanedTicketId: data.ticketId } : {}),
+      } as Prisma.InputJsonValue,
+    };
+  }
+
+  private warnIfSevere(input: SecurityEventInput, severity: SecuritySeverity): void {
+    if (severity === SecuritySeverity.CRITICAL || severity === SecuritySeverity.HIGH) {
+      this.logger.warn(
+        `security ${input.type} severity=${severity} user=${input.userId ?? '-'} ${
+          input.message ?? ''
+        }`,
+      );
     }
   }
 

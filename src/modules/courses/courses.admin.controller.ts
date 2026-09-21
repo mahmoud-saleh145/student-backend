@@ -26,6 +26,13 @@ import {
  * capability — happens inside the service via
  * CourseAccessService.assertCanManageCourse, because it needs to load the
  * assignment row anyway.
+ *
+ * Two operations are the exception and are @AdminOnly() at the door: bringing
+ * a course into existence, and deciding who teaches it. A teacher works on the
+ * courses an administrator assigned to them and creates none of their own.
+ * Both are refused a second time inside the service, because a decorator only
+ * protects the route it is written on and these must hold for every caller
+ * that reaches the method.
  */
 @ApiTags('courses')
 @ApiBearerAuth('access-token')
@@ -58,18 +65,22 @@ export class CoursesAdminController {
 
   @Get(':courseId')
   @StaffOnly()
-  @ApiOperation({ summary: 'Full course record for editing' })
-  detail(@Param('courseId') courseId: string) {
-    return this.admin.detailForStaff(courseId);
+  @ApiOperation({
+    summary: 'Full course record for editing',
+    description:
+      'A teacher may only read a course they are assigned to. The record carries price history and per-teacher revenue shares, so it is scoped like every other course operation rather than being readable by any staff account that knows an id.',
+  })
+  detail(@Param('courseId') courseId: string, @CurrentUser() actor: AuthenticatedUser) {
+    return this.admin.detailForActor(courseId, actor);
   }
 
   @Post()
-  @StaffOnly()
+  @AdminOnly()
   @Audit({ action: AuditAction.CREATE, entity: 'course' })
   @ApiOperation({
     summary: 'Create a course',
     description:
-      'Starts in DRAFT. Sections are optional here and fully dynamic — pass any number with any titles, or add them later.',
+      'Administrators only — a teacher works on the courses assigned to them and creates none. Starts in DRAFT. Sections are optional here and fully dynamic — pass any number with any titles, or add them later.',
   })
   create(@Body() dto: CreateCourseDto, @CurrentUser() actor: AuthenticatedUser) {
     return this.admin.create(dto, actor);

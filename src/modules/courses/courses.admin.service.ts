@@ -197,15 +197,33 @@ export class CoursesAdminService {
   // Create
   // ---------------------------------------------------------------------------
 
+  /**
+   * Creates a course. Administrators only.
+   *
+   * The role check is here and not only on the route because creation is the
+   * one operation with no resource to authorize against: every other method in
+   * this service loads a course and asks `assertCanManageCourse` whether this
+   * actor is assigned to it, which by construction excludes a teacher acting
+   * on a course that is not theirs. A course that does not exist yet has no
+   * assignment to check, so without this the only thing standing between a
+   * teacher and a course of their own making is the decorator on the
+   * controller — and a decorator protects one route, not a method.
+   *
+   * Refusing here also closes the self-assignment path. A teacher who could
+   * create a course would name themselves in `teacherIds` and have arranged
+   * their own access to it, which is the decision `assignTeacher` reserves to
+   * administrators three hundred lines below.
+   */
   async create(input: CreateCourseInput, actor: { id: string; role: UserRole }) {
-    if (input.teacherIds.length === 0) {
-      throw AppException.validation({ teacherIds: ['at least one teacher is required'] });
+    if (actor.role !== UserRole.MASTER && actor.role !== UserRole.ADMIN) {
+      throw new AppException(ErrorCode.INSUFFICIENT_ROLE, {
+        message: 'Only administrators can create courses',
+        details: { required: [UserRole.MASTER, UserRole.ADMIN], actual: actor.role },
+      });
     }
 
-    // A teacher creating a course must include themselves, otherwise they'd
-    // immediately lose access to what they just made.
-    if (actor.role === UserRole.TEACHER && !input.teacherIds.includes(actor.id)) {
-      input.teacherIds.push(actor.id);
+    if (input.teacherIds.length === 0) {
+      throw AppException.validation({ teacherIds: ['at least one teacher is required'] });
     }
 
     await this.assertTeachersExist(input.teacherIds);
@@ -859,6 +877,28 @@ export class CoursesAdminService {
   // ---------------------------------------------------------------------------
   // Staff detail
   // ---------------------------------------------------------------------------
+
+  /**
+   * The staff record of a course, scoped to what this actor may see.
+   *
+   * `detailForStaff` answers for any id, which is right for the internal
+   * callers that have already authorized the actor — `create`, `update` and
+   * the lifecycle methods all return it after their own checks. It is not
+   * right for a request, because the record carries price history and every
+   * teacher's revenue share, and a teacher who knows an id is not thereby
+   * assigned to that course. Requests come through here instead.
+   */
+  async detailForActor(courseId: string, actor: { id: string; role: UserRole }) {
+    const mayView = await this.access.staffMayViewCourse(actor.id, actor.role, courseId);
+
+    if (!mayView) {
+      throw new AppException(ErrorCode.NOT_COURSE_TEACHER, {
+        message: 'You are not assigned to this course',
+      });
+    }
+
+    return this.detailForStaff(courseId);
+  }
 
   async detailForStaff(courseId: string) {
     const course = await this.prisma.course.findFirst({
