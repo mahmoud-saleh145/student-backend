@@ -1,0 +1,84 @@
+# =============================================================================
+# EduPlatform — media edge gate (Cloudflare Worker)
+# =============================================================================
+#
+# Deploys the EXISTING Worker at docs/cloudflare-worker.js. `main` points at
+# that file directly rather than copying it, so there is exactly one
+# implementation of the signature check and it cannot drift from the backend's
+# in src/modules/storage/storage.service.ts.
+#
+# The two sides share a contract that is verified, not assumed:
+#
+#   HMAC-SHA256(MEDIA_SIGNING_KEY,
+#     objectKey \n exp \n uid \n sid \n did \n tid \n mh) -> base64url
+#
+# storage.service.ts:403 and cloudflare-worker.js:115 build that string
+# identically. If MEDIA_SIGNING_KEY differs between the API and this Worker,
+# every media request returns 403 with `x-deny-reason: bad_signature`.
+#
+# Run wrangler from the repository root, where this file lives.
+# =============================================================================
+
+name = "edu-media-gate"
+main = "docs/cloudflare-worker.js"
+compatibility_date = "2025-01-01"
+
+# No *.workers.dev hostname.
+#
+# The bucket is private and this Worker is the only path to its bytes; a second
+# public hostname would be a second, unmonitored door to the same content. The
+# custom domain below is the only way in.
+workers_dev = false
+
+# --- R2 ----------------------------------------------------------------------
+# The binding name is part of the Worker's contract: cloudflare-worker.js:142
+# calls `env.MEDIA.get(...)`. Renaming it fails at runtime with a 500, not at
+# deploy time, so it must stay exactly `MEDIA`.
+#
+# The bucket stays PRIVATE. Do not enable R2 public access or attach an
+# r2.dev domain to it — this Worker performs the viewer binding that a public
+# bucket would bypass entirely.
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "edu-media"
+
+# --- plain vars (not secrets) ------------------------------------------------
+[vars]
+# Origin the Worker asks whether a playback ticket is still live. It appends
+# /api/v1/playback/tickets/:ticketId/state?uid=... (cloudflare-worker.js:242),
+# which matches the @Public() route in playback.controller.ts:189 given
+# API_PREFIX=api and API_VERSION=1. No trailing slash.
+#
+# REPLACE with your real production API hostname before deploying.
+API_ORIGIN = "https://api.REPLACE-ME.example"
+
+# Compared as the string "true" (cloudflare-worker.js:134), so it is quoted.
+# With this on, a signed URL that was copied elsewhere still fails once the
+# ticket is revoked, instead of working until its expiry.
+TICKET_CHECK = "true"
+
+# MEDIA_SIGNING_KEY is deliberately NOT here.
+#
+# [vars] is committed to Git in plain text. The signing key is set as an
+# encrypted Worker secret instead:
+#
+#     wrangler secret put MEDIA_SIGNING_KEY
+#
+# It must be byte-identical to MEDIA_SIGNING_KEY in the API's .env.
+
+# --- custom domain -----------------------------------------------------------
+# Commented out for the FIRST deploy on purpose: if the zone is not yet on this
+# Cloudflare account, an active route makes `wrangler deploy` fail outright and
+# you never get a Worker to attach the secret to. Deploy once without it, set
+# the secret, confirm the binding, then uncomment this and redeploy.
+#
+# Replace the hostname, then this value goes into the API's MEDIA_CDN_BASE_URL
+# as https://media.REPLACE-ME.example (with the scheme, no trailing slash).
+#
+# The Worker serves from the domain ROOT — storage.service.ts:324 resolves
+# object keys against the base URL, so `hls/<id>/master.m3u8` becomes
+# https://media.../hls/<id>/master.m3u8. Do not put it behind a path prefix.
+#
+# routes = [
+#   { pattern = "media.REPLACE-ME.example", custom_domain = true }
+# ]

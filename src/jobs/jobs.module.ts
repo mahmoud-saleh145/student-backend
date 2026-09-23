@@ -40,6 +40,11 @@ const runWorkers = process.env.RUN_WORKERS === 'true';
             port: Number(url.port || 6379),
             username: url.username || undefined,
             password: url.password || undefined,
+            // Rebuilding the connection field by field drops the scheme, and
+            // with it the TLS that `rediss://` asks for — ioredis infers that
+            // from the URL, which BullMQ never sees. A managed Redis that
+            // requires TLS would refuse the handshake, so it is restored here.
+            tls: url.protocol === 'rediss:' ? {} : undefined,
             // BullMQ requires this to be null, not a number.
             maxRetriesPerRequest: null,
             enableReadyCheck: false,

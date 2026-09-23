@@ -83,7 +83,7 @@ export default {
       return deny(405, 'method_not_allowed');
     }
 
-    const url = new URL(request.url);
+    const url = new globalThis.URL(request.url);
     // Strip the leading slash: object keys are stored without one.
     const objectKey = decodeURIComponent(url.pathname.replace(/^\/+/, ''));
 
@@ -145,7 +145,7 @@ export default {
 
     if (!object) return deny(404, 'not_found');
 
-    const headers = new Headers();
+    const headers = new globalThis.Headers();
     object.writeHttpMetadata(headers);
     headers.set('etag', object.httpEtag);
     headers.set('content-type', contentTypeFor(objectKey));
@@ -165,13 +165,13 @@ export default {
         'content-range',
         `bytes ${offset}-${offset + length - 1}/${object.size}`,
       );
-      return new Response(request.method === 'HEAD' ? null : object.body, {
+      return new globalThis.Response(request.method === 'HEAD' ? null : object.body, {
         status: 206,
         headers,
       });
     }
 
-    return new Response(request.method === 'HEAD' ? null : object.body, {
+    return new globalThis.Response(request.method === 'HEAD' ? null : object.body, {
       status: 200,
       headers,
     });
@@ -186,28 +186,28 @@ function deny(status, reason) {
   // The reason is returned as a header, not a body: a player receiving JSON
   // where it expected a playlist produces a confusing error. The header is
   // enough for curl-based debugging.
-  return new Response(null, {
+  return new globalThis.Response(null, {
     status,
     headers: { 'x-deny-reason': reason, 'cache-control': 'no-store' },
   });
 }
 
 async function hmacBase64Url(secret, message) {
-  const key = await crypto.subtle.importKey(
+  const key = await globalThis.crypto.subtle.importKey(
     'raw',
-    new TextEncoder().encode(secret),
+    new globalThis.TextEncoder().encode(secret),
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign'],
   );
 
-  const signature = await crypto.subtle.sign(
+  const signature = await globalThis.crypto.subtle.sign(
     'HMAC',
     key,
-    new TextEncoder().encode(message),
+    new globalThis.TextEncoder().encode(message),
   );
 
-  return btoa(String.fromCharCode(...new Uint8Array(signature)))
+  return globalThis.btoa(String.fromCharCode(...new Uint8Array(signature)))
     .replace(/\+/g, '-')
     .replace(/\//g, '_')
     .replace(/=+$/, '');
@@ -240,8 +240,8 @@ function renditionHeight(objectKey) {
  */
 async function ticketIsLive(env, ctx, ticketId, userId) {
   const probe = `${env.API_ORIGIN}/api/v1/playback/tickets/${ticketId}/state?uid=${encodeURIComponent(userId)}`;
-  const cacheKey = new Request(probe, { method: 'GET' });
-  const cache = caches.default;
+  const cacheKey = new globalThis.Request(probe, { method: 'GET' });
+  const cache = globalThis.caches.default;
 
   const cached = await cache.match(cacheKey);
   if (cached) {
@@ -251,9 +251,9 @@ async function ticketIsLive(env, ctx, ticketId, userId) {
 
   let response;
   try {
-    response = await fetch(probe, {
+    response = await globalThis.fetch(probe, {
       headers: { 'x-edge-check': '1' },
-      signal: AbortSignal.timeout(2000),
+      signal: globalThis.AbortSignal.timeout(2000),
     });
   } catch {
     // Fail OPEN on a network error, deliberately.
@@ -273,7 +273,7 @@ async function ticketIsLive(env, ctx, ticketId, userId) {
   ctx.waitUntil(
     cache.put(
       cacheKey,
-      new Response(JSON.stringify(payload), {
+      new globalThis.Response(JSON.stringify(payload), {
         headers: { 'cache-control': 'max-age=10', 'content-type': 'application/json' },
       }),
     ),
