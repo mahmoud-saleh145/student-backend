@@ -90,6 +90,21 @@ export class CreateCourseDto {
 
   @IsOptional() @IsString() @MaxLength(32) leadTeacherId?: string;
 
+  /**
+   * Departments this course is offered to.
+   *
+   * Every id must belong to `facultyId`, and `facultyId` to `universityId` —
+   * checked server-side in `CoursesAdminService`, not merely filtered in the
+   * form. Omitting the field on an update leaves the existing links alone;
+   * passing `[]` clears them. That distinction is the difference between
+   * "I did not touch departments" and "this course has none".
+   */
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(50)
+  @IsString({ each: true })
+  departmentIds?: string[];
+
   @IsOptional() @Type(() => Number) @IsNumber() @Min(0) @Max(1_000_000) price?: number;
   @IsOptional() @IsString() @MaxLength(3) currency?: string;
   @IsOptional() @toBool() @IsBoolean() isFree?: boolean;
@@ -161,6 +176,20 @@ export class UpdateCourseDto {
 
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(100) completionThreshold?: number;
   @IsOptional() @toBool() @IsBoolean() completionRequireContiguous?: boolean;
+
+  /**
+   * Replaces the course's department links.
+   *
+   * Absent means "leave them alone"; `[]` means "this course has none". The
+   * global pipe runs with `forbidNonWhitelisted`, so this has to be declared
+   * here as well as on the create DTO — `UpdateCourseDto` is its own class,
+   * not a `Partial` of the other.
+   */
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(50)
+  @IsString({ each: true })
+  departmentIds?: string[];
 }
 
 export class ChangePriceDto {

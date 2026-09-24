@@ -111,6 +111,8 @@ export class EnvironmentVariables {
   @IsOptional() @IsString() R2_SECRET_ACCESS_KEY?: string;
   @IsString() R2_BUCKET_MEDIA = 'edu-media-dev';
   @IsString() R2_BUCKET_UPLOADS = 'edu-uploads-dev';
+  /** Separate store for Library documents — see storageConfig.buckets. */
+  @IsOptional() @IsString() R2_BUCKET_LIBRARY?: string;
   @IsString() R2_REGION = 'auto';
   @IsOptional() @IsString() R2_ENDPOINT?: string;
 

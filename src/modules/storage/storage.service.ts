@@ -14,12 +14,25 @@ import { createHmac, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
+import type { Readable } from 'node:stream';
 
 import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
 import type { StorageConfig } from '../../config/configuration';
 
-export type Bucket = 'media' | 'uploads';
+/**
+ * The three object stores this platform uses.
+ *
+ *  - `media`    — HLS renditions, thumbnails, avatars, captions. Fronted by the
+ *                 Cloudflare Worker and subject to the whole protected-video
+ *                 delivery path.
+ *  - `uploads`  — raw source files a client hands us before processing (video
+ *                 originals, course attachments). Never served directly.
+ *  - `library`  — Library documents. Separate so that paid PDFs do not consume
+ *                 the capacity budgeted for protected video, and so the two can
+ *                 be sized, priced and lifecycle-managed independently.
+ */
+export type Bucket = 'media' | 'uploads' | 'library';
 
 export interface SignedUpload {
   uploadUrl: string;
@@ -73,7 +86,26 @@ export class StorageService {
   }
 
   private bucketName(bucket: Bucket): string {
-    return bucket === 'media' ? this.cfg.buckets.media : this.cfg.buckets.uploads;
+    // A lookup rather than a ternary: with three buckets a ternary silently
+    // routes the unlisted one to the wrong store, which is precisely how
+    // Library documents ended up written to `uploads` and read from `media`.
+    return this.cfg.buckets[bucket];
+  }
+
+  /**
+   * Which bucket an object key belongs to.
+   *
+   * The read path needs this because a signed media URL carries only the key —
+   * and deliberately so: the key is already inside the HMAC, so deriving the
+   * bucket from it costs nothing and adds no forgeable parameter. Adding a
+   * `bucket` query argument would have meant changing the signature contract
+   * shared with docs/cloudflare-worker.js, for no gain.
+   *
+   * Anything that is not a Library key stays on `media`, which is what every
+   * caller assumed before this function existed.
+   */
+  static bucketForKey(objectKey: string): Bucket {
+    return objectKey.startsWith('library/') ? 'library' : 'media';
   }
 
   get isConfigured(): boolean {
@@ -170,6 +202,37 @@ export class StorageService {
         Bucket: this.bucketName(params.bucket),
         Key: params.objectKey,
         Body: params.body,
+        ContentType: params.contentType,
+        CacheControl: params.cacheControl ?? 'private, max-age=31536000, immutable',
+      }),
+    );
+  }
+
+  /**
+   * Uploads straight from a readable stream, without buffering in memory.
+   *
+   * Used by the Library's proxied upload: the bytes arrive on the request and
+   * go out to R2 as they land, so a 200 MB document costs a socket rather than
+   * 200 MB of heap. `contentLength` is required because S3 will not accept a
+   * stream of unknown length without falling back to a multipart upload, and
+   * the caller already has it from the Content-Length header.
+   */
+  async putStream(params: {
+    bucket: Bucket;
+    objectKey: string;
+    body: Readable;
+    contentLength: number;
+    contentType: string;
+    cacheControl?: string;
+  }): Promise<void> {
+    this.assertConfigured();
+
+    await this.client.send(
+      new PutObjectCommand({
+        Bucket: this.bucketName(params.bucket),
+        Key: params.objectKey,
+        Body: params.body,
+        ContentLength: params.contentLength,
         ContentType: params.contentType,
         CacheControl: params.cacheControl ?? 'private, max-age=31536000, immutable',
       }),

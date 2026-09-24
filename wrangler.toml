@@ -42,6 +42,17 @@ workers_dev = false
 binding = "MEDIA"
 bucket_name = "edu-media"
 
+# Library documents. Separate from `edu-media` so paid PDFs do not consume the
+# storage budgeted for protected video, and so the two can be sized and
+# lifecycle-managed independently. The Worker picks this store for keys under
+# `library/` and falls back to MEDIA when the binding is absent, so deploying
+# the Worker before the bucket exists degrades rather than breaks.
+#
+# Must match R2_BUCKET_LIBRARY in the API's environment. Keep it PRIVATE.
+[[r2_buckets]]
+binding = "LIBRARY"
+bucket_name = "edu-library"
+
 # --- plain vars (not secrets) ------------------------------------------------
 [vars]
 # Origin the Worker asks whether a playback ticket is still live. It appends

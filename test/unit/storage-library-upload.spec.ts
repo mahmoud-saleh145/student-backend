@@ -53,7 +53,12 @@ const STORAGE_CONFIG = {
   region: 'auto',
   endpoint: 'https://acct-test.r2.cloudflarestorage.com',
   forcePathStyle: true,
-  buckets: { media: 'edu-media-test', uploads: 'edu-uploads-test' },
+  buckets: {
+    media: 'edu-media-test',
+    uploads: 'edu-uploads-test',
+    // Library documents have their own store; see StorageService.Bucket.
+    library: 'edu-library-test',
+  },
   cdnBaseUrl: 'https://cdn.example.test',
   signingKey: 'signing-key-for-tests',
 };
@@ -427,13 +432,19 @@ describe('POST /storage/uploads/library-document — success', () => {
     });
   });
 
-  it('signs against the private uploads bucket, not media', async () => {
+  it('signs against the private library bucket, not media or uploads', async () => {
     const { controller } = buildController();
 
     const { uploadUrl } = await controller.libraryDocument(body() as never);
 
-    expect(uploadUrl).toContain('edu-uploads-test');
+    // The Library has its own bucket. It used to share `uploads` with raw
+    // video sources while being READ from `media` — so a document that
+    // uploaded successfully still could not be opened. The bucket a key
+    // belongs to is now derived from its prefix on both sides
+    // (StorageService.bucketForKey), and `library/…` resolves here.
+    expect(uploadUrl).toContain('edu-library-test');
     expect(uploadUrl).not.toContain('edu-media-test');
+    expect(uploadUrl).not.toContain('edu-uploads-test');
   });
 
   it('issues a signature that expires, not a permanent or public URL', async () => {
@@ -460,14 +471,14 @@ describe('POST /storage/uploads/library-document — success', () => {
     expect(signed.objectKey.endsWith('.png')).toBe(true);
   });
 
-  it('asks the service for the uploads bucket and the library key', async () => {
+  it('asks the service for the library bucket and the library key', async () => {
     const { controller, presignSpy } = buildController();
 
     await controller.libraryDocument(body() as never);
 
     expect(presignSpy).toHaveBeenCalledTimes(1);
     expect(presignSpy.mock.calls[0][0]).toMatchObject({
-      bucket: 'uploads',
+      bucket: 'library',
       contentType: PDF,
       expiresIn: 3600,
     });

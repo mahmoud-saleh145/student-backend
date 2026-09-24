@@ -154,7 +154,13 @@ export class MediaOriginController {
       }
     }
 
-    const body = await this.storage.getObjectBuffer('media', objectKey);
+    // Bucket-aware: a `library/…` key lives in the Library store, everything
+    // else on `media`. This was hard-coded to 'media', so a Library document —
+    // which is written to the Library bucket — could never be read back.
+    const body = await this.storage.getObjectBuffer(
+      StorageService.bucketForKey(objectKey),
+      objectKey,
+    );
 
     res.setHeader('Content-Type', MediaOriginController.contentTypeFor(objectKey));
     res.setHeader('Content-Length', String(body.length));

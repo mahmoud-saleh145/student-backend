@@ -23,6 +23,21 @@ import { AuditService } from '../audit/audit.service';
 const trim = ({ value }: { value: unknown }) =>
   typeof value === 'string' ? value.trim() : value;
 
+/**
+ * Coerces a query-string boolean.
+ *
+ * A JSON body delivers a real `true`; a query string delivers the *text*
+ * `"true"`, and the global ValidationPipe runs with
+ * `enableImplicitConversion: false` (main.ts:112) precisely so that no other
+ * field is silently coerced behind the author's back. That makes `@IsBoolean()`
+ * on a query field a guaranteed 422 — which is what the Subjects page was
+ * showing. Same shape as the transform in modules/courses/dto/course.dto.ts.
+ */
+const toBool = () =>
+  Transform(({ value }) =>
+    value === undefined ? undefined : value === true || value === 'true' || value === '1',
+  );
+
 class CreateSubjectDto {
   @IsString() @MinLength(2) @MaxLength(120) @Transform(trim) name!: string;
   @IsString() @MinLength(2) @MaxLength(120) @Transform(trim) nameAr!: string;
@@ -38,7 +53,8 @@ class UpdateSubjectDto {
 
 class ListSubjectsDto {
   @IsOptional() @IsString() @MaxLength(120) @Transform(trim) q?: string;
-  @IsOptional() @IsBoolean() includeInactive?: boolean;
+  // Query param, so it arrives as a string — see `toBool` above.
+  @IsOptional() @toBool() @IsBoolean() includeInactive?: boolean;
 }
 
 /**

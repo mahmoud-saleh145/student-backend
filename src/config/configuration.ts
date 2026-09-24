@@ -75,6 +75,14 @@ export const storageConfig = registerAs('storage', () => {
     buckets: {
       media: process.env.R2_BUCKET_MEDIA ?? 'edu-media-dev',
       uploads: process.env.R2_BUCKET_UPLOADS ?? 'edu-uploads-dev',
+      // Library documents live apart from protected video so the two do not
+      // compete for the same storage budget. Falls back to the uploads bucket
+      // only when unset, which keeps an existing deployment working until the
+      // new bucket is provisioned.
+      library:
+        process.env.R2_BUCKET_LIBRARY ??
+        process.env.R2_BUCKET_UPLOADS ??
+        'edu-library-dev',
     },
     cdnBaseUrl: process.env.MEDIA_CDN_BASE_URL ?? '',
     signingKey: process.env.MEDIA_SIGNING_KEY!,

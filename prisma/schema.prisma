@@ -694,12 +694,36 @@ model Department {
   updatedAt DateTime @updatedAt
   deletedAt DateTime?
 
-  faculty  Faculty          @relation(fields: [facultyId], references: [id], onDelete: Restrict)
+  faculty  Faculty            @relation(fields: [facultyId], references: [id], onDelete: Restrict)
   students StudentProfile[]
+  courses  CourseDepartment[]
 
   @@unique([facultyId, name])
   @@index([facultyId, isActive])
   @@map("departments")
+}
+
+/// Course ↔ Department, the many-to-many the hierarchy needs.
+///
+/// An explicit join model rather than an implicit `Department[]` on Course,
+/// for two reasons: the row carries its own `createdAt`, and an explicit table
+/// can be indexed from the department side, which is what "every course in
+/// this department" needs.
+///
+/// `onDelete: Restrict` on the department mirrors Department→Faculty: these
+/// rows are soft-deactivated, never removed, so a hard delete that would
+/// orphan a course's structure should fail loudly rather than cascade.
+model CourseDepartment {
+  courseId     String
+  departmentId String
+  createdAt    DateTime @default(now())
+
+  course     Course     @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  department Department @relation(fields: [departmentId], references: [id], onDelete: Restrict)
+
+  @@id([courseId, departmentId])
+  @@index([departmentId])
+  @@map("course_departments")
 }
 
 model AcademicYear {
@@ -1027,6 +1051,9 @@ model Course {
   createdBy    User?         @relation("CourseCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
 
   teachers    CourseTeacher[]
+  /// Which departments this course is offered to. Many-to-many: a course is
+  /// commonly shared across several departments of the same college.
+  departments CourseDepartment[]
   parts       CoursePart[]
   sections    CourseSection[]
   lessons     Lesson[]

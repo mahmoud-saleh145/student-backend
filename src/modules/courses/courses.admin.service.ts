@@ -31,6 +31,14 @@ export interface CreateCourseInput {
   subjectId?: string;
   teacherIds: string[];
   leadTeacherId?: string;
+  /**
+   * Departments the course is offered to.
+   *
+   * On an update, `undefined` leaves the existing links alone and `[]` clears
+   * them — the two are deliberately different, so a partial edit cannot wipe a
+   * course's structure.
+   */
+  departmentIds?: string[];
   price?: number;
   currency?: string;
   isFree?: boolean;
@@ -227,6 +235,11 @@ export class CoursesAdminService {
     }
 
     await this.assertTeachersExist(input.teacherIds);
+    await this.assertAcademicStructure({
+      universityId: input.universityId,
+      facultyId: input.facultyId,
+      departmentIds: input.departmentIds,
+    });
 
     const isFree = input.isFree ?? (input.price ?? 0) <= 0;
     if (!isFree && (input.price === undefined || input.price <= 0)) {
@@ -266,6 +279,16 @@ export class CoursesAdminService {
           completionThreshold: input.completionThreshold ?? 90,
           completionRequireContiguous: input.completionRequireContiguous ?? true,
           createdById: actor.id,
+          // Validated above, so these ids are known to exist and to belong to
+          // `facultyId`. Empty when none were chosen, which is a valid course.
+          departments: {
+            // `connect` rather than a bare `departmentId`: this is a checked
+            // nested create, so Prisma wants the relation, not the raw foreign
+            // key. The ids were validated above, so each one resolves.
+            create: [...new Set(input.departmentIds ?? [])].map((departmentId) => ({
+              department: { connect: { id: departmentId } },
+            })),
+          },
           teachers: {
             create: input.teacherIds.map((teacherId) => ({
               teacherId,
@@ -338,8 +361,29 @@ export class CoursesAdminService {
 
     const before = await this.prisma.course.findFirst({
       where: { id: courseId, ...notDeleted },
+      include: { departments: { select: { departmentId: true } } },
     });
     if (!before) throw AppException.notFound('Course', courseId);
+
+    /**
+     * Validate the course as it will be, not as it was asked to change.
+     *
+     * A PATCH that moves the college but says nothing about departments still
+     * has to produce a coherent hierarchy, so the incoming fields are merged
+     * over the stored ones first. `undefined` means "not mentioned" and keeps
+     * the current value; only an explicit value replaces it.
+     */
+    const effective = {
+      universityId:
+        input.universityId !== undefined ? input.universityId : before.universityId,
+      facultyId: input.facultyId !== undefined ? input.facultyId : before.facultyId,
+      departmentIds:
+        input.departmentIds !== undefined
+          ? input.departmentIds
+          : before.departments.map((d) => d.departmentId),
+    };
+
+    await this.assertAcademicStructure(effective);
 
     if (before.status === CourseStatus.ARCHIVED) {
       throw new AppException(ErrorCode.COURSE_ARCHIVED, {
@@ -391,7 +435,42 @@ export class CoursesAdminService {
         : {}),
     };
 
-    const updated = await this.prisma.course.update({ where: { id: courseId }, data });
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const course = await tx.course.update({ where: { id: courseId }, data });
+
+      /**
+       * Department links are replaced only when the caller mentioned them.
+       *
+       * This is the difference between "I did not touch departments" and
+       * "this course has none". A PATCH that only renames the course must
+       * leave its structure alone — deleting and re-creating unconditionally
+       * would wipe the links on every unrelated edit.
+       */
+      if (input.departmentIds !== undefined) {
+        const wanted = [...new Set(input.departmentIds)];
+        const current = before.departments.map((d) => d.departmentId);
+
+        const added = wanted.filter((id) => !current.includes(id));
+        const removed = current.filter((id) => !wanted.includes(id));
+
+        // A diff rather than delete-all-then-insert: untouched rows keep their
+        // `createdAt`, and a no-op edit writes nothing at all.
+        if (removed.length > 0) {
+          await tx.courseDepartment.deleteMany({
+            where: { courseId, departmentId: { in: removed } },
+          });
+        }
+
+        if (added.length > 0) {
+          await tx.courseDepartment.createMany({
+            data: added.map((departmentId) => ({ courseId, departmentId })),
+            skipDuplicates: true,
+          });
+        }
+      }
+
+      return course;
+    });
 
     await this.audit.record({
       actorId: actor.id,
@@ -929,21 +1008,61 @@ export class CoursesAdminService {
           },
         },
         university: { select: { id: true, name: true } },
+        // Faculty and subject were missing, so the course page rendered a dash
+        // for College and Subject on every course that had them set.
+        faculty: { select: { id: true, name: true } },
         academicYear: { select: { id: true, name: true } },
+        subject: { select: { id: true, name: true } },
+        // The edit form prefills from these, so it needs the names, not just
+        // the ids it will post back.
+        departments: {
+          select: {
+            department: { select: { id: true, name: true, facultyId: true } },
+          },
+        },
         _count: { select: { enrollments: true, attachments: true } },
       },
     });
 
     if (!course) throw AppException.notFound('Course', courseId);
 
+    const prices = course.prices.map((p) => ({
+      ...p,
+      amount: Number(p.amount),
+      compareAtAmount: p.compareAtAmount ? Number(p.compareAtAmount) : null,
+    }));
+
+    // The price a client should display is the current version, not the head
+    // of a five-element history. Spelling it out here means the dashboard does
+    // not have to know that `prices` is ordered by version descending.
+    const current = prices.find((p) => p.isCurrent) ?? prices[0] ?? null;
+
     return {
       ...course,
       thumbnailUrl: await this.storage.publicAssetUrl(course.thumbnailKey),
-      prices: course.prices.map((p) => ({
-        ...p,
-        amount: Number(p.amount),
-        compareAtAmount: p.compareAtAmount ? Number(p.compareAtAmount) : null,
-      })),
+      prices,
+      /**
+       * Flat, named aggregates.
+       *
+       * These are read straight off the denormalised columns that
+       * `recountCourse` maintains, rather than counted again here. `counts`
+       * exists as a named object because every consumer wants the pair; the
+       * list endpoint already returns the same shape, and its absence here was
+       * a crash rather than a blank — `data.counts.sections` on an undefined
+       * `counts` took the whole course page down.
+       */
+      counts: {
+        enrollments: course._count.enrollments,
+        attachments: course._count.attachments,
+        sections: course.sectionCount,
+        lessons: course.lessonCount,
+      },
+      price: current
+        ? { amount: current.amount, currency: current.currency }
+        : null,
+      // Flattened out of the join rows: a consumer wants the departments, not
+      // the fact that they arrive through a link table.
+      departments: course.departments.map((link) => link.department),
       teachers: course.teachers.map((t) => ({
         ...t,
         revenueSharePercent: t.revenueSharePercent ? Number(t.revenueSharePercent) : null,
@@ -954,6 +1073,69 @@ export class CoursesAdminService {
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
+
+  /**
+   * University → College → Department must actually hold.
+   *
+   * The dashboard filters each select by its parent, but a filtered dropdown
+   * is a convenience, not a constraint: the API accepts whatever is posted.
+   * `users.service.ts` has checked this for student profiles since the
+   * beginning; courses never did, so a course could be saved with a college
+   * belonging to a different university and nothing would complain.
+   *
+   * Returns the department ids it validated, so the caller does not have to
+   * re-derive them.
+   */
+  private async assertAcademicStructure(input: {
+    universityId?: string | null;
+    facultyId?: string | null;
+    departmentIds?: string[] | null;
+  }): Promise<void> {
+    const fields: Record<string, string[]> = {};
+
+    const facultyId = input.facultyId ?? null;
+    const universityId = input.universityId ?? null;
+    const departmentIds = [...new Set(input.departmentIds ?? [])];
+
+    const faculty = facultyId
+      ? await this.prisma.faculty.findFirst({
+        where: { id: facultyId, ...notDeleted },
+        select: { id: true, universityId: true },
+      })
+      : null;
+
+    if (facultyId && !faculty) {
+      fields.facultyId = ['college not found'];
+    } else if (faculty && universityId && faculty.universityId !== universityId) {
+      fields.facultyId = ['does not belong to the selected university'];
+    }
+
+    if (departmentIds.length > 0) {
+      if (!facultyId) {
+        // A department is only meaningful under a college. Accepting one
+        // without a parent would store a hierarchy that cannot be rendered.
+        fields.departmentIds = ['choose a college before choosing departments'];
+      } else {
+        const found = await this.prisma.department.findMany({
+          where: { id: { in: departmentIds }, ...notDeleted },
+          select: { id: true, facultyId: true },
+        });
+
+        const missing = departmentIds.filter((id) => !found.some((d) => d.id === id));
+        const foreign = found.filter((d) => d.facultyId !== facultyId);
+
+        if (missing.length > 0) {
+          fields.departmentIds = ['one or more departments do not exist'];
+        } else if (foreign.length > 0) {
+          fields.departmentIds = ['one or more departments do not belong to the selected college'];
+        }
+      }
+    }
+
+    if (Object.keys(fields).length > 0) {
+      throw AppException.validation(fields);
+    }
+  }
 
   private async assertTeachersExist(teacherIds: string[]): Promise<void> {
     const found = await this.prisma.user.count({

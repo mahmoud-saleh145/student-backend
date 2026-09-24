@@ -74,6 +74,12 @@ function buildPrisma() {
         thumbnailKey: null,
         prices: [],
         teachers: [],
+        // `detailForStaff` reads these off the row; its own `include` always
+        // selects them, so a double without them is unrealistic.
+        _count: { enrollments: 0, attachments: 0 },
+        sectionCount: 0,
+        lessonCount: 0,
+        departments: [],
       })),
       update: jest.fn(async () => ({ id: 'crs_new' })),
       findMany: jest.fn(async () => [] as unknown[]),
@@ -487,6 +493,10 @@ describe('GET /admin/courses/:courseId — a teacher reads only assigned courses
       thumbnailKey: null,
       prices: [],
       teachers: [],
+      _count: { enrollments: 0, attachments: 0 },
+      sectionCount: 0,
+      lessonCount: 0,
+      departments: [],
     }));
 
     await expect(service.detailForActor('crs_mine', TEACHER)).resolves.toMatchObject({
@@ -517,6 +527,10 @@ describe('GET /admin/courses/:courseId — a teacher reads only assigned courses
       thumbnailKey: null,
       prices: [],
       teachers: [],
+      _count: { enrollments: 0, attachments: 0 },
+      sectionCount: 0,
+      lessonCount: 0,
+      departments: [],
     }));
 
     await expect(service.detailForActor('crs_other', ADMIN)).resolves.toMatchObject({

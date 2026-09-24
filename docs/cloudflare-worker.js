@@ -51,6 +51,10 @@
  *     binding = "MEDIA"
  *     bucket_name = "edu-media-prod"
  *
+ *     [[r2_buckets]]
+ *     binding = "LIBRARY"
+ *     bucket_name = "edu-library"
+ *
  *     [vars]
  *     API_ORIGIN = "https://api.example.com"
  *     TICKET_CHECK = "true"
@@ -75,7 +79,7 @@
 export default {
   /**
    * @param {Request} request
-   * @param {{ MEDIA: R2Bucket, MEDIA_SIGNING_KEY: string, API_ORIGIN?: string, TICKET_CHECK?: string }} env
+   * @param {{ MEDIA: R2Bucket, LIBRARY?: R2Bucket, MEDIA_SIGNING_KEY: string, API_ORIGIN?: string, TICKET_CHECK?: string }} env
    * @param {ExecutionContext} ctx
    */
   async fetch(request, env, ctx) {
@@ -83,7 +87,7 @@ export default {
       return deny(405, 'method_not_allowed');
     }
 
-    const url = new globalThis.URL(request.url);
+    const url = new URL(request.url);
     // Strip the leading slash: object keys are stored without one.
     const objectKey = decodeURIComponent(url.pathname.replace(/^\/+/, ''));
 
@@ -139,13 +143,23 @@ export default {
     // --- serve --------------------------------------------------------------
     const range = request.headers.get('range');
 
-    const object = await env.MEDIA.get(objectKey, {
+    // Library documents live in their own bucket so that paid PDFs do not
+    // consume the capacity budgeted for protected video. The bucket is derived
+    // from the key prefix rather than from a query parameter, so it needs no
+    // change to the signature contract above — the key is already inside the
+    // HMAC, which makes the choice of bucket authenticated for free.
+    //
+    // Falling back to MEDIA when LIBRARY is unbound keeps an already-deployed
+    // Worker serving exactly what it served before this binding existed.
+    const store = objectKey.startsWith('library/') && env.LIBRARY ? env.LIBRARY : env.MEDIA;
+
+    const object = await store.get(objectKey, {
       range: range ? parseRange(range) : undefined,
     });
 
     if (!object) return deny(404, 'not_found');
 
-    const headers = new globalThis.Headers();
+    const headers = new Headers();
     object.writeHttpMetadata(headers);
     headers.set('etag', object.httpEtag);
     headers.set('content-type', contentTypeFor(objectKey));
@@ -165,13 +179,13 @@ export default {
         'content-range',
         `bytes ${offset}-${offset + length - 1}/${object.size}`,
       );
-      return new globalThis.Response(request.method === 'HEAD' ? null : object.body, {
+      return new Response(request.method === 'HEAD' ? null : object.body, {
         status: 206,
         headers,
       });
     }
 
-    return new globalThis.Response(request.method === 'HEAD' ? null : object.body, {
+    return new Response(request.method === 'HEAD' ? null : object.body, {
       status: 200,
       headers,
     });
@@ -186,28 +200,28 @@ function deny(status, reason) {
   // The reason is returned as a header, not a body: a player receiving JSON
   // where it expected a playlist produces a confusing error. The header is
   // enough for curl-based debugging.
-  return new globalThis.Response(null, {
+  return new Response(null, {
     status,
     headers: { 'x-deny-reason': reason, 'cache-control': 'no-store' },
   });
 }
 
 async function hmacBase64Url(secret, message) {
-  const key = await globalThis.crypto.subtle.importKey(
+  const key = await crypto.subtle.importKey(
     'raw',
-    new globalThis.TextEncoder().encode(secret),
+    new TextEncoder().encode(secret),
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign'],
   );
 
-  const signature = await globalThis.crypto.subtle.sign(
+  const signature = await crypto.subtle.sign(
     'HMAC',
     key,
-    new globalThis.TextEncoder().encode(message),
+    new TextEncoder().encode(message),
   );
 
-  return globalThis.btoa(String.fromCharCode(...new Uint8Array(signature)))
+  return btoa(String.fromCharCode(...new Uint8Array(signature)))
     .replace(/\+/g, '-')
     .replace(/\//g, '_')
     .replace(/=+$/, '');
@@ -240,8 +254,8 @@ function renditionHeight(objectKey) {
  */
 async function ticketIsLive(env, ctx, ticketId, userId) {
   const probe = `${env.API_ORIGIN}/api/v1/playback/tickets/${ticketId}/state?uid=${encodeURIComponent(userId)}`;
-  const cacheKey = new globalThis.Request(probe, { method: 'GET' });
-  const cache = globalThis.caches.default;
+  const cacheKey = new Request(probe, { method: 'GET' });
+  const cache = caches.default;
 
   const cached = await cache.match(cacheKey);
   if (cached) {
@@ -251,9 +265,9 @@ async function ticketIsLive(env, ctx, ticketId, userId) {
 
   let response;
   try {
-    response = await globalThis.fetch(probe, {
+    response = await fetch(probe, {
       headers: { 'x-edge-check': '1' },
-      signal: globalThis.AbortSignal.timeout(2000),
+      signal: AbortSignal.timeout(2000),
     });
   } catch {
     // Fail OPEN on a network error, deliberately.
@@ -273,7 +287,7 @@ async function ticketIsLive(env, ctx, ticketId, userId) {
   ctx.waitUntil(
     cache.put(
       cacheKey,
-      new globalThis.Response(JSON.stringify(payload), {
+      new Response(JSON.stringify(payload), {
         headers: { 'cache-control': 'max-age=10', 'content-type': 'application/json' },
       }),
     ),

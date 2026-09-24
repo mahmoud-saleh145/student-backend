@@ -1,4 +1,4 @@
-import { Body, Controller, Post } from '@nestjs/common';
+import { Body, Controller, Post, Query, Req } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { IsIn, IsInt, IsOptional, IsString, Matches, Max, MaxLength, Min } from 'class-validator';
 import { Type } from 'class-transformer';
@@ -9,7 +9,12 @@ import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
 import type { AuthenticatedUser } from '../../common/types/request-context';
 
+import type { Request } from 'express';
+
 import { StorageService } from './storage.service';
+
+/** Ceiling for a Library document, shared by both upload transports. */
+const MAX_LIBRARY_DOCUMENT_BYTES = 200 * 1024 * 1024;
 
 const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const DOC_TYPES = [
@@ -51,7 +56,25 @@ export class PresignLibraryDocumentDto {
   filename!: string;
 
   @IsIn([...DOC_TYPES, ...IMAGE_TYPES]) contentType!: string;
-  @Type(() => Number) @IsInt() @Min(1) @Max(200 * 1024 * 1024) sizeBytes!: number;
+  @Type(() => Number) @IsInt() @Min(1) @Max(MAX_LIBRARY_DOCUMENT_BYTES) sizeBytes!: number;
+}
+
+/**
+ * The proxied Library upload.
+ *
+ * Same filename and content-type rules as `PresignLibraryDocumentDto` — the
+ * decorators are restated rather than shared because the two carry different
+ * size fields: the presign form is *told* the size, whereas here the size is a
+ * fact of the request and is read from Content-Length rather than trusted.
+ */
+export class UploadLibraryDocumentQueryDto {
+  @IsString() @MaxLength(200)
+  @Matches(/^[\w .()\-؀-ۿ]+\.[A-Za-z0-9]{1,8}$/, {
+    message: 'filename contains unsupported characters',
+  })
+  filename!: string;
+
+  @IsIn([...DOC_TYPES, ...IMAGE_TYPES]) contentType!: string;
 }
 
 class PresignAttachmentDto {
@@ -146,11 +169,74 @@ export class StorageController {
     }
 
     return this.storage.presignUpload({
-      bucket: 'uploads',
+      // The Library's own bucket, not `uploads`. Reads resolve the bucket from
+      // the key prefix (StorageService.bucketForKey), so a `library/…` object
+      // written anywhere else cannot be read back.
+      bucket: 'library',
       objectKey: StorageService.keys.libraryDocument(dto.filename),
       contentType: dto.contentType,
       expiresIn: 3600,
     });
+  }
+
+  /**
+   * Uploads a Library document through this API instead of browser→R2.
+   *
+   * The presigned route above is the cheaper transport and stays available,
+   * but it needs a CORS policy on the bucket: that PUT is cross-origin, and
+   * without `Access-Control-Allow-Origin` the preflight fails before a byte
+   * moves — which is exactly the failure the dashboard was reporting. This
+   * route needs no CORS, because the dashboard talks only to its own origin.
+   *
+   * Bytes are streamed to R2 as they arrive rather than buffered, so a 200 MB
+   * document costs a held socket rather than 200 MB of heap. Content-Length is
+   * required — it is what lets the upload stream instead of falling back to a
+   * multipart upload — and is held to the same ceiling as the presign form.
+   */
+  @Post('uploads/library-document/content')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Upload a library document through the API',
+    description:
+      'Raw request body. Returns the object key to register with POST /library/materials/:id/parts.',
+  })
+  async libraryDocumentContent(
+    @Query() query: UploadLibraryDocumentQueryDto,
+    @Req() req: Request,
+  ) {
+    if (query.filename.includes('..') || query.filename.includes('/')) {
+      throw new AppException(ErrorCode.VALIDATION_ERROR, {
+        fields: { filename: ['must not contain path separators'] },
+      });
+    }
+
+    const declared = Number(req.headers['content-length'] ?? 0);
+
+    if (!Number.isFinite(declared) || declared <= 0) {
+      throw new AppException(ErrorCode.VALIDATION_ERROR, {
+        fields: { body: ['a Content-Length header is required'] },
+      });
+    }
+
+    if (declared > MAX_LIBRARY_DOCUMENT_BYTES) {
+      throw new AppException(ErrorCode.VALIDATION_ERROR, {
+        fields: {
+          body: [`document exceeds the ${MAX_LIBRARY_DOCUMENT_BYTES} byte limit`],
+        },
+      });
+    }
+
+    const objectKey = StorageService.keys.libraryDocument(query.filename);
+
+    await this.storage.putStream({
+      bucket: 'library',
+      objectKey,
+      body: req,
+      contentLength: declared,
+      contentType: query.contentType,
+    });
+
+    return { objectKey, sizeBytes: declared };
   }
 }
 
