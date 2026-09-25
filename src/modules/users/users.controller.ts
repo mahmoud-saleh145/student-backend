@@ -17,7 +17,7 @@ import {
 
 import { Audit } from '../../common/decorators/audit.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
-import { AdminOnly, MasterOnly } from '../../common/decorators/roles.decorator';
+import { AdminOnly } from '../../common/decorators/roles.decorator';
 import { SearchablePaginationDto } from '../../common/dto/pagination.dto';
 import type { AuthenticatedUser } from '../../common/types/request-context';
 
@@ -166,11 +166,11 @@ export class UsersController {
   }
 
   @Delete(':id')
-  @MasterOnly()
+  @AdminOnly()
   @ApiOperation({
-    summary: 'Soft-delete a user (master only)',
+    summary: 'Soft-delete a teacher or student (admin/master)',
     description:
-      'Marks the account deleted and frees the phone number. Financial and audit history is retained — the database forbids a hard delete.',
+      'Marks the account deleted, disables it, revokes every session, refresh token and playback grant, and frees the phone number. Financial, enrollment, wallet and audit history is retained — the database forbids a hard delete. Admins may delete teachers and students; only the master may delete an admin; nobody may delete the master. A teacher who is the only teacher on a live course must be replaced first.',
   })
   remove(
     @Param('id') id: string,

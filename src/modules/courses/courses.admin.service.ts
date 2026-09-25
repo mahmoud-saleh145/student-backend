@@ -953,6 +953,109 @@ export class CoursesAdminService {
     return { id: courseId, status: CourseStatus.DRAFT };
   }
 
+  /**
+   * Deletes a course — as far as the business rules allow.
+   *
+   * Always a SOFT delete. A course is referenced with `onDelete: Restrict` by
+   * payments, enrollments, access codes, redemptions, watch history and part
+   * purchases; those rows are the financial record and must outlive it. So a
+   * deleted course keeps its row (and every row pointing at it) but is gone
+   * from every list, detail and student surface, cannot be restored from the
+   * dashboard, and every unredeemed code for it is revoked so nobody can buy
+   * into something that no longer exists.
+   *
+   * Refused for a course students can still reach: a PUBLISHED course must be
+   * hidden or archived first, and a course with active enrollments must be
+   * archived first (which is the step that tells those students, and keeps a
+   * snapshot of what they had).
+   */
+  async remove(courseId: string, actor: { id: string; role: UserRole }, reason: string) {
+    if (actor.role !== UserRole.MASTER && actor.role !== UserRole.ADMIN) {
+      throw new AppException(ErrorCode.INSUFFICIENT_ROLE, {
+        message: 'Only administrators can delete a course',
+      });
+    }
+
+    const course = await this.prisma.course.findFirst({
+      where: { id: courseId, ...notDeleted },
+      select: { id: true, title: true, status: true },
+    });
+    if (!course) throw AppException.notFound('Course', courseId);
+
+    if (course.status === CourseStatus.PUBLISHED) {
+      throw new AppException(ErrorCode.INVALID_STATE, {
+        message: 'A published course cannot be deleted. Hide or archive it first.',
+      });
+    }
+
+    const [activeEnrollments, payments, redemptions] = await Promise.all([
+      this.prisma.enrollment.count({
+        where: {
+          courseId,
+          state: { in: [EnrollmentState.ACTIVE, EnrollmentState.PENDING_APPROVAL] },
+        },
+      }),
+      this.prisma.payment.count({ where: { courseId } }),
+      this.prisma.enrollment.count({ where: { courseId } }),
+    ]);
+
+    if (activeEnrollments > 0 && course.status !== CourseStatus.ARCHIVED) {
+      throw new AppException(ErrorCode.INVALID_STATE, {
+        message: `${activeEnrollments} student(s) still have access. Archive the course first, then delete it.`,
+        details: { activeEnrollments },
+      });
+    }
+
+    const now = new Date();
+
+    const revokedCodes = await this.prisma.$transaction(async (tx) => {
+      await tx.course.update({
+        where: { id: courseId },
+        data: {
+          deletedAt: now,
+          status: CourseStatus.ARCHIVED,
+          archivedAt: course.status === CourseStatus.ARCHIVED ? undefined : now,
+        },
+      });
+
+      await tx.enrollment.updateMany({
+        where: { courseId, state: { in: [EnrollmentState.ACTIVE, EnrollmentState.PENDING_APPROVAL] } },
+        data: { state: EnrollmentState.ARCHIVED },
+      });
+
+      await tx.playbackTicket.updateMany({
+        where: { courseId, status: 'ACTIVE' },
+        data: { status: 'REVOKED', revokedAt: now, revokedReason: 'Course deleted' },
+      });
+
+      const codes = await tx.accessCode.updateMany({
+        where: { courseId, status: 'ACTIVE' },
+        data: { status: 'REVOKED' },
+      });
+
+      return codes.count;
+    });
+
+    await this.audit.record({
+      actorId: actor.id,
+      actorRole: actor.role,
+      action: AuditAction.DELETE,
+      entity: 'course',
+      entityId: courseId,
+      before: { title: course.title, status: course.status },
+      after: { deletedAt: now.toISOString(), revokedCodes },
+      note: `${reason} — soft delete; ${payments} payment(s) and ${redemptions} enrollment record(s) retained`,
+    });
+
+    return {
+      id: courseId,
+      deleted: true,
+      mode: 'soft' as const,
+      retained: { payments, enrollments: redemptions },
+      revokedCodes,
+    };
+  }
+
   // ---------------------------------------------------------------------------
   // Staff detail
   // ---------------------------------------------------------------------------
@@ -1003,7 +1106,11 @@ export class CoursesAdminService {
             lessons: {
               where: notDeleted,
               orderBy: { sortOrder: 'asc' },
-              include: { video: { select: { id: true, status: true, durationSeconds: true } } },
+              include: {
+                video: {
+                  select: { id: true, status: true, durationSeconds: true, deletedAt: true },
+                },
+              },
             },
           },
         },
@@ -1039,6 +1146,15 @@ export class CoursesAdminService {
 
     return {
       ...course,
+      // A deleted video keeps its row; it must not read as the lecture's video.
+      sections: (course.sections ?? []).map((section) => ({
+        ...section,
+        lessons: (section.lessons ?? []).map((lesson) => ({
+          ...lesson,
+          video: lesson.video && !lesson.video.deletedAt ? lesson.video : null,
+          videoCount: lesson.video && !lesson.video.deletedAt ? 1 : 0,
+        })),
+      })),
       thumbnailUrl: await this.storage.publicAssetUrl(course.thumbnailKey),
       prices,
       /**

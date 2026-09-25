@@ -61,9 +61,13 @@ export class SectionsController {
 
   @Get('admin/courses/:courseId/sections')
   @StaffOnly()
-  @ApiOperation({ summary: 'List sections for authoring' })
-  list(@Param('courseId') courseId: string) {
-    return this.sections.listForCourse(courseId);
+  @ApiOperation({
+    summary: 'List sections, with every lecture, for authoring',
+    description:
+      'Staff view: includes DRAFT, HIDDEN and ARCHIVED lectures (so they can be published or restored), each with its live video and a real video count. Soft-deleted lectures and deleted videos are excluded.',
+  })
+  list(@Param('courseId') courseId: string, @CurrentUser() actor: AuthenticatedUser) {
+    return this.sections.listForCourse(courseId, actor);
   }
 
   @Post('admin/courses/:courseId/sections')

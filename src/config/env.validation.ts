@@ -176,6 +176,23 @@ export class EnvironmentVariables {
 /** Secrets that must never survive into a production deploy unchanged. */
 const PLACEHOLDER_PATTERN = /CHANGE_ME|changeme|your[-_]?secret|placeholder/i;
 
+/**
+ * The API's public origin, as the outside world reaches it.
+ *
+ * It is baked into every playback URL (master/media playlists and the AES key
+ * endpoint are served by this API). Left at its localhost default on a hosted
+ * deploy, every ticket handed a phone a manifest URL pointing at the phone
+ * itself. Render sets RENDER_EXTERNAL_URL on every web service, so that is
+ * used when PUBLIC_API_URL is not set explicitly.
+ */
+export function resolvePublicApiUrl(raw: Record<string, unknown> = process.env): string {
+  const explicit = typeof raw.PUBLIC_API_URL === 'string' ? raw.PUBLIC_API_URL.trim() : '';
+  if (explicit) return explicit.replace(/\/+$/, '');
+  const render = typeof raw.RENDER_EXTERNAL_URL === 'string' ? raw.RENDER_EXTERNAL_URL.trim() : '';
+  if (render) return render.replace(/\/+$/, '');
+  return 'http://localhost:3000';
+}
+
 export function validateEnv(raw: Record<string, unknown>): EnvironmentVariables {
   const config = plainToInstance(EnvironmentVariables, raw, {
     enableImplicitConversion: false,
@@ -242,6 +259,25 @@ export function validateEnv(raw: Record<string, unknown>): EnvironmentVariables 
       throw new Error(
         'MEDIA_CDN_BASE_URL is required in production: signed media URLs must be ' +
           'verified at the edge. See docs/MANUAL_STEPS.md step 8.',
+      );
+    }
+    if (!raw.R2_BUCKET_LIBRARY) {
+      console.error(
+        '[config] R2_BUCKET_LIBRARY is not set: Library documents fall back into the uploads ' +
+          'bucket, while the media Worker reads library/ keys from its LIBRARY binding ' +
+          '(edu-library) — uploaded PDFs will not open. Set R2_BUCKET_LIBRARY=edu-library.',
+      );
+    }
+
+    const publicUrl = resolvePublicApiUrl(raw);
+    if (!/^https:\/\//i.test(publicUrl) || /localhost|127\.0\.0\.1|10\.0\.2\.2/i.test(publicUrl)) {
+      // Logged, not thrown: the same production-mode .env is also used to run
+      // the API on a developer machine, where localhost is the right answer.
+      // On a hosted deploy it means no phone can open any video.
+      console.error(
+        `[config] PUBLIC_API_URL resolves to "${publicUrl}". Protected playback will not work ` +
+          'from a phone until it is the API\'s public https origin (e.g. ' +
+          'https://student-backend-814y.onrender.com) — manifest and AES-key URLs are built from it.',
       );
     }
     if (config.MEDIA_LOCAL_ORIGIN) {

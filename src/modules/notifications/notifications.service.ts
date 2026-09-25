@@ -453,11 +453,33 @@ export class NotificationsService {
       courseId?: string;
       universityId?: string;
       academicYearId?: string;
+      userId?: string;
       sendPush?: boolean;
       publishNow?: boolean;
     },
     actor: { id: string },
   ) {
+    // A direct message to one student is a notification, not an audience
+    // broadcast: there is no audience to record, so no Announcement row.
+    if (input.userId) {
+      const student = await this.prisma.user.findFirst({
+        where: { id: input.userId, role: UserRole.STUDENT, deletedAt: null },
+        select: { id: true, status: true },
+      });
+      if (!student) throw AppException.notFound('Student', input.userId);
+
+      const result = await this.createForMany([student.id], {
+        kind: NotificationKind.ANNOUNCEMENT,
+        title: input.title,
+        titleAr: input.titleAr,
+        body: input.body,
+        bodyAr: input.bodyAr,
+        route: input.route,
+        sendPush: input.sendPush ?? true,
+      });
+      return { userId: student.id, recipients: result.created, sentById: actor.id };
+    }
+
     const announcement = await this.prisma.announcement.create({
       data: {
         title: input.title,

@@ -178,7 +178,7 @@ and environment:
 
 | | API | Worker |
 | --- | --- | --- |
-| Command | `node dist/main.js` | `node dist/worker.js` |
+| Command | `node dist/src/main.js` | `node dist/src/worker.js` |
 | `RUN_WORKERS` | unset | `true` |
 | Ports | 3000 | none |
 | Disk | minimal | ≥100 GB scratch |

@@ -155,7 +155,11 @@ export class PlaybackService {
       });
     }
 
-    if (video.lesson.status !== ContentStatus.PUBLISHED && user.role === UserRole.STUDENT) {
+    if (
+      user.role === UserRole.STUDENT &&
+      (video.lesson.status !== ContentStatus.PUBLISHED ||
+        video.lesson.section.status !== ContentStatus.PUBLISHED)
+    ) {
       await this.denied(user, videoId, video.courseId, 'lesson not published');
       throw new AppException(ErrorCode.VIDEO_UNAVAILABLE);
     }

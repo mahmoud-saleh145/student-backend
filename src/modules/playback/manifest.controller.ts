@@ -1,7 +1,7 @@
 import { Controller, Get, Header, Param, Query, Res } from '@nestjs/common';
 import { ApiExcludeEndpoint, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsInt, IsString, MaxLength, Min } from 'class-validator';
+import { IsInt, IsOptional, IsString, MaxLength, Min } from 'class-validator';
 import type { Response } from 'express';
 
 import { Public } from '../../common/decorators/public.decorator';
@@ -9,12 +9,21 @@ import { RawResponse } from '../../common/decorators/raw-response.decorator';
 
 import { ManifestService } from './manifest.service';
 
-class SignedQueryDto {
+export class SignedQueryDto {
   @Type(() => Number) @IsInt() @Min(0) exp!: number;
   @IsString() @MaxLength(200) sig!: string;
 
-  /** Optional client ceiling; the ticket's ceiling still wins. */
-  @Type(() => Number) @IsInt() @Min(0) maxHeight?: number;
+  /**
+   * Optional client ceiling; the ticket's ceiling still wins.
+   *
+   * `@IsOptional()` is load-bearing. Without it the global ValidationPipe
+   * rejected every request that omitted the parameter with 422 — which is
+   * every "auto" quality master request and EVERY media-playlist request,
+   * because the per-rendition URLs this service writes never carry it. No
+   * stream could start: the player received a JSON error where it expected a
+   * playlist and failed immediately.
+   */
+  @IsOptional() @Type(() => Number) @IsInt() @Min(0) maxHeight?: number;
 }
 
 /**

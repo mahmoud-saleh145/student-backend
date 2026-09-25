@@ -214,6 +214,10 @@ export class ArchiveCourseDto {
   @IsString() @MinLength(3) @MaxLength(500) reason!: string;
 }
 
+export class DeleteCourseDto {
+  @IsString() @MinLength(3) @MaxLength(500) reason!: string;
+}
+
 export class UnpublishCourseDto {
   @IsIn([CourseStatus.DRAFT, CourseStatus.HIDDEN, CourseStatus.SUSPENDED])
   status!: Extract<CourseStatus, 'DRAFT' | 'HIDDEN' | 'SUSPENDED'>;

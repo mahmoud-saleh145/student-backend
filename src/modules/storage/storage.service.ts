@@ -11,10 +11,11 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHmac, randomUUID } from 'node:crypto';
-import { createReadStream } from 'node:fs';
+import { createReadStream, createWriteStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
 import type { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 
 import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
@@ -301,6 +302,21 @@ export class StorageService {
     const bytes = await response.Body?.transformToByteArray();
     if (!bytes) throw new AppException(ErrorCode.STORAGE_UNAVAILABLE);
     return Buffer.from(bytes);
+  }
+
+  /** Streams an object to a local file without holding it in memory. */
+  async downloadToFile(bucket: Bucket, objectKey: string, destination: string): Promise<void> {
+    this.assertConfigured();
+    const response = await this.client.send(
+      new GetObjectCommand({ Bucket: this.bucketName(bucket), Key: objectKey }),
+    );
+    const body = response.Body as NodeJS.ReadableStream | undefined;
+    if (!body || typeof (body as { pipe?: unknown }).pipe !== 'function') {
+      throw new AppException(ErrorCode.STORAGE_UNAVAILABLE, {
+        message: `Could not stream ${objectKey} from storage`,
+      });
+    }
+    await pipeline(body, createWriteStream(destination));
   }
 
   async exists(bucket: Bucket, objectKey: string): Promise<boolean> {

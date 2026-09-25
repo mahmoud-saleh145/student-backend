@@ -75,6 +75,14 @@ export class MaintenanceScheduler implements OnModuleInit {
     await schedule(this.maintenance as never, MAINTENANCE_JOBS.reclaimStreamSlots, '*/2 * * * *');
     await schedule(this.maintenance as never, MAINTENANCE_JOBS.expireTickets, '*/10 * * * *');
 
+    // Videos whose job vanished (Redis eviction, a worker killed mid-job) are
+    // put back on the queue instead of sitting in QUEUED forever.
+    await schedule(
+      this.maintenance as never,
+      MAINTENANCE_JOBS.recoverStrandedVideos,
+      '*/10 * * * *',
+    );
+
     // Hourly bookkeeping.
     await schedule(this.maintenance as never, MAINTENANCE_JOBS.expireEnrollments, '15 * * * *');
     await schedule(this.maintenance as never, MAINTENANCE_JOBS.expireCodes, '25 * * * *');

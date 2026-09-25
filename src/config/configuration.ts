@@ -1,6 +1,6 @@
 import { registerAs } from '@nestjs/config';
 
-import { type EnvironmentVariables, NodeEnv } from './env.validation';
+import { type EnvironmentVariables, NodeEnv, resolvePublicApiUrl } from './env.validation';
 
 const env = () => process.env as unknown as EnvironmentVariables;
 
@@ -19,7 +19,7 @@ export const appConfig = registerAs('app', () => ({
   port: num(process.env.PORT, 3000),
   apiPrefix: process.env.API_PREFIX ?? 'api',
   apiVersion: process.env.API_VERSION ?? '1',
-  publicUrl: process.env.PUBLIC_API_URL ?? 'http://localhost:3000',
+  publicUrl: resolvePublicApiUrl(process.env),
   corsOrigins: (process.env.CORS_ORIGINS ?? '')
     .split(',')
     .map((o) => o.trim())

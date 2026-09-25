@@ -3,7 +3,16 @@ import 'source-map-support/register';
 import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 
-import { AppModule } from './app.module';
+// NOTE: AppModule is deliberately NOT imported statically here.
+//
+// `jobs.module.ts` decides whether to register the BullMQ processors when it
+// is first evaluated, by reading RUN_WORKERS. A static import is hoisted and
+// runs before any statement in this file, so setting the variable inside
+// bootstrap() came too late: the processors were never registered, the worker
+// booted, logged "processing video…" and consumed nothing. Every uploaded
+// video stayed QUEUED. The flag is set first and the module graph is loaded
+// afterwards, dynamically.
+process.env.RUN_WORKERS = 'true';
 
 /**
  * Worker entry point.
@@ -19,7 +28,7 @@ import { AppModule } from './app.module';
  *   • a transcode must never compete with request handling for CPU.
  */
 async function bootstrap(): Promise<void> {
-  process.env.RUN_WORKERS = 'true';
+  const { AppModule } = await import('./app.module');
 
   const app = await NestFactory.createApplicationContext(AppModule, {
     bufferLogs: false,

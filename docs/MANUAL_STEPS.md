@@ -442,7 +442,7 @@ rate, the worker on queue depth.
 
 | | API service | Worker service |
 | --- | --- | --- |
-| Command | `node dist/main.js` | `node dist/worker.js` |
+| Command | `node dist/src/main.js` | `node dist/src/worker.js` |
 | `RUN_WORKERS` | leave unset | `true` |
 | Port | 3000 | none |
 | CPU / RAM | 1 vCPU / 1 GB | 4 vCPU / 8 GB |

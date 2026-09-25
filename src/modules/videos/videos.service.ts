@@ -19,6 +19,8 @@ import {
   VIDEO_JOBS,
   type TranscodeJobData,
 } from '../../jobs/queue.constants';
+import { readWorkerHeartbeat } from '../../jobs/worker-heartbeat';
+import { RedisService } from '../../redis/redis.service';
 import { AuditService } from '../audit/audit.service';
 import { CourseAccessService } from '../courses/course-access.service';
 import { CoursesService } from '../courses/courses.service';
@@ -64,6 +66,7 @@ export class VideosService {
     private readonly courses: CoursesService,
     private readonly notifications: NotificationsService,
     private readonly audit: AuditService,
+    private readonly redis: RedisService,
     @InjectQueue(QUEUE_NAMES.video) private readonly queue: Queue<TranscodeJobData>,
     config: ConfigService,
   ) {
@@ -96,28 +99,41 @@ export class VideosService {
 
     const lesson = await this.prisma.lesson.findFirst({
       where: { id: params.lessonId, ...notDeleted },
-      select: { id: true, courseId: true, video: { select: { id: true, status: true } } },
+      select: {
+        id: true,
+        courseId: true,
+        video: { select: { id: true, status: true, deletedAt: true, hlsPrefix: true } },
+      },
     });
     if (!lesson) throw AppException.notFound('Lesson', params.lessonId);
 
     await this.access.assertCanManageCourse(actor.id, actor.role, lesson.courseId, 'content');
 
-    // Uploading over an existing video replaces the source a student streams.
-    // That is the operation the "edit video URLs" switch governs; a first
-    // upload onto an empty lesson is ordinary content authoring and is not
-    // gated by it.
-    if (lesson.video) {
+    // Uploading over a LIVE video replaces the source a student streams. That
+    // is the operation the "edit video URLs" switch governs; a first upload
+    // onto an empty lesson — or onto one whose video was deleted — is
+    // ordinary content authoring and is not gated by it.
+    const liveVideo = lesson.video && !lesson.video.deletedAt ? lesson.video : null;
+    if (liveVideo) {
       await this.access.assertTeacherCapability(actor.role, 'editVideoUrls');
     }
 
-    // Replacing a video: reuse the row so the lesson↔video relation and every
-    // watch event that references it survive.
+    // A lecture holds one video row (lessonId is unique). Replacing — or
+    // uploading after a delete — reuses it, so the lesson↔video relation and
+    // every watch event that references it survive. `deletedAt` is cleared:
+    // before this, a re-upload after a delete kept the tombstone, and
+    // `complete` then answered "Video not found" for the video it had just
+    // created.
     const video = lesson.video
       ? await this.prisma.video.update({
           where: { id: lesson.video.id },
           data: {
             status: VideoStatus.UPLOADING,
             processingError: null,
+            processingJobId: null,
+            processingStartedAt: null,
+            processedAt: null,
+            deletedAt: null,
             uploadedById: actor.id,
           },
         })
@@ -190,43 +206,172 @@ export class VideosService {
       });
     }
 
+    if (video.status === VideoStatus.PROCESSING) {
+      throw new AppException(ErrorCode.INVALID_STATE, {
+        message: 'This video is already being processed',
+      });
+    }
+
     await this.prisma.video.update({
       where: { id: videoId },
       data: {
-        status: VideoStatus.QUEUED,
         sourceSizeBytes: BigInt(size),
         processingError: null,
         processingStartedAt: null,
       },
     });
 
-    const job = await this.queue.add(
-      VIDEO_JOBS.transcode,
-      {
-        videoId,
+    const jobId = await this.enqueueTranscode(
+      { id: videoId, sourceKey: video.sourceKey, lessonId: video.lessonId, courseId: video.courseId },
+      actor.id,
+    );
+
+    this.logger.log(`queued transcode job ${jobId} for video ${videoId} (${size} bytes)`);
+
+    return { videoId, status: VideoStatus.QUEUED, jobId, ...(await this.workerStatus()) };
+  }
+
+  /**
+   * Puts a transcode job on the queue and records it.
+   *
+   * The row only becomes QUEUED once the job is really in Redis. The previous
+   * order — status first, `queue.add` second — left a video QUEUED with no job
+   * behind it whenever Redis refused the write (a quota, a blip), and nothing
+   * would ever pick it up. On failure the row returns to UPLOADING with the
+   * reason, so the dashboard can offer the retry and the error is visible.
+   */
+  private async enqueueTranscode(
+    video: { id: string; sourceKey: string; lessonId: string; courseId: string },
+    requestedById?: string,
+  ): Promise<string> {
+    let jobId: string;
+    try {
+      const job = await this.queue.add(
+        VIDEO_JOBS.transcode,
+        {
+          videoId: video.id,
+          sourceKey: video.sourceKey,
+          lessonId: video.lessonId,
+          courseId: video.courseId,
+          ladder: this.cfg.ladder,
+          encrypt: this.cfg.encryptionEnabled,
+          requestedById,
+        },
+        {
+          ...DEFAULT_JOB_OPTIONS,
+          // Transcoding is expensive; two attempts, not three.
+          attempts: 2,
+          jobId: `transcode:${video.id}:${Date.now()}`,
+        },
+      );
+      jobId = String(job.id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.prisma.video.update({
+        where: { id: video.id },
+        data: {
+          status: VideoStatus.UPLOADING,
+          processingError: `Could not queue processing: ${message}`.slice(0, 1000),
+        },
+      });
+      this.logger.error(`could not enqueue transcode for ${video.id}: ${message}`);
+      throw new AppException(ErrorCode.QUEUE_UNAVAILABLE, {
+        message: 'The processing queue is unavailable. The upload is kept — try again shortly.',
+      });
+    }
+
+    await this.prisma.video.update({
+      where: { id: video.id },
+      data: { status: VideoStatus.QUEUED, processingJobId: jobId },
+    });
+
+    return jobId;
+  }
+
+  /**
+   * Whether any queue consumer has checked in recently. Returned with every
+   * enqueue so the dashboard can say "no worker is running" instead of
+   * showing QUEUED forever with no explanation.
+   */
+  async workerStatus(): Promise<{
+    workerOnline: boolean;
+    workerLastSeenAt: string | null;
+    workerCanTranscode: boolean | null;
+  }> {
+    const beat = await readWorkerHeartbeat(this.redis);
+    return {
+      workerOnline: Boolean(beat),
+      workerLastSeenAt: beat?.at ?? null,
+      workerCanTranscode: beat ? beat.ffmpeg && beat.ffprobe : null,
+    };
+  }
+
+  /**
+   * Re-queues videos whose job is gone.
+   *
+   * Run by the maintenance scheduler. A job can disappear without the row
+   * learning about it: Redis evicted or flushed, a worker killed mid-job
+   * (out of memory on a large source), a retention sweep. Such a video sits
+   * in QUEUED or PROCESSING indefinitely; this is what moves it again.
+   */
+  async recoverStrandedVideos(now = new Date()): Promise<{ requeued: number; failed: number }> {
+    const queuedCutoff = new Date(now.getTime() - 10 * 60_000);
+    const processingCutoff = new Date(now.getTime() - 3 * 3600_000);
+
+    const stranded = await this.prisma.video.findMany({
+      where: {
+        ...notDeleted,
+        OR: [
+          { status: VideoStatus.QUEUED, updatedAt: { lt: queuedCutoff } },
+          { status: VideoStatus.PROCESSING, processingStartedAt: { lt: processingCutoff } },
+        ],
+      },
+      select: {
+        id: true,
+        status: true,
+        sourceKey: true,
+        lessonId: true,
+        courseId: true,
+        processingJobId: true,
+      },
+      take: 50,
+    });
+
+    let requeued = 0;
+    let failed = 0;
+
+    for (const video of stranded) {
+      const job = video.processingJobId ? await this.queue.getJob(video.processingJobId) : null;
+      const state = job ? await job.getState() : 'missing';
+
+      if (state === 'waiting' || state === 'active' || state === 'delayed' || state === 'prioritized' || state === 'waiting-children') {
+        continue; // still genuinely in the pipeline
+      }
+
+      if (!video.sourceKey) continue;
+
+      if (video.status === VideoStatus.PROCESSING) {
+        await this.markFailed(
+          video.id,
+          `Processing was interrupted (job ${state}); retry to process the stored file again`,
+        );
+        failed += 1;
+        continue;
+      }
+
+      await this.enqueueTranscode({
+        id: video.id,
         sourceKey: video.sourceKey,
         lessonId: video.lessonId,
         courseId: video.courseId,
-        ladder: this.cfg.ladder,
-        encrypt: this.cfg.encryptionEnabled,
-        requestedById: actor.id,
-      },
-      {
-        ...DEFAULT_JOB_OPTIONS,
-        // Transcoding is expensive; two attempts, not three.
-        attempts: 2,
-        jobId: `transcode:${videoId}:${Date.now()}`,
-      },
-    );
+      });
+      requeued += 1;
+    }
 
-    await this.prisma.video.update({
-      where: { id: videoId },
-      data: { processingJobId: String(job.id) },
-    });
-
-    this.logger.log(`queued transcode job ${job.id} for video ${videoId} (${size} bytes)`);
-
-    return { videoId, status: VideoStatus.QUEUED, jobId: job.id };
+    if (requeued || failed) {
+      this.logger.warn(`stranded videos: requeued ${requeued}, marked failed ${failed}`);
+    }
+    return { requeued, failed };
   }
 
   // ---------------------------------------------------------------------------
@@ -270,11 +415,16 @@ export class VideosService {
       processingStartedAt: video.processingStartedAt?.toISOString() ?? null,
       processedAt: video.processedAt?.toISOString() ?? null,
       sourceSizeBytes: video.sourceSizeBytes ? Number(video.sourceSizeBytes) : null,
+      deleted: Boolean(video.deletedAt),
+      // Only worth a Redis read while the answer can explain a wait.
+      ...(video.status === VideoStatus.QUEUED || video.status === VideoStatus.PROCESSING
+        ? await this.workerStatus()
+        : {}),
     };
   }
 
   async retryProcessing(videoId: string, actor: { id: string; role: UserRole }) {
-    const video = await this.prisma.video.findFirst({ where: { id: videoId } });
+    const video = await this.prisma.video.findFirst({ where: { id: videoId, ...notDeleted } });
     if (!video) throw AppException.notFound('Video', videoId);
 
     await this.access.assertCanManageCourse(actor.id, actor.role, video.courseId, 'content');
@@ -290,35 +440,37 @@ export class VideosService {
 
     await this.prisma.video.update({
       where: { id: videoId },
-      data: { status: VideoStatus.QUEUED, processingError: null },
+      data: { processingError: null, processingStartedAt: null },
     });
 
-    const job = await this.queue.add(
-      VIDEO_JOBS.transcode,
-      {
-        videoId,
-        sourceKey: video.sourceKey,
-        lessonId: video.lessonId,
-        courseId: video.courseId,
-        ladder: this.cfg.ladder,
-        encrypt: this.cfg.encryptionEnabled,
-        requestedById: actor.id,
-      },
-      { ...DEFAULT_JOB_OPTIONS, attempts: 2 },
+    const jobId = await this.enqueueTranscode(
+      { id: video.id, sourceKey: video.sourceKey, lessonId: video.lessonId, courseId: video.courseId },
+      actor.id,
     );
 
-    return { videoId, status: VideoStatus.QUEUED, jobId: job.id };
+    return { videoId, status: VideoStatus.QUEUED, jobId, ...(await this.workerStatus()) };
   }
 
   // ---------------------------------------------------------------------------
   // Called by the worker
   // ---------------------------------------------------------------------------
 
-  async markProcessing(videoId: string): Promise<void> {
-    await this.prisma.video.update({
-      where: { id: videoId },
-      data: { status: VideoStatus.PROCESSING, processingStartedAt: new Date() },
+  /**
+   * Claims a video for processing. Returns false for a job that is no longer
+   * current — the video was deleted, or re-uploaded so its source changed —
+   * which the worker then skips instead of overwriting the newer state.
+   */
+  async markProcessing(videoId: string, sourceKey?: string): Promise<boolean> {
+    const claimed = await this.prisma.video.updateMany({
+      where: {
+        id: videoId,
+        deletedAt: null,
+        ...(sourceKey ? { sourceKey } : {}),
+        status: { in: [VideoStatus.QUEUED, VideoStatus.PROCESSING, VideoStatus.FAILED] },
+      },
+      data: { status: VideoStatus.PROCESSING, processingStartedAt: new Date(), processingError: null },
     });
+    return claimed.count > 0;
   }
 
   async markReady(
@@ -472,16 +624,37 @@ export class VideosService {
    * streamable.
    */
   async remove(videoId: string, actor: { id: string; role: UserRole }, purgeObjects = true) {
-    const video = await this.prisma.video.findFirst({ where: { id: videoId } });
+    const video = await this.prisma.video.findFirst({ where: { id: videoId, ...notDeleted } });
     if (!video) throw AppException.notFound('Video', videoId);
 
     await this.access.assertCanManageCourse(actor.id, actor.role, video.courseId, 'content');
     await this.access.assertTeacherCapability(actor.role, 'deleteVideos');
 
-    await this.prisma.video.update({
-      where: { id: videoId },
-      data: { status: VideoStatus.ARCHIVED, deletedAt: new Date() },
+    const now = new Date();
+    await this.prisma.$transaction(async (tx) => {
+      await tx.video.update({
+        where: { id: videoId },
+        data: { status: VideoStatus.ARCHIVED, deletedAt: now },
+      });
+      // Anyone mid-stream loses the grant at the next playlist fetch rather
+      // than watching a video that no longer exists until the ticket lapses.
+      await tx.playbackTicket.updateMany({
+        where: { videoId, status: 'ACTIVE' },
+        data: { status: 'REVOKED', revokedAt: now, revokedReason: 'Video deleted' },
+      });
+      // The lecture's duration came from this video (see markReady).
+      await tx.lesson.update({ where: { id: video.lessonId }, data: { durationSeconds: 0 } });
     });
+
+    // Drop any job still waiting so a deleted video is not transcoded later.
+    if (video.processingJobId) {
+      await this.queue
+        .getJob(video.processingJobId)
+        .then((job) => job?.remove())
+        .catch(() => undefined);
+    }
+
+    await this.courses.recountCourse(video.courseId);
 
     if (purgeObjects) {
       if (video.hlsPrefix) {

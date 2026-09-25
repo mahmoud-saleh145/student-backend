@@ -1,5 +1,5 @@
 import { BullModule } from '@nestjs/bullmq';
-import { Module } from '@nestjs/common';
+import { Logger, Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
 import type { RedisConfig } from '../config/configuration';
@@ -15,6 +15,7 @@ import { PushProcessor } from './processors/push.processor';
 import { VideoProcessor } from './processors/video.processor';
 import { QUEUE_NAMES } from './queue.constants';
 import { MaintenanceScheduler } from './schedulers/maintenance.scheduler';
+import { WorkerHeartbeat } from './worker-heartbeat';
 
 /**
  * Queue wiring.
@@ -25,6 +26,16 @@ import { MaintenanceScheduler } from './schedulers/maintenance.scheduler';
  * handling for CPU, and lets the two scale independently.
  */
 const runWorkers = process.env.RUN_WORKERS === 'true';
+
+if (!runWorkers && process.env.NODE_ENV !== 'test') {
+  // Not an error — the API is meant to only enqueue — but it is the single
+  // most common reason a video stays QUEUED, so it is said at boot.
+  new Logger('JobsModule').warn(
+    'RUN_WORKERS is not "true": this process only ENQUEUES jobs. Videos will stay QUEUED, ' +
+      'scheduled announcements will not send and stream slots will not be reclaimed unless a ' +
+      'worker (`npm run worker`, or RUN_WORKERS=true on a process with ffmpeg) is running.',
+  );
+}
 
 @Module({
   imports: [
@@ -68,7 +79,7 @@ const runWorkers = process.env.RUN_WORKERS === 'true';
   providers: [
     MaintenanceScheduler,
     ...(runWorkers
-      ? [VideoProcessor, PushProcessor, MaintenanceProcessor, AnalyticsProcessor]
+      ? [VideoProcessor, PushProcessor, MaintenanceProcessor, AnalyticsProcessor, WorkerHeartbeat]
       : []),
   ],
   exports: [BullModule],

@@ -59,6 +59,11 @@ class CreateAnnouncementDto {
   @IsOptional() @IsString() @MaxLength(32) courseId?: string;
   @IsOptional() @IsString() @MaxLength(32) universityId?: string;
   @IsOptional() @IsString() @MaxLength(32) academicYearId?: string;
+  /**
+   * One student. Used by the dashboard's "Send notification" on a student;
+   * the field was never accepted, so that button always failed validation.
+   */
+  @IsOptional() @IsString() @MaxLength(32) userId?: string;
   @IsOptional() @IsBoolean() sendPush?: boolean;
   @IsOptional() @IsBoolean() publishNow?: boolean;
 }

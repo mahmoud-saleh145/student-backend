@@ -68,9 +68,14 @@ export class LessonsService {
 
     if (!lesson) throw AppException.notFound('Lesson', lessonId);
 
+    // A student only reaches a published lecture in a published section. The
+    // section check was missing: hiding a section removed it from the course
+    // outline but its lectures stayed openable (and playable) by id, and the
+    // next/previous pointers still led into it.
     if (
-      lesson.status !== ContentStatus.PUBLISHED &&
-      role === UserRole.STUDENT
+      role === UserRole.STUDENT &&
+      (lesson.status !== ContentStatus.PUBLISHED ||
+        lesson.section.status !== ContentStatus.PUBLISHED)
     ) {
       throw AppException.notFound('Lesson', lessonId);
     }
@@ -117,6 +122,11 @@ export class LessonsService {
 
     const index = siblings.findIndex((s) => s.id === lesson.id);
 
+    // A deleted video keeps its row (watch events reference it) and the
+    // lesson↔video relation is one-to-one, so the relation still resolves to
+    // the tombstone. It must read as "no video", not as a playable one.
+    const video = lesson.video && !lesson.video.deletedAt ? lesson.video : null;
+
     return {
       id: lesson.id,
       sectionId: lesson.sectionId,
@@ -125,25 +135,25 @@ export class LessonsService {
       description: lesson.description,
       kind: lesson.kind,
       order: lesson.sortOrder,
-      durationSeconds: lesson.durationSeconds || lesson.video?.durationSeconds || 0,
+      durationSeconds: lesson.durationSeconds || video?.durationSeconds || 0,
       isPreview: lesson.isPreview,
       locked: false,
       attachmentCount: lesson.attachments.length,
       progress: toWatchProgress(progress),
 
       // Metadata only — deliberately no URL. See PlaybackService.
-      video: lesson.video
+      video: video
         ? {
-            id: lesson.video.id,
+            id: video.id,
             lessonId: lesson.id,
             courseId: lesson.courseId,
-            assetId: lesson.video.id,
-            durationSeconds: lesson.video.durationSeconds,
+            assetId: video.id,
+            durationSeconds: video.durationSeconds,
             thumbnailUrl: null,
-            availableQualities: lesson.video.renditions.map((r) => `${r.height}p`),
-            hasCaptions: lesson.video.captions.length > 0,
-            captionLanguages: lesson.video.captions.map((c) => c.language),
-            status: lesson.video.status,
+            availableQualities: video.renditions.map((r) => `${r.height}p`),
+            hasCaptions: video.captions.length > 0,
+            captionLanguages: video.captions.map((c) => c.language),
+            status: video.status,
           }
         : null,
 
@@ -174,11 +184,19 @@ export class LessonsService {
     courseId: string,
   ): Promise<{ id: string; videoId: string | null }[]> {
     const rows = await this.prisma.lesson.findMany({
-      where: { courseId, ...notDeleted, status: ContentStatus.PUBLISHED },
+      where: {
+        courseId,
+        ...notDeleted,
+        status: ContentStatus.PUBLISHED,
+        section: { deletedAt: null, status: ContentStatus.PUBLISHED },
+      },
       orderBy: [{ section: { sortOrder: 'asc' } }, { sortOrder: 'asc' }],
-      select: { id: true, video: { select: { id: true } } },
+      select: { id: true, video: { select: { id: true, deletedAt: true } } },
     });
-    return rows.map((r) => ({ id: r.id, videoId: r.video?.id ?? null }));
+    return rows.map((r) => ({
+      id: r.id,
+      videoId: r.video && !r.video.deletedAt ? r.video.id : null,
+    }));
   }
 
   /**
@@ -414,12 +432,35 @@ export class LessonsService {
       },
     });
 
+    // Taking a lecture off the shelf (draft, hidden, archived) must stop
+    // anyone already streaming it, not only the next person to ask.
+    if (
+      lesson.status === ContentStatus.PUBLISHED &&
+      updated.status !== ContentStatus.PUBLISHED
+    ) {
+      await this.prisma.playbackTicket.updateMany({
+        where: { lessonId, status: 'ACTIVE' },
+        data: {
+          status: 'REVOKED',
+          revokedAt: new Date(),
+          revokedReason: `Lecture ${updated.status.toLowerCase()}`,
+        },
+      });
+    }
+
     await this.courses.recountCourse(lesson.courseId);
 
     await this.audit.record({
       actorId: actor.id,
       actorRole: actor.role,
-      action: AuditAction.UPDATE,
+      action:
+        input.status && input.status !== lesson.status
+          ? input.status === ContentStatus.ARCHIVED
+            ? AuditAction.ARCHIVE
+            : lesson.status === ContentStatus.ARCHIVED
+              ? AuditAction.RESTORE
+              : AuditAction.UPDATE
+          : AuditAction.UPDATE,
       entity: 'lesson',
       entityId: lessonId,
       before: { title: lesson.title, status: lesson.status },
@@ -483,6 +524,11 @@ export class LessonsService {
       await tx.video.updateMany({
         where: { lessonId },
         data: { status: VideoStatus.ARCHIVED },
+      });
+
+      await tx.playbackTicket.updateMany({
+        where: { lessonId, status: 'ACTIVE' },
+        data: { status: 'REVOKED', revokedAt: now, revokedReason: 'Lecture deleted' },
       });
 
       await tx.$executeRaw`

@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { AuditAction, ContentStatus, type UserRole } from '@prisma/client';
 
 import { AppException } from '../../common/errors/app.exception';
+import { ErrorCode } from '../../common/errors/error-codes';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { CourseAccessService } from '../courses/course-access.service';
@@ -25,14 +26,71 @@ export class SectionsService {
     private readonly audit: AuditService,
   ) {}
 
-  async listForCourse(courseId: string) {
-    return this.prisma.courseSection.findMany({
+  /**
+   * The authoring view of a course's structure.
+   *
+   * The dashboard used to read lectures from the student endpoint
+   * (`GET /courses/:id/sections`), which has the student shape: no lecture
+   * status, no video, no way to see an archived lecture again. So a lecture
+   * that was archived vanished with no restore path, a DRAFT lecture looked
+   * identical to a published one, and nothing said students could not see it.
+   * This returns every non-deleted lecture with its status, its live video and
+   * a real video count.
+   */
+  async listForCourse(courseId: string, actor?: { id: string; role: UserRole }) {
+    if (actor && !(await this.access.staffMayViewCourse(actor.id, actor.role, courseId))) {
+      throw new AppException(ErrorCode.NOT_COURSE_TEACHER, {
+        message: 'You are not assigned to this course',
+      });
+    }
+
+    const sections = await this.prisma.courseSection.findMany({
       where: { courseId, ...notDeleted },
       orderBy: { sortOrder: 'asc' },
       include: {
         _count: { select: { lessons: { where: { deletedAt: null } } } },
+        lessons: {
+          where: notDeleted,
+          orderBy: { sortOrder: 'asc' },
+          include: {
+            video: {
+              select: {
+                id: true,
+                status: true,
+                durationSeconds: true,
+                deletedAt: true,
+                processingError: true,
+                updatedAt: true,
+              },
+            },
+            _count: { select: { attachments: { where: { deletedAt: null } } } },
+          },
+        },
       },
     });
+
+    return sections.map(({ lessons, ...section }) => ({
+      ...section,
+      lessons: lessons.map(({ video, _count, ...lesson }) => {
+        const live = video && !video.deletedAt ? video : null;
+        return {
+          ...lesson,
+          attachmentCount: _count.attachments,
+          // From the relation, not a stored counter: 0 or 1 today, because a
+          // lecture holds exactly one video row (Video.lessonId is unique).
+          videoCount: live ? 1 : 0,
+          video: live
+            ? {
+                id: live.id,
+                status: live.status,
+                durationSeconds: live.durationSeconds,
+                processingError: live.processingError,
+                updatedAt: live.updatedAt,
+              }
+            : null,
+        };
+      }),
+    }));
   }
 
   async create(

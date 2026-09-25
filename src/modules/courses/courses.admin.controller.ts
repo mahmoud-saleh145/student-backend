@@ -11,6 +11,7 @@ import { CoursesAdminService } from './courses.admin.service';
 import {
   ArchiveCourseDto,
   AssignTeacherDto,
+  DeleteCourseDto,
   ChangePriceDto,
   CreateCourseDto,
   ListStaffCoursesDto,
@@ -199,5 +200,20 @@ export class CoursesAdminController {
   })
   restore(@Param('courseId') courseId: string, @CurrentUser() actor: AuthenticatedUser) {
     return this.admin.restore(courseId, actor);
+  }
+
+  @Delete(':courseId')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Delete a course (soft delete)',
+    description:
+      'Removes the course from every list and from the app. Payments, enrollments, codes, redemptions and watch history are retained (the schema forbids deleting them) and unredeemed codes are revoked. Refused for a PUBLISHED course, and for one whose students still have access until it is archived.',
+  })
+  remove(
+    @Param('courseId') courseId: string,
+    @Body() dto: DeleteCourseDto,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    return this.admin.remove(courseId, actor, dto.reason);
   }
 }

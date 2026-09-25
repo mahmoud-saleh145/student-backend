@@ -596,6 +596,37 @@ export class UsersService {
     }
     this.assertCanManage(actor, target.role);
 
+    if (target.id === actor.id) {
+      throw new AppException(ErrorCode.INVALID_STATE, { message: 'You cannot delete your own account' });
+    }
+
+    // A course with no teacher cannot be managed or published. Deleting its
+    // only teacher would strand it, so that is refused with the courses named.
+    if (target.role === UserRole.TEACHER) {
+      const assignments = await this.prisma.courseTeacher.findMany({
+        where: {
+          teacherId: userId,
+          course: { deletedAt: null, status: { not: 'ARCHIVED' } },
+        },
+        select: {
+          course: {
+            select: { id: true, title: true, _count: { select: { teachers: true } } },
+          },
+        },
+      });
+      const stranded = assignments
+        .map((a) => a.course)
+        .filter((course) => course._count.teachers <= 1);
+      if (stranded.length > 0) {
+        throw new AppException(ErrorCode.INVALID_STATE, {
+          message: `This teacher is the only teacher on: ${stranded
+            .map((c) => c.title)
+            .join(', ')}. Assign another teacher (or archive the course) first.`,
+          details: { courseIds: stranded.map((c) => c.id) },
+        });
+      }
+    }
+
     const now = new Date();
 
     await this.prisma.$transaction([
@@ -615,6 +646,10 @@ export class UsersService {
       this.prisma.refreshToken.updateMany({
         where: { userId, revokedAt: null },
         data: { revokedAt: now, revokedReason: reason },
+      }),
+      this.prisma.playbackTicket.updateMany({
+        where: { userId, status: 'ACTIVE' },
+        data: { status: 'REVOKED', revokedAt: now, revokedReason: 'Account deleted' },
       }),
     ]);
 

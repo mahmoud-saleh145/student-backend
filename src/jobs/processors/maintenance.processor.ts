@@ -9,6 +9,7 @@ import { EnrollmentsService } from '../../modules/enrollments/enrollments.servic
 import { AnnouncementsService } from '../../modules/notifications/announcements.service';
 import { NotificationsService } from '../../modules/notifications/notifications.service';
 import { PlaybackService } from '../../modules/playback/playback.service';
+import { VideosService } from '../../modules/videos/videos.service';
 import { MAINTENANCE_JOBS, QUEUE_NAMES, type MaintenanceJobData } from '../queue.constants';
 
 /**
@@ -34,6 +35,7 @@ export class MaintenanceProcessor extends WorkerHost {
     private readonly playback: PlaybackService,
     private readonly notifications: NotificationsService,
     private readonly announcements: AnnouncementsService,
+    private readonly videos: VideosService,
   ) {
     super();
   }
@@ -66,6 +68,9 @@ export class MaintenanceProcessor extends WorkerHost {
       // any message is written, so a duplicate tick dispatches nothing.
       case MAINTENANCE_JOBS.dispatchAnnouncements:
         return this.announcements.dispatchDue(new Date());
+
+      case MAINTENANCE_JOBS.recoverStrandedVideos:
+        return this.videos.recoverStrandedVideos();
 
       default:
         this.logger.warn(`unknown maintenance job: ${job.name}`);

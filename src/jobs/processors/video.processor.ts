@@ -7,7 +7,7 @@ import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path';
 
 import type { VideoConfig } from '../../config/configuration';
-import { ManifestService } from '../../modules/playback/manifest.service';
+import { HLS_CODECS, ManifestService } from '../../modules/playback/manifest.service';
 import { StorageService } from '../../modules/storage/storage.service';
 import { VideosService } from '../../modules/videos/videos.service';
 import { QUEUE_NAMES, VIDEO_JOBS, type TranscodeJobData } from '../queue.constants';
@@ -79,7 +79,11 @@ export class VideoProcessor extends WorkerHost {
     this.logger.log(`transcoding video ${videoId} (job ${job.id})`);
 
     try {
-      await this.videos.markProcessing(videoId);
+      const claimed = await this.videos.markProcessing(videoId, sourceKey);
+      if (!claimed) {
+        this.logger.warn(`skipping stale transcode job ${job.id} for video ${videoId}`);
+        return { videoId, skipped: true };
+      }
       await mkdir(workDir, { recursive: true });
 
       // 1. download ---------------------------------------------------------
@@ -205,9 +209,17 @@ export class VideoProcessor extends WorkerHost {
   // Steps
   // ---------------------------------------------------------------------------
 
+  /**
+   * Streams the source to scratch disk.
+   *
+   * It used to buffer the whole object in memory first. Sources are allowed
+   * up to 8 GB, so any real lecture recording could exhaust the worker's heap
+   * (a 512 MB instance dies on a ~400 MB file) — the job then vanished with
+   * the process instead of being marked FAILED, and the video sat in
+   * PROCESSING/QUEUED forever.
+   */
   private async downloadSource(sourceKey: string, destination: string): Promise<void> {
-    const buffer = await this.storage.getObjectBuffer('uploads', sourceKey);
-    await writeFile(destination, buffer);
+    await this.storage.downloadToFile('uploads', sourceKey, destination);
   }
 
   private async probe(filePath: string): Promise<ProbeResult> {
@@ -406,7 +418,7 @@ export class VideoProcessor extends WorkerHost {
 
     for (const r of renditions) {
       lines.push(
-        `#EXT-X-STREAM-INF:BANDWIDTH=${r.bitrateKbps * 1000},RESOLUTION=${r.width}x${r.height},CODECS="avc1.4d401f,mp4a.40.2"`,
+        `#EXT-X-STREAM-INF:BANDWIDTH=${r.bitrateKbps * 1000},RESOLUTION=${r.width}x${r.height},CODECS="${HLS_CODECS}"`,
       );
       lines.push(`${r.height}p/index.m3u8`);
     }

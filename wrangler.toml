@@ -23,12 +23,16 @@ name = "edu-media-gate"
 main = "docs/cloudflare-worker.js"
 compatibility_date = "2025-01-01"
 
-# No *.workers.dev hostname.
+# The *.workers.dev hostname stays ON.
 #
-# The bucket is private and this Worker is the only path to its bytes; a second
-# public hostname would be a second, unmonitored door to the same content. The
-# custom domain below is the only way in.
-workers_dev = false
+# Production's MEDIA_CDN_BASE_URL is https://edu-media-gate.startuppp3.workers.dev/
+# and that hostname is live (verified 2026-09-25: unsigned requests answer 403
+# `x-deny-reason: unsigned`, i.e. this Worker is serving it). This file used to
+# say `workers_dev = false`; the next `wrangler deploy` from it would have
+# switched that hostname off and every segment request would have failed —
+# playback down for everyone. Turn it off only after a custom domain is live
+# AND MEDIA_CDN_BASE_URL has been moved to it.
+workers_dev = true
 
 # --- R2 ----------------------------------------------------------------------
 # The binding name is part of the Worker's contract: cloudflare-worker.js:142
@@ -60,8 +64,10 @@ bucket_name = "edu-library"
 # which matches the @Public() route in playback.controller.ts:189 given
 # API_PREFIX=api and API_VERSION=1. No trailing slash.
 #
-# REPLACE with your real production API hostname before deploying.
-API_ORIGIN = "https://api.REPLACE-ME.example"
+# The production API on Render. With the placeholder that was here, every
+# live-ticket check failed to resolve and the Worker failed OPEN — revoked
+# tickets kept streaming until their signed URLs expired.
+API_ORIGIN = "https://student-backend-814y.onrender.com"
 
 # Compared as the string "true" (cloudflare-worker.js:134), so it is quoted.
 # With this on, a signed URL that was copied elsewhere still fails once the

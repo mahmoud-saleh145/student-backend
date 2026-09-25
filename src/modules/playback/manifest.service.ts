@@ -37,6 +37,9 @@ import { StorageService } from '../storage/storage.service';
  * `playbackHeaders` is therefore empty by design.
  * ─────────────────────────────────────────────────────────────────────────
  */
+/** Kept in step with VideoProcessor.runFfmpeg's encoder settings. */
+export const HLS_CODECS = 'avc1.640029,mp4a.40.2';
+
 @Injectable()
 export class ManifestService {
   private readonly logger = new Logger(ManifestService.name);
@@ -202,7 +205,11 @@ export class ManifestService {
         `#EXT-X-STREAM-INF:BANDWIDTH=${rendition.bitrateKbps * 1000},` +
           `AVERAGE-BANDWIDTH=${Math.round(rendition.bitrateKbps * 900)},` +
           `RESOLUTION=${rendition.width}x${rendition.height},` +
-          `CODECS="avc1.4d401f,mp4a.40.2"`,
+          // Must describe what the worker actually encodes: libx264
+          // `-profile:v high -level 4.1` (avc1.640029) + AAC-LC. The previous
+          // value advertised Main@3.1, which AVPlayer and ExoPlayer can use to
+          // reject or mis-select a variant.
+          `CODECS="${HLS_CODECS}"`,
       );
       lines.push(this.buildMediaUrl(params.ticketId, rendition.height, params.exp));
     }
