@@ -233,6 +233,17 @@ export class DevicesService {
       message: `Login from an unbound device (${created.name}); account already has ${activeCount} active device(s)`,
     });
 
+    // The device is parked PENDING_APPROVAL, and the protected-content gate
+    // answers DEVICE_CHANGE_PENDING for exactly that status. Without a
+    // matching DeviceChangeRequest the administrator has nothing to approve:
+    // `listChangeRequests` reads `deviceChangeRequest`, not `device`, so the
+    // student was told to wait for a review that could never be queued.
+    await this.ensureChangeRequest(
+      userId,
+      created,
+      'Automatic: sign-in from an unbound device',
+    );
+
     return {
       deviceId: created.id,
       status: created.status,
@@ -383,22 +394,6 @@ export class DevicesService {
       });
     }
 
-    const existingPending = await this.prisma.deviceChangeRequest.findFirst({
-      where: { userId: params.userId, status: DeviceChangeStatus.PENDING },
-    });
-
-    if (existingPending) {
-      const updated = await this.prisma.deviceChangeRequest.update({
-        where: { id: existingPending.id },
-        data: {
-          requestedDeviceKey: params.device.deviceKey,
-          requestedDeviceName: params.device.name ?? 'Unknown device',
-          reason: params.reason ?? existingPending.reason,
-        },
-      });
-      return { ok: true, status: updated.status, requestId: updated.id };
-    }
-
     // Make sure a row exists for the requested device so an approving admin
     // has something concrete to authorize.
     const deviceRow = await this.prisma.device.upsert({
@@ -418,17 +413,55 @@ export class DevicesService {
       update: { lastSeenAt: new Date() },
     });
 
-    const request = await this.prisma.deviceChangeRequest.create({
-      data: {
-        userId: params.userId,
-        requestedDeviceId: deviceRow.id,
-        requestedDeviceKey: params.device.deviceKey,
-        requestedDeviceName: deviceRow.name,
-        reason: params.reason,
-      },
-    });
+    const request = await this.ensureChangeRequest(
+      params.userId,
+      deviceRow,
+      params.reason,
+    );
 
     return { ok: true, status: request.status, requestId: request.id };
+  }
+
+  /**
+   * One pending change request per student, pointing at the device they are
+   * actually trying to use.
+   *
+   * Idempotent on purpose. A blocked device keeps signing in and keeps landing
+   * here; creating a row each time would bury the administrator in duplicates
+   * of the same decision. An existing pending request is re-pointed at the
+   * newest device instead, which is also the behaviour a student expects after
+   * switching handsets twice.
+   */
+  private async ensureChangeRequest(
+    userId: string,
+    deviceRow: { id: string; deviceKey: string; name: string },
+    reason?: string,
+  ) {
+    const existingPending = await this.prisma.deviceChangeRequest.findFirst({
+      where: { userId, status: DeviceChangeStatus.PENDING },
+    });
+
+    if (existingPending) {
+      return this.prisma.deviceChangeRequest.update({
+        where: { id: existingPending.id },
+        data: {
+          requestedDeviceId: deviceRow.id,
+          requestedDeviceKey: deviceRow.deviceKey,
+          requestedDeviceName: deviceRow.name,
+          reason: reason ?? existingPending.reason,
+        },
+      });
+    }
+
+    return this.prisma.deviceChangeRequest.create({
+      data: {
+        userId,
+        requestedDeviceId: deviceRow.id,
+        requestedDeviceKey: deviceRow.deviceKey,
+        requestedDeviceName: deviceRow.name,
+        reason,
+      },
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -666,16 +699,48 @@ export class DevicesService {
   }
 
   /** Admin clears a student's binding entirely (e.g. lost phone). */
+  /**
+   * Clears a student's device bindings so the next sign-in binds afresh.
+   *
+   * The rows are **deleted**, not marked revoked. Marking them left the
+   * binding permanently stuck: `resolveOnLogin` looks the device up by
+   * `(userId, deviceKey)`, and a surviving row — whatever its status — sends
+   * the sign-in down `handleKnownDevice`, which has no path back to ACTIVE.
+   * Auto-binding lives only in `handleUnknownDevice`, reachable only when no
+   * row exists. So the same handset could never re-bind after a reset, and the
+   * old comment here promising it would was simply wrong.
+   *
+   * Deleting is safe for history: `Session.deviceId`, `PlaybackTicket.deviceId`
+   * and `DeviceChangeRequest.requestedDeviceId` are all `onDelete: SetNull`, so
+   * sessions, playback grants and the request trail survive with a null device
+   * reference. Security events record `deviceKey` as text and are untouched.
+   *
+   * Outstanding requests are cancelled in the same breath: a pending request
+   * for a binding that no longer exists is a decision an administrator can no
+   * longer meaningfully make, and leaving it would have `ensureChangeRequest`
+   * re-point that stale row instead of opening a fresh one.
+   */
   async resetBinding(userId: string, actor: { id: string; role: UserRole }, reason: string) {
-    const { count } = await this.prisma.device.updateMany({
-      where: { userId, status: { in: [DeviceStatus.ACTIVE, DeviceStatus.PENDING_APPROVAL] } },
-      data: { status: DeviceStatus.REVOKED, revokedAt: new Date(), revokedReason: reason },
-    });
-
-    await this.prisma.session.updateMany({
-      where: { userId, status: 'ACTIVE' },
-      data: { status: 'REVOKED', revokedAt: new Date(), revokedReason: 'Device binding reset' },
-    });
+    const [{ count }, { count: cancelled }] = await this.prisma.$transaction([
+      this.prisma.device.deleteMany({ where: { userId } }),
+      this.prisma.deviceChangeRequest.updateMany({
+        where: { userId, status: DeviceChangeStatus.PENDING },
+        data: {
+          status: DeviceChangeStatus.CANCELLED,
+          reviewedById: actor.id,
+          reviewedAt: new Date(),
+          reviewNote: `Cancelled by device binding reset: ${reason}`,
+        },
+      }),
+      this.prisma.session.updateMany({
+        where: { userId, status: 'ACTIVE' },
+        data: {
+          status: 'REVOKED',
+          revokedAt: new Date(),
+          revokedReason: 'Device binding reset',
+        },
+      }),
+    ]);
 
     await this.audit.record({
       actorId: actor.id,
@@ -683,10 +748,11 @@ export class DevicesService {
       action: AuditAction.DEVICE_REVOKE,
       entity: 'user',
       entityId: userId,
-      note: `Device binding reset (${count} device(s)): ${reason}`,
+      note: `Device binding reset (${count} device(s), ${cancelled} pending request(s) cancelled): ${reason}`,
     });
 
-    // The next login re-binds automatically when autoBindFirst is on.
-    return { ok: true, revoked: count };
+    // The next sign-in now genuinely reaches `handleUnknownDevice` and binds
+    // under the ordinary limit rule.
+    return { ok: true, revoked: count, cancelledRequests: cancelled };
   }
 }
