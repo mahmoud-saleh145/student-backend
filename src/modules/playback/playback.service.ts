@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   ContentStatus,
+  DeviceStatus,
   PlaybackTicketStatus,
   SecurityEventType,
   SecuritySeverity,
@@ -24,6 +25,13 @@ import { StorageService } from '../storage/storage.service';
 import { TokenService } from '../auth/token.service';
 
 import { ManifestService } from './manifest.service';
+
+/**
+ * Prefix `LibraryDocumentsService.issueTicket` puts on `tid` for a document
+ * grant. Declared here because the edge liveness probe is the other half of
+ * that contract, and the two must agree.
+ */
+const LIBRARY_TICKET_PREFIX = 'lib_';
 
 /** Matches the mobile app's `PlaybackTicket` type exactly. */
 export interface PlaybackTicketResponse {
@@ -701,6 +709,19 @@ export class PlaybackService {
   async ticketLiveness(ticketId: string, uid: string | null): Promise<{ live: boolean }> {
     if (!ticketId || !uid) return { live: false };
 
+    // A library document grant carries no PlaybackTicket row: `issueTicket` in
+    // library-documents.service.ts signs `lib_<partId>` and relies on the
+    // entitlement as the durable record. Looking that id up in
+    // `playbackTicket` therefore always missed, the edge read `live: false`,
+    // and every library PDF was refused with `ticket_revoked` — while the
+    // signature, the expiry and the bucket were all fine.
+    if (ticketId.startsWith(LIBRARY_TICKET_PREFIX)) {
+      return this.libraryTicketLiveness(
+        ticketId.slice(LIBRARY_TICKET_PREFIX.length),
+        uid,
+      );
+    }
+
     const ticket = await this.prisma.playbackTicket.findFirst({
       where: { id: ticketId, userId: uid },
       select: {
@@ -728,6 +749,80 @@ export class PlaybackService {
     if (Date.now() - ticket.lastHeartbeatAt.getTime() > staleAfter) {
       return { live: false };
     }
+
+    return { live: true };
+  }
+
+  /**
+   * Is a library document grant still good?
+   *
+   * The video branch above re-reads the ticket row, which pins one session and
+   * one device. A library grant has no row, so this re-runs the checks
+   * `LibraryDocumentsService.issueTicket` made when it minted the URL:
+   *
+   *   - the part and its material must not be withdrawn — deleted or
+   *     `ARCHIVED`. Mirrored exactly from `issueTicket`, including that
+   *     `isActive` is deliberately *not* part of it: the edge must not refuse
+   *     a grant the issuing path would have allowed.
+   *   - a non-preview part needs a live entitlement. A preview is openable by
+   *     anyone, which is what makes it a preview.
+   *
+   * **One deliberate difference.** The edge probe carries only the ticket id
+   * and `uid` (`ticketIsLive` in docs/cloudflare-worker.js), not `sid`/`did`,
+   * so the specific session and device in the URL cannot be identified here
+   * without changing the Worker contract. Instead this asks whether the
+   * account still has *any* live session, and any authorised device for
+   * device-bound content. That keeps the property the check exists for — a
+   * signed URL dies when the student is signed out, their device revoked or
+   * their binding reset — while being weaker than the video branch for an
+   * account holding several devices, where revoking one does not kill a URL
+   * minted on it until the URL expires (PLAYBACK_TICKET_TTL, 300s).
+   */
+  private async libraryTicketLiveness(
+    libraryPartId: string,
+    userId: string,
+  ): Promise<{ live: boolean }> {
+    if (!libraryPartId) return { live: false };
+
+    const part = await this.prisma.libraryPart.findFirst({
+      where: { id: libraryPartId, ...notDeleted },
+      select: {
+        id: true,
+        isPreview: true,
+        status: true,
+        material: { select: { status: true, deletedAt: true } },
+      },
+    });
+
+    if (!part) return { live: false };
+
+    if (
+      part.status === ContentStatus.ARCHIVED ||
+      part.material.deletedAt !== null ||
+      part.material.status === ContentStatus.ARCHIVED
+    ) {
+      return { live: false };
+    }
+
+    if (!part.isPreview) {
+      const entitlement = await this.prisma.libraryEntitlement.findUnique({
+        where: { userId_libraryPartId: { userId, libraryPartId: part.id } },
+        select: { revokedAt: true },
+      });
+
+      if (!entitlement || entitlement.revokedAt !== null) return { live: false };
+    }
+
+    const [activeSessions, activeDevices] = await this.prisma.$transaction([
+      this.prisma.session.count({ where: { userId, status: 'ACTIVE' } }),
+      this.prisma.device.count({ where: { userId, status: DeviceStatus.ACTIVE } }),
+    ]);
+
+    if (activeSessions === 0) return { live: false };
+
+    // Previews are not device-bound when the URL is minted, so they are not
+    // device-bound when it is re-checked either.
+    if (!part.isPreview && activeDevices === 0) return { live: false };
 
     return { live: true };
   }
