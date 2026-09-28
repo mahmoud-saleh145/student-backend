@@ -259,8 +259,7 @@ async function ticketIsLive(env, ctx, ticketId, userId) {
 
   const cached = await cache.match(cacheKey);
   if (cached) {
-    const body = await cached.json();
-    return body.live === true;
+    return readLive(await cached.json());
   }
 
   let response;
@@ -293,7 +292,26 @@ async function ticketIsLive(env, ctx, ticketId, userId) {
     ),
   );
 
-  return payload.live === true;
+  return readLive(payload);
+}
+
+/**
+ * Pull the liveness flag out of the API's answer.
+ *
+ * The API wraps every handler's return value in an envelope —
+ * `{ success, data: { live }, meta }` — so reading `payload.live` found
+ * `undefined`, which is not `true`, and every signed media request was refused
+ * with `ticket_revoked` even though the grant was live. That took down video
+ * segments and Library documents together, while manifests and AES keys (which
+ * the API serves itself, never through this Worker) kept working — which is
+ * what made it look like a storage problem rather than an edge one.
+ *
+ * Both shapes are accepted so this Worker keeps working whichever side of the
+ * envelope the API is on, and a missing flag still reads as "not live".
+ */
+function readLive(payload) {
+  const live = payload?.data?.live ?? payload?.live;
+  return live === true;
 }
 
 function contentTypeFor(objectKey) {
