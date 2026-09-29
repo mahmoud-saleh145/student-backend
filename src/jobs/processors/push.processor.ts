@@ -8,6 +8,7 @@ import type { NotificationConfig } from '../../config/configuration';
 import { PrismaService } from '../../database/prisma.service';
 import { NotificationsService } from '../../modules/notifications/notifications.service';
 import { QUEUE_NAMES, type PushJobData } from '../queue.constants';
+import { RESPONSIVE_WORKER } from '../queue.tuning';
 
 interface ExpoTicket {
   status: 'ok' | 'error';
@@ -38,7 +39,7 @@ interface ExpoTicket {
  *     app is uninstalled; three strikes and the token is deactivated, which
  *     keeps the send list from degrading into mostly-dead entries.
  */
-@Processor(QUEUE_NAMES.push, { concurrency: 5 })
+@Processor(QUEUE_NAMES.push, { concurrency: 5, ...RESPONSIVE_WORKER })
 export class PushProcessor extends WorkerHost {
   private readonly logger = new Logger(PushProcessor.name);
   private readonly cfg: NotificationConfig;

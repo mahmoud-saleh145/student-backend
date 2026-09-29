@@ -16,15 +16,25 @@ import { RedisService } from '../redis/redis.service';
  *
  * So the consuming process writes a short-lived heartbeat key, and the API
  * reads it (`/meta/health/deep`, `POST /videos/:id/complete`). A missing key
- * means "no worker has checked in within the last minute" — reported plainly
+ * means "no worker has checked in for three minutes" — reported plainly
  * instead of being discovered by a stuck lecture.
  *
  * A plain Redis key rather than BullMQ's `getWorkers()`: that relies on
  * `CLIENT LIST`, which managed Redis services such as Upstash do not allow.
  */
 export const WORKER_HEARTBEAT_KEY = 'worker:heartbeat';
-export const WORKER_HEARTBEAT_TTL_SECONDS = 60;
-const INTERVAL_MS = 20_000;
+/*
+ * One write per interval, forever, on a per-request Redis plan: at the old
+ * 20 seconds that was 4,320 requests a day — about 130,000 a month — to answer
+ * a question nobody asks more than a few times a day.
+ *
+ * A minute between beats with a three-minute TTL still reports a dead worker
+ * within three minutes, which is well inside the window that matters: the
+ * symptom it exists to explain is a video stuck in QUEUED, and nobody notices
+ * that in under three minutes.
+ */
+export const WORKER_HEARTBEAT_TTL_SECONDS = 180;
+const INTERVAL_MS = 60_000;
 
 export interface WorkerHeartbeatPayload {
   pid: number;

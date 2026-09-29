@@ -78,18 +78,28 @@ export class CatalogService {
     );
   }
 
-  /** One call for admin dashboards that need the whole tree. */
+  /**
+   * One call for admin dashboards that need the whole tree.
+   *
+   * Inactive rows are **included**, unlike every student-facing reader above.
+   * Deactivating sets both `isActive: false` and `deletedAt`, so filtering
+   * `notDeleted` here made a deactivated university vanish from the only
+   * screen that could bring it back: the row disappeared, its "Reactivate"
+   * menu item became unreachable, and the `Inactive` badge the structure
+   * manager renders could never appear. This is the management view — it has
+   * to show the things that need managing.
+   *
+   * Nothing student-facing reads this route (`@AdminOnly`), so no catalogue a
+   * student sees widens as a result.
+   */
   async tree() {
     const universities = await this.prisma.university.findMany({
-      where: notDeleted,
       orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
       include: {
         faculties: {
-          where: notDeleted,
           orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
           include: {
             departments: {
-              where: notDeleted,
               orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
             },
           },

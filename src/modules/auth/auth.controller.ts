@@ -3,6 +3,7 @@ import { ApiBearerAuth, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagg
 import type { Request } from 'express';
 
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { CredentialThrottle } from '../../common/throttle.constants';
 import { Public } from '../../common/decorators/public.decorator';
 import { AuthThrottle } from '../../common/decorators/throttle.decorator';
 import type { AuthenticatedUser, DeviceContext } from '../../common/types/request-context';
@@ -24,6 +25,7 @@ export class AuthController {
   // ---------------------------------------------------------------------------
 
   @Post('register')
+  @CredentialThrottle()
   @Public()
   @AuthThrottle()
   @HttpCode(HttpStatus.CREATED)
@@ -40,6 +42,7 @@ export class AuthController {
   }
 
   @Post('login')
+  @CredentialThrottle()
   @Public()
   @AuthThrottle()
   @HttpCode(HttpStatus.OK)
@@ -55,6 +58,16 @@ export class AuthController {
     return this.auth.login(dto, meta(req));
   }
 
+  // Deliberately NOT @CredentialThrottle().
+  //
+  // Refresh is not a guessing target — the refresh token is a 256-bit secret,
+  // single-use and rotating, so a 10-per-minute ceiling buys nothing against
+  // an attacker. What it does buy is an outage: this route is `@Public()`, so
+  // the rate-limit key falls back to the client IP, and a school or a mobile
+  // carrier puts hundreds of students behind one. Ten refreshes a minute
+  // shared between all of them means legitimate sessions start failing to
+  // renew at peak, each failure sends the app straight back to try again, and
+  // the 429s feed the retry that caused them.
   @Post('refresh')
   @Public()
   @HttpCode(HttpStatus.OK)
@@ -120,6 +133,7 @@ export class AuthController {
   }
 
   @Post('password')
+  @CredentialThrottle()
   @ApiBearerAuth('access-token')
   @AuthThrottle()
   @HttpCode(HttpStatus.OK)

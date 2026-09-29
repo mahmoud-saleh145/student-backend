@@ -11,6 +11,7 @@ import { NotificationsService } from '../../modules/notifications/notifications.
 import { PlaybackService } from '../../modules/playback/playback.service';
 import { VideosService } from '../../modules/videos/videos.service';
 import { MAINTENANCE_JOBS, QUEUE_NAMES, type MaintenanceJobData } from '../queue.constants';
+import { BACKGROUND_WORKER } from '../queue.tuning';
 
 /**
  * Housekeeping.
@@ -24,7 +25,7 @@ import { MAINTENANCE_JOBS, QUEUE_NAMES, type MaintenanceJobData } from '../queue
  * idempotency keys are the only rows pruned, and both are transient by
  * construction.
  */
-@Processor(QUEUE_NAMES.maintenance, { concurrency: 1 })
+@Processor(QUEUE_NAMES.maintenance, { concurrency: 1, ...BACKGROUND_WORKER })
 export class MaintenanceProcessor extends WorkerHost {
   private readonly logger = new Logger(MaintenanceProcessor.name);
 

@@ -11,6 +11,7 @@ import { HLS_CODECS, ManifestService } from '../../modules/playback/manifest.ser
 import { StorageService } from '../../modules/storage/storage.service';
 import { VideosService } from '../../modules/videos/videos.service';
 import { QUEUE_NAMES, VIDEO_JOBS, type TranscodeJobData } from '../queue.constants';
+import { RESPONSIVE_WORKER } from '../queue.tuning';
 
 interface ProbeResult {
   durationSeconds: number;
@@ -55,7 +56,10 @@ const BITRATES: Record<number, { video: number; audio: number; maxrate: number }
   // parallel jobs just thrash.
   concurrency: 1,
   lockDuration: 30 * 60_000,
-  stalledInterval: 60_000,
+  // `stalledInterval` comes from the shared profile; the explicit 60s here was
+  // the same value, and centralising it keeps the Redis polling budget in one
+  // place. `drainDelay` is the one that was never set and cost the most.
+  ...RESPONSIVE_WORKER,
 })
 export class VideoProcessor extends WorkerHost {
   private readonly logger = new Logger(VideoProcessor.name);

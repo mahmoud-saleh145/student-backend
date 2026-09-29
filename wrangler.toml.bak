@@ -99,18 +99,3 @@ TICKET_CHECK = "true"
 # routes = [
 #   { pattern = "media.REPLACE-ME.example", custom_domain = true }
 # ]
-
-# --- observability -----------------------------------------------------------
-# Worker logs, ON deliberately.
-#
-# Without this block wrangler sends the default for compatibility_date
-# 2025-01-01, which is OFF, and a deploy from this file SILENTLY TURNS OFF
-# logging that was enabled in the dashboard. That happened on 2026-09-27: the
-# deploy that fixed library/ routing also disabled logs, so the per-invocation
-# status and x-deny-reason needed to diagnose the next failure were gone.
-#
-# These logs are the only place the media gate's deny reason is observable;
-# the Worker returns it as the `x-deny-reason` response header and logs the
-# invocation's response.status. Keep this ON.
-[observability]
-enabled = true

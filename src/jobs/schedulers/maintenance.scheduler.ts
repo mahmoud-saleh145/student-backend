@@ -62,25 +62,38 @@ export class MaintenanceScheduler implements OnModuleInit {
     };
 
     // Every minute, because a send scheduled for 19:00 should happen at 19:00
-    // and not at 19:09. The job is a single indexed query when nothing is due,
-    // which is almost always — cheap enough to run at this rate.
+    // and not at 19:09. The job body is a single indexed query when nothing is
+    // due, which is almost always — but the *scheduling* is not free: on a
+    // per-request Redis plan each occurrence costs roughly a dozen commands
+    // between the delayed-set move, the fetch script, the completion and the
+    // re-schedule. At one a minute that is ~1,400 occurrences a day.
+    //
+    // Left at one minute because punctuality is the feature. It is the single
+    // largest remaining scheduled cost, so it is configurable: set
+    // ANNOUNCEMENT_SWEEP_CRON to '*/5 * * * *' to trade nine minutes of
+    // worst-case lateness for four fifths of this line's Redis traffic.
     await schedule(
       this.maintenance as never,
       MAINTENANCE_JOBS.dispatchAnnouncements,
-      '* * * * *',
+      process.env.ANNOUNCEMENT_SWEEP_CRON?.trim() || '* * * * *',
     );
 
-    // Frequent, cheap: reclaim streaming slots so a crashed client doesn't
-    // block the student's next video for long.
-    await schedule(this.maintenance as never, MAINTENANCE_JOBS.reclaimStreamSlots, '*/2 * * * *');
-    await schedule(this.maintenance as never, MAINTENANCE_JOBS.expireTickets, '*/10 * * * *');
+    // Reclaim streaming slots so a crashed client doesn't block the student's
+    // next video for long. Every five minutes rather than every two: each
+    // occurrence is a dozen-odd Redis commands on a per-request plan, and the
+    // slot lease already expires on its own — this sweep only shortens the
+    // wait, it is not what makes the slot recoverable.
+    await schedule(this.maintenance as never, MAINTENANCE_JOBS.reclaimStreamSlots, '*/5 * * * *');
+    await schedule(this.maintenance as never, MAINTENANCE_JOBS.expireTickets, '*/15 * * * *');
 
     // Videos whose job vanished (Redis eviction, a worker killed mid-job) are
-    // put back on the queue instead of sitting in QUEUED forever.
+    // put back on the queue instead of sitting in QUEUED forever. This is a
+    // rare-failure backstop, not a hot path — half-hourly is soon enough, and
+    // `POST /videos/:id/complete` re-enqueues immediately in the normal case.
     await schedule(
       this.maintenance as never,
       MAINTENANCE_JOBS.recoverStrandedVideos,
-      '*/10 * * * *',
+      '*/30 * * * *',
     );
 
     // Hourly bookkeeping.

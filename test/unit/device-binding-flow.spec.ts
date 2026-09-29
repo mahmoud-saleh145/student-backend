@@ -95,6 +95,15 @@ function build(options: Options = {}) {
     count: 3,
   }));
 
+  // A reset has to take away everything the old handset could still act with,
+  // not just its Device rows — see the assertions below.
+  const ticketUpdateMany = jest.fn(async (_args: { where: Record<string, unknown> }) => ({
+    count: 2,
+  }));
+  const refreshTokenUpdateMany = jest.fn(
+    async (_args: { where: Record<string, unknown> }) => ({ count: 2 }),
+  );
+
   // Only the array form is modelled. The callback form would have to hand the
   // callback a client, which means referencing `prisma` inside its own
   // initialiser — a circular type under `noImplicitAny`.
@@ -114,6 +123,8 @@ function build(options: Options = {}) {
       updateMany: requestUpdateMany,
     },
     session: { updateMany: sessionUpdateMany },
+    playbackTicket: { updateMany: ticketUpdateMany },
+    refreshToken: { updateMany: refreshTokenUpdateMany },
     $transaction: jest.fn(async (operations: readonly unknown[]) => Promise.all(operations)),
   };
 
@@ -144,6 +155,8 @@ function build(options: Options = {}) {
     requestUpdate,
     requestUpdateMany,
     sessionUpdateMany,
+    ticketUpdateMany,
+    refreshTokenUpdateMany,
     audit,
   };
 }
@@ -198,6 +211,39 @@ describe('resetting a binding frees the handset', () => {
     const { service, sessionUpdateMany } = build();
     await service.resetBinding(STUDENT_ID, ADMIN, 'reset');
     expect(sessionUpdateMany).toHaveBeenCalled();
+  });
+
+  it('revokes the playback tickets the old handset was holding', async () => {
+    // This is the case the feature exists for — a lost or stolen phone — and
+    // the one that was not covered. `PlaybackTicket.deviceId` is ON DELETE SET
+    // NULL, so hard-deleting the Device rows left every ticket ACTIVE with a
+    // null device: the handset kept streaming until the ticket lapsed.
+    const { service, ticketUpdateMany } = build();
+
+    await service.resetBinding(STUDENT_ID, ADMIN, 'phone stolen');
+
+    const call = ticketUpdateMany.mock.calls[0];
+    if (!call) throw new Error('playbackTicket.updateMany was never called');
+
+    const where = call[0].where as { userId: string; status: string };
+    expect(where.userId).toBe(STUDENT_ID);
+    expect(where.status).toBe('ACTIVE');
+  });
+
+  it('revokes the refresh tokens, so the old handset cannot mint a new session', async () => {
+    // Revoking the sessions alone was not enough: the very next request would
+    // have exchanged a still-valid refresh token for a fresh access token and
+    // put the revoked handset straight back in.
+    const { service, refreshTokenUpdateMany } = build();
+
+    await service.resetBinding(STUDENT_ID, ADMIN, 'phone stolen');
+
+    const call = refreshTokenUpdateMany.mock.calls[0];
+    if (!call) throw new Error('refreshToken.updateMany was never called');
+
+    const where = call[0].where as { userId: string; revokedAt: null };
+    expect(where.userId).toBe(STUDENT_ID);
+    expect(where.revokedAt).toBeNull();
   });
 
   it('the next sign-in from the same handset binds it ACTIVE', async () => {

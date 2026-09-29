@@ -165,6 +165,21 @@ export class AnnouncementsService {
     const existing = await this.prisma.announcement.findUnique({ where: { id } });
     if (!existing) throw AppException.notFound('Announcement', id);
 
+    // Only something still to come can be called off. Cancelling a SENT
+    // announcement overwrote its status and made the history read as though it
+    // had never gone out, when in fact students had already received it —
+    // and cancelling mid-SENDING raced `advance()`, which then wrote the
+    // status back and revived the schedule.
+    if (
+      existing.status !== AnnouncementStatus.SCHEDULED &&
+      existing.status !== AnnouncementStatus.DRAFT
+    ) {
+      throw new AppException(ErrorCode.ANNOUNCEMENT_NOT_EDITABLE, {
+        message: `This announcement is ${existing.status.toLowerCase()} and can no longer be cancelled.`,
+        details: { announcementId: id, status: existing.status },
+      });
+    }
+
     // Cancelling stops future occurrences. It never touches notifications
     // already delivered — those belong to the students who received them.
     return this.prisma.announcement.update({
@@ -307,6 +322,14 @@ export class AnnouncementsService {
       where: { id: announcementId },
     });
     if (!announcement) throw AppException.notFound('Announcement', announcementId);
+
+    // A cancelled announcement must stay cancelled. "Send now" on one would
+    // otherwise deliver it and then `advance()` would stamp SCHEDULED or SENT
+    // over the cancellation — reviving something an administrator had
+    // deliberately called off, and pushing it to students.
+    if (announcement.status === AnnouncementStatus.CANCELLED) {
+      return { announcementId, occurrenceAt: now, skipped: 'cancelled' as const };
+    }
 
     const occurrenceAt = announcement.nextOccurrenceAt ?? now;
 

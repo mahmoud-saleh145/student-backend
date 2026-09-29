@@ -674,6 +674,14 @@ export class DevicesService {
           revokedReason: 'Device revoked',
         },
       }),
+      // ...and so does its ability to mint a new session. Killing the session
+      // alone left the refresh token live, and the very next request would
+      // have exchanged it for a fresh access token on the device we had just
+      // revoked. `SessionsService.revoke` has always done both; this did not.
+      this.prisma.refreshToken.updateMany({
+        where: { session: { deviceId }, revokedAt: null },
+        data: { revokedAt: new Date(), revokedReason: `Device revoked: ${reason}` },
+      }),
     ]);
 
     await this.audit.record({
@@ -712,8 +720,12 @@ export class DevicesService {
    *
    * Deleting is safe for history: `Session.deviceId`, `PlaybackTicket.deviceId`
    * and `DeviceChangeRequest.requestedDeviceId` are all `onDelete: SetNull`, so
-   * sessions, playback grants and the request trail survive with a null device
-   * reference. Security events record `deviceKey` as text and are untouched.
+   * the request trail survives with a null device reference, and security
+   * events record `deviceKey` as text, so the history stays readable.
+   *
+   * Everything the old handset could still act with is revoked in the same
+   * transaction: sessions, playback tickets and refresh tokens. Anything less
+   * leaves a reset that looks complete on screen and is not.
    *
    * Outstanding requests are cancelled in the same breath: a pending request
    * for a binding that no longer exists is a decision an administrator can no
@@ -739,6 +751,28 @@ export class DevicesService {
           revokedAt: new Date(),
           revokedReason: 'Device binding reset',
         },
+      }),
+
+      // Revoking the sessions is not enough on its own, and this is the case
+      // the feature exists for: a lost or stolen phone.
+      //
+      // The Device rows are hard-deleted above, and `PlaybackTicket.deviceId`
+      // is ON DELETE SET NULL — so every ticket the old handset held simply
+      // lost its device reference and stayed ACTIVE. It could keep streaming
+      // until the ticket lapsed. And an un-revoked refresh token would have
+      // minted a fresh access token the moment the old session was killed,
+      // putting it straight back in.
+      this.prisma.playbackTicket.updateMany({
+        where: { userId, status: 'ACTIVE' },
+        data: {
+          status: 'REVOKED',
+          revokedAt: new Date(),
+          revokedReason: 'Device binding reset',
+        },
+      }),
+      this.prisma.refreshToken.updateMany({
+        where: { userId, revokedAt: null },
+        data: { revokedAt: new Date(), revokedReason: 'Device binding reset' },
       }),
     ]);
 

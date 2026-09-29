@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { AuditAction, ContentStatus, type UserRole } from '@prisma/client';
+import { AuditAction, ContentStatus, type UserRole, VideoStatus } from '@prisma/client';
 
 import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
@@ -269,6 +269,20 @@ export class SectionsService {
     const section = await this.requireSection(sectionId);
     await this.access.assertCanManageCourse(actor.id, actor.role, section.courseId, 'content');
 
+    const liveLessons = await this.prisma.lesson.count({
+      where: { sectionId, deletedAt: null },
+    });
+
+    // Removing a section removes every lecture inside it, so it has to clear
+    // the same bar `LessonsService.remove` does. Without this, the platform's
+    // "teachers may delete lectures" switch was bypassable by deleting the
+    // section instead — the dashboard hides the per-lecture button when the
+    // switch is off, but the section button was never gated, and the API is
+    // the boundary that counts.
+    if (liveLessons > 0) {
+      await this.access.assertTeacherCapability(actor.role, 'deleteLectures');
+    }
+
     const watched = await this.prisma.watchProgress.count({
       where: { lesson: { sectionId } },
     });
@@ -283,6 +297,21 @@ export class SectionsService {
       await tx.lesson.updateMany({
         where: { sectionId, deletedAt: null },
         data: { deletedAt: now, status: ContentStatus.ARCHIVED },
+      });
+
+      // Mirrors `LessonsService.remove`. The video rows are retained because
+      // watch events reference them and storage cleanup is a separate audited
+      // job, but they must stop being streamable.
+      await tx.video.updateMany({
+        where: { lesson: { sectionId } },
+        data: { status: VideoStatus.ARCHIVED },
+      });
+
+      // A ticket already issued keeps playing until it lapses, which meant a
+      // student could carry on watching a section that had just been removed.
+      await tx.playbackTicket.updateMany({
+        where: { lesson: { sectionId }, status: 'ACTIVE' },
+        data: { status: 'REVOKED', revokedAt: now, revokedReason: 'Section deleted' },
       });
 
       // Close the gap so ordering stays contiguous.

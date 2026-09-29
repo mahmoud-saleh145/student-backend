@@ -5,6 +5,7 @@ import type { Job } from 'bullmq';
 
 import { PrismaService } from '../../database/prisma.service';
 import { ANALYTICS_JOBS, QUEUE_NAMES, type AnalyticsJobData } from '../queue.constants';
+import { BACKGROUND_WORKER } from '../queue.tuning';
 
 /**
  * Nightly analytics rollup.
@@ -16,7 +17,7 @@ import { ANALYTICS_JOBS, QUEUE_NAMES, type AnalyticsJobData } from '../queue.con
  * The rollup is idempotent (upsert keyed on course+day), so re-running it for
  * a past day corrects the numbers rather than double-counting.
  */
-@Processor(QUEUE_NAMES.analytics, { concurrency: 1 })
+@Processor(QUEUE_NAMES.analytics, { concurrency: 1, ...BACKGROUND_WORKER })
 export class AnalyticsProcessor extends WorkerHost {
   private readonly logger = new Logger(AnalyticsProcessor.name);
 

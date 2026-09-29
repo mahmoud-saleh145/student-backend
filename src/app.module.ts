@@ -5,6 +5,7 @@ import { ThrottlerModule } from '@nestjs/throttler';
 
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { RolesGuard } from './common/guards/roles.guard';
+import { ResilientThrottlerStorage } from './common/guards/resilient-throttler.storage';
 import { ThrottlerProxyGuard } from './common/guards/throttler-proxy.guard';
 import { RequestContextMiddleware } from './common/middleware/request-context.middleware';
 import { ConfigModule } from './config/config.module';
@@ -85,11 +86,31 @@ import { RedisModule } from './redis/redis.module';
         const throttle = config.getOrThrow<ThrottleConfig>('throttle');
         const redis = config.getOrThrow<RedisConfig>('redis');
 
-        // Named throttlers let sensitive routes opt into a tighter bucket via
-        // @Throttle({ auth: {...} }) without lowering the global ceiling.
+        // ONE throttler, not two.
+        //
+        // There used to be a second named `auth` throttler here, on the theory
+        // that credential routes could opt into it with `@Throttle({ auth })`.
+        // Nothing ever did — and `ThrottlerGuard` does not wait to be asked: it
+        // loops over every configured throttler and applies each one unless a
+        // route explicitly skips it by name. So the `auth` bucket was not a
+        // stricter option available to login; it was a second ceiling on the
+        // entire API, and the lower of the two always won.
+        //
+        // Two consequences, both live in production:
+        //
+        //  1. The real global limit was THROTTLE_AUTH_LIMIT (10/min), not
+        //     THROTTLE_LIMIT (120/min). A dashboard screen that fires a dozen
+        //     queries on load was one page refresh away from 429s.
+        //  2. Every single request cost **two** Redis round trips instead of
+        //     one, because each throttler increments its own key. On Upstash,
+        //     where the bill is per request, that doubled the cost of every
+        //     call the platform makes.
+        //
+        // The tight credential limit still exists — it now lives on the four
+        // routes it was written for (see `CREDENTIAL_THROTTLE`), applied to
+        // this same throttler so there is still only one key per request.
         const throttlers = [
           { name: 'default', ttl: throttle.ttl * 1000, limit: throttle.limit },
-          { name: 'auth', ttl: throttle.ttl * 1000, limit: throttle.authLimit },
         ];
 
         // Redis storage is loaded lazily and optionally: local development
@@ -101,7 +122,13 @@ import { RedisModule } from './redis/redis.module';
 
           return {
             throttlers,
-            storage: new ThrottlerStorageRedisService(redis.url),
+            // Wrapped so a Redis outage degrades the rate limiter instead of
+            // the API. See ResilientThrottlerStorage — an unavailable store
+            // used to surface as a 500 on every route, which both clients
+            // then retried.
+            storage: new ResilientThrottlerStorage(
+              new ThrottlerStorageRedisService(redis.url),
+            ),
           };
         } catch {
           return { throttlers };

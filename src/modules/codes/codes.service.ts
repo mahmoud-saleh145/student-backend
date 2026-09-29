@@ -801,10 +801,38 @@ export class CodesService {
     const code = await this.prisma.accessCode.findUnique({ where: { id: codeId } });
     if (!code) throw AppException.notFound('Access code', codeId);
 
-    const updated = await this.prisma.accessCode.update({
-      where: { id: codeId },
+    // Only a code that can still be used is revocable. Without this guard a
+    // REDEEMED or EXHAUSTED card could be stamped REVOKED, which rewrites the
+    // commercial history of a card a student actually paid for: the row stops
+    // saying "this was sold and used" and starts saying "this was cancelled".
+    // The redemption rows survive either way, but the code's own status is
+    // what the codes screen and the revenue reconciliation read.
+    //
+    // Enforced here rather than only in the dashboard, because the dashboard
+    // decides from a list that may be seconds out of date — a card redeemed
+    // between the page load and the click would otherwise be overwritten.
+    if (code.status !== CodeStatus.ACTIVE) {
+      throw new AppException(ErrorCode.INVALID_STATE, {
+        message: `This code is ${code.status.toLowerCase()} and can no longer be cancelled.`,
+        details: { codeId, status: code.status },
+      });
+    }
+
+    // Conditional on the status we just read, so two administrators cancelling
+    // at once, or a redemption landing in between, cannot both win.
+    const { count } = await this.prisma.accessCode.updateMany({
+      where: { id: codeId, status: CodeStatus.ACTIVE },
       data: { status: CodeStatus.REVOKED, revokedAt: new Date(), revokedById: actor.id },
     });
+
+    if (count === 0) {
+      throw new AppException(ErrorCode.INVALID_STATE, {
+        message: 'This code changed while you were cancelling it. Reload and try again.',
+        details: { codeId },
+      });
+    }
+
+    const updated = { status: CodeStatus.REVOKED };
 
     await this.audit.record({
       actorId: actor.id,
@@ -821,6 +849,12 @@ export class CodesService {
   }
 
   async revokeBatch(batchId: string, actor: { id: string; role: UserRole }, reason: string) {
+    // A batch id that does not exist used to answer `{ revoked: 0 }` and write
+    // an audit row saying an administrator cancelled a batch that was never
+    // there. A typo should be a 404, not a misleading entry in the log.
+    const batch = await this.prisma.codeBatch.findUnique({ where: { id: batchId } });
+    if (!batch) throw AppException.notFound('Code batch', batchId);
+
     const { count } = await this.prisma.accessCode.updateMany({
       where: { batchId, status: { in: [CodeStatus.ACTIVE] } },
       data: { status: CodeStatus.REVOKED, revokedAt: new Date(), revokedById: actor.id },
