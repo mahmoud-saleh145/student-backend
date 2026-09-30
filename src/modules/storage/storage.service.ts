@@ -133,6 +133,21 @@ export class StorageService {
     videoThumbnail: (videoId: string) => `thumbnails/videos/${videoId}.jpg`,
     courseThumbnail: (courseId: string, ext: string) =>
       `thumbnails/courses/${courseId}/${randomUUID()}${ext}`,
+    /**
+     * Part and library-part thumbnails.
+     *
+     * Filed under the parent's prefix so a course's or material's images stay
+     * together, and each upload gets a fresh UUID rather than overwriting:
+     * replacing a thumbnail must not break a URL a client already cached, and
+     * the old object is deleted explicitly once the row points at the new one.
+     */
+    coursePartThumbnail: (courseId: string, partId: string, ext: string) =>
+      `thumbnails/courses/${courseId}/parts/${partId}/${randomUUID()}${ext}`,
+    libraryPartThumbnail: (materialId: string, partId: string, ext: string) =>
+      `thumbnails/library/${materialId}/parts/${partId}/${randomUUID()}${ext}`,
+    /** The fallback image applied to library parts that have none of their own. */
+    libraryDefaultThumbnail: (ext: string) =>
+      `thumbnails/library/_default/${randomUUID()}${ext}`,
     avatar: (userId: string, ext: string) => `avatars/${userId}/${randomUUID()}${ext}`,
     attachment: (courseId: string, filename: string) =>
       `attachments/${courseId}/${randomUUID()}${extname(filename).toLowerCase() || '.bin'}`,

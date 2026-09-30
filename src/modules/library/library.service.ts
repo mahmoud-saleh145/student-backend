@@ -6,6 +6,7 @@ import { paginated } from '../../common/types/api-response';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { StorageService } from '../storage/storage.service';
+import { PlatformSettingsService } from '../settings/platform-settings.service';
 
 /**
  * Library structure, and what a student sees of it.
@@ -29,7 +30,33 @@ export class LibraryService {
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
     private readonly storage: StorageService,
+    // SettingsModule is @Global, so this arrives without a module import and
+    // without risking a cycle back into the library.
+    private readonly settings: PlatformSettingsService,
   ) {}
+
+  /**
+   * The image to show for a library part.
+   *
+   * Three tiers, most specific first: the part's own thumbnail, the
+   * material's cover, then the platform default. Resolved HERE, on read,
+   * rather than written onto the row — which is the whole point. If the
+   * default were copied into `thumbnailKey` at publish time, an inherited
+   * image would be indistinguishable from a chosen one, and the next time an
+   * Admin changed the default there would be no way to tell which rows to
+   * update without also overwriting the ones they had picked deliberately.
+   *
+   * `defaultKey` is passed in rather than read per part so listing a material
+   * with twenty parts costs one settings read, not twenty.
+   */
+  private async resolvePartThumbnailUrl(
+    partThumbnailKey: string | null,
+    materialCoverKey: string | null,
+    defaultKey: string | null,
+  ): Promise<string | null> {
+    const key = partThumbnailKey ?? materialCoverKey ?? defaultKey;
+    return key ? this.storage.publicAssetUrl(key) : null;
+  }
 
   // ===========================================================================
   // Student
@@ -154,6 +181,7 @@ export class LibraryService {
             pageCount: true,
             mimeType: true,
             isPreview: true,
+            thumbnailKey: true,
           },
         },
         packages: {
@@ -184,15 +212,11 @@ export class LibraryService {
     });
     const owned = new Map(entitlements.map((e) => [e.libraryPartId, e.grantedAt]));
 
-    return {
-      id: material.id,
-      title: material.title,
-      titleAr: material.titleAr,
-      description: material.description,
-      coverUrl: await this.storage.publicAssetUrl(material.coverKey),
-      subject: material.subject,
-      ownsAllParts: partIds.length > 0 && partIds.every((id) => owned.has(id)),
-      parts: material.parts.map((part) => ({
+    // One read for the whole material, not one per part.
+    const defaultThumbnailKey = await this.settings.libraryDefaultThumbnailKey();
+
+    const parts = await Promise.all(
+      material.parts.map(async (part) => ({
         id: part.id,
         title: part.title,
         titleAr: part.titleAr,
@@ -203,12 +227,28 @@ export class LibraryService {
         pageCount: part.pageCount,
         mimeType: part.mimeType,
         isPreview: part.isPreview,
+        thumbnailUrl: await this.resolvePartThumbnailUrl(
+          part.thumbnailKey,
+          material.coverKey,
+          defaultThumbnailKey,
+        ),
         // A preview reads as open because it is; no purchase will ever be
         // required for it.
         owned: part.isPreview || owned.has(part.id),
         ownedSince: owned.get(part.id)?.toISOString() ?? null,
         purchasable: !owned.has(part.id) && !part.isPreview && Number(part.price) > 0,
       })),
+    );
+
+    return {
+      id: material.id,
+      title: material.title,
+      titleAr: material.titleAr,
+      description: material.description,
+      coverUrl: await this.storage.publicAssetUrl(material.coverKey),
+      subject: material.subject,
+      ownsAllParts: partIds.length > 0 && partIds.every((id) => owned.has(id)),
+      parts,
       packages: material.packages.map((pkg) => {
         const included = pkg.items.map((i) => i.libraryPartId);
         const ownedInPackage = included.filter((id) => owned.has(id)).length;
@@ -370,6 +410,10 @@ export class LibraryService {
 
     if (!material) throw AppException.notFound('Library material', materialId);
 
+    // One read for the whole editor. Passed down rather than looked up per
+    // part, so a twenty-part material costs one settings read.
+    const adminDefaultThumbnailKey = await this.settings.libraryDefaultThumbnailKey();
+
     return {
       id: material.id,
       title: material.title,
@@ -383,7 +427,13 @@ export class LibraryService {
       academicYearId: material.academicYearId,
       subjectId: material.subjectId,
       coverUrl: await this.storage.publicAssetUrl(material.coverKey),
-      parts: material.parts.map((part) => ({
+      /**
+       * The default is reported alongside the parts rather than folded into
+       * each one, so the editor can say "inherited" instead of showing an
+       * image the administrator never chose and might then "keep" by accident.
+       */
+      defaultThumbnailUrl: await this.storage.publicAssetUrl(adminDefaultThumbnailKey),
+      parts: await Promise.all(material.parts.map(async (part) => ({
         id: part.id,
         title: part.title,
         titleAr: part.titleAr,
@@ -400,9 +450,17 @@ export class LibraryService {
         // Never the object key. An admin does not need it and an accidental
         // leak into a log or a browser devtools panel is one copy too many.
         hasDocument: !!part.objectKey,
+        // The key so the editor can tell a chosen image from an inherited
+        // one, and the resolved URL so it can render whichever is in force.
+        thumbnailKey: part.thumbnailKey,
+        thumbnailUrl: await this.resolvePartThumbnailUrl(
+          part.thumbnailKey,
+          material.coverKey,
+          adminDefaultThumbnailKey,
+        ),
         entitlementCount: part._count.entitlements,
         createdAt: part.createdAt.toISOString(),
-      })),
+      }))),
       packages: material.packages.map((pkg) => ({
         id: pkg.id,
         title: pkg.title,
@@ -561,6 +619,7 @@ export class LibraryService {
       pageCount?: number;
       isPreview?: boolean;
       sortOrder?: number;
+      thumbnailKey?: string | null;
     },
     actor: { id: string; role: UserRole },
   ) {
@@ -590,6 +649,10 @@ export class LibraryService {
           sizeBytes: input.sizeBytes ?? null,
           pageCount: input.pageCount ?? null,
           isPreview: input.isPreview ?? false,
+          // Null, not the library default. The default is resolved at read
+          // time; writing it here would make an inherited image look like a
+          // chosen one and the next change of default would overwrite it.
+          thumbnailKey: input.thumbnailKey ?? null,
           uploadedById: actor.id,
         },
       });
@@ -629,6 +692,7 @@ export class LibraryService {
       mimeType: string | null;
       sizeBytes: number | null;
       pageCount: number | null;
+      thumbnailKey: string | null;
     }>,
     actor: { id: string; role: UserRole },
   ) {

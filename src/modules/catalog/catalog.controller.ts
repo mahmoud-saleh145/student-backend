@@ -1,8 +1,20 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Put, Query } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
-import { AuditAction } from '@prisma/client';
+import { AcademicStructureKind, AuditAction } from '@prisma/client';
 import { Type } from 'class-transformer';
-import { IsBoolean, IsInt, IsOptional, IsString, MaxLength, Min } from 'class-validator';
+import {
+  ArrayMaxSize,
+  ArrayMinSize,
+  IsArray,
+  IsBoolean,
+  IsEnum,
+  IsInt,
+  IsOptional,
+  IsString,
+  MaxLength,
+  Min,
+  ValidateNested,
+} from 'class-validator';
 
 import { Audit } from '../../common/decorators/audit.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -97,6 +109,50 @@ class CreateAcademicYearDto {
   @Type(() => Number) @IsInt() @Min(1) order!: number;
   @IsString() @MaxLength(80) name!: string;
   @IsString() @MaxLength(80) nameAr!: string;
+  /** Omitted means the platform-wide structure, as before structures existed. */
+  @IsOptional() @IsString() structureId?: string;
+}
+
+/**
+ * Which unit a structure belongs to. At most one may be given; the service
+ * rejects more than one, because a structure owned by both a faculty and a
+ * department has no representable scope.
+ */
+class AcademicScopeQueryDto {
+  @IsOptional() @IsString() universityId?: string;
+  @IsOptional() @IsString() facultyId?: string;
+  @IsOptional() @IsString() departmentId?: string;
+}
+
+class CreateAcademicStructureDto extends AcademicScopeQueryDto {
+  @IsEnum(AcademicStructureKind) kind!: AcademicStructureKind;
+}
+
+class UpdateAcademicStructureDto {
+  @IsOptional() @IsEnum(AcademicStructureKind) kind?: AcademicStructureKind;
+  @IsOptional() @IsBoolean() isActive?: boolean;
+}
+
+class StructureEntryDto {
+  @Type(() => Number) @IsInt() @Min(1) order!: number;
+  @IsString() @MaxLength(80) name!: string;
+  @IsString() @MaxLength(80) nameAr!: string;
+}
+
+/**
+ * The whole ladder in one write: how many rungs, and what each is called.
+ *
+ * The cap is 60 rather than 4 — the count is the Admin's to choose, and the
+ * only reason for an upper bound at all is to stop a malformed request
+ * creating thousands of rows.
+ */
+class ReplaceStructureEntriesDto {
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(60)
+  @ValidateNested({ each: true })
+  @Type(() => StructureEntryDto)
+  entries!: StructureEntryDto[];
 }
 
 /**
@@ -133,9 +189,64 @@ export class CatalogController {
 
   @Get('academic-years')
   @Public()
-  @ApiOperation({ summary: 'List academic years, ordered' })
-  academicYears() {
-    return this.catalog.academicYears();
+  @ApiOperation({
+    summary: 'List academic years or levels, ordered',
+    description:
+      'With no query parameters this returns the platform-wide list, exactly as before academic structures existed. Passing a university, faculty or department returns that unit\'s own list, inheriting upwards when it has none of its own. Each entry carries the structure\'s `kind` so the UI can label the control Year or Level.',
+  })
+  academicYears(@Query() query: AcademicScopeQueryDto) {
+    return this.catalog.academicYears(query);
+  }
+
+  @Get('academic-structures')
+  @AdminOnly()
+  @ApiOperation({ summary: 'Every academic structure with its entries' })
+  academicStructures() {
+    return this.catalog.academicStructures();
+  }
+
+  @Post('academic-structures')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Create an academic structure for a unit',
+    description:
+      'One per unit. Omit all three ids for the platform-wide structure that every unit inherits.',
+  })
+  createAcademicStructure(
+    @Body() dto: CreateAcademicStructureDto,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    return this.catalog.createAcademicStructure(dto, actor);
+  }
+
+  @Patch('academic-structures/:id')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Switch a structure between Years and Levels, or deactivate it',
+    description:
+      'Changing `kind` only changes how the rungs are labelled; the rungs themselves, and every student and course filed under them, are untouched.',
+  })
+  updateAcademicStructure(
+    @Param('id') id: string,
+    @Body() dto: UpdateAcademicStructureDto,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    return this.catalog.updateAcademicStructure(id, dto, actor);
+  }
+
+  @Put('academic-structures/:id/entries')
+  @AdminOnly()
+  @ApiOperation({
+    summary: "Define a structure's rungs: how many, and their names",
+    description:
+      'Entries are matched by `order`, so renaming a rung keeps every student and course already filed under it. A rung left out is deactivated rather than deleted, because rows point at it; sending it again reactivates it.',
+  })
+  replaceStructureEntries(
+    @Param('id') id: string,
+    @Body() dto: ReplaceStructureEntriesDto,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    return this.catalog.replaceStructureEntries(id, dto.entries, actor);
   }
 
   @Get('tree')

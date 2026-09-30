@@ -170,6 +170,20 @@ async function seedAcademicStructure() {
 
   // Five years, because engineering in Egypt is a five-year degree. The point
   // of the `order` column is precisely that nothing assumes four.
+  // The years hang off a structure now. This is the platform-wide one, which
+  // every university inherits until it defines its own; the migration creates
+  // the same row with the same fixed id, so seeding a migrated database finds
+  // it rather than making a second one.
+  const platformStructure = await prisma.academicStructure.upsert({
+    where: { scopeKey: 'platform' },
+    update: {},
+    create: {
+      id: 'acadstruct_platform_default',
+      kind: 'YEAR',
+      scopeKey: 'platform',
+    },
+  });
+
   const years = await Promise.all(
     [
       { order: 1, name: 'First Year', nameAr: 'الفرقة الأولى' },
@@ -178,7 +192,33 @@ async function seedAcademicStructure() {
       { order: 4, name: 'Fourth Year', nameAr: 'الفرقة الرابعة' },
       { order: 5, name: 'Fifth Year', nameAr: 'الفرقة الخامسة' },
     ].map((y) =>
-      prisma.academicYear.upsert({ where: { order: y.order }, update: {}, create: y }),
+      prisma.academicYear.upsert({
+        where: { structureId_order: { structureId: platformStructure.id, order: y.order } },
+        update: {},
+        create: { ...y, structureId: platformStructure.id },
+      }),
+    ),
+  );
+
+  // A second, LEVEL-kind structure on one faculty, so the seeded database
+  // actually exercises both systems side by side rather than only Years.
+  const medicineLevels = await prisma.academicStructure.upsert({
+    where: { scopeKey: `faculty:${medicine.id}` },
+    update: {},
+    create: { kind: 'LEVEL', scopeKey: `faculty:${medicine.id}`, facultyId: medicine.id },
+  });
+  await Promise.all(
+    [1, 2, 3, 4, 5, 6].map((n) =>
+      prisma.academicYear.upsert({
+        where: { structureId_order: { structureId: medicineLevels.id, order: n } },
+        update: {},
+        create: {
+          structureId: medicineLevels.id,
+          order: n,
+          name: `Level ${n}`,
+          nameAr: `المستوى ${n}`,
+        },
+      }),
     ),
   );
 

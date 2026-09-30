@@ -46,8 +46,10 @@ describe('CourseAccessService.decide', () => {
   // touches it. Constructing it this way keeps the test honest: if someone
   // later adds a query inside decide(), this test crashes rather than quietly
   // becoming an integration test.
-  // The platform-settings service is null for the same reason.
-  const service = new CourseAccessService(null as never, null as never);
+  // The platform-settings service is null for the same reason. Config is
+  // null too: decide() does not consult it either — only availableMethods
+  // does, and that has its own tests below.
+  const service = new CourseAccessService(null as never, null as never, null as never);
 
   describe('grants access', () => {
     it('to an active enrollment on a published course with no end date', () => {

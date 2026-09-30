@@ -85,23 +85,31 @@ export class AttachmentsService {
       isPreviewContent: attachment.isPreview,
     });
 
-    // Material hanging off a lesson inherits that lesson's section scope, so a
-    // section-scoped student cannot pull the PDF from a section they did not
-    // buy. Course-level material (no lessonId) is unaffected.
-    if (
-      params.user.role === UserRole.STUDENT &&
-      !attachment.isPreview &&
-      attachment.lessonId
-    ) {
-      const lesson = await this.prisma.lesson.findUnique({
-        where: { id: attachment.lessonId },
-        select: { sectionId: true },
-      });
-      if (lesson) {
+    // Section scope, for both the shapes an attachment can have.
+    //
+    // A document hanging off a LESSON inherits that lesson's section. One
+    // scoped to a SECTION carries it directly. Either way a student who
+    // bought only part 1 must not be able to pull part 2's handout, and when
+    // section-scoped attachments were added this check had to learn the
+    // second shape — reading `lessonId` alone would have skipped it entirely
+    // and handed the file over. Course-level material (both null) is
+    // deliberately unaffected: it is not part of any section.
+    if (params.user.role === UserRole.STUDENT && !attachment.isPreview) {
+      let sectionId: string | null = attachment.sectionId;
+
+      if (!sectionId && attachment.lessonId) {
+        const lesson = await this.prisma.lesson.findUnique({
+          where: { id: attachment.lessonId },
+          select: { sectionId: true },
+        });
+        sectionId = lesson?.sectionId ?? null;
+      }
+
+      if (sectionId) {
         await this.access.assertSectionAccessible({
           userId: params.user.id,
           courseId: attachment.courseId,
-          sectionId: lesson.sectionId,
+          sectionId,
         });
       }
     }
@@ -176,6 +184,7 @@ export class AttachmentsService {
     input: {
       courseId: string;
       lessonId?: string;
+      sectionId?: string;
       title: string;
       kind: AttachmentKind;
       objectKey: string;
@@ -191,6 +200,15 @@ export class AttachmentsService {
   ) {
     await this.access.assertCanManageCourse(actor.id, actor.role, input.courseId, 'content');
 
+    // One scope, or none. Two would mean two different access rules for one
+    // file, and there is a CHECK constraint behind this that would reject the
+    // row anyway — this is the error an Admin can act on.
+    if (input.lessonId && input.sectionId) {
+      throw AppException.validation({
+        sectionId: ['a document belongs to a lecture or to a section, not both'],
+      });
+    }
+
     if (input.lessonId) {
       const lesson = await this.prisma.lesson.findFirst({
         where: { id: input.lessonId, courseId: input.courseId, ...notDeleted },
@@ -203,12 +221,28 @@ export class AttachmentsService {
       }
     }
 
+    // Checked against the course for the same reason as the lesson: without
+    // it an Admin on course A could attach a file scoped to a section of
+    // course B, and every later access check would consult the wrong course.
+    if (input.sectionId) {
+      const section = await this.prisma.courseSection.findFirst({
+        where: { id: input.sectionId, courseId: input.courseId, ...notDeleted },
+        select: { id: true },
+      });
+      if (!section) {
+        throw AppException.validation({
+          sectionId: ['section does not belong to this course'],
+        });
+      }
+    }
+
     const isProtected = input.isProtected ?? true;
 
     const attachment = await this.prisma.attachment.create({
       data: {
         courseId: input.courseId,
         lessonId: input.lessonId,
+        sectionId: input.sectionId,
         title: input.title.trim(),
         kind: input.kind,
         objectKey: input.objectKey,
@@ -231,7 +265,13 @@ export class AttachmentsService {
       action: AuditAction.CREATE,
       entity: 'attachment',
       entityId: attachment.id,
-      after: { courseId: input.courseId, title: attachment.title, isProtected },
+      after: {
+        courseId: input.courseId,
+        lessonId: input.lessonId ?? null,
+        sectionId: input.sectionId ?? null,
+        title: attachment.title,
+        isProtected,
+      },
     });
 
     return toAttachment(attachment, true);
@@ -306,6 +346,38 @@ export class AttachmentsService {
     });
 
     return { ok: true };
+  }
+
+  /**
+   * The documents belonging to a section as a whole.
+   *
+   * Deliberately NOT a union with its lectures' documents: the dashboard and
+   * the app both need to show "this section has 2 files" separately from "this
+   * lecture has 1", and merging them here would make that impossible to
+   * express without a second query anyway.
+   */
+  async listForSection(sectionId: string, userId: string, role: UserRole) {
+    const section = await this.prisma.courseSection.findFirst({
+      where: { id: sectionId, ...notDeleted },
+      select: { id: true, courseId: true },
+    });
+    if (!section) throw AppException.notFound('Section', sectionId);
+
+    const decision = await this.access.resolve({
+      userId,
+      role,
+      courseId: section.courseId,
+    });
+
+    const rows = await this.prisma.attachment.findMany({
+      where: { sectionId, ...notDeleted },
+      orderBy: { sortOrder: 'asc' },
+    });
+
+    // `canAccessContent` decides whether the row carries anything actionable;
+    // the list itself is visible either way, so a student can see that buying
+    // the section would give them three handouts.
+    return rows.map((a) => toAttachment(a, decision.canAccessContent));
   }
 
   async listForLesson(lessonId: string, userId: string, role: UserRole) {

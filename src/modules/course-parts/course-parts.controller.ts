@@ -57,6 +57,17 @@ export class CoursePartsController {
     return this.parts.listForStudent(courseId, user.id);
   }
 
+  @Get('courses/:courseId/join-options')
+  @StudentOnly()
+  @ApiOperation({
+    summary: 'What the student can buy to get into this course',
+    description:
+      'One request behind the JOIN action: the whole-course option and every part, each with its price and owned state, plus the mechanisms currently available. `methods.wallet` is always false — the wallet belongs to the Library and a course never debits it. `methods.onlinePayment` follows the configured provider, which ships disabled; the payment implementation is intact behind it.',
+  })
+  joinOptions(@Param('courseId') courseId: string, @CurrentUser() user: AuthenticatedUser) {
+    return this.parts.joinOptions(courseId, user.id);
+  }
+
   // There is deliberately no purchase route here. Course parts are unlocked by
   // redeeming a part-scoped access card through the existing redemption
   // endpoint — the wallet is for the Library and is never debited for a course.

@@ -29,6 +29,15 @@ export interface SettingShape {
   'wallet.minimumRecharge': number;
   'wallet.maximumRecharge': number;
   'wallet.allowAdminOverrideMinimum': boolean;
+  /**
+   * Object key of the fallback image for library parts with none of their own.
+   *
+   * A key, not a URL, so it goes through the same signing path as every other
+   * asset. Empty means "no default", which is the behaviour before this
+   * existed. It is resolved at READ time and never written onto a part row —
+   * see `resolveLibraryPartThumbnail`.
+   */
+  'library.defaultThumbnailKey': string;
 }
 
 export const SETTING_DEFAULTS: SettingShape = {
@@ -49,6 +58,7 @@ export const SETTING_DEFAULTS: SettingShape = {
   // When on, an administrator may issue a card below the minimum by asking
   // for it explicitly. Off by default, so the floor means what it says.
   'wallet.allowAdminOverrideMinimum': false,
+  'library.defaultThumbnailKey': '',
 };
 
 export type SettingKey = keyof SettingShape;
@@ -87,6 +97,8 @@ const SETTING_DESCRIPTIONS: Record<SettingKey, string> = {
   'contact.whatsapp': 'Public WhatsApp number.',
   'contact.facebook': 'Public Facebook page URL.',
   'contact.email': 'Public support email address.',
+  'library.defaultThumbnailKey':
+    'Fallback image for library parts that have none of their own. Applied when the part is read, so it never overwrites a thumbnail an administrator chose.',
   'wallet.minimumRecharge': 'Smallest face value a recharge code may carry, in EGP.',
   'wallet.maximumRecharge': 'Largest face value a recharge code may carry, in EGP.',
   'wallet.allowAdminOverrideMinimum':
@@ -197,6 +209,12 @@ export class PlatformSettingsService {
 
   async allowsAcademicYearChange(): Promise<boolean> {
     return this.get('student.allowAcademicYearChange');
+  }
+
+  /** The library fallback thumbnail key, or null when none is configured. */
+  async libraryDefaultThumbnailKey(): Promise<string | null> {
+    const key = await this.get('library.defaultThumbnailKey');
+    return key ? key : null;
   }
 
   async teacherMay(capability: TeacherCapability): Promise<boolean> {

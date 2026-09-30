@@ -441,6 +441,9 @@ describe('a teacher keeps what they had', () => {
         },
       } as never,
       { teacherMay: jest.fn(async () => true) } as never,
+      // Config is only read by availableMethods, which this suite does not
+      // exercise; a stub keeps the arity right without pretending otherwise.
+      { get: () => 'none' } as never,
     );
 
     return access;

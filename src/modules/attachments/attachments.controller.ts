@@ -22,7 +22,10 @@ import { AttachmentsService } from './attachments.service';
 
 class CreateAttachmentDto {
   @IsString() @MaxLength(32) courseId!: string;
+  /** Scope to a lecture. Mutually exclusive with `sectionId`. */
   @IsOptional() @IsString() @MaxLength(32) lessonId?: string;
+  /** Scope to a section as a whole. Mutually exclusive with `lessonId`. */
+  @IsOptional() @IsString() @MaxLength(32) sectionId?: string;
   @IsString() @MinLength(1) @MaxLength(200) title!: string;
   @IsEnum(AttachmentKind) kind!: AttachmentKind;
   @IsString() @MaxLength(400) objectKey!: string;
@@ -80,6 +83,19 @@ export class AttachmentsController {
   }
 
   // --- authoring -------------------------------------------------------------
+
+  @Get('sections/:sectionId/attachments')
+  @ApiOperation({
+    summary: "A section's own documents",
+    description:
+      'Section-level documents only — a lecture\'s own documents come from the lesson endpoint. The two are deliberately separate because the dashboard and the app show them differently.',
+  })
+  listForSection(
+    @Param('sectionId') sectionId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.attachments.listForSection(sectionId, user.id, user.role);
+  }
 
   @Post('attachments')
   @StaffOnly()

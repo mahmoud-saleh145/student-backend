@@ -60,6 +60,33 @@ export const playbackConfig = registerAs('playback', () => ({
   maxConcurrentStreams: num(process.env.PLAYBACK_MAX_CONCURRENT_STREAMS, 1),
   ticketsPerHour: num(process.env.PLAYBACK_TICKETS_PER_HOUR, 60),
   captureStrikes: num(process.env.PLAYBACK_CAPTURE_STRIKES, 3),
+
+  /**
+   * How many times a student may play one protected video. Enforced in
+   * `PlaybackService.claimPlay` by counting `video_plays` rows, so it survives
+   * a reinstall; the client is never trusted with it.
+   *
+   * Free/preview lessons are exempt and consume nothing.
+   */
+  maxPlaysPerVideo: num(process.env.PLAYBACK_MAX_PLAYS_PER_VIDEO, 3),
+
+  /**
+   * How long an idle-but-open play still accepts a new ticket as the SAME
+   * attempt. This is what stops the app being backgrounded, the network
+   * dropping, or a ticket expiring mid-lesson from silently burning a play.
+   *
+   * Sized well above ticketTtl (300s) on purpose: a student whose ticket
+   * expired while they were reading is resuming, not restarting.
+   */
+  playResumeWindow: num(process.env.PLAYBACK_PLAY_RESUME_WINDOW, 45 * 60),
+
+  /**
+   * Below this many watched seconds a finished play does not count against
+   * the limit. A tap that failed to start, or a 5-second look at the wrong
+   * lesson, is not an attempt — and without this the limit would punish
+   * exactly the technical failures it should ignore.
+   */
+  minCountedPlaySeconds: num(process.env.PLAYBACK_MIN_COUNTED_PLAY_SECONDS, 30),
 }));
 
 export const storageConfig = registerAs('storage', () => {

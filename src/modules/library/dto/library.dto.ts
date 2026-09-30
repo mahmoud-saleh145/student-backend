@@ -101,6 +101,16 @@ export class CreateLibraryPartDto {
   @ApiPropertyOptional() @IsOptional() @Type(() => Number) @IsInt() @Min(0) pageCount?: number;
   @ApiPropertyOptional() @IsOptional() @IsBoolean() isPreview?: boolean;
   @ApiPropertyOptional() @IsOptional() @Type(() => Number) @IsInt() @Min(1) sortOrder?: number;
+
+  /**
+   * Object key from a presigned thumbnail upload, never a public URL.
+   *
+   * Left unset the part inherits, at read time, the material's cover and then
+   * the library default. The default is never written onto the row: doing so
+   * would make an inherited image indistinguishable from a chosen one, and
+   * the next change of default would silently overwrite the Admin's choice.
+   */
+  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(512) thumbnailKey?: string;
 }
 
 export class UpdateLibraryPartDto {
@@ -122,6 +132,13 @@ export class UpdateLibraryPartDto {
   @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(512) objectKey?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(120) mimeType?: string;
   @ApiPropertyOptional() @IsOptional() @Type(() => Number) @IsInt() @Min(0) pageCount?: number;
+
+  /** Send null to clear the part's own image and fall back to inheritance. */
+  @ApiPropertyOptional({ nullable: true })
+  @IsOptional()
+  @IsString()
+  @MaxLength(512)
+  thumbnailKey?: string | null;
 }
 
 export class CreateLibraryPackageDto {

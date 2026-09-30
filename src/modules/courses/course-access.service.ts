@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
   CourseStatus,
   type Enrollment,
@@ -71,7 +72,26 @@ export class CourseAccessService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly settings: PlatformSettingsService,
+    private readonly config: ConfigService,
   ) {}
+
+  /**
+   * Whether online payment is live.
+   *
+   * `payment.provider` ships as 'none'. Nothing about the payment
+   * implementation is removed — the module, the Payment rows, the webhook
+   * handlers and the provider clients are all intact and untouched — it is
+   * simply not offered while no provider is configured. Turning it back on is
+   * setting PAYMENT_PROVIDER, not restoring code.
+   *
+   * Filtering HERE rather than in the app is deliberate: the client renders
+   * exactly the methods this list contains, so a single server-side answer
+   * keeps the mobile app, any future client and the enrolment endpoint from
+   * disagreeing about whether a checkout exists.
+   */
+  private get onlinePaymentEnabled(): boolean {
+    return (this.config.get<string>('payment.provider') ?? 'none') !== 'none';
+  }
 
   // ---------------------------------------------------------------------------
   // Resolution
@@ -363,14 +383,23 @@ export class CourseAccessService {
   ): EnrollmentMethod[] {
     if (courseStatus !== CourseStatus.PUBLISHED) return [];
 
+    // Offering a checkout that cannot complete is worse than offering
+    // nothing: the student picks it, reaches a dead end, and opens a support
+    // ticket. Applied to every branch below rather than to one of them.
+    const offerable = this.onlinePaymentEnabled
+      ? configured
+      : configured.filter((m) => m !== EnrollmentMethod.PAYMENT);
+
     switch (state) {
       case 'NOT_ENROLLED':
       case 'EXPIRED':
         // Renewal uses the same methods as a first join.
-        return configured;
+        return offerable;
       case 'PENDING_PAYMENT':
-        // Let the student retry payment or fall back to a code.
-        return configured.filter(
+        // Let the student retry payment or fall back to a code. With no
+        // provider configured this leaves CODE, which is the only way a
+        // part-paid enrolment can now be completed.
+        return offerable.filter(
           (m) => m === EnrollmentMethod.PAYMENT || m === EnrollmentMethod.CODE,
         );
       case 'REVOKED':

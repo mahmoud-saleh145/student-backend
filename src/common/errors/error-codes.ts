@@ -69,6 +69,10 @@ export enum ErrorCode {
   VIDEO_NOT_READY = 'VIDEO_NOT_READY',
   VIDEO_UNAVAILABLE = 'VIDEO_UNAVAILABLE',
   CAPTURE_DETECTED = 'CAPTURE_DETECTED',
+  /** The three-play limit for this video is spent. */
+  VIDEO_WATCH_LIMIT_REACHED = 'VIDEO_WATCH_LIMIT_REACHED',
+  /** Transcoding failed; re-uploading or a retry by an admin is needed. */
+  VIDEO_PROCESSING_FAILED = 'VIDEO_PROCESSING_FAILED',
 
   // --- back-office only ------------------------------------------------------
   // These never reach the student app, so they have no mobile translation.
@@ -134,6 +138,13 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   [ErrorCode.VIDEO_NOT_READY]: 409,
   [ErrorCode.VIDEO_UNAVAILABLE]: 404,
   [ErrorCode.CAPTURE_DETECTED]: 403,
+  // 403, not 429: the limit is not a rate to wait out. Nothing the student
+  // does later will grant a fourth play, so a client that retries on 429
+  // must not retry on this.
+  [ErrorCode.VIDEO_WATCH_LIMIT_REACHED]: 403,
+  // 409: the video's state is wrong, not the request. Distinct from
+  // VIDEO_NOT_READY so the app can say "failed" rather than "try later".
+  [ErrorCode.VIDEO_PROCESSING_FAILED]: 409,
 
   [ErrorCode.CONFLICT]: 409,
   [ErrorCode.ALREADY_ENROLLED]: 409,
@@ -196,6 +207,8 @@ export const ERROR_MESSAGE: Record<ErrorCode, string> = {
   [ErrorCode.VIDEO_NOT_READY]: 'Video is still processing',
   [ErrorCode.VIDEO_UNAVAILABLE]: 'Video is unavailable',
   [ErrorCode.CAPTURE_DETECTED]: 'Playback stopped: screen capture detected',
+  [ErrorCode.VIDEO_WATCH_LIMIT_REACHED]: 'The allowed number of plays for this video is used up',
+  [ErrorCode.VIDEO_PROCESSING_FAILED]: 'Video processing failed',
 
   [ErrorCode.CONFLICT]: 'Conflicting state',
   [ErrorCode.ALREADY_ENROLLED]: 'Student is already enrolled',

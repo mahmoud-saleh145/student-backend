@@ -229,6 +229,10 @@ export function toAttachment(attachment: Attachment, hasCourseAccess: boolean) {
   return {
     id: attachment.id,
     lessonId: attachment.lessonId,
+    // Exposed so the client can tell a section handout from a lecture one
+    // without inferring it from which list the row arrived in — the two are
+    // shown differently and one of them is null on every row.
+    sectionId: attachment.sectionId,
     courseId: attachment.courseId,
     title: attachment.title,
     kind: attachment.kind,

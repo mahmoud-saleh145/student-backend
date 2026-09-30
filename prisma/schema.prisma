@@ -398,6 +398,15 @@ enum AuditAction {
   SETTINGS_CHANGE
 }
 
+/// Whether an academic structure is expressed as Years ("First Year") or
+/// Levels ("Level 1"). The label text itself is Admin-defined; this only says
+/// which of the two systems a unit uses, so the UI can name things correctly
+/// and so a university cannot accidentally mix both in one list.
+enum AcademicStructureKind {
+  YEAR
+  LEVEL
+}
+
 enum WatchEventType {
   STARTED
   PROGRESS
@@ -496,6 +505,12 @@ model LibraryPart {
   mimeType  String?
   sizeBytes BigInt?
   pageCount Int?
+
+  /// Part-specific thumbnail in R2. Null falls back to the material's
+  /// coverKey, and then to the library default-thumbnail setting. Resolution
+  /// happens in the service, never by writing the default onto the row — an
+  /// explicitly chosen thumbnail must never be overwritten by the default.
+  thumbnailKey String?
 
   /// A free sample, readable without buying anything. The one documented way
   /// to get library content without an entitlement.
@@ -656,6 +671,7 @@ model University {
   students  StudentProfile[]
   courses   Course[]
   libraryMaterials LibraryMaterial[]
+  academicStructures AcademicStructure[]
 
   @@index([isActive, sortOrder])
   @@map("universities")
@@ -677,6 +693,7 @@ model Faculty {
   students    StudentProfile[]
   courses     Course[]
   libraryMaterials LibraryMaterial[]
+  academicStructures AcademicStructure[]
 
   @@unique([universityId, name])
   @@index([universityId, isActive])
@@ -697,6 +714,7 @@ model Department {
   faculty  Faculty            @relation(fields: [facultyId], references: [id], onDelete: Restrict)
   students StudentProfile[]
   courses  CourseDepartment[]
+  academicStructures AcademicStructure[]
 
   @@unique([facultyId, name])
   @@index([facultyId, isActive])
@@ -726,20 +744,71 @@ model CourseDepartment {
   @@map("course_departments")
 }
 
-model AcademicYear {
-  id        String   @id @default(cuid())
-  /// Display/sort order (1 = first year). Never assume a fixed maximum.
-  order     Int      @unique
-  name      String
-  nameAr    String
+/// One academic ladder, owned by exactly one unit of the catalogue.
+///
+/// `kind` decides whether its entries are Years or Levels; the entries
+/// themselves carry the Admin-chosen names, and there is no fixed maximum —
+/// four is a convention, not a rule.
+///
+/// Ownership is expressed as three nullable FKs, at most one of which is set.
+/// `scopeKey` is the denormalised form of that choice and carries the unique
+/// constraint, because Postgres treats NULLs as distinct: a UNIQUE over the
+/// nullable FKs would happily accept two platform-wide structures, which is
+/// precisely the duplicate this model exists to prevent. The service is the
+/// only writer of `scopeKey` and derives it from the FKs.
+model AcademicStructure {
+  id   String                @id @default(cuid())
+  kind AcademicStructureKind @default(YEAR)
+
+  universityId String?
+  facultyId    String?
+  departmentId String?
+
+  /// "platform" | "university:<id>" | "faculty:<id>" | "department:<id>".
+  scopeKey String @unique
+
   isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  university University? @relation(fields: [universityId], references: [id], onDelete: Cascade)
+  faculty    Faculty?    @relation(fields: [facultyId], references: [id], onDelete: Cascade)
+  department Department? @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+
+  entries AcademicYear[]
+
+  @@index([universityId])
+  @@index([facultyId])
+  @@index([departmentId])
+  @@map("academic_structures")
+}
+
+/// One rung of an AcademicStructure — "Third Year", "Level 2".
+///
+/// The model keeps its name and its table: StudentProfile, Course and
+/// LibraryMaterial all point here, so renaming it would have rewritten 27
+/// files and three foreign keys for no gain. What changed is that `order` is
+/// no longer globally unique — it is unique *within a structure*, which is
+/// what lets two faculties both have a rung numbered 1.
+model AcademicYear {
+  id          String @id @default(cuid())
+  structureId String
+  /// Display/sort order within the structure (1 = first). No fixed maximum.
+  order       Int
+  name        String
+  nameAr      String
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  structure AcademicStructure @relation(fields: [structureId], references: [id], onDelete: Cascade)
 
   students StudentProfile[]
   courses  Course[]
   libraryMaterials LibraryMaterial[]
 
+  @@unique([structureId, order])
+  @@index([structureId, isActive, order])
   @@map("academic_years")
 }
 
@@ -789,6 +858,7 @@ model User {
   watchProgress    WatchProgress[]
   watchEvents      WatchEvent[]
   playbackTickets  PlaybackTicket[]
+  videoPlays       VideoPlay[]
   notifications    Notification[]
   pushTokens       PushToken[]
   notificationPrefs NotificationPreference?
@@ -1181,6 +1251,9 @@ model CourseSection {
   // material inside it. The sections simply become unassigned.
   part    CoursePart? @relation(fields: [partId], references: [id], onDelete: SetNull)
   lessons Lesson[]
+  // Cascade: a section's own documents belong to the section and go with it.
+  // Lecture attachments are not touched here; they cascade from the lesson.
+  attachments Attachment[]
 
   codes  AccessCode[]             @relation("SectionCodes")
   grants EnrollmentSectionGrant[]
@@ -1280,6 +1353,7 @@ model Video {
   renditions VideoRendition[]
   captions   CaptionTrack[]
   tickets    PlaybackTicket[]
+  plays      VideoPlay[]
   watchEvents WatchEvent[]
 
   @@index([courseId, status])
@@ -1324,10 +1398,20 @@ model CaptionTrack {
 // Attachments
 // =============================================================================
 
+/// A downloadable or ticket-served document.
+///
+/// Scope is decided by which of `lessonId` / `sectionId` is set, and at most
+/// one ever is:
+///   * `lessonId` set  -> belongs to that lecture
+///   * `sectionId` set -> belongs to the section as a whole
+///   * both null       -> a course-wide document
+/// The service enforces the "at most one" rule, and a CHECK constraint in the
+/// migration stops a hand-edited row claiming both.
 model Attachment {
-  id       String         @id @default(cuid())
-  courseId String
-  lessonId String?
+  id        String         @id @default(cuid())
+  courseId  String
+  lessonId  String?
+  sectionId String?
   title    String
   titleAr  String?
   kind     AttachmentKind @default(PDF)
@@ -1347,11 +1431,13 @@ model Attachment {
   updatedAt DateTime  @updatedAt
   deletedAt DateTime?
 
-  course Course  @relation(fields: [courseId], references: [id], onDelete: Cascade)
-  lesson Lesson? @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  course  Course         @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  lesson  Lesson?        @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  section CourseSection? @relation(fields: [sectionId], references: [id], onDelete: Cascade)
 
   @@index([courseId, deletedAt])
   @@index([lessonId])
+  @@index([sectionId])
   @@map("attachments")
 }
 
@@ -1733,6 +1819,47 @@ model AccessCodeRedemption {
 
 /// One row per issued playback grant. Kept after expiry as the audit trail of
 /// who was authorized to watch what, from where, and when.
+/// One counted play of one protected video by one student.
+///
+/// The three-play rule is a COUNT of rows here, which is why it cannot be
+/// reset by reinstalling the app, clearing storage or signing in again: the
+/// row is keyed on the account, and the client never writes it.
+///
+/// A play is not the same thing as a ticket. One play can span several
+/// tickets — a rotation part-way through a long lesson, a resume after the app
+/// was backgrounded, a retry after the network dropped before playback ever
+/// started. `closedAt` is what separates "still the same attempt" from "a new
+/// attempt": while a play is open and recently active, a fresh ticket attaches
+/// to it and consumes nothing. This is the whole reason the counter is not
+/// simply `count(PlaybackTicket)`.
+model VideoPlay {
+  id      String @id @default(cuid())
+  userId  String
+  videoId String
+
+  /// 1-based, allocated server-side. The unique index is the guarantee that
+  /// two concurrent issue requests cannot both claim the same attempt.
+  attemptNumber Int
+
+  startedAt      DateTime  @default(now())
+  lastActivityAt DateTime  @default(now())
+  /// Seconds watched across every ticket in this play.
+  watchedSeconds Int       @default(0)
+  /// Set when the play is settled: released, expired, or completed. A closed
+  /// play can no longer absorb a resume, so the next ticket starts a new one.
+  closedAt       DateTime?
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  video Video @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  tickets PlaybackTicket[]
+
+  @@unique([userId, videoId, attemptNumber])
+  @@index([userId, videoId, closedAt])
+  @@index([videoId, startedAt])
+  @@map("video_plays")
+}
+
 model PlaybackTicket {
   id        String               @id @default(cuid())
   userId    String
@@ -1741,6 +1868,10 @@ model PlaybackTicket {
   courseId  String
   sessionId String?
   deviceId  String?
+  /// The counted play this grant belongs to. Nullable: preview/free lessons
+  /// are not counted at all, and every ticket issued before this model existed
+  /// predates counting.
+  playId    String?
   status    PlaybackTicketStatus @default(ACTIVE)
 
   /// Opaque forensic tag embedded in the watermark payload.
@@ -1772,6 +1903,7 @@ model PlaybackTicket {
   course      Course          @relation(fields: [courseId], references: [id], onDelete: Restrict)
   session     Session?        @relation(fields: [sessionId], references: [id], onDelete: SetNull)
   device      Device?         @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  play        VideoPlay?      @relation(fields: [playId], references: [id], onDelete: SetNull)
   rotatedFrom PlaybackTicket? @relation("TicketRotation", fields: [rotatedFromId], references: [id], onDelete: SetNull)
   rotatedTo   PlaybackTicket? @relation("TicketRotation")
   securityEvents SecurityEvent[]
@@ -1779,6 +1911,7 @@ model PlaybackTicket {
   @@index([userId, status, expiresAt])
   @@index([videoId, issuedAt])
   @@index([status, expiresAt])
+  @@index([playId])
   @@map("playback_tickets")
 }
 
@@ -2358,6 +2491,8 @@ model CoursePart {
   title       String
   titleAr     String?
   description String?
+  /// Part-specific thumbnail in R2. Null falls back to the course thumbnail.
+  thumbnailKey String?
   sortOrder   Int
   status      ContentStatus @default(PUBLISHED)
 

@@ -68,8 +68,14 @@ describe('auth', () => {
       const department = await prisma.department.create({
         data: { facultyId: faculty.id, name: 'Computer', nameAr: 'حاسبات' },
       });
+      // Years belong to a structure now. This fixture makes its own rather
+      // than leaning on the platform row, so the test stays independent of
+      // whether the database has been seeded.
+      const structure = await prisma.academicStructure.create({
+        data: { kind: 'YEAR', scopeKey: `university:${university.id}`, universityId: university.id },
+      });
       const year = await prisma.academicYear.create({
-        data: { order: 2, name: 'Second Year', nameAr: 'الفرقة الثانية' },
+        data: { structureId: structure.id, order: 2, name: 'Second Year', nameAr: 'الفرقة الثانية' },
       });
       catalog = {
         universityId: university.id,

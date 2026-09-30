@@ -1,5 +1,10 @@
 import { Injectable } from '@nestjs/common';
-import { AuditAction, type Prisma, type UserRole } from '@prisma/client';
+import {
+  AcademicStructureKind,
+  AuditAction,
+  type Prisma,
+  type UserRole,
+} from '@prisma/client';
 
 import { AppException } from '../../common/errors/app.exception';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
@@ -19,6 +24,53 @@ const CACHE_TTL_SECONDS = 15 * 60;
  */
 /** The four rows the catalogue is made of. */
 export type CatalogEntity = 'university' | 'faculty' | 'department' | 'academicYear';
+
+/**
+ * Which unit an academic structure belongs to. At most one field is set; all
+ * three null means the platform-wide structure, which is the fallback every
+ * unit inherits until it defines its own.
+ */
+export interface AcademicScope {
+  universityId?: string | null;
+  facultyId?: string | null;
+  departmentId?: string | null;
+}
+
+/** The scopeKey of the structure every unit falls back to. */
+export const PLATFORM_SCOPE_KEY = 'platform';
+
+/**
+ * Derives the unique key the database enforces one-structure-per-unit with.
+ *
+ * `scopeKey` exists because Postgres treats NULLs as distinct, so a UNIQUE
+ * over the three nullable FKs would accept two platform-wide structures. This
+ * function is the only place the key is built; the column is never written
+ * from outside the service.
+ */
+export function academicScopeKey(scope: AcademicScope): string {
+  if (scope.departmentId) return `department:${scope.departmentId}`;
+  if (scope.facultyId) return `faculty:${scope.facultyId}`;
+  if (scope.universityId) return `university:${scope.universityId}`;
+  return PLATFORM_SCOPE_KEY;
+}
+
+/**
+ * Rejects a scope naming more than one owner.
+ *
+ * A structure owned by both a faculty and a department has no meaning and no
+ * representable `scopeKey`. The CHECK constraint in the migration is the
+ * backstop; this is the error the Admin actually sees.
+ */
+export function assertSingleAcademicOwner(scope: AcademicScope): void {
+  const owners = [scope.universityId, scope.facultyId, scope.departmentId].filter(
+    (v) => v != null && v !== '',
+  );
+  if (owners.length > 1) {
+    throw AppException.validation({
+      scope: ['an academic structure belongs to one unit: a university, a faculty or a department'],
+    });
+  }
+}
 
 @Injectable()
 export class CatalogService {
@@ -68,14 +120,240 @@ export class CatalogService {
     );
   }
 
-  async academicYears() {
-    return this.redis.remember('catalog:academic-years', CACHE_TTL_SECONDS, () =>
-      this.prisma.academicYear.findMany({
-        where: { isActive: true },
+  /**
+   * The year/level list a student picks from.
+   *
+   * With no scope this returns the platform-wide list, which is what every
+   * registration screen showed before structures existed — so the endpoint's
+   * old contract is unchanged for old callers. Passing a unit returns that
+   * unit's own list, falling back up the hierarchy when it has none.
+   */
+  async academicYears(scope: AcademicScope = {}) {
+    assertSingleAcademicOwner(scope);
+    const cacheKey = `catalog:academic-years:${academicScopeKey(scope)}`;
+
+    return this.redis.remember(cacheKey, CACHE_TTL_SECONDS, async () => {
+      const structure = await this.resolveAcademicStructure(scope);
+      if (!structure) return [];
+
+      const entries = await this.prisma.academicYear.findMany({
+        where: { structureId: structure.id, isActive: true },
         orderBy: { order: 'asc' },
         select: { id: true, order: true, name: true, nameAr: true },
+      });
+
+      // `kind` rides along so the UI can label the control "Year" or "Level"
+      // without a second request and without guessing from the names.
+      return entries.map((e) => ({ ...e, kind: structure.kind }));
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Academic structures
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The structure that governs a unit, most specific first.
+   *
+   * A department inherits its faculty's structure, a faculty its university's,
+   * and a university the platform's. That inheritance is what stops an Admin
+   * having to redefine the same four years for every department, and it is
+   * resolved here rather than denormalised onto rows so that defining a
+   * structure lower down takes effect immediately.
+   */
+  async resolveAcademicStructure(scope: AcademicScope) {
+    assertSingleAcademicOwner(scope);
+
+    const candidates: string[] = [];
+
+    if (scope.departmentId) {
+      candidates.push(`department:${scope.departmentId}`);
+      const dept = await this.prisma.department.findUnique({
+        where: { id: scope.departmentId },
+        select: { facultyId: true, faculty: { select: { universityId: true } } },
+      });
+      if (dept) {
+        candidates.push(`faculty:${dept.facultyId}`);
+        candidates.push(`university:${dept.faculty.universityId}`);
+      }
+    } else if (scope.facultyId) {
+      candidates.push(`faculty:${scope.facultyId}`);
+      const faculty = await this.prisma.faculty.findUnique({
+        where: { id: scope.facultyId },
+        select: { universityId: true },
+      });
+      if (faculty) candidates.push(`university:${faculty.universityId}`);
+    } else if (scope.universityId) {
+      candidates.push(`university:${scope.universityId}`);
+    }
+
+    candidates.push(PLATFORM_SCOPE_KEY);
+
+    // One query, then pick in precedence order — cheaper than up to four
+    // round trips, and the list is tiny.
+    const found = await this.prisma.academicStructure.findMany({
+      where: { scopeKey: { in: candidates }, isActive: true },
+      select: { id: true, kind: true, scopeKey: true },
+    });
+
+    for (const key of candidates) {
+      const hit = found.find((f) => f.scopeKey === key);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  /** Every structure with its entries. Admin view. */
+  async academicStructures() {
+    return this.prisma.academicStructure.findMany({
+      orderBy: [{ scopeKey: 'asc' }],
+      select: {
+        id: true,
+        kind: true,
+        scopeKey: true,
+        isActive: true,
+        universityId: true,
+        facultyId: true,
+        departmentId: true,
+        university: { select: { id: true, name: true, nameAr: true } },
+        faculty: { select: { id: true, name: true, nameAr: true } },
+        department: { select: { id: true, name: true, nameAr: true } },
+        entries: {
+          orderBy: { order: 'asc' },
+          select: { id: true, order: true, name: true, nameAr: true, isActive: true },
+        },
+      },
+    });
+  }
+
+  async createAcademicStructure(
+    input: { kind: AcademicStructureKind } & AcademicScope,
+    actor: { id: string; role: UserRole },
+  ) {
+    assertSingleAcademicOwner(input);
+    const scopeKey = academicScopeKey(input);
+
+    // Checked before the insert so the Admin gets a field error rather than a
+    // unique-violation surfaced as a 500. The unique index still has the last
+    // word if two Admins race.
+    const existing = await this.prisma.academicStructure.findUnique({
+      where: { scopeKey },
+      select: { id: true },
+    });
+    if (existing) {
+      throw AppException.validation({
+        scope: ['this unit already has an academic structure; edit that one instead'],
+      });
+    }
+
+    const created = await this.prisma.academicStructure.create({
+      data: {
+        kind: input.kind,
+        scopeKey,
+        universityId: input.universityId ?? null,
+        facultyId: input.facultyId ?? null,
+        departmentId: input.departmentId ?? null,
+      },
+    });
+
+    await this.bust();
+    await this.audit.record({
+      actorId: actor.id,
+      actorRole: actor.role,
+      action: AuditAction.CREATE,
+      entity: 'academic_structure',
+      entityId: created.id,
+      after: created,
+    });
+    return created;
+  }
+
+  async updateAcademicStructure(
+    id: string,
+    data: { kind?: AcademicStructureKind; isActive?: boolean },
+    actor: { id: string; role: UserRole },
+  ) {
+    const before = await this.prisma.academicStructure.findUnique({ where: { id } });
+    if (!before) throw AppException.notFound('academic structure');
+
+    const updated = await this.prisma.academicStructure.update({ where: { id }, data });
+
+    await this.bust();
+    await this.audit.record({
+      actorId: actor.id,
+      actorRole: actor.role,
+      action: AuditAction.UPDATE,
+      entity: 'academic_structure',
+      entityId: id,
+      before,
+      after: updated,
+    });
+    return updated;
+  }
+
+  /**
+   * Defines a structure's rungs in one write: how many, and what they are
+   * called. This is the endpoint that makes the count configurable — there is
+   * no fixed four anywhere.
+   *
+   * Entries are matched by `order`, so renaming "Third Year" keeps every
+   * student and course already filed under it. An entry the Admin removes is
+   * DEACTIVATED rather than deleted, because students and courses point at it
+   * and deleting the row would either fail on the foreign key or strip their
+   * academic placement. Reappearing at the same order reactivates it.
+   */
+  async replaceStructureEntries(
+    structureId: string,
+    entries: { order: number; name: string; nameAr: string }[],
+    actor: { id: string; role: UserRole },
+  ) {
+    const structure = await this.prisma.academicStructure.findUnique({
+      where: { id: structureId },
+      select: { id: true, entries: { select: { id: true, order: true } } },
+    });
+    if (!structure) throw AppException.notFound('academic structure');
+
+    const orders = entries.map((e) => e.order);
+    if (new Set(orders).size !== orders.length) {
+      throw AppException.validation({ entries: ['two entries share the same order'] });
+    }
+    if (orders.some((o) => !Number.isInteger(o) || o < 1)) {
+      throw AppException.validation({ entries: ['order must be a whole number from 1 up'] });
+    }
+
+    const keep = new Set(orders);
+    const retire = structure.entries.filter((e) => !keep.has(e.order)).map((e) => e.id);
+
+    await this.prisma.$transaction([
+      ...entries.map((e) =>
+        this.prisma.academicYear.upsert({
+          where: { structureId_order: { structureId, order: e.order } },
+          update: { name: e.name, nameAr: e.nameAr, isActive: true },
+          create: { structureId, order: e.order, name: e.name, nameAr: e.nameAr },
+        }),
+      ),
+      this.prisma.academicYear.updateMany({
+        where: { id: { in: retire } },
+        data: { isActive: false },
       }),
-    );
+    ]);
+
+    await this.bust();
+    await this.audit.record({
+      actorId: actor.id,
+      actorRole: actor.role,
+      action: AuditAction.UPDATE,
+      entity: 'academic_structure_entries',
+      entityId: structureId,
+      before: { entries: structure.entries },
+      after: { entries, deactivated: retire },
+    });
+
+    return this.prisma.academicYear.findMany({
+      where: { structureId },
+      orderBy: { order: 'asc' },
+      select: { id: true, order: true, name: true, nameAr: true, isActive: true },
+    });
   }
 
   /**
@@ -256,10 +534,34 @@ export class CatalogService {
   }
 
   async createAcademicYear(
-    data: { order: number; name: string; nameAr: string },
+    data: { order: number; name: string; nameAr: string; structureId?: string },
     actor: { id: string; role: UserRole },
   ) {
-    const created = await this.prisma.academicYear.create({ data });
+    // Omitting the structure means the platform-wide list, which is what this
+    // endpoint has always written to. Keeping that default is what lets the
+    // existing dashboard form keep working untouched.
+    let structureId = data.structureId;
+    if (!structureId) {
+      const platform = await this.prisma.academicStructure.findUnique({
+        where: { scopeKey: PLATFORM_SCOPE_KEY },
+        select: { id: true },
+      });
+      if (!platform) {
+        throw AppException.validation({
+          structureId: ['no platform academic structure exists; create one first'],
+        });
+      }
+      structureId = platform.id;
+    }
+
+    const created = await this.prisma.academicYear.create({
+      data: {
+        structureId,
+        order: data.order,
+        name: data.name,
+        nameAr: data.nameAr,
+      },
+    });
     await this.bust();
     await this.audit.record({
       actorId: actor.id,

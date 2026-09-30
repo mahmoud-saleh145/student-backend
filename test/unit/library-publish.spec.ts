@@ -71,10 +71,19 @@ function build(
   // missing method would fail the test for the wrong reason.
   const storage = { publicAssetUrl: jest.fn(async () => null), signMediaUrl: jest.fn() };
 
+  // LibraryService gained a settings dependency for the library default
+  // thumbnail; it resolves images on read rather than writing the default
+  // onto part rows. Nothing under test here reads it, so it answers "no
+  // default configured".
+  const settings = {
+    libraryDefaultThumbnailKey: jest.fn(async () => null),
+  };
+
   const service = new LibraryService(
     prisma as never,
     audit as never,
     storage as never,
+    settings as never,
   );
 
   // `updateMaterial` returns `materialForAdmin`, which re-reads. The second

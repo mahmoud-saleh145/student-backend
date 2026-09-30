@@ -4,6 +4,7 @@ import {
   ContentStatus,
   DeviceStatus,
   PlaybackTicketStatus,
+  Prisma,
   SecurityEventType,
   SecuritySeverity,
   UserRole,
@@ -156,6 +157,16 @@ export class PlaybackService {
       });
     }
 
+    // A failed transcode is its own answer. Folded into VIDEO_UNAVAILABLE the
+    // app could only say "unavailable", which reads to a student as "try
+    // later" — and no amount of waiting fixes a failed encode.
+    if (video.status === VideoStatus.FAILED) {
+      await this.denied(user, videoId, video.courseId, 'video processing failed');
+      throw new AppException(ErrorCode.VIDEO_PROCESSING_FAILED, {
+        details: { status: video.status },
+      });
+    }
+
     if (video.status !== VideoStatus.READY) {
       await this.denied(user, videoId, video.courseId, `video status ${video.status}`);
       throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
@@ -224,6 +235,13 @@ export class PlaybackService {
     // --- 7. concurrency ------------------------------------------------------
     await this.acquireStreamSlot(user, video.courseId, videoId, params.ip);
 
+    // --- 7b. play allowance --------------------------------------------------
+    // Counted only for protected lessons and only for students. A free
+    // preview consumes nothing, and staff previewing their own material are
+    // not spending a student's allowance.
+    const countPlays = user.role === UserRole.STUDENT && !video.lesson.isPreview;
+    const play = countPlays ? await this.claimPlay(user, videoId, params.ip) : null;
+
     // --- 8. mint -------------------------------------------------------------
     return this.mintTicket({
       user,
@@ -233,7 +251,133 @@ export class PlaybackService {
       ip: params.ip,
       userAgent: params.userAgent,
       rotatedFromId: null,
+      playId: play?.id ?? null,
     });
+  }
+
+  /**
+   * Reserves one of the student's plays for this video, or resumes the play
+   * already in progress.
+   *
+   * The limit is a COUNT of `video_plays` rows keyed on the account, which is
+   * what makes it survive a reinstall, a storage wipe or a fresh sign-in. The
+   * client never writes here and is never told the count in a way it could
+   * edit — it receives the remaining figure for display only.
+   *
+   * Two rules keep the count honest rather than merely strict, and both exist
+   * because a limit that punishes technical failure is worse than no limit:
+   *
+   *   * An OPEN play whose last activity is inside `playResumeWindow` is
+   *     reused. Backgrounding the app, losing the network, or letting a ticket
+   *     expire mid-lesson all come back through here and must not cost a play.
+   *   * A CLOSED play that never reached `minCountedPlaySeconds` does not
+   *     count. A tap that failed to start is not an attempt.
+   */
+  private async claimPlay(
+    user: AuthenticatedUser,
+    videoId: string,
+    ip?: string | null,
+  ): Promise<{ id: string; attemptNumber: number }> {
+    const limit = this.cfg.maxPlaysPerVideo;
+    const resumeCutoff = new Date(Date.now() - this.cfg.playResumeWindow * 1000);
+
+    // Resume first: cheaper than counting, and the common case for a student
+    // whose ticket lapsed while the lesson was still on screen.
+    const open = await this.prisma.videoPlay.findFirst({
+      where: {
+        userId: user.id,
+        videoId,
+        closedAt: null,
+        lastActivityAt: { gte: resumeCutoff },
+      },
+      orderBy: { attemptNumber: 'desc' },
+      select: { id: true, attemptNumber: true },
+    });
+
+    if (open) {
+      await this.prisma.videoPlay.update({
+        where: { id: open.id },
+        data: { lastActivityAt: new Date() },
+      });
+      return open;
+    }
+
+    // Anything still open but beyond the window is a play the student walked
+    // away from. Close it before counting, so it counts on its own merits
+    // (watched long enough) rather than as a permanently open attempt.
+    await this.prisma.videoPlay.updateMany({
+      where: { userId: user.id, videoId, closedAt: null },
+      data: { closedAt: new Date() },
+    });
+
+    const used = await this.countedPlays(user.id, videoId);
+
+    if (used >= limit) {
+      await this.denied(user, videoId, null, `play limit reached (${used}/${limit})`);
+      throw new AppException(ErrorCode.VIDEO_WATCH_LIMIT_REACHED, {
+        details: { used, limit },
+      });
+    }
+
+    // `attemptNumber` is allocated from the current highest rather than from
+    // the counted total, because uncounted plays still occupy a number and
+    // the unique index would reject a collision.
+    const highest = await this.prisma.videoPlay.aggregate({
+      where: { userId: user.id, videoId },
+      _max: { attemptNumber: true },
+    });
+    const next = (highest._max.attemptNumber ?? 0) + 1;
+
+    try {
+      return await this.prisma.videoPlay.create({
+        data: { userId: user.id, videoId, attemptNumber: next },
+        select: { id: true, attemptNumber: true },
+      });
+    } catch (error) {
+      // Two concurrent issue requests both read the same count. The unique
+      // index on (userId, videoId, attemptNumber) lets exactly one win; the
+      // loser re-enters rather than inventing a number, so racing the
+      // endpoint cannot manufacture a fourth play.
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        void ip;
+        return this.claimPlay(user, videoId);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Plays that count against the limit: everything still open, plus finished
+   * ones that were actually watched. See `claimPlay` for why the threshold
+   * exists.
+   */
+  private async countedPlays(userId: string, videoId: string): Promise<number> {
+    return this.prisma.videoPlay.count({
+      where: {
+        userId,
+        videoId,
+        OR: [
+          { closedAt: null },
+          { watchedSeconds: { gte: this.cfg.minCountedPlaySeconds } },
+        ],
+      },
+    });
+  }
+
+  /**
+   * What the student has left on this video, for display. Read-only, and the
+   * server never trusts a figure the client sends back.
+   */
+  async playAllowance(
+    userId: string,
+    videoId: string,
+  ): Promise<{ used: number; limit: number; remaining: number }> {
+    const limit = this.cfg.maxPlaysPerVideo;
+    const used = await this.countedPlays(userId, videoId);
+    return { used, limit, remaining: Math.max(0, limit - used) };
   }
 
   private async mintTicket(params: {
@@ -253,6 +397,8 @@ export class PlaybackService {
     ip?: string | null;
     userAgent?: string | null;
     rotatedFromId: string | null;
+    /** The counted play this grant belongs to; null for free/preview lessons. */
+    playId: string | null;
   }): Promise<PlaybackTicketResponse> {
     const { user, video } = params;
 
@@ -292,6 +438,7 @@ export class PlaybackService {
         ipAddress: params.ip ?? null,
         userAgent: params.userAgent?.slice(0, 500) ?? null,
         rotatedFromId: params.rotatedFromId,
+        playId: params.playId,
       },
     });
 
@@ -631,6 +778,24 @@ export class PlaybackService {
         .catch(() => undefined);
     }
 
+    // --- play accounting ------------------------------------------------------
+    // The play's own watched total, which is what decides whether this attempt
+    // counted at all. Kept on the play rather than summed from tickets so a
+    // rotation mid-lesson cannot double-count the overlap.
+    if (ticket.playId) {
+      await this.prisma.videoPlay
+        .update({
+          where: { id: ticket.playId },
+          data: {
+            lastActivityAt: new Date(),
+            ...(delta > 0 ? { watchedSeconds: { increment: delta } } : {}),
+          },
+        })
+        // Best-effort: a pruned play must not break playback for a student
+        // who is legitimately watching.
+        .catch(() => undefined);
+    }
+
     // --- rotation -------------------------------------------------------------
     // Rotate before the manifest URL lapses so a long lesson never stalls.
     const remainingMs = ticket.expiresAt.getTime() - Date.now();
@@ -649,6 +814,10 @@ export class PlaybackService {
         maxHeight: ticket.maxHeight,
         ip: params.ip,
         rotatedFromId: ticket.id,
+        // The SAME play. A rotation is the middle of one attempt, not a new
+        // one — carrying the id forward is what stops a long lesson spending
+        // the student's whole allowance on a single sitting.
+        playId: ticket.playId,
       });
 
       return { ok: true, ticket: rotated };
@@ -664,7 +833,15 @@ export class PlaybackService {
   async release(user: AuthenticatedUser, ticketId: string): Promise<{ ok: true }> {
     const ticket = await this.prisma.playbackTicket.findFirst({
       where: { id: ticketId, userId: user.id },
-      select: { id: true, status: true, lastPositionSeconds: true, lessonId: true, courseId: true, videoId: true },
+      select: {
+        id: true,
+        status: true,
+        lastPositionSeconds: true,
+        lessonId: true,
+        courseId: true,
+        videoId: true,
+        playId: true,
+      },
     });
 
     if (!ticket) return { ok: true };
@@ -677,6 +854,25 @@ export class PlaybackService {
     }
 
     await this.releaseStreamSlot(user.id, user.sessionId);
+
+    // Deliberately NOT closing the play here.
+    //
+    // Releasing a ticket is what the app does when the player is dismissed,
+    // the screen is left, or the process is backgrounded — none of which
+    // means the student is finished with the lesson. Closing the play on
+    // release would make reopening the player ten seconds later cost a second
+    // attempt, which is precisely the technical-retry penalty the limit must
+    // not have. The play stays open and `claimPlay` decides: inside
+    // `playResumeWindow` it is the same attempt, beyond it the play is closed
+    // and counted on the seconds it actually accumulated.
+    //
+    // Touching lastActivityAt keeps the window measured from when they
+    // stopped watching rather than from when the ticket was minted.
+    if (ticket.playId) {
+      await this.prisma.videoPlay
+        .update({ where: { id: ticket.playId }, data: { lastActivityAt: new Date() } })
+        .catch(() => undefined);
+    }
 
     await this.prisma.watchEvent
       .create({

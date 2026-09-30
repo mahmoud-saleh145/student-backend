@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
   AuditAction,
   ContentStatus,
@@ -13,6 +14,7 @@ import { ErrorCode } from '../../common/errors/error-codes';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { CourseAccessService } from '../courses/course-access.service';
+import { StorageService } from '../storage/storage.service';
 import { toEgpNumber } from '../wallet/money';
 
 import { loadPartAllocation } from './part-allocation.guard';
@@ -40,6 +42,10 @@ export class CoursePartsService {
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
     private readonly access: CourseAccessService,
+    private readonly config: ConfigService,
+    // StorageModule is @Global, so this needs no module import. Used only to
+    // turn a thumbnail key into a URL — nothing here writes to storage.
+    private readonly storage: StorageService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -103,6 +109,16 @@ export class CoursePartsService {
       }
     }
 
+    // Resolved once for the whole list rather than per part.
+    const adminThumbnails = new Map(
+      await Promise.all(
+        parts.map(
+          async (part) =>
+            [part.id, await this.storage.publicAssetUrl(part.thumbnailKey)] as const,
+        ),
+      ),
+    );
+
     return {
       courseId,
       coursePrice: price === null ? null : Number(price),
@@ -127,6 +143,10 @@ export class CoursePartsService {
         sectionCount: part.sections.length,
         entitlementCount: part._count.entitlements,
         purchaseCount: part._count.purchases,
+        // The key so the dashboard can tell "own image" from "inherited", and
+        // the URL so it can show whichever is in force.
+        thumbnailKey: part.thumbnailKey,
+        thumbnailUrl: adminThumbnails.get(part.id) ?? null,
         createdAt: part.createdAt.toISOString(),
       })),
     };
@@ -166,6 +186,7 @@ export class CoursePartsService {
           pricePercent: true,
           priceAmount: true,
           currency: true,
+          thumbnailKey: true,
           sections: {
             where: { ...notDeleted, status: ContentStatus.PUBLISHED },
             orderBy: { sortOrder: 'asc' },
@@ -221,6 +242,16 @@ export class CoursePartsService {
       }
     }
 
+    // One pass for the list, not one lookup per part.
+    const studentThumbnails = new Map(
+      await Promise.all(
+        parts.map(
+          async (part) =>
+            [part.id, await this.storage.publicAssetUrl(part.thumbnailKey)] as const,
+        ),
+      ),
+    );
+
     const owned = new Map(entitlements.map((e) => [e.coursePartId, e.grantedAt]));
     // A whole-course enrollment predates parts, or came from a course-wide
     // code. Either way the student already has everything, and every part must
@@ -241,6 +272,8 @@ export class CoursePartsService {
           titleAr: part.titleAr,
           description: part.description,
           sortOrder: part.sortOrder,
+          thumbnailKey: part.thumbnailKey,
+          thumbnailUrl: studentThumbnails.get(part.id) ?? null,
           price: allocation?.get(part.id)?.egp ?? null,
           pricePercent: allocation?.get(part.id)?.percent ?? null,
           currency: part.currency,
@@ -265,6 +298,103 @@ export class CoursePartsService {
           })),
         };
       }),
+    };
+  }
+
+  /**
+   * Everything the JOIN sheet needs, in one request.
+   *
+   * Composed from `listForStudent` rather than duplicating it: the part price
+   * allocation is delicate (percentages must total exactly 100, and the
+   * rounding remainder goes to a defined part), and a second implementation
+   * would drift from the first. What this adds is the whole-course option
+   * alongside the parts, and the list of mechanisms actually available — so
+   * the app renders what the server permits rather than deciding for itself.
+   *
+   * On mechanisms:
+   *   * `accessCode` is always the live path. A part is unlocked by redeeming
+   *     a part-scoped card through the existing redemption endpoint.
+   *   * `wallet` is ALWAYS false here, and deliberately so. The wallet belongs
+   *     to the Library; a course must never debit it. It is reported rather
+   *     than omitted so the app never has to infer it.
+   *   * `onlinePayment` follows the configured provider, which ships as
+   *     'none'. The payment implementation is intact and dormant behind this
+   *     flag — turning it on is a configuration change, not a code change.
+   */
+  async joinOptions(courseId: string, userId: string) {
+    const [course, partsView, enrollment, enrollmentRow] = await Promise.all([
+      this.prisma.course.findFirst({
+        where: { id: courseId, ...notDeleted },
+        select: {
+          id: true,
+          title: true,
+          titleAr: true,
+          status: true,
+          isFree: true,
+          thumbnailKey: true,
+          enrollmentMethods: true,
+        },
+      }),
+      this.listForStudent(courseId, userId),
+      this.prisma.enrollment.findUnique({
+        where: { userId_courseId: { userId, courseId } },
+        select: { coversAllSections: true, state: true },
+      }),
+      // The enrolment row, for the same `decide()` the course screen feeds.
+      this.prisma.enrollment.findUnique({
+        where: { userId_courseId: { userId, courseId } },
+      }),
+    ]);
+
+    if (!course) throw AppException.notFound('Course', courseId);
+
+    const paymentProvider = this.config.get<string>('payment.provider') ?? 'none';
+    const courseEnrollmentMethods = course.enrollmentMethods;
+
+    const ownsWholeCourse = enrollment?.coversAllSections === true;
+    const coursePrice = partsView.coursePrice;
+
+    return {
+      courseId: course.id,
+      title: course.title,
+      titleAr: course.titleAr,
+      /**
+       * The whole-course option. Always present, because a course with parts
+       * can still be bought entire and that is usually the better deal — the
+       * student must be able to see both and choose.
+       */
+      fullCourse: {
+        price: course.isFree ? 0 : coursePrice,
+        currency: 'EGP',
+        isFree: course.isFree,
+        owned: ownsWholeCourse,
+        // A misconfigured allocation leaves `coursePrice` null; offering a
+        // purchase with no price would produce a card the student cannot use.
+        purchasable: !ownsWholeCourse && (course.isFree || coursePrice !== null),
+      },
+      hasParts: partsView.hasParts,
+      ownsAllParts: partsView.ownsAllParts,
+      parts: partsView.parts,
+      methods: {
+        accessCode: true,
+        wallet: false,
+        onlinePayment: paymentProvider !== 'none',
+      },
+      /**
+       * The enrolment methods this course actually permits right now, from
+       * the same resolver the course screen uses — PAYMENT already filtered
+       * out when no provider is configured.
+       *
+       * Exposed because the JOIN sheet must render exactly what the server
+       * allows and nothing else. Without it the sheet would have to infer
+       * that a free course can be joined with one tap, which is the kind of
+       * guess that produces a button leading nowhere.
+       */
+      enrollmentMethods: this.access.toCourseAccess(
+        this.access.decide(course.status, enrollmentRow),
+        courseEnrollmentMethods,
+        course.status,
+      ).availableMethods,
     };
   }
 
@@ -350,6 +480,7 @@ export class CoursePartsService {
       priceAmount?: number;
       sortOrder?: number;
       sectionIds?: string[];
+      thumbnailKey?: string | null;
     },
     actor: { id: string; role: UserRole },
   ) {
@@ -377,6 +508,7 @@ export class CoursePartsService {
           titleAr: input.titleAr ?? null,
           description: input.description ?? null,
           sortOrder: input.sortOrder ?? (last?.sortOrder ?? 0) + 1,
+          thumbnailKey: input.thumbnailKey ?? null,
           pricingModel: input.pricingModel,
           pricePercent: input.pricingModel === PartPricingModel.PERCENTAGE
             ? (input.pricePercent ?? 0)
@@ -434,6 +566,7 @@ export class CoursePartsService {
       priceAmount?: number;
       isActive?: boolean;
       status?: ContentStatus;
+      thumbnailKey?: string | null;
     },
     actor: { id: string; role: UserRole },
   ) {
@@ -478,6 +611,10 @@ export class CoursePartsService {
           ...(input.title !== undefined ? { title: input.title } : {}),
           ...(input.titleAr !== undefined ? { titleAr: input.titleAr } : {}),
           ...(input.description !== undefined ? { description: input.description } : {}),
+          // `undefined` leaves it alone, explicit null clears it. Collapsing
+          // the two would make "don't touch the image" impossible to express
+          // in a PATCH that changes only the title.
+          ...(input.thumbnailKey !== undefined ? { thumbnailKey: input.thumbnailKey } : {}),
           ...(input.isActive !== undefined ? { isActive: input.isActive } : {}),
           ...(input.status !== undefined ? { status: input.status } : {}),
           ...(input.pricingModel || input.pricePercent !== undefined || input.priceAmount !== undefined

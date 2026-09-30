@@ -186,6 +186,19 @@ export class PlaybackController {
    * request, the session may have been revoked, the device unbound, or a
    * capture detected. The Worker caches this answer for ten seconds.
    */
+  @Get('videos/:videoId/allowance')
+  @ApiOperation({
+    summary: 'How many plays of this video the student has left',
+    description:
+      'Display only. The limit is enforced when a ticket is issued, from the same server-side count — the app cannot raise it by lying about this figure, and a student who never calls this is limited exactly the same way.',
+  })
+  allowance(
+    @Param('videoId') videoId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ): Promise<{ used: number; limit: number; remaining: number }> {
+    return this.playback.playAllowance(user.id, videoId);
+  }
+
   @Get('tickets/:ticketId/state')
   @Public()
   @ApiOperation({

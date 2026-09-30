@@ -82,6 +82,18 @@ export class CreateCoursePartDto {
   @ArrayMaxSize(200)
   @IsString({ each: true })
   sectionIds?: string[];
+
+  /**
+   * Object key from a presigned thumbnail upload, never a public URL.
+   *
+   * Omit to leave the current image alone; send null to clear it, which falls
+   * back to the course's own thumbnail at read time rather than copying it.
+   */
+  @ApiPropertyOptional({ nullable: true })
+  @IsOptional()
+  @IsString()
+  @MaxLength(512)
+  thumbnailKey?: string | null;
 }
 
 export class UpdateCoursePartDto {
@@ -134,6 +146,18 @@ export class UpdateCoursePartDto {
   @IsOptional()
   @IsEnum(ContentStatus)
   status?: ContentStatus;
+
+  /**
+   * Object key from a presigned thumbnail upload, never a public URL.
+   *
+   * Omit to leave the current image alone; send null to clear it, which falls
+   * back to the course's own thumbnail at read time rather than copying it.
+   */
+  @ApiPropertyOptional({ nullable: true })
+  @IsOptional()
+  @IsString()
+  @MaxLength(512)
+  thumbnailKey?: string | null;
 }
 
 export class SetPartSectionsDto {

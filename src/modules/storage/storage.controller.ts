@@ -16,6 +16,19 @@ import { StorageService } from './storage.service';
 /** Ceiling for a Library document, shared by both upload transports. */
 const MAX_LIBRARY_DOCUMENT_BYTES = 200 * 1024 * 1024;
 
+/**
+ * Thumbnails are small and go through this API rather than browser→R2.
+ *
+ * The presigned route beside these exists too, but a presigned PUT is
+ * cross-origin and so needs a CORS policy on the bucket it targets. The
+ * uploads bucket has one (the 8 GB video path needs it); the media bucket does
+ * not, and adding one to the bucket students read from to save a 200 KB image
+ * would be the wrong trade. At this size streaming through the API costs a
+ * held socket, not memory.
+ */
+const MAX_THUMBNAIL_BYTES = 10 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024;
+
 const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const DOC_TYPES = [
   'application/pdf',
@@ -32,6 +45,22 @@ class PresignAvatarDto {
 
 class PresignCourseThumbnailDto {
   @IsString() @MaxLength(32) courseId!: string;
+  @IsIn(IMAGE_TYPES) contentType!: string;
+  @Type(() => Number) @IsInt() @Min(1) @Max(10 * 1024 * 1024) sizeBytes!: number;
+}
+class PresignCoursePartThumbnailDto {
+  @IsString() @MaxLength(32) courseId!: string;
+  @IsString() @MaxLength(32) partId!: string;
+  @IsIn(IMAGE_TYPES) contentType!: string;
+  @Type(() => Number) @IsInt() @Min(1) @Max(10 * 1024 * 1024) sizeBytes!: number;
+}
+class PresignLibraryPartThumbnailDto {
+  @IsString() @MaxLength(32) materialId!: string;
+  @IsString() @MaxLength(32) partId!: string;
+  @IsIn(IMAGE_TYPES) contentType!: string;
+  @Type(() => Number) @IsInt() @Min(1) @Max(10 * 1024 * 1024) sizeBytes!: number;
+}
+class PresignLibraryDefaultThumbnailDto {
   @IsIn(IMAGE_TYPES) contentType!: string;
   @Type(() => Number) @IsInt() @Min(1) @Max(10 * 1024 * 1024) sizeBytes!: number;
 }
@@ -67,6 +96,32 @@ export class PresignLibraryDocumentDto {
  * size fields: the presign form is *told* the size, whereas here the size is a
  * fact of the request and is read from Content-Length rather than trusted.
  */
+/** Query shape shared by every streaming thumbnail upload. */
+class UploadThumbnailQueryDto {
+  @IsIn(IMAGE_TYPES) contentType!: string;
+}
+
+class UploadCoursePartThumbnailQueryDto extends UploadThumbnailQueryDto {
+  @IsString() @MaxLength(32) courseId!: string;
+  @IsString() @MaxLength(32) partId!: string;
+}
+
+class UploadLibraryPartThumbnailQueryDto extends UploadThumbnailQueryDto {
+  @IsString() @MaxLength(32) materialId!: string;
+  @IsString() @MaxLength(32) partId!: string;
+}
+
+class UploadAttachmentQueryDto {
+  @IsString() @MaxLength(32) courseId!: string;
+  @IsString() @MaxLength(200)
+  @Matches(/^[\w .()\-؀-ۿ]+\.[A-Za-z0-9]{1,8}$/, {
+    message: 'filename contains unsupported characters',
+  })
+  filename!: string;
+
+  @IsIn([...DOC_TYPES, ...IMAGE_TYPES]) contentType!: string;
+}
+
 export class UploadLibraryDocumentQueryDto {
   @IsString() @MaxLength(200)
   @Matches(/^[\w .()\-؀-ۿ]+\.[A-Za-z0-9]{1,8}$/, {
@@ -127,6 +182,53 @@ export class StorageController {
     return this.storage.presignUpload({
       bucket: 'media',
       objectKey: StorageService.keys.courseThumbnail(dto.courseId, ext),
+      contentType: dto.contentType,
+      expiresIn: 900,
+    });
+  }
+
+  @Post('uploads/course-part-thumbnail')
+  @StaffOnly()
+  @ApiOperation({
+    summary: 'Presign a course-part thumbnail upload',
+    description:
+      'Returns an object key. Register it with PATCH /admin/courses/:courseId/parts/:partId to make it the part\'s thumbnail.',
+  })
+  async coursePartThumbnail(@Body() dto: PresignCoursePartThumbnailDto) {
+    const ext = extensionFor(dto.contentType);
+    return this.storage.presignUpload({
+      bucket: 'media',
+      objectKey: StorageService.keys.coursePartThumbnail(dto.courseId, dto.partId, ext),
+      contentType: dto.contentType,
+      expiresIn: 900,
+    });
+  }
+
+  @Post('uploads/library-part-thumbnail')
+  @AdminOnly()
+  @ApiOperation({ summary: 'Presign a library-part thumbnail upload' })
+  async libraryPartThumbnail(@Body() dto: PresignLibraryPartThumbnailDto) {
+    const ext = extensionFor(dto.contentType);
+    return this.storage.presignUpload({
+      bucket: 'media',
+      objectKey: StorageService.keys.libraryPartThumbnail(dto.materialId, dto.partId, ext),
+      contentType: dto.contentType,
+      expiresIn: 900,
+    });
+  }
+
+  @Post('uploads/library-default-thumbnail')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Presign the library default-thumbnail upload',
+    description:
+      'The fallback image for library parts that have none of their own. Register it with PUT /settings/library-default-thumbnail. It is never written onto a part row — resolution happens at read time, so an explicitly chosen thumbnail is never overwritten.',
+  })
+  async libraryDefaultThumbnail(@Body() dto: PresignLibraryDefaultThumbnailDto) {
+    const ext = extensionFor(dto.contentType);
+    return this.storage.presignUpload({
+      bucket: 'media',
+      objectKey: StorageService.keys.libraryDefaultThumbnail(ext),
       contentType: dto.contentType,
       expiresIn: 900,
     });
@@ -237,6 +339,151 @@ export class StorageController {
     });
 
     return { objectKey, sizeBytes: declared };
+  }
+
+  // -------------------------------------------------------------------------
+  // Streaming uploads for thumbnails and course material
+  //
+  // Each of these declares its own size ceiling and requires Content-Length,
+  // for the same reason the library document above does: `putStream` streams
+  // to storage rather than buffering, and it needs the length up front. A
+  // request without one is refused rather than read into memory to measure.
+  // -------------------------------------------------------------------------
+
+  @Post('uploads/course-part-thumbnail/content')
+  @StaffOnly()
+  @ApiOperation({
+    summary: 'Upload a course-part thumbnail through the API',
+    description: 'Raw request body. Returns the object key to set on the part.',
+  })
+  async coursePartThumbnailContent(
+    @Query() query: UploadCoursePartThumbnailQueryDto,
+    @Req() req: Request,
+  ) {
+    const declared = this.requireLength(req, MAX_THUMBNAIL_BYTES);
+    const objectKey = StorageService.keys.coursePartThumbnail(
+      query.courseId,
+      query.partId,
+      extensionFor(query.contentType),
+    );
+
+    await this.storage.putStream({
+      bucket: 'media',
+      objectKey,
+      body: req,
+      contentLength: declared,
+      contentType: query.contentType,
+    });
+
+    return { objectKey, sizeBytes: declared };
+  }
+
+  @Post('uploads/library-part-thumbnail/content')
+  @AdminOnly()
+  @ApiOperation({ summary: 'Upload a library-part thumbnail through the API' })
+  async libraryPartThumbnailContent(
+    @Query() query: UploadLibraryPartThumbnailQueryDto,
+    @Req() req: Request,
+  ) {
+    const declared = this.requireLength(req, MAX_THUMBNAIL_BYTES);
+    const objectKey = StorageService.keys.libraryPartThumbnail(
+      query.materialId,
+      query.partId,
+      extensionFor(query.contentType),
+    );
+
+    await this.storage.putStream({
+      bucket: 'media',
+      objectKey,
+      body: req,
+      contentLength: declared,
+      contentType: query.contentType,
+    });
+
+    return { objectKey, sizeBytes: declared };
+  }
+
+  @Post('uploads/library-default-thumbnail/content')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Upload the library default thumbnail through the API',
+    description:
+      'Returns the object key to store in the library.defaultThumbnailKey setting. It is never written onto a part row.',
+  })
+  async libraryDefaultThumbnailContent(
+    @Query() query: UploadThumbnailQueryDto,
+    @Req() req: Request,
+  ) {
+    const declared = this.requireLength(req, MAX_THUMBNAIL_BYTES);
+    const objectKey = StorageService.keys.libraryDefaultThumbnail(
+      extensionFor(query.contentType),
+    );
+
+    await this.storage.putStream({
+      bucket: 'media',
+      objectKey,
+      body: req,
+      contentLength: declared,
+      contentType: query.contentType,
+    });
+
+    return { objectKey, sizeBytes: declared };
+  }
+
+  @Post('uploads/attachment/content')
+  @StaffOnly()
+  @ApiOperation({
+    summary: 'Upload course material through the API',
+    description:
+      'Raw request body. Returns the object key to register with POST /attachments, scoped there to a lecture, a section, or the whole course.',
+  })
+  async attachmentContent(
+    @Query() query: UploadAttachmentQueryDto,
+    @Req() req: Request,
+  ) {
+    if (query.filename.includes('..') || query.filename.includes('/')) {
+      throw new AppException(ErrorCode.VALIDATION_ERROR, {
+        fields: { filename: ['must not contain path separators'] },
+      });
+    }
+
+    const declared = this.requireLength(req, MAX_ATTACHMENT_BYTES);
+    const objectKey = StorageService.keys.attachment(query.courseId, query.filename);
+
+    await this.storage.putStream({
+      bucket: 'uploads',
+      objectKey,
+      body: req,
+      contentLength: declared,
+      contentType: query.contentType,
+    });
+
+    return { objectKey, sizeBytes: declared };
+  }
+
+  /**
+   * The Content-Length gate, shared by every streaming upload above.
+   *
+   * Refusing a request with no declared length is deliberate: the alternative
+   * is reading an unbounded body to find out how big it is, which is the
+   * memory profile these endpoints exist to avoid.
+   */
+  private requireLength(req: Request, max: number): number {
+    const declared = Number(req.headers['content-length'] ?? 0);
+
+    if (!Number.isFinite(declared) || declared <= 0) {
+      throw new AppException(ErrorCode.VALIDATION_ERROR, {
+        fields: { body: ['a Content-Length header is required'] },
+      });
+    }
+
+    if (declared > max) {
+      throw new AppException(ErrorCode.VALIDATION_ERROR, {
+        fields: { body: [`upload exceeds the ${max} byte limit`] },
+      });
+    }
+
+    return declared;
   }
 }
 
