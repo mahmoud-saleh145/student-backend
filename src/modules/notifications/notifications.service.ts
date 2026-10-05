@@ -10,6 +10,7 @@ import {
 import { Queue } from 'bullmq';
 
 import { AppException } from '../../common/errors/app.exception';
+import { ConfigService } from '@nestjs/config';
 import { paginated } from '../../common/types/api-response';
 import { PrismaService } from '../../database/prisma.service';
 import { QUEUE_NAMES, type PushJobData } from '../../jobs/queue.constants';
@@ -45,6 +46,27 @@ export interface CreateNotificationInput {
  * ends up driving client-side navigation and an arbitrary URL there would be a
  * redirect vector.
  */
+/**
+ * Page order for an inbox, newest first.
+ *
+ * `createdAt` alone is not an order, it is a partial one. `createdAt` defaults
+ * to `now()`, which in Postgres is *transaction* time — so every row written by
+ * a single `createMany` shares one identical timestamp. Ordering on it alone
+ * leaves those rows in whatever order the planner happens to produce, which is
+ * not stable between the `SELECT` for page 2 and the one for page 1. The visible
+ * symptom is a notification shown twice while another never appears, and it
+ * shows up under exactly the load the inbox is built for: a busy week.
+ *
+ * `id` is unique, so adding it as a tiebreaker makes the order total and the
+ * pages partition the set rather than sampling it. Both list methods have to use
+ * the same order for that to hold, which is why it is a constant rather than
+ * written out twice.
+ */
+const NOTIFICATION_PAGE_ORDER: Prisma.NotificationOrderByWithRelationInput[] = [
+  { createdAt: 'desc' },
+  { id: 'desc' },
+];
+
 @Injectable()
 export class NotificationsService {
   private readonly logger = new Logger(NotificationsService.name);
@@ -52,10 +74,22 @@ export class NotificationsService {
   private static readonly SAFE_ROUTE =
     /^\/(?:course|lesson|player|viewer|settings|profile|search|notifications)(?:\/[A-Za-z0-9._~-]+)*\/?$/;
 
+  /**
+   * Active push tokens one account may hold. See PUSH_MAX_ACTIVE_TOKENS_PER_USER.
+   *
+   * Falls back to the validated default so a unit test that builds this service
+   * without a ConfigService still enforces the same ceiling instead of quietly
+   * allowing an unbounded set.
+   */
+  private readonly pushTokenCap: number;
+
   constructor(
     private readonly prisma: PrismaService,
     @InjectQueue(QUEUE_NAMES.push) private readonly pushQueue: Queue<PushJobData>,
-  ) {}
+    config: ConfigService,
+  ) {
+    this.pushTokenCap = config.get<number>('PUSH_MAX_ACTIVE_TOKENS_PER_USER') ?? 8;
+  }
 
   // ---------------------------------------------------------------------------
   // Creation
@@ -135,6 +169,83 @@ export class NotificationsService {
     return { created: created.count };
   }
 
+  /**
+   * Creates notifications that are each allowed to exist once, ever.
+   *
+   * `createForMany` is deliberately unguarded, because a broadcast is supposed
+   * to reach everyone and re-running it should be a no-op by virtue of the
+   * caller not asking twice. This is the variant for jobs that *will* re-run —
+   * a cron that fires again, a retry, a duplicate delivery — where "won't happen
+   * again today" is not a guarantee, it is an assumption.
+   *
+   * Each row carries a `dedupeKey`, and the uniqueness constraint does the work:
+   * a repeat run inserts the rows it has not seen and skips the rest, in one
+   * statement, atomically. Nothing has to read first and then write, so two
+   * overlapping runs cannot both decide a row is missing.
+   *
+   * `createMany` does not report *which* rows it skipped, so push targets are
+   * resolved separately against the same indexed column. That lookup is only an
+   * optimisation for the push: correctness of the notification itself does not
+   * depend on it.
+   */
+  async createOnce(
+    rows: Array<CreateNotificationInput & { dedupeKey: string }>,
+  ): Promise<{ created: number; skipped: number }> {
+    if (rows.length === 0) return { created: 0, skipped: 0 };
+
+    const keys = rows.map((r) => r.dedupeKey);
+
+    const alreadyPresent = await this.prisma.notification.findMany({
+      where: { dedupeKey: { in: keys } },
+      select: { dedupeKey: true },
+    });
+    const present = new Set(alreadyPresent.map((r) => r.dedupeKey));
+
+    const fresh = rows.filter((r) => !present.has(r.dedupeKey));
+
+    const inserted = await this.prisma.notification.createMany({
+      data: fresh.map((r) => ({
+        userId: r.userId,
+        kind: r.kind,
+        title: r.title,
+        titleAr: r.titleAr,
+        body: r.body,
+        bodyAr: r.bodyAr,
+        route: this.sanitizeRoute(r.route),
+        imageUrl: r.imageUrl,
+        data: (r.data ?? undefined) as Prisma.InputJsonValue | undefined,
+        announcementId: r.announcementId,
+        dedupeKey: r.dedupeKey,
+      })),
+      // The safety net for two runs overlapping between the read above and this
+      // insert. Without it the second run would raise P2002 on the whole batch
+      // and lose the rows that were genuinely new.
+      skipDuplicates: true,
+    });
+
+    const pushable = fresh.filter((r) => r.sendPush !== false);
+    if (pushable.length > 0) {
+      await this.pushQueue
+        .add(
+          'bulk',
+          {
+            type: 'bulk',
+            userIds: pushable.map((r) => r.userId),
+            kind: pushable[0].kind,
+            title: pushable[0].title,
+            titleAr: pushable[0].titleAr,
+            body: pushable[0].body,
+            bodyAr: pushable[0].bodyAr,
+            route: this.sanitizeRoute(pushable[0].route),
+          },
+          { removeOnComplete: 100, removeOnFail: 500, attempts: 3, backoff: { type: 'exponential', delay: 5000 } },
+        )
+        .catch((e) => this.logger.warn(`push enqueue failed: ${e.message}`));
+    }
+
+    return { created: inserted.count, skipped: rows.length - inserted.count };
+  }
+
   /** Everyone with active access to a course. Used for new-lesson alerts. */
   async notifyCourseStudents(
     courseId: string,
@@ -198,7 +309,7 @@ export class NotificationsService {
     const [rows, total] = await this.prisma.$transaction([
       this.prisma.notification.findMany({
         where,
-        orderBy: { createdAt: 'desc' },
+        orderBy: NOTIFICATION_PAGE_ORDER,
         skip: (params.page - 1) * params.pageSize,
         take: params.pageSize,
       }),
@@ -263,7 +374,7 @@ export class NotificationsService {
     const [rows, total] = await this.prisma.$transaction([
       this.prisma.notification.findMany({
         where,
-        orderBy: { createdAt: 'desc' },
+        orderBy: NOTIFICATION_PAGE_ORDER,
         skip: (params.page - 1) * params.pageSize,
         take: params.pageSize,
       }),
@@ -315,23 +426,54 @@ export class NotificationsService {
     // A token is globally unique. If it moves to another account (shared
     // handset, account switch) it must be re-pointed, not duplicated —
     // otherwise the previous owner keeps receiving this student's pushes.
-    await this.prisma.pushToken.upsert({
-      where: { token: params.token },
-      create: {
-        userId: params.userId,
-        token: params.token,
-        platform: params.platform,
-        provider: params.provider ?? 'expo',
-        deviceKey: params.deviceKey ?? null,
-      },
-      update: {
-        userId: params.userId,
-        platform: params.platform,
-        deviceKey: params.deviceKey ?? null,
-        isActive: true,
-        failureCount: 0,
-        lastUsedAt: new Date(),
-      },
+    //
+    // Both halves run in one transaction so two devices registering at the same
+    // moment cannot each count the other's row and both keep an over-cap set.
+    await this.prisma.$transaction(async (tx) => {
+      await tx.pushToken.upsert({
+        where: { token: params.token },
+        create: {
+          userId: params.userId,
+          token: params.token,
+          platform: params.platform,
+          provider: params.provider ?? 'expo',
+          deviceKey: params.deviceKey ?? null,
+          lastUsedAt: new Date(),
+        },
+        update: {
+          userId: params.userId,
+          platform: params.platform,
+          deviceKey: params.deviceKey ?? null,
+          isActive: true,
+          failureCount: 0,
+          lastUsedAt: new Date(),
+        },
+      });
+
+      // Keep the most recently seen `cap` tokens and retire the rest.
+      //
+      // Ordered by updatedAt rather than lastUsedAt: lastUsedAt is nullable, and
+      // on Postgres a DESC sort puts NULLs first — which would rank a token that
+      // has never been used above the ones that have. updatedAt is bumped by
+      // this very upsert, so "newest" means "most recently registered".
+      const keepers = await tx.pushToken.findMany({
+        where: { userId: params.userId, isActive: true },
+        orderBy: { updatedAt: 'desc' },
+        take: this.pushTokenCap,
+        select: { id: true },
+      });
+
+      // Anything not in the kept set goes inactive. A user who registered
+      // thousands of tokens while this was unbounded is repaired by their next
+      // registration, and only `cap` rows are ever read to do it.
+      await tx.pushToken.updateMany({
+        where: {
+          userId: params.userId,
+          isActive: true,
+          id: { notIn: keepers.map((k) => k.id) },
+        },
+        data: { isActive: false },
+      });
     });
 
     return { ok: true };
@@ -440,122 +582,58 @@ export class NotificationsService {
   }
 
   // ---------------------------------------------------------------------------
-  // Announcements (admin broadcast)
+  // Direct message to one student
+  //
+  // The broadcast routes used to live here too. They now go through
+  // `AnnouncementsService` — see `createLegacy`/`publishLegacy` for what that
+  // fixed — which leaves only the single-recipient case, which is genuinely a
+  // notification rather than an audience dispatch and so needs no claim.
   // ---------------------------------------------------------------------------
 
-  async createAnnouncement(
+  async messageStudent(
     input: {
       title: string;
       titleAr?: string;
       body: string;
       bodyAr?: string;
       route?: string;
-      courseId?: string;
-      universityId?: string;
-      academicYearId?: string;
       userId?: string;
       sendPush?: boolean;
-      publishNow?: boolean;
     },
     actor: { id: string },
   ) {
-    // A direct message to one student is a notification, not an audience
-    // broadcast: there is no audience to record, so no Announcement row.
-    if (input.userId) {
-      const student = await this.prisma.user.findFirst({
-        where: { id: input.userId, role: UserRole.STUDENT, deletedAt: null },
-        select: { id: true, status: true },
-      });
-      if (!student) throw AppException.notFound('Student', input.userId);
+    if (!input.userId) throw AppException.validation({ userId: ['Required.'] }, 'Who to message?');
 
-      const result = await this.createForMany([student.id], {
-        kind: NotificationKind.ANNOUNCEMENT,
-        title: input.title,
-        titleAr: input.titleAr,
-        body: input.body,
-        bodyAr: input.bodyAr,
-        route: input.route,
-        sendPush: input.sendPush ?? true,
-      });
-      return { userId: student.id, recipients: result.created, sentById: actor.id };
-    }
-
-    const announcement = await this.prisma.announcement.create({
-      data: {
-        title: input.title,
-        titleAr: input.titleAr,
-        body: input.body,
-        bodyAr: input.bodyAr,
-        route: this.sanitizeRoute(input.route),
-        courseId: input.courseId,
-        universityId: input.universityId,
-        academicYearId: input.academicYearId,
-        sendPush: input.sendPush ?? true,
-        createdById: actor.id,
-        publishedAt: input.publishNow === false ? null : new Date(),
-      },
-    });
-
-    if (announcement.publishedAt) {
-      await this.publishAnnouncement(announcement.id);
-    }
-
-    return announcement;
-  }
-
-  async publishAnnouncement(announcementId: string) {
-    const announcement = await this.prisma.announcement.findUnique({
-      where: { id: announcementId },
-    });
-    if (!announcement) throw AppException.notFound('Announcement', announcementId);
-
-    const recipients = await this.prisma.user.findMany({
+    // Scoped to an active, undeleted student. A teacher id, a suspended account
+    // or a deleted one is a not-found here rather than a silently dropped
+    // message: the caller asked to reach a student and no student was reached.
+    //
+    // `status` is load-bearing, not decoration. Without it the guard accepted
+    // PENDING, SUSPENDED and DISABLED accounts, so a direct message could reach
+    // a student the rest of the platform refuses to deliver to — broadcast
+    // audiences already filter on `AccountStatus.ACTIVE`, and this route was
+    // the one way around that.
+    const student = await this.prisma.user.findFirst({
       where: {
+        id: input.userId,
         role: UserRole.STUDENT,
         status: AccountStatus.ACTIVE,
         deletedAt: null,
-        ...(announcement.courseId
-          ? {
-              enrollments: {
-                some: { courseId: announcement.courseId, state: EnrollmentState.ACTIVE },
-              },
-            }
-          : {}),
-        ...(announcement.universityId || announcement.academicYearId
-          ? {
-              studentProfile: {
-                ...(announcement.universityId
-                  ? { universityId: announcement.universityId }
-                  : {}),
-                ...(announcement.academicYearId
-                  ? { academicYearId: announcement.academicYearId }
-                  : {}),
-              },
-            }
-          : {}),
       },
       select: { id: true },
     });
+    if (!student) throw AppException.notFound('Student', input.userId);
 
-    const result = await this.createForMany(
-      recipients.map((r) => r.id),
-      {
-        kind: NotificationKind.ANNOUNCEMENT,
-        title: announcement.title,
-        titleAr: announcement.titleAr ?? undefined,
-        body: announcement.body,
-        bodyAr: announcement.bodyAr ?? undefined,
-        route: announcement.route,
-        announcementId: announcement.id,
-        sendPush: announcement.sendPush,
-      },
-    );
-
-    await this.prisma.announcement.update({
-      where: { id: announcementId },
-      data: { publishedAt: announcement.publishedAt ?? new Date() },
+    const result = await this.createForMany([student.id], {
+      kind: NotificationKind.ANNOUNCEMENT,
+      title: input.title,
+      titleAr: input.titleAr,
+      body: input.body,
+      bodyAr: input.bodyAr,
+      route: input.route,
+      sendPush: input.sendPush ?? true,
     });
 
-    return { announcementId, recipients: result.created };
+    return { userId: student.id, recipients: result.created, sentById: actor.id };
   }
 }

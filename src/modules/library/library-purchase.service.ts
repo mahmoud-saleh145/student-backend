@@ -12,7 +12,13 @@ import {
 
 import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
-import { MONEY_TX_OPTIONS, PrismaService, notDeleted } from '../../database/prisma.service';
+import {
+  assertLibraryItemOnSale,
+  assertMaterialOnSale,
+  isOnSale,
+} from '../../common/publication';
+import { PrismaService, notDeleted } from '../../database/prisma.service';
+import { withSerializableRetry } from '../../database/serializable-retry';
 import { AuditService } from '../audit/audit.service';
 import { fromPiastres, parseAmount, toEgpNumber } from '../wallet/money';
 import { WalletService } from '../wallet/wallet.service';
@@ -125,6 +131,14 @@ export class LibraryPurchaseService {
       /** Everything in it is already owned — buying would grant nothing. */
       fullyOwned: target.partIds.length > 0 && owned.size === target.partIds.length,
       purchasable: target.pricePiastres > 0 && target.partIds.length > 0,
+      /** All items the package lists, receivable or not (1 for a single part). */
+      totalPartCount: target.totalPartCount,
+      /**
+       * Items listed but currently withdrawn. A package at full price with a
+       * non-zero count here is a reduced bundle — the client must show it
+       * before the student pays, not after.
+       */
+      withdrawnPartCount: Math.max(0, target.totalPartCount - target.partIds.length),
     };
   }
 
@@ -148,8 +162,9 @@ export class LibraryPurchaseService {
     const existing = await this.findExisting(idempotencyKey);
     if (existing) return existing;
 
-    const result = await this.prisma
-      .$transaction(async (tx) => {
+    const result = await withSerializableRetry(
+      this.prisma,
+      async (tx) => {
         const target =
           params.kind === LibraryPurchaseKind.PART
             ? await this.loadPart(tx, params.targetId)
@@ -265,7 +280,8 @@ export class LibraryPurchaseService {
           purchasedAt: purchase.purchasedAt.toISOString(),
           alreadyPurchased: false,
         };
-      }, MONEY_TX_OPTIONS)
+      },
+    )
       .catch(async (error: unknown) => {
         // A unique violation means a concurrent request won. From the
         // student's point of view they now own it, so the original purchase is
@@ -421,11 +437,11 @@ export class LibraryPurchaseService {
   ) {
     const part = await tx.libraryPart.findFirst({
       where: { id: partId, ...notDeleted },
-      include: { material: { select: { title: true, status: true, isActive: true, deletedAt: true } } },
+      include: { material: { select: { id: true, title: true, status: true, isActive: true, deletedAt: true } } },
     });
     if (!part) throw AppException.notFound('Library part', partId);
 
-    this.assertOnSale(part.isActive, part.status, part.material);
+    this.assertOnSale(part.isActive, part.status, part.material, part.id);
 
     return {
       title: part.title,
@@ -433,6 +449,8 @@ export class LibraryPurchaseService {
       currency: part.currency,
       pricePiastres: parseAmount(part.price.toString(), 'price'),
       partIds: [part.id],
+      // A single part is indivisible: what is on sale is everything there is.
+      totalPartCount: 1,
     };
   }
 
@@ -443,7 +461,7 @@ export class LibraryPurchaseService {
     const pkg = await tx.libraryPackage.findFirst({
       where: { id: packageId, ...notDeleted },
       include: {
-        material: { select: { title: true, status: true, isActive: true, deletedAt: true } },
+        material: { select: { id: true, title: true, status: true, isActive: true, deletedAt: true } },
         items: {
           orderBy: { sortOrder: 'asc' },
           include: {
@@ -461,22 +479,32 @@ export class LibraryPurchaseService {
     });
     if (!pkg) throw AppException.notFound('Library package', packageId);
 
-    if (!pkg.isActive || pkg.status === ContentStatus.ARCHIVED || pkg.deletedAt) {
-      throw new AppException(ErrorCode.INVALID_STATE, {
-        message: 'This package is not currently on sale',
-      });
-    }
+    // Same rule as a single part: published, active, not deleted, and its
+    // material likewise. Previously only `ARCHIVED` was refused, so a draft or
+    // hidden package could be bought by direct id.
+    assertLibraryItemOnSale(
+      { status: pkg.status, isActive: pkg.isActive, deletedAt: pkg.deletedAt },
+      'This package',
+      pkg.id,
+    );
+
+    // A package whose material has been withdrawn is not for sale either, even
+    // when the package row itself is untouched.
+    if (pkg.material) assertMaterialOnSale(pkg.material, pkg.material.id ?? pkg.id);
 
     // Withdrawn parts are excluded from what the buyer receives. Selling access
-    // to material that has been taken down would be selling nothing.
+    // to material that has been taken down would be selling nothing. Only
+    // `PUBLISHED` parts are included now — a draft or hidden part inside an
+    // otherwise sound package must not be handed over silently.
     const partIds = pkg.items
-      .filter(
-        (item) =>
-          item.part.isActive &&
-          item.part.deletedAt === null &&
-          item.part.status !== ContentStatus.ARCHIVED,
-      )
+      .filter((item) => isOnSale(item.part))
       .map((item) => item.part.id);
+
+    if (partIds.length === 0) {
+      throw new AppException(ErrorCode.INVALID_STATE, {
+        message: 'This package has no purchasable content',
+      });
+    }
 
     return {
       title: pkg.title,
@@ -484,28 +512,38 @@ export class LibraryPurchaseService {
       currency: pkg.currency,
       pricePiastres: parseAmount(pkg.price.toString(), 'price'),
       partIds,
+      // Everything the package lists, whether currently receivable or not. The
+      // quote contrasts this with `partIds.length` so the buyer sees an
+      // explicit "N of M parts currently available" instead of discovering a
+      // smaller bundle only after paying the full package price.
+      totalPartCount: pkg.items.length,
     };
   }
 
+  /**
+   * A library item may be newly acquired only while it is published, active and
+   * not deleted, and only while the material it belongs to is too.
+   *
+   * The previous version here refused `ARCHIVED` on the item and
+   * `ARCHIVED`/`DRAFT` on the material. That left two holes, both reachable by
+   * calling the purchase endpoint with an id instead of tapping through the
+   * catalogue, because the catalogue only ever lists `PUBLISHED`:
+   *
+   *   • a `DRAFT` or `HIDDEN` part or package was purchasable;
+   *   • a `HIDDEN` material was purchasable even though a `DRAFT` one was not.
+   *
+   * The asymmetry was the tell: nothing about hiding a material differs from
+   * drafting it in terms of whether it is for sale, so the two should not have
+   * been spelled differently. Both now go through the shared rule in
+   * `common/publication.ts`.
+   */
   private assertOnSale(
     isActive: boolean,
     status: ContentStatus,
     material: { status: ContentStatus; isActive: boolean; deletedAt: Date | null },
+    id?: string,
   ): void {
-    if (!isActive || status === ContentStatus.ARCHIVED) {
-      throw new AppException(ErrorCode.INVALID_STATE, {
-        message: 'This item is not currently on sale',
-      });
-    }
-    if (
-      material.deletedAt ||
-      !material.isActive ||
-      material.status === ContentStatus.ARCHIVED ||
-      material.status === ContentStatus.DRAFT
-    ) {
-      throw new AppException(ErrorCode.INVALID_STATE, {
-        message: 'This material is not currently available',
-      });
-    }
+    assertLibraryItemOnSale({ status, isActive }, 'This item', id);
+    assertMaterialOnSale(material, id);
   }
 }

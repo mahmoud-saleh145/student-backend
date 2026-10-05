@@ -3,9 +3,8 @@ import { ApiBearerAuth, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagg
 import type { Request } from 'express';
 
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
-import { CredentialThrottle } from '../../common/throttle.constants';
 import { Public } from '../../common/decorators/public.decorator';
-import { AuthThrottle } from '../../common/decorators/throttle.decorator';
+import { CredentialThrottle } from '../../common/decorators/throttle.decorator';
 import type { AuthenticatedUser, DeviceContext } from '../../common/types/request-context';
 import { UsersService } from '../users/users.service';
 
@@ -27,7 +26,6 @@ export class AuthController {
   @Post('register')
   @CredentialThrottle()
   @Public()
-  @AuthThrottle()
   @HttpCode(HttpStatus.CREATED)
   @ApiOperation({
     summary: 'Register a student account',
@@ -44,7 +42,6 @@ export class AuthController {
   @Post('login')
   @CredentialThrottle()
   @Public()
-  @AuthThrottle()
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: 'Sign in',
@@ -135,7 +132,6 @@ export class AuthController {
   @Post('password')
   @CredentialThrottle()
   @ApiBearerAuth('access-token')
-  @AuthThrottle()
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: 'Change your own password',

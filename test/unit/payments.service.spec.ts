@@ -102,6 +102,9 @@ function buildService(row: ReturnType<typeof payment>) {
   const service = new PaymentsService(
     prisma as never,
     audit as never,
+    // Only `listForAdmin` uses the access engine; these specs cover
+    // capture/refund, which never consult it.
+    { readableCourseIds: jest.fn(async () => null) } as never,
     config as never,
   );
 

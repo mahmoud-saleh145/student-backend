@@ -34,7 +34,14 @@ interface Options {
   recipients?: number;
   frequency?: AnnouncementFrequency;
   occurrenceCount?: number;
+  maxOccurrences?: number | null;
   fanOutFails?: boolean;
+  /**
+   * State of the pre-existing claim when `alreadyClaimed` is set: a live owner
+   * (unfinished, just started) versus one that died (finished, or started long
+   * ago). This is the distinction the wedge fix turns on.
+   */
+  existingClaim?: { startedAt: Date; finishedAt: Date | null; error?: string } | null;
 }
 
 function build(options: Options = {}) {
@@ -58,7 +65,7 @@ function build(options: Options = {}) {
     dayOfMonth: null,
     startsOn: null,
     endsOn: null,
-    maxOccurrences: null,
+    maxOccurrences: options.maxOccurrences ?? null,
     occurrenceCount: options.occurrenceCount ?? 0,
     nextOccurrenceAt: NOW,
   };
@@ -90,7 +97,24 @@ function build(options: Options = {}) {
         { id: 'ann_1', nextOccurrenceAt: NOW },
       ]),
     },
-    announcementDispatch: { create: dispatchCreate, update: dispatchUpdate },
+    announcementDispatch: {
+      create: dispatchCreate,
+      update: dispatchUpdate,
+      // The abandoned-claim sweep, run at the top of every dispatchDue. Empty by
+      // default: these tests are about the due path, not about recovery.
+      findMany: jest.fn(async () => []),
+      // Only consulted when the insert lost the race.
+      findUnique: jest.fn(async () =>
+        options.existingClaim === undefined || options.existingClaim === null
+          ? null
+          : {
+              id: 'disp_0',
+              startedAt: options.existingClaim.startedAt,
+              finishedAt: options.existingClaim.finishedAt,
+              error: options.existingClaim.error ?? null,
+            },
+      ),
+    },
     user: {
       count: jest.fn(async (_args: unknown) => recipientCount),
       findMany: jest.fn(async (_args: unknown) => users),
@@ -138,7 +162,11 @@ describe('claiming an occurrence', () => {
   });
 
   it('sends nothing when another worker already holds the occurrence', async () => {
-    const { service, createForMany } = build({ alreadyClaimed: true });
+    // A live owner: claimed moments ago, still unfinished.
+    const { service, createForMany } = build({
+      alreadyClaimed: true,
+      existingClaim: { startedAt: new Date(NOW.getTime() - 30_000), finishedAt: null },
+    });
 
     const result = await service.dispatch('ann_1', NOW);
 
@@ -149,9 +177,162 @@ describe('claiming an occurrence', () => {
   it('treats a lost race as ordinary, not as an error', async () => {
     // Two workers racing is the normal case with several replicas; it must not
     // surface as a failure anyone has to investigate.
-    const { service } = build({ alreadyClaimed: true });
+    const { service } = build({
+      alreadyClaimed: true,
+      existingClaim: { startedAt: new Date(NOW.getTime() - 30_000), finishedAt: null },
+    });
 
     await expect(service.dispatch('ann_1', NOW)).resolves.toBeDefined();
+  });
+
+  it('leaves the schedule alone while the owner is still working', async () => {
+    // Advancing here would double-schedule: the live worker advances too, and the
+    // announcement would skip an occurrence.
+    const { service, announcementUpdate } = build({
+      alreadyClaimed: true,
+      existingClaim: { startedAt: new Date(NOW.getTime() - 60_000), finishedAt: null },
+    });
+
+    await service.dispatch('ann_1', NOW);
+
+    expect(announcementUpdate).not.toHaveBeenCalled();
+  });
+});
+
+describe('recovering from a worker that died holding the claim', () => {
+  /**
+   * The wedge: a worker claimed an occurrence and died before advancing. The row
+   * stays SENDING with the same `nextOccurrenceAt`, so `dispatchDue` re-selects it
+   * every minute, re-loses the claim race forever, and the recurring
+   * announcement never fires again and never reaches SENT — one stranded row per
+   * crash, re-examined on every tick.
+   */
+  const DEAD = {
+    alreadyClaimed: true as const,
+  };
+
+  it('advances the schedule when the claim is older than the lease', async () => {
+    const { service, announcementUpdate } = build({
+      ...DEAD,
+      existingClaim: { startedAt: new Date(NOW.getTime() - 10 * 60_000), finishedAt: null },
+    });
+
+    const result = await service.dispatch('ann_1', NOW);
+
+    expect(result).toMatchObject({ skipped: 'recovered-stale-claim' });
+
+    const final = announcementUpdate.mock.calls.at(-1)?.[0] as {
+      data: { status: AnnouncementStatus; occurrenceCount: number; nextOccurrenceAt: Date };
+    };
+    expect(final.data.occurrenceCount).toBe(1);
+    expect(final.data.nextOccurrenceAt.getTime()).toBeGreaterThan(NOW.getTime());
+    expect(final.data.status).toBe(AnnouncementStatus.SCHEDULED);
+  });
+
+  it('does not resend — a push cannot be recalled', async () => {
+    // The dead worker may already have reached some students. `notifications` has
+    // no unique constraint on (userId, announcementId), so a resend would show
+    // duplicates in exactly the trays that already got the first one.
+    const { service, createForMany } = build({
+      ...DEAD,
+      existingClaim: { startedAt: new Date(NOW.getTime() - 10 * 60_000), finishedAt: null },
+    });
+
+    await service.dispatch('ann_1', NOW);
+
+    expect(createForMany).not.toHaveBeenCalled();
+  });
+
+  it('treats an unfinished-but-failed claim as abandoned, not as live', async () => {
+    // The owner recorded an error, so it is not still fanning out.
+    const { service, createForMany } = build({
+      ...DEAD,
+      existingClaim: {
+        startedAt: new Date(NOW.getTime() - 10 * 60_000),
+        finishedAt: null,
+        error: 'queue unavailable',
+      },
+    });
+
+    const result = await service.dispatch('ann_1', NOW);
+
+    expect(result).toMatchObject({ skipped: 'recovered-stale-claim', error: 'queue unavailable' });
+    expect(createForMany).not.toHaveBeenCalled();
+  });
+
+  it('treats a finished claim as spent rather than waiting for the lease', async () => {
+    // A worker that finished is not coming back, so there is no reason to make
+    // the schedule wait out the lease.
+    const { service, announcementUpdate } = build({
+      ...DEAD,
+      existingClaim: {
+        startedAt: new Date(NOW.getTime() - 10_000),
+        finishedAt: new Date(NOW.getTime() - 5_000),
+      },
+    });
+
+    await service.dispatch('ann_1', NOW);
+
+    const final = announcementUpdate.mock.calls.at(-1)?.[0] as { data: { occurrenceCount: number } };
+    expect(final.data.occurrenceCount).toBe(1);
+  });
+
+  it('finishes a one-off instead of stranding it in SENDING forever', async () => {
+    const { service, announcementUpdate } = build({
+      ...DEAD,
+      frequency: AnnouncementFrequency.ONCE,
+      existingClaim: { startedAt: new Date(NOW.getTime() - 10 * 60_000), finishedAt: null },
+    });
+
+    await service.dispatch('ann_1', NOW);
+
+    const final = announcementUpdate.mock.calls.at(-1)?.[0] as {
+      data: { status: AnnouncementStatus; nextOccurrenceAt: Date | null };
+    };
+    expect(final.data.status).toBe(AnnouncementStatus.SENT);
+    expect(final.data.nextOccurrenceAt).toBeNull();
+  });
+
+  it('retires an announcement that has used all its occurrences', async () => {
+    const { service, announcementUpdate } = build({
+      ...DEAD,
+      occurrenceCount: 4,
+      maxOccurrences: 5,
+      existingClaim: { startedAt: new Date(NOW.getTime() - 10 * 60_000), finishedAt: null },
+    });
+
+    await service.dispatch('ann_1', NOW);
+
+    const final = announcementUpdate.mock.calls.at(-1)?.[0] as {
+      data: { status: AnnouncementStatus; nextOccurrenceAt: Date | null };
+    };
+    expect(final.data.status).toBe(AnnouncementStatus.SENT);
+    expect(final.data.nextOccurrenceAt).toBeNull();
+  });
+
+  it('still defers when the claim is younger than the lease', async () => {
+    // The boundary case: young enough that the owner may still be working, so
+    // advancing would risk a double-schedule.
+    const { service, announcementUpdate } = build({
+      ...DEAD,
+      existingClaim: { startedAt: new Date(NOW.getTime() - 60_000), finishedAt: null },
+    });
+
+    const result = await service.dispatch('ann_1', NOW);
+
+    expect(result).toMatchObject({ skipped: 'already-claimed' });
+    expect(announcementUpdate).not.toHaveBeenCalled();
+  });
+
+  it('defers when the claim row has disappeared', async () => {
+    // Raced with a worker that released it; the occurrence is still pending, so
+    // the next tick must get another chance at it.
+    const { service, announcementUpdate } = build({ ...DEAD, existingClaim: null });
+
+    const result = await service.dispatch('ann_1', NOW);
+
+    expect(result).toMatchObject({ skipped: 'already-claimed' });
+    expect(announcementUpdate).not.toHaveBeenCalled();
   });
 });
 

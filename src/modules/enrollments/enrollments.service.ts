@@ -12,8 +12,13 @@ import {
 
 import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
+import {
+  ACQUIRABLE_COURSE_STATUS,
+  assertCourseAcquirable,
+} from '../../common/publication';
 import { paginated } from '../../common/types/api-response';
-import { MONEY_TX_OPTIONS, PrismaService, notDeleted } from '../../database/prisma.service';
+import { PrismaService, notDeleted } from '../../database/prisma.service';
+import { withSerializableRetry } from '../../database/serializable-retry';
 import { AuditService } from '../audit/audit.service';
 import { CodesService } from '../codes/codes.service';
 import { grantPartFromCode } from '../course-parts/grant-part-from-code';
@@ -64,12 +69,18 @@ export class EnrollmentsService {
 
   async join(params: {
     userId: string;
+    role: UserRole;
     courseId: string;
     method: EnrollmentMethod;
     ip?: string | null;
     deviceKey?: string | null;
   }): Promise<EnrollmentResult> {
     const course = await this.courses.requirePublishedCourse(params.courseId);
+
+    // Targeting is checked before the method, so a student outside the course's
+    // academic group is told that rather than being sent down a payment or
+    // approval path they can never complete. Staff are exempt inside the helper.
+    await this.access.assertCourseTargeting(params.userId, params.role, params.courseId);
 
     // The requested method must be one the course actually offers. A client
     // asking for FREE on a paid course is either stale or hostile; either way
@@ -132,14 +143,12 @@ export class EnrollmentsService {
       });
     }
 
-    const enrollment = await this.prisma.$transaction(
-      (tx) =>
-        this.grantAccess(tx, {
-          userId,
-          course,
-          method: EnrollmentMethod.FREE,
-        }),
-      MONEY_TX_OPTIONS,
+    const enrollment = await withSerializableRetry(this.prisma, (tx) =>
+      this.grantAccess(tx, {
+        userId,
+        course,
+        method: EnrollmentMethod.FREE,
+      }),
     );
 
     await this.afterGrant(userId, course.id, course.title, EnrollmentMethod.FREE);
@@ -164,7 +173,7 @@ export class EnrollmentsService {
       });
     }
 
-    const result = await this.prisma.$transaction(async (tx) => {
+    const result = await withSerializableRetry(this.prisma, async (tx) => {
       const enrollment = await tx.enrollment.upsert({
         where: { userId_courseId: { userId, courseId: course.id } },
         create: {
@@ -189,7 +198,7 @@ export class EnrollmentsService {
       });
 
       return { enrollment, checkout };
-    }, MONEY_TX_OPTIONS);
+    });
 
     await this.audit.record({
       actorId: userId,
@@ -259,12 +268,19 @@ export class EnrollmentsService {
 
   async redeemCode(params: {
     userId: string;
+    role: UserRole;
     courseId: string;
     code: string;
     ip?: string | null;
     deviceKey?: string | null;
   }): Promise<EnrollmentResult> {
     const course = await this.courses.requirePublishedCourse(params.courseId);
+
+    // A code must not become a way around targeting: the code authorises payment
+    // for the course, it does not change who the course is offered to. Checked
+    // before the code is even validated so a wrong-department student cannot
+    // burn redemption attempts against it.
+    await this.access.assertCourseTargeting(params.userId, params.role, params.courseId);
 
     if (!course.enrollmentMethods.includes(EnrollmentMethod.CODE)) {
       throw new AppException(ErrorCode.FORBIDDEN, {
@@ -293,7 +309,15 @@ export class EnrollmentsService {
 
     // Code consumption and access grant share one Serializable transaction:
     // a crash between them would burn a code without granting anything.
-    const enrollment = await this.prisma.$transaction(async (tx) => {
+    //
+    // Retried on a write conflict. Every redemption reads `redemptionCount` and
+    // writes `redemptionCount + 1`, so two students redeeming the last
+    // remaining use of a card collide by construction — the loser is aborted by
+    // the database and, before this, that abort reached them as a 500 for a
+    // request that was valid and would have succeeded a moment later. The retry
+    // re-reads the count and takes the correct branch, so the code is still
+    // oversold to nobody.
+    const enrollment = await withSerializableRetry(this.prisma, async (tx) => {
       const validation = await this.codes.redeemInTransaction(tx, {
         rawCode: params.code,
         userId: params.userId,
@@ -346,10 +370,21 @@ export class EnrollmentsService {
           where: {
             id: { in: extraCourseIds },
             deletedAt: null,
-            status: { notIn: [CourseStatus.ARCHIVED, CourseStatus.SUSPENDED] },
+            // Only a published course may be newly acquired. This used to be
+            // `notIn: [ARCHIVED, SUSPENDED]`, which let a card grant a DRAFT or
+            // HIDDEN course — content nobody had put up for sale, reached by
+            // redeeming a card that had been frozen when those courses were
+            // live. The primary course is held to this by
+            // `requirePublishedCourse`; these extras were not.
+            status: ACQUIRABLE_COURSE_STATUS,
           },
           select: {
             id: true,
+            // Carried so `assertCourseAcquirable` below has a status to assert
+            // on. Selecting it is not redundant: the guard is what makes the
+            // rule hold, and a guard fed `undefined` denies everything.
+            status: true,
+            deletedAt: true,
             accessDurationType: true,
             accessDurationDays: true,
             accessEndsAt: true,
@@ -357,6 +392,18 @@ export class EnrollmentsService {
         });
 
         for (const other of others) {
+          // A multi-course card reaches courses the student was never checked
+          // against. The targeting check on the primary course says nothing
+          // about these, so each one is checked before it grants anything —
+          // otherwise the extra scope is a way around targeting entirely.
+          await this.access.assertCourseTargeting(params.userId, params.role, other.id);
+
+          // The query above filters on status, so this cannot fail today. It is
+          // here because "the filter is correct" is not a property that survives
+          // the next edit to that query, and this is the last line before access
+          // is granted.
+          assertCourseAcquirable(other, other.id);
+
           await this.grantAccess(tx, {
             userId: params.userId,
             course: other,
@@ -392,7 +439,7 @@ export class EnrollmentsService {
       });
 
       return granted;
-    }, MONEY_TX_OPTIONS);
+    });
 
     await this.afterGrant(params.userId, course.id, course.title, EnrollmentMethod.CODE);
 
@@ -588,6 +635,12 @@ export class EnrollmentsService {
   async list(params: {
     page: number;
     pageSize: number;
+    /**
+     * The staff member asking. Enrollments carry student PII and are the
+     * backbone of per-course revenue reporting, so the list is scoped to what
+     * this actor is permitted to see rather than trusting the filters below.
+     */
+    actor: { id: string; role: UserRole };
     courseId?: string;
     userId?: string;
     state?: EnrollmentState;
@@ -599,8 +652,35 @@ export class EnrollmentsService {
     sectionId?: string;
     q?: string;
   }) {
+    // `null` = master/admin, unrestricted. A teacher gets exactly the courses
+    // whose assignment grants `students`; being assigned to nothing yields an
+    // empty page rather than an unfiltered one.
+    const readable = await this.access.readableCourseIds(
+      params.actor.id,
+      params.actor.role,
+      'students',
+    );
+
+    if (readable !== null && readable.length === 0) {
+      return paginated([], 0, params.page, params.pageSize);
+    }
+
+    // A single `courseId` condition, composed rather than spread twice — two
+    // `courseId` keys in one object literal would silently overwrite, and the
+    // scope is the one that must win.
+    //
+    // Intersecting (instead of rejecting) a teacher-supplied courseId keeps
+    // asking about a course outside the assignment indistinguishable from
+    // asking about one that does not exist.
+    const courseCondition: Prisma.EnrollmentWhereInput['courseId'] =
+      readable === null
+        ? params.courseId
+        : params.courseId
+          ? { in: readable.filter((id) => id === params.courseId) }
+          : { in: readable };
+
     const where: Prisma.EnrollmentWhereInput = {
-      ...(params.courseId ? { courseId: params.courseId } : {}),
+      ...(courseCondition ? { courseId: courseCondition } : {}),
       ...(params.userId ? { userId: params.userId } : {}),
       ...(params.state ? { state: params.state } : {}),
       ...(params.sectionId
@@ -754,7 +834,8 @@ export class EnrollmentsService {
     });
     if (!course) throw AppException.notFound('Course', params.courseId);
 
-    const enrollment = await this.prisma.$transaction(
+    const enrollment = await withSerializableRetry(
+      this.prisma,
       (tx) =>
         this.grantAccess(tx, {
           userId: params.userId,
@@ -771,7 +852,6 @@ export class EnrollmentsService {
               }
             : {}),
         }),
-      MONEY_TX_OPTIONS,
     );
 
     await this.audit.record({

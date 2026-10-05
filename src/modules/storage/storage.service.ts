@@ -62,6 +62,47 @@ export interface SignedUpload {
  *
  * The bucket itself is always private. There is no public read path.
  */
+
+/**
+ * Rejects an object key that this API did not issue for this kind of asset.
+ *
+ * Presign responses hand the client an `objectKey`, and the client sends it
+ * back when it registers the upload. Nothing checked that the key it sent back
+ * belongs to the namespace its own presign endpoint writes to — and the key is
+ * what every later URL is built from.
+ *
+ * That is why this is a security check and not tidiness. `publicAssetUrl`
+ * produces an **unsigned** CDN URL, because it exists for images that are public
+ * by design. So a `thumbnailKey` of `hls/<paidVideoId>/360p/index.m3u8` — a
+ * namespace no thumbnail endpoint ever issues — would be turned into a
+ * permanent public link to protected video, stepping around the playback ticket
+ * and the viewer-bound signature entirely. The same trick reaches the original
+ * uploads under `source/videos/`, and reaches a paid library document through
+ * `objectKey`.
+ *
+ * The check is on the prefix rather than against a recorded key, because the
+ * entity id is not always known yet: a part is created with its thumbnail in the
+ * same insert, so there is no earlier row to compare against. Prefix checking
+ * still removes every sensitive namespace, which is what matters.
+ *
+ * Free function rather than a method on the service: it is pure validation, and
+ * hanging it on the S3 client would make every caller depend on that shape.
+ */
+export function assertObjectKeyInNamespace(
+  objectKey: string,
+  namespace: string,
+  field: string,
+): void {
+  if (!objectKey.startsWith(namespace)) {
+    throw new AppException(ErrorCode.VALIDATION_ERROR, {
+      message:
+        `${field} must be an object key issued for this asset, starting with "${namespace}". ` +
+        'Upload the file through its presign endpoint and send back the key it returns.',
+      details: { field, expectedPrefix: namespace },
+    });
+  }
+}
+
 @Injectable()
 export class StorageService {
   private readonly logger = new Logger(StorageService.name);
@@ -174,6 +215,31 @@ export class StorageService {
    * never through this API. Streaming a 2 GB lecture through Node would tie
    * up a worker for minutes and cap throughput at one upload per process.
    */
+  // ---------------------------------------------------------------------------
+  // Client-supplied object keys
+  // ---------------------------------------------------------------------------
+
+  /** `thumbnails/courses/<courseId>/…` — course and course-part thumbnails. */
+  static courseThumbnailPrefix(courseId: string): string {
+    return `thumbnails/courses/${courseId}/`;
+  }
+
+  /** `thumbnails/library/<materialId>/…` — library part and default thumbnails. */
+  static libraryThumbnailPrefix(materialId: string): string {
+    return `thumbnails/library/${materialId}/`;
+  }
+
+  /** `thumbnails/library/_default/…` — the site-wide fallback image. */
+  static LIBRARY_DEFAULT_THUMBNAIL_PREFIX = 'thumbnails/library/_default/';
+
+  /** `library/…` — paid Library documents, which live in their own bucket. */
+  static LIBRARY_DOCUMENT_PREFIX = 'library/';
+
+  /** `attachments/<courseId>/…` — course materials. */
+  static attachmentPrefix(courseId: string): string {
+    return `attachments/${courseId}/`;
+  }
+
   async presignUpload(params: {
     bucket: Bucket;
     objectKey: string;

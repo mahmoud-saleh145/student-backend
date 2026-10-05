@@ -94,6 +94,15 @@ services:
       - .:/app
       - /app/node_modules
     command: sh -c "npx prisma migrate deploy && npm run start:dev"
+    # Same check as the production image, run through ts-node because the
+    # development target has no dist/. It probes the HTTP port for the API and
+    # the Redis heartbeat for the worker.
+    healthcheck:
+      test: ['CMD', 'npx', 'ts-node', '-r', 'tsconfig-paths/register', 'scripts/healthcheck.ts']
+      interval: 30s
+      timeout: 15s
+      start_period: 40s
+      retries: 3
 
   worker:
     build:
@@ -112,12 +121,30 @@ services:
       R2_ENDPOINT: http://minio:9000
       R2_ACCESS_KEY_ID: eduminio
       R2_SECRET_ACCESS_KEY: eduminio_dev_password
+      # Must be set on the container, not just inside `src/worker.ts`.
+      #
+      # `worker.ts` sets this for its own process before the module graph loads,
+      # but the healthcheck is a *separate* `ts-node` process that never imports
+      # it. Without the variable here, `roleFromEnv()` classified the worker as
+      # the API and probed port 3000 — where this container deliberately listens
+      # on nothing, because the worker has no HTTP server. The container would
+      # report unhealthy while working perfectly.
+      #
+      # Set explicitly rather than relying on `.env`, because the API container
+      # reads the same file and must NOT run workers.
+      RUN_WORKERS: 'true'
     env_file:
       - .env
     volumes:
       - .:/app
       - /app/node_modules
     command: npm run worker:dev
+    healthcheck:
+      test: ['CMD', 'npx', 'ts-node', '-r', 'tsconfig-paths/register', 'scripts/healthcheck.ts']
+      interval: 30s
+      timeout: 15s
+      start_period: 40s
+      retries: 3
 
 volumes:
   postgres-data:

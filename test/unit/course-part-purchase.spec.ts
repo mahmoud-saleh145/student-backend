@@ -1,4 +1,9 @@
-import { PartEntitlementSource, PartPricingModel } from '@prisma/client';
+import {
+  ContentStatus,
+  CourseStatus,
+  PartEntitlementSource,
+  PartPricingModel,
+} from '@prisma/client';
 
 import { grantPartFromCode } from '../../src/modules/course-parts/grant-part-from-code';
 
@@ -60,12 +65,24 @@ interface Options {
 }
 
 function build(options: Options = {}) {
+  // Published and active, inside a published course: an item actually for sale.
+  // Stated rather than left to the schema default because the redemption path
+  // refuses anything that is not, and these tests are about money, not about the
+  // publication rule — which has its own suite.
   const part = {
     ...PARTS[0],
     courseId: 'crs_1',
     currency: 'EGP',
     deletedAt: null,
-    course: { id: 'crs_1', title: 'Circuit Analysis II', teachers: COURSE_TEACHERS },
+    status: ContentStatus.PUBLISHED,
+    isActive: true,
+    course: {
+      id: 'crs_1',
+      title: 'Circuit Analysis II',
+      status: CourseStatus.PUBLISHED,
+      deletedAt: null,
+      teachers: COURSE_TEACHERS,
+    },
   };
 
   const acquisitionCreate = jest.fn(

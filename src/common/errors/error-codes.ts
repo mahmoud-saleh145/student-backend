@@ -39,6 +39,16 @@ export enum ErrorCode {
   NOT_FOUND = 'NOT_FOUND',
   COURSE_NOT_AVAILABLE = 'COURSE_NOT_AVAILABLE',
   COURSE_ARCHIVED = 'COURSE_ARCHIVED',
+  /**
+   * The student is not in the academic group this course is offered to.
+   *
+   * Distinct from `FORBIDDEN` because the fix is on the student's side — update
+   * their faculty/department/year — and a generic 403 tells them nothing. 403
+   * rather than 404: the course is genuinely visible to them, it just is not
+   * theirs to take, and hiding it would break the catalogue's own filtering
+   * story, which already narrows by department.
+   */
+  COURSE_NOT_TARGETED = 'COURSE_NOT_TARGETED',
   ACCESS_EXPIRED = 'ACCESS_EXPIRED',
   NOT_ENROLLED = 'NOT_ENROLLED',
   ENROLLMENT_PENDING = 'ENROLLMENT_PENDING',
@@ -115,6 +125,7 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   [ErrorCode.NOT_FOUND]: 404,
   [ErrorCode.COURSE_NOT_AVAILABLE]: 404,
   [ErrorCode.COURSE_ARCHIVED]: 410,
+  [ErrorCode.COURSE_NOT_TARGETED]: 403,
   [ErrorCode.ACCESS_EXPIRED]: 410,
   [ErrorCode.NOT_ENROLLED]: 403,
   [ErrorCode.ENROLLMENT_PENDING]: 409,
@@ -183,6 +194,7 @@ export const ERROR_MESSAGE: Record<ErrorCode, string> = {
   [ErrorCode.FORBIDDEN]: 'Not permitted',
   [ErrorCode.NOT_FOUND]: 'Resource not found',
   [ErrorCode.COURSE_NOT_AVAILABLE]: 'Course is not available',
+  [ErrorCode.COURSE_NOT_TARGETED]: 'This course is not offered to your department',
   [ErrorCode.COURSE_ARCHIVED]: 'Course has been archived',
   [ErrorCode.ACCESS_EXPIRED]: 'Access to this content has expired',
   [ErrorCode.NOT_ENROLLED]: 'Not enrolled in this course',

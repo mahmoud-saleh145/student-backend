@@ -14,7 +14,10 @@ import { ErrorCode } from '../../common/errors/error-codes';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { CourseAccessService } from '../courses/course-access.service';
-import { StorageService } from '../storage/storage.service';
+import {
+  assertObjectKeyInNamespace,
+  StorageService,
+} from '../storage/storage.service';
 import { toEgpNumber } from '../wallet/money';
 
 import { loadPartAllocation } from './part-allocation.guard';
@@ -43,10 +46,26 @@ export class CoursePartsService {
     private readonly audit: AuditService,
     private readonly access: CourseAccessService,
     private readonly config: ConfigService,
-    // StorageModule is @Global, so this needs no module import. Used only to
-    // turn a thumbnail key into a URL — nothing here writes to storage.
+    // StorageModule is @Global, so this needs no module import. Used to turn a
+    // thumbnail key into a URL, and to refuse a key from a namespace this API
+    // never issues for course thumbnails.
     private readonly storage: StorageService,
   ) {}
+
+  /**
+   * Holds a submitted thumbnail key to the namespace it was issued from.
+   *
+   * Returns the key unchanged so it can be used inline in a data literal.
+   * `null`/`undefined` pass through: clearing a thumbnail is legitimate.
+   */
+  private assertPartThumbnailKey(
+    key: string | null | undefined,
+    namespace: string,
+  ): string | null | undefined {
+    if (key === null || key === undefined) return key;
+    assertObjectKeyInNamespace(key, namespace, 'thumbnailKey');
+    return key;
+  }
 
   // ---------------------------------------------------------------------------
   // Reads
@@ -167,13 +186,28 @@ export class CoursePartsService {
     });
     if (!course) throw AppException.notFound('Course', courseId);
 
+    // Structure leakage: a draft or hidden course must not expose its parts.
+    // Previously this listed them for any non-deleted course, so a draft course
+    // revealed its whole part structure, prices and section titles through an
+    // endpoint the catalogue never links to. Students cannot be prevented from
+    // *asking* for a draft course id — that is what `requirePublishedCourse` is
+    // for at the acquisition boundary — but there is no reason for the read path
+    // to volunteer the details as well.
+    if (course.status !== CourseStatus.PUBLISHED) {
+      throw AppException.notFound('Course', courseId);
+    }
+
     const [parts, price, entitlements, enrollment] = await Promise.all([
       this.prisma.coursePart.findMany({
         where: {
           courseId,
           ...notDeleted,
           isActive: true,
-          status: { not: ContentStatus.ARCHIVED },
+          // Only published parts. This was `status: { not: ARCHIVED }`, which
+          // listed draft and hidden parts — with their prices — to students,
+          // while the admin listing and the purchase rules treated them
+          // differently again.
+          status: ContentStatus.PUBLISHED,
         },
         orderBy: { sortOrder: 'asc' },
         select: {
@@ -494,6 +528,12 @@ export class CoursePartsService {
 
     this.assertPriceMatchesModel(input);
 
+    // The part does not exist yet, so the key cannot be checked against this
+    // part's own prefix. Holding it to the course-thumbnail namespace is what
+    // stops a client pointing a part image at `hls/<paidVideoId>/…`, which
+    // publicAssetUrl would then turn into an unsigned public URL.
+    this.assertPartThumbnailKey(input.thumbnailKey, `thumbnails/courses/${courseId}/`);
+
     const part = await this.prisma.$transaction(async (tx) => {
       const last = await tx.coursePart.findFirst({
         where: { courseId, ...notDeleted },
@@ -614,7 +654,17 @@ export class CoursePartsService {
           // `undefined` leaves it alone, explicit null clears it. Collapsing
           // the two would make "don't touch the image" impossible to express
           // in a PATCH that changes only the title.
-          ...(input.thumbnailKey !== undefined ? { thumbnailKey: input.thumbnailKey } : {}),
+          ...(input.thumbnailKey !== undefined
+            ? {
+                thumbnailKey: (
+                  this.assertPartThumbnailKey(
+                    input.thumbnailKey,
+                    `thumbnails/courses/${part.courseId}/parts/${partId}/`,
+                  ),
+                  input.thumbnailKey
+                ),
+              }
+            : {}),
           ...(input.isActive !== undefined ? { isActive: input.isActive } : {}),
           ...(input.status !== undefined ? { status: input.status } : {}),
           ...(input.pricingModel || input.pricePercent !== undefined || input.priceAmount !== undefined

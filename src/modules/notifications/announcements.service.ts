@@ -293,6 +293,13 @@ export class AnnouncementsService {
    * double send.
    */
   async dispatchDue(now: Date = new Date(), limit = 50) {
+    // Before anything else, deal with claims whose owner never came back. This
+    // has to run first and independently of the due query below: an occurrence
+    // abandoned by a dead worker is not necessarily *due* any more (a `DRAFT`
+    // reached through the legacy publish route never was), so selecting only
+    // rows matching the schedule would leave it stranded with nobody noticing.
+    const abandoned = await this.recoverAbandonedClaims(now, limit);
+
     const due = await this.prisma.announcement.findMany({
       where: {
         status: { in: [AnnouncementStatus.SCHEDULED, AnnouncementStatus.SENDING] },
@@ -314,10 +321,78 @@ export class AnnouncementsService {
       }
     }
 
-    return { considered: due.length, results };
+    return { considered: due.length, abandoned, results };
   }
 
-  async dispatch(announcementId: string, now: Date) {
+  /**
+   * Finalises claims whose owner died, wherever the announcement happens to be.
+   *
+   * `dispatchDue`'s own selection recovers the easy case: a `SCHEDULED` or
+   * `SENDING` row whose occurrence is still due gets re-selected, collides with
+   * its claim, and is repaired. The awkward case is everything else — chiefly a
+   * legacy "publish now" announcement, which sits in `DRAFT` and is therefore
+   * never selected at all. Its occurrence is spent, its claim is unfinished, and
+   * without this sweep it is simply never sent, with nothing in any log to say
+   * why.
+   *
+   * The action is always the same and always the conservative one: mark the
+   * occurrence spent and move the schedule on, never send. A crashed fan-out may
+   * have reached some students already, and there is no unique constraint on
+   * `(userId, announcementId)` to make a resend idempotent — so the dispatch row
+   * is treated as the record of what was attempted, and recipients who did get
+   * it are not asked to receive it twice.
+   */
+  private async recoverAbandonedClaims(now: Date, limit: number) {
+    const cutoff = new Date(now.getTime() - AnnouncementsService.CLAIM_LEASE_MS);
+
+    const stale = await this.prisma.announcementDispatch.findMany({
+      where: { finishedAt: null, startedAt: { lt: cutoff } },
+      select: { id: true, announcementId: true, occurrenceAt: true, startedAt: true },
+      orderBy: { startedAt: 'asc' },
+      take: limit,
+    });
+
+    const recovered = [];
+    for (const claim of stale) {
+      try {
+        const announcement = await this.prisma.announcement.findUnique({
+          where: { id: claim.announcementId },
+          select: {
+            id: true,
+            status: true,
+            occurrenceCount: true,
+            lastOccurrenceAt: true,
+            frequency: true,
+            sendAtLocal: true,
+            timezone: true,
+            weekdays: true,
+            dayOfMonth: true,
+            startsOn: true,
+            endsOn: true,
+            maxOccurrences: true,
+          },
+        });
+        if (!announcement) continue;
+
+        const outcome = await this.recoverClaimedOccurrence(
+          announcement as Parameters<AnnouncementsService['recoverClaimedOccurrence']>[0],
+          claim.occurrenceAt,
+          now,
+        );
+        recovered.push(outcome);
+      } catch (e) {
+        // A single unrecoverable row must not stop the sweep; the next tick
+        // will see it again.
+        this.logger.error(
+          `failed to recover abandoned claim ${claim.id}: ${(e as Error).message}`,
+        );
+      }
+    }
+
+    return recovered;
+  }
+
+  async dispatch(announcementId: string, now: Date, claimedAt?: Date) {
     const announcement = await this.prisma.announcement.findUnique({
       where: { id: announcementId },
     });
@@ -331,7 +406,12 @@ export class AnnouncementsService {
       return { announcementId, occurrenceAt: now, skipped: 'cancelled' as const };
     }
 
-    const occurrenceAt = announcement.nextOccurrenceAt ?? now;
+    // Which instant is being claimed. `claimedAt` pins it for a retry that must
+    // collide with a claim a dead process left behind; it deliberately does not
+    // become `now`, because `advance()` schedules the *following* occurrence from
+    // `now` and a reclaimed instant is in the past — passing it through would
+    // schedule the next send in the past too.
+    const occurrenceAt = claimedAt ?? announcement.nextOccurrenceAt ?? now;
 
     // --- claim, before any message exists ------------------------------------
     let dispatchId: string;
@@ -346,8 +426,16 @@ export class AnnouncementsService {
         e instanceof Prisma.PrismaClientKnownRequestError &&
         e.code === 'P2002'
       ) {
-        // Another worker owns this occurrence. Not an error.
-        return { announcementId, occurrenceAt, skipped: 'already-claimed' as const };
+        // Another worker owns this occurrence — either it is mid-fan-out right
+        // now, or it died after claiming and never advanced.
+        //
+        // Distinguishing those two matters: returning here without advancing is
+        // correct for a live owner, and a permanent stall for a dead one. A dead
+        // owner leaves the row in SENDING with `nextOccurrenceAt` unchanged, so
+        // `dispatchDue` re-selects it every minute, re-hits this same claim, and
+        // a recurring announcement never fires again and never reaches SENT.
+        // The row then spins in the due list forever, one row per crash.
+        return this.recoverClaimedOccurrence(announcement, occurrenceAt, now);
       }
       throw e;
     }
@@ -390,6 +478,236 @@ export class AnnouncementsService {
       });
       throw e;
     }
+  }
+
+  /**
+   * How long an unfinished claim is assumed to belong to a live worker.
+   *
+   * The fan-out is a bounded number of inserts, so anything still unfinished
+   * after this is treated as abandoned. Five minutes is comfortably longer than
+   * a healthy dispatch and short enough that a crashed occurrence recovers on
+   * the next few ticks rather than waiting for someone to notice.
+   */
+  private static readonly CLAIM_LEASE_MS = 5 * 60 * 1000;
+
+  /**
+   * Handles an occurrence whose claim already exists.
+   *
+   * Three outcomes, and getting them wrong is how the wedge happens:
+   *
+   *   - **Owner still working** — leave everything alone and try again later.
+   *     Advancing here would double-schedule: the live worker will advance too.
+   *   - **Owner finished, or is gone** — advance the schedule *without* sending.
+   *     This occurrence is spent; its dispatch row is the proof, and re-sending
+   *     would duplicate every notification the dead worker already delivered.
+   *     Advancing is what un-wedges the announcement.
+   *   - **Owner gone mid-fan-out** — same as above. Some recipients may already
+   *     have a notification row; `notifications` has no unique constraint on
+   *     `(userId, announcementId)`, so a *resend* would duplicate for exactly
+   *     those students. Not resending is therefore the only safe answer, and the
+   *     dispatch row records the error so the partial send is visible.
+   */
+  private async recoverClaimedOccurrence(
+    announcement: {
+      id: string;
+      occurrenceCount: number;
+      lastOccurrenceAt: Date | null;
+      frequency: AnnouncementFrequency;
+      sendAtLocal: string | null;
+      timezone: string;
+      weekdays: number[];
+      dayOfMonth: number | null;
+      startsOn: Date | null;
+      endsOn: Date | null;
+      maxOccurrences: number | null;
+    },
+    occurrenceAt: Date,
+    now: Date,
+  ) {
+    const existing = await this.prisma.announcementDispatch.findUnique({
+      where: { announcementId_occurrenceAt: { announcementId: announcement.id, occurrenceAt } },
+      select: { id: true, startedAt: true, finishedAt: true, error: true },
+    });
+
+    // The claim vanished between our failed insert and this read — another
+    // worker released it. Treat the occurrence as still pending.
+    if (!existing) {
+      return { announcementId: announcement.id, occurrenceAt, skipped: 'already-claimed' as const };
+    }
+
+    const ageMs = now.getTime() - existing.startedAt.getTime();
+    const live = existing.finishedAt === null && ageMs < AnnouncementsService.CLAIM_LEASE_MS;
+
+    if (live) {
+      return { announcementId: announcement.id, occurrenceAt, skipped: 'already-claimed' as const };
+    }
+
+    const advanced = this.advance(announcement, occurrenceAt, now);
+
+    await this.prisma.announcement.update({
+      where: { id: announcement.id },
+      data: advanced,
+    });
+
+    this.logger.warn(
+      `announcement ${announcement.id} occurrence ${occurrenceAt.toISOString()} was claimed by a ` +
+        `worker that did not finish (${existing.error ? `error: ${existing.error}` : 'abandoned'}); ` +
+        `advanced to ${advanced.nextOccurrenceAt?.toISOString() ?? 'no further occurrence'} without resending`,
+    );
+
+    return {
+      announcementId: announcement.id,
+      occurrenceAt,
+      skipped: 'recovered-stale-claim' as const,
+      error: existing.error ?? undefined,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Legacy endpoints
+  //
+  // `POST /notifications/announcements` and
+  // `POST /notifications/announcements/:id/publish` are the original admin
+  // broadcast routes, kept because the dashboard still calls them. They used to
+  // have their own publication code, and that was three bugs at once:
+  //
+  //   - **No claim.** They never inserted an `AnnouncementDispatch` row, so
+  //     nothing stopped a second publish from broadcasting the same message
+  //     again. `notifications` has no unique constraint on
+  //     `(userId, announcementId)`, so the duplicates were real rows, not a
+  //     no-op — every student in the audience got the message twice.
+  //   - **No paging.** `user.findMany` with no `take` loaded every recipient id
+  //     into memory in one unbounded result set.
+  //   - **Its own audience query.** A hand-rolled `where` over the three legacy
+  //     columns, which ignored `audienceRule`, departments, faculty and
+  //     subjects, and applied no `MAX_AUDIENCE_SIZE` ceiling.
+  //
+  // Both now go through `dispatch`, so there is exactly one publication path:
+  // claim first, audience resolved by `audience.ts`, paged fan-out.
+  // ---------------------------------------------------------------------------
+
+  async createLegacy(input: {
+    title: string;
+    titleAr?: string;
+    body: string;
+    bodyAr?: string;
+    route?: string;
+    courseId?: string;
+    universityId?: string;
+    academicYearId?: string;
+    sendPush?: boolean;
+    publishNow?: boolean;
+  }, actor: { id: string }) {
+    // Untargeted is "every active student", and the rule is stored rather than
+    // left as null columns: `audienceRule: {}` and three null columns compile to
+    // the same filter, but only the first is re-evaluated on later sends.
+    const audience = ruleFromLegacyColumns({
+      courseId: input.courseId ?? null,
+      universityId: input.universityId ?? null,
+      academicYearId: input.academicYearId ?? null,
+    });
+
+    return this.create(
+      {
+        title: input.title,
+        titleAr: input.titleAr,
+        body: input.body,
+        bodyAr: input.bodyAr,
+        route: input.route,
+        sendPush: input.sendPush,
+        audience,
+        // Omitting `sendAtLocal` is what marks this as a draft in `create`.
+        sendNow: input.publishNow !== false,
+      },
+      actor,
+    );
+  }
+
+  /**
+   * Publishing a draft. Idempotent, which is the whole point of it existing.
+   *
+   * `dispatch` alone is not enough here. After a successful send the row is
+   * `SENT` with `nextOccurrenceAt: null`, so a second press would fall back to
+   * `occurrenceAt = now`, miss the claim that exists for the *first* instant,
+   * and broadcast again. The button would send the message twice for a reason no
+   * dashboard user could see.
+   *
+   * So publication is refused once it has happened. One occurrence is the
+   * semantic of this route — an admin publishing a draft — and the draft is now
+   * `SENT`, so it has had it.
+   */
+  async publishLegacy(id: string) {
+    const announcement = await this.prisma.announcement.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        status: true,
+        occurrenceCount: true,
+        frequency: true,
+        nextOccurrenceAt: true,
+      },
+    });
+    if (!announcement) throw AppException.notFound('Announcement', id);
+
+    if (announcement.status === AnnouncementStatus.CANCELLED) {
+      throw new AppException(ErrorCode.ANNOUNCEMENT_NOT_EDITABLE, {
+        message: 'This announcement was cancelled and will not be published.',
+        details: { announcementId: id, status: announcement.status },
+      });
+    }
+
+    if (announcement.status === AnnouncementStatus.SENDING) {
+      throw new AppException(ErrorCode.ANNOUNCEMENT_NOT_EDITABLE, {
+        message: 'This announcement is already being sent.',
+        details: { announcementId: id, status: announcement.status },
+      });
+    }
+
+    if (announcement.status === AnnouncementStatus.SENT || announcement.occurrenceCount > 0) {
+      throw new AppException(ErrorCode.ANNOUNCEMENT_NOT_EDITABLE, {
+        message: 'This announcement has already been published.',
+        details: {
+          announcementId: id,
+          status: announcement.status,
+          occurrenceCount: announcement.occurrenceCount,
+        },
+      });
+    }
+
+    // A recurring announcement scheduled through this route can be in DRAFT
+    // with a future `nextOccurrenceAt`. Publishing now consumes that occurrence
+    // rather than adding a second one, so the schedule keeps its shape.
+    //
+    // The claim instant has to be *stable* across retries, and for a legacy
+    // announcement it has nowhere natural to come from: `frequency` is ONCE and
+    // `nextOccurrenceAt` is null, so the only candidate is `new Date()` — a
+    // different instant on every press. That defeats the entire duplicate-send
+    // defence, because the uniqueness guarantee is
+    // `(announcementId, occurrenceAt)`:
+    //
+    //   press 1 → claim (a, T1) → process dies before the status update
+    //   press 2 → occurrenceAt is now T2 → no conflict → a *second* claim row
+    //            → the fan-out runs again → every student gets it twice
+    //
+    // Nothing above catches that, because the guards read the announcement and
+    // the crash left it looking untouched: still DRAFT, still occurrenceCount 0.
+    //
+    // So an existing unfinished claim wins. A retry then collides with it on the
+    // unique index and lands in `recoverClaimedOccurrence`, which is the code
+    // that already knows how to tell a live owner from a dead one.
+    const unfinished = await this.prisma.announcementDispatch.findFirst({
+      where: { announcementId: id, finishedAt: null },
+      orderBy: { startedAt: 'desc' },
+      select: { occurrenceAt: true },
+    });
+
+    const occurrenceAt =
+      unfinished?.occurrenceAt ??
+      (announcement.frequency === AnnouncementFrequency.ONCE
+        ? new Date()
+        : announcement.nextOccurrenceAt ?? new Date());
+
+    return this.dispatch(id, new Date(), occurrenceAt);
   }
 
   /**

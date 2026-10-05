@@ -50,11 +50,20 @@ COPY --from=build --chown=app:app /app/dist ./dist
 COPY --from=build --chown=app:app /app/prisma ./prisma
 COPY --chown=app:app package.json ./
 
+# The Prisma CLI is a runtime dependency (see package.json) because the release
+# gate runs `prisma migrate status` inside this image. `npm prune --omit=dev`
+# above would otherwise remove it and `npm run db:gate:prod` would fail with
+# "prisma: not found" in exactly the environment the gate exists for.
+
 USER app
 EXPOSE 3000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/api/v1/meta/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+# Role-aware: the API checks its HTTP endpoint, the worker checks its Redis
+# heartbeat because it opens no listener. A single HTTP-only check here marked
+# the worker permanently unhealthy and restarted it in a loop.
+# See scripts/healthcheck.ts.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=45s --retries=3 \
+  CMD node dist/scripts/healthcheck.js
 
 ENTRYPOINT ["dumb-init", "--"]
 # `nest build` emits to dist/src/ (prisma/ and scripts/ are compiled too, so

@@ -384,6 +384,28 @@ Run this as a **separate deployment step, before** the application starts. Two
 replicas booting at once and both running migrations is a race you do not want
 to debug.
 
+**Then gate the release on the result:**
+
+```bash
+DATABASE_URL="<production url>" npx prisma migrate deploy
+DATABASE_URL="<production url>" npm run db:gate:prod   # must exit 0
+```
+
+Inside the built image use `db:gate:prod` (compiled). From a working copy use
+`db:gate` (TypeScript through `ts-node`) — the production image prunes dev
+dependencies, so only the compiled form runs there. Do not roll the API or the
+Worker until it exits 0.
+
+| Exit | Meaning | Response |
+|------|---------|----------|
+| 0 | Schema matches this build | Roll |
+| 1 | Migrations still pending | The deploy step did not run. Re-run it, re-check |
+| 2 | Drift, a failed migration, or the database unreachable | **Stop.** `migrate deploy` will not fix this; reconcile by hand |
+
+Exit 2 is deliberately the same for "the database is unreachable" as for
+"drift". A release that cannot prove the schema is safe must not proceed, and
+the two cases need a human either way.
+
 **Do NOT run the seed against production.** It refuses when `NODE_ENV=production`
 unless you also set `ALLOW_PROD_SEED=1`, which exists only for a deliberate
 staging refresh.
@@ -444,11 +466,30 @@ rate, the worker on queue depth.
 | --- | --- | --- |
 | Command | `node dist/src/main.js` | `node dist/src/worker.js` |
 | `RUN_WORKERS` | leave unset | `true` |
-| Port | 3000 | none |
+| Port | 3000 | none — it opens no HTTP listener |
 | CPU / RAM | 1 vCPU / 1 GB | 4 vCPU / 8 GB |
 | Disk | minimal | **100 GB** scratch |
 | Replicas | 2+ | 1+ |
-| Health check | `/api/v1/meta/health` | none |
+| Health check | `node dist/scripts/healthcheck.js` (probes `/api/v1/meta/health`) | `node dist/scripts/healthcheck.js` (probes the Redis heartbeat) |
+
+Both images ship that healthcheck, and it is role-aware. **Do not** point the
+Worker's check at a port: it has none, so a port-based probe reports
+permanently unhealthy and an orchestrator will restart it in a loop, and it will
+never transcode anything. The Worker's check reads its own `worker:heartbeat`
+key from Redis, the same key `/api/v1/meta/health/deep` reports. Run it by hand
+once per deployment:
+
+```bash
+docker run --rm -e RUN_WORKERS=true -e REDIS_URL="$REDIS_URL" \
+  -e REDIS_PREFIX="$REDIS_PREFIX" <image> node dist/scripts/healthcheck.js
+echo $?   # 0 = the worker checked in within the last three minutes
+```
+
+If it exits 1, the Worker container is running but its heartbeat is stale —
+look for a crash on boot, an ffmpeg failure, or a `REDIS_PREFIX` that does not
+match the API's. That last one is the usual cause: the Worker writes
+`edu:worker:heartbeat` and the check reads a different prefix, so a perfectly
+healthy Worker looks dead.
 
 Both need the identical environment from steps 3, 7, 9 and 10, plus:
 
@@ -685,12 +726,13 @@ Production:
 
 - [ ] 7. R2 buckets created, **public access disabled**, credentials in `.env`
 - [ ] 8. Edge Worker deployed, `MEDIA_SIGNING_KEY` matches, unsigned request 403s
-- [ ] 9. Managed PostgreSQL, migrations applied, backups on
+- [ ] 9. Managed PostgreSQL, migrations applied, `db:gate` exited 0, backups on
 - [ ] 10. Managed Redis with persistence
 - [ ] 11. API and worker deployed as separate services, `TRUST_PROXY=true`
-- [ ] 12. Domain and TLS, HSTS header present
-- [ ] 13. Expo access token
-- [ ] 14. Alerts configured
+- [ ] 12. Worker's `scripts/healthcheck.js` exits 0 against production Redis
+- [ ] 13. Domain and TLS, HSTS header present
+- [ ] 14. Expo access token
+- [ ] 15. Alerts configured
 
 When needed:
 
@@ -716,6 +758,26 @@ decoration. Test it with `curl` rather than assuming.
 
 **Running `prisma migrate deploy` from inside the app's startup.** Works with
 one replica, corrupts with two.
+
+**Rolling the API without gating on `db:gate`.** The gate exits 2 both when the
+schema has drifted and when the database is merely unreachable. That is
+intentional — a release that cannot prove the schema is safe must not proceed —
+but it means an expired or wrong `DATABASE_URL` in the release job also halts
+the deploy. Check the URL before you assume drift.
+
+**Running the background Worker on your own machine.** It works, uploads queue,
+and the videos transcode — until the laptop sleeps, the VPN drops, or you
+reboot. The API has no way to tell: it only enqueues, so the symptom is a
+lecture that stays `QUEUED` forever and nobody is paged. The Worker must be a
+deployed service (Step 11) even during a pilot. If you must keep it local
+temporarily, `docs/LOCAL_WORKER_WINDOWS.md` describes that arrangement, and
+`/api/v1/meta/health/deep` reports `checks.worker: false` within three minutes
+of it stopping. That is detection, not paging: nothing alerts on its own.
+
+**Pointing the Worker's healthcheck at an HTTP port.** It has no listener. The
+container goes permanently unhealthy and gets restarted in a loop, so it never
+transcodes anything and gives no useful error. Use the shipped
+`scripts/healthcheck.ts`, which reads the Redis heartbeat for that role.
 
 **Forgetting `TRUST_PROXY=true` in production.** Rate limiting sees one client
 and throttles everyone.

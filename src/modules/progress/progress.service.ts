@@ -45,8 +45,28 @@ export interface ProgressInput {
 export class ProgressService {
   private readonly logger = new Logger(ProgressService.name);
 
-  /** Anything above this in a single report is a client bug or a forgery. */
+  /**
+   * Ceiling on the watch time a single report may bank.
+   *
+   * Necessary but not sufficient. A per-report cap only bounds one request: a
+   * patched client can call `POST /progress` a thousand times and bank a
+   * thousand caps, so on its own this number is not an anti-forgery control. It
+   * exists to absorb a buggy client in one gulp rather than in a thousand.
+   *
+   * The real control is `PlaybackTicket.watchedSeconds` below — watch time is
+   * only credited when a heartbeat for this lesson's video has actually recorded
+   * it server-side.
+   */
   private static readonly MAX_DELTA_SECONDS = 900;
+
+  /**
+   * How far behind the server's observed position a report may claim.
+   *
+   * Resume position and percent are client-reported because the server only
+   * sees the player through heartbeats, but percent is an achievement, so it
+   * cannot be self-awarded. See `clampToObserved`.
+   */
+  private static readonly POSITION_TOLERANCE_SECONDS = 120;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -93,11 +113,45 @@ export class ProgressService {
       where: { userId_lessonId: { userId: params.userId, lessonId: lesson.id } },
     });
 
-    const position = this.clamp(params.input.positionSeconds, 0, duration || 86_400);
-    const delta = this.clamp(
-      params.input.watchedSeconds,
+    // --- what the server can actually vouch for -------------------------------
+    //
+    // `POST /progress` is reachable by any signed-in student with the lesson id
+    // and nothing else — it is not behind the playback ticket. So the numbers in
+    // its body are claims, not observations. Clamping them per-report only
+    // limits how much a *single* lie buys; a loop of honest-looking reports buys
+    // unlimited watch time, and `positionSeconds` can be set straight to the
+    // duration to complete any lesson in one call.
+    //
+    // The server does keep its own record of real viewing: every heartbeat
+    // increments `PlaybackTicket.watchedSeconds` and
+    // `PlaybackTicket.lastPositionSeconds`, and that increment can only happen on
+    // a ticket the server itself issued after the full access chain passed. So
+    // watch time is credited from there, never from the request body, and the
+    // body's position is only allowed to lead the observed position by a small
+    // tolerance.
+    //
+    // Note the asymmetry that makes this safe: the client is not required to
+    // heartbeat for its own progress to be saved, so a genuine student on a
+    // flaky connection can always move their resume marker. What they cannot do
+    // is move it *far*, or bank watch time with no playback behind it at all.
+    const observed = await this.observePlayback(params.userId, lesson.video?.id ?? null);
+
+    // Only the portion of observed watch time not already banked can be claimed,
+    // so replaying the same heartbeat window cannot be counted twice.
+    const uncreditedObserved = Math.max(
       0,
-      ProgressService.MAX_DELTA_SECONDS,
+      observed.watchedSeconds - (existing?.watchedSeconds ?? 0),
+    );
+
+    const delta = Math.min(
+      this.clamp(params.input.watchedSeconds, 0, ProgressService.MAX_DELTA_SECONDS),
+      uncreditedObserved,
+    );
+
+    const position = this.clampToObserved(
+      params.input.positionSeconds,
+      observed.positionSeconds,
+      duration || 86_400,
     );
 
     const watchedSeconds = (existing?.watchedSeconds ?? 0) + delta;
@@ -227,6 +281,79 @@ export class ProgressService {
     }
 
     return { accepted, rejected };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Playback evidence
+  // ---------------------------------------------------------------------------
+
+  /**
+   * What the server has itself recorded of real viewing for this video.
+   *
+   * Summing across tickets rather than reading the latest is deliberate: a long
+   * lesson rotates its ticket (`rotatedFromId` chains the grants), so the most
+   * recent ticket only covers the tail of the session. Revoked and released
+   * tickets are included on purpose — that time really was watched, and
+   * excluding it would let a student reset the counter by forcing a rotation.
+   *
+   * `watchProgress.watchedSeconds` is derived from this total and is never
+   * reduced, so the sum only ever grows and the uncredited remainder stays
+   * meaningful.
+   */
+  private async observePlayback(
+    userId: string,
+    videoId: string | null,
+  ): Promise<{ watchedSeconds: number; positionSeconds: number }> {
+    // A lesson with no video cannot have been watched, so there is nothing to
+    // vouch for. Returning zeroes makes that lesson's progress inert rather
+    // than throwing, which would break a legitimate report of "opened, watched
+    // nothing".
+    if (!videoId) return { watchedSeconds: 0, positionSeconds: 0 };
+
+    const rows = await this.prisma.playbackTicket.findMany({
+      where: { userId, videoId },
+      select: { watchedSeconds: true, lastPositionSeconds: true },
+    });
+
+    let watchedSeconds = 0;
+    let positionSeconds = 0;
+
+    for (const row of rows) {
+      watchedSeconds += this.clamp(row.watchedSeconds, 0, Number.MAX_SAFE_INTEGER);
+      positionSeconds = Math.max(positionSeconds, row.lastPositionSeconds);
+    }
+
+    return { watchedSeconds, positionSeconds };
+  }
+
+  /**
+   * Bounds a reported resume position by what has actually been observed.
+   *
+   * The claim may lead the observed position by a small tolerance, because
+   * heartbeat and progress are separate requests and the player legitimately
+   * moves between them — rejecting that would drop the marker on every seek.
+   * Beyond the tolerance it is a claim with nothing behind it, so it is capped.
+   *
+   * There is deliberately no "nothing observed, so trust the claim" escape
+   * hatch. That would reintroduce the original hole: a student who never takes
+   * a playback ticket has no observation, so the fallback would let them claim
+   * any position — including the full duration — and complete the lesson. With
+   * no observation the ceiling is just the tolerance, so the marker starts at
+   * zero and advances on the first real heartbeat.
+   *
+   * The marker is allowed to move backwards, because the player can. That is safe
+   * because percent and completion are monotonic in their own right, so a rewind
+   * cannot take back an achievement.
+   */
+  private clampToObserved(reported: number, observedPosition: number, maxSeconds: number): number {
+    const claimed = this.clamp(reported, 0, maxSeconds);
+
+    const ceiling = Math.min(
+      maxSeconds,
+      Math.max(0, observedPosition) + ProgressService.POSITION_TOLERANCE_SECONDS,
+    );
+
+    return Math.min(claimed, ceiling);
   }
 
   // ---------------------------------------------------------------------------

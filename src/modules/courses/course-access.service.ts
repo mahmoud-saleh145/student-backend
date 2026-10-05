@@ -499,12 +499,159 @@ export class CourseAccessService {
     }
   }
 
+  /**
+   * Whether a course is offered to a given academic group.
+   *
+   * A course is filed against an optional `universityId`, `facultyId`,
+   * `academicYearId` and a set of `departments`. Those columns were writable
+   * from the admin API and readable everywhere, but nothing ever compared them
+   * to the enrolling student — so a Mechanical Engineering student could take a
+   * course offered only to the Civil Engineering department, and targeting was
+   * decoration. This method is the missing comparison.
+   *
+   * ## The rule is a conjunction, not a disjunction
+   *
+   * A dimension the course sets must be one the student matches. A dimension the
+   * course leaves null is unconstrained and is skipped. A student whose own
+   * profile has no value for a constrained dimension does *not* match: an unset
+   * profile is missing information, and treating it as a wildcard would make
+   * every unconfigured account eligible for everything — which is the same hole
+   * in a new shape.
+   *
+   * ## Why a course with no targeting at all is open
+   *
+   * Every column is nullable, and plenty of courses are deliberately general.
+   * Refusing those would break every course created before targeting existed,
+   * so "no targeting" means "open". Only a course that actually names a
+   * dimension is restricted by it.
+   *
+   * Staff are not subject to this: an administrator enrolling a student by hand
+   * is a deliberate override, which is why callers pass the role through.
+   */
+  async isTargetedToStudent(
+    userId: string,
+    courseId: string,
+    role: UserRole,
+  ): Promise<boolean> {
+    if (role !== UserRole.STUDENT) return true;
+
+    const course = await this.prisma.course.findFirst({
+      where: { id: courseId, ...notDeleted },
+      select: {
+        universityId: true,
+        facultyId: true,
+        academicYearId: true,
+        departments: { select: { departmentId: true } },
+      },
+    });
+
+    if (!course) return true;
+
+    const constrainsDepartment = course.departments.length > 0;
+    const constrainsUniversity = course.universityId !== null;
+    const constrainsFaculty = course.facultyId !== null;
+    const constrainsYear = course.academicYearId !== null;
+
+    // Untargeted: open to everyone.
+    if (
+      !constrainsDepartment &&
+      !constrainsUniversity &&
+      !constrainsFaculty &&
+      !constrainsYear
+    ) {
+      return true;
+    }
+
+    const profile = await this.prisma.studentProfile.findUnique({
+      where: { userId },
+      select: {
+        universityId: true,
+        facultyId: true,
+        departmentId: true,
+        academicYearId: true,
+      },
+    });
+
+    // No profile, or a dimension the course constrains that the student has not
+    // filled in. Undetermined, and undetermined is not a match.
+    if (!profile) return false;
+
+    if (constrainsDepartment && !course.departments.some((d) => d.departmentId === profile.departmentId)) {
+      return false;
+    }
+    if (constrainsUniversity && course.universityId !== profile.universityId) return false;
+    if (constrainsFaculty && course.facultyId !== profile.facultyId) return false;
+    if (constrainsYear && course.academicYearId !== profile.academicYearId) return false;
+
+    return true;
+  }
+
+  /**
+   * Throws `COURSE_NOT_TARGETED` when the student is outside the course's
+   * academic group.
+   *
+   * `details.mismatch` names the dimensions that failed, so the client can tell
+   * the student which field of their profile to correct rather than saying only
+   * "not permitted".
+   */
+  async assertCourseTargeting(
+    userId: string,
+    role: UserRole,
+    courseId: string,
+  ): Promise<void> {
+    if (role !== UserRole.STUDENT) return;
+    if (await this.isTargetedToStudent(userId, courseId, role)) return;
+
+    throw new AppException(ErrorCode.COURSE_NOT_TARGETED, {
+      message: 'This course is not offered to your department or year',
+    });
+  }
+
   /** Course ids a teacher is assigned to — used to scope list queries. */
   async teacherCourseIds(teacherId: string): Promise<string[]> {
     const rows = await this.prisma.courseTeacher.findMany({
       where: { teacherId },
       select: { courseId: true },
     });
+    return rows.map((r) => r.courseId);
+  }
+
+  /**
+   * The course ids a staff actor may read student- or revenue-bearing rows for.
+   *
+   * This is the single place list-endpoint scoping is derived, so
+   * `GET /admin/enrollments` and `GET /admin/payments` cannot each invent
+   * their own weaker version of `assertCanManageCourse`.
+   *
+   * Returns `null` for "unrestricted" (master and admin) rather than a list of
+   * every course, so callers can tell *may see everything* apart from *may see
+   * nothing*. That distinction is load-bearing: a teacher assigned to nothing
+   * must yield an empty page, never an unfiltered one.
+   *
+   * Callers intersect a client-supplied `courseId` with the result rather than
+   * rejecting it, so probing for a course the teacher cannot see is
+   * indistinguishable from probing for one that does not exist.
+   */
+  async readableCourseIds(
+    userId: string,
+    role: UserRole,
+    capability: 'students' | 'revenue',
+  ): Promise<string[] | null> {
+    if (role === UserRole.MASTER || role === UserRole.ADMIN) return null;
+    if (role !== UserRole.TEACHER) {
+      throw new AppException(ErrorCode.INSUFFICIENT_ROLE);
+    }
+
+    const rows = await this.prisma.courseTeacher.findMany({
+      where: {
+        teacherId: userId,
+        ...(capability === 'students'
+          ? { canViewStudents: true }
+          : { canViewRevenue: true }),
+      },
+      select: { courseId: true },
+    });
+
     return rows.map((r) => r.courseId);
   }
 

@@ -1,5 +1,6 @@
 import { PartEntitlementSource, type Prisma } from '@prisma/client';
 
+import { assertCourseAcquirable, assertPartOnSale } from '../../common/publication';
 import { fromPiastres } from '../wallet/money';
 
 import { loadPartAllocation } from './part-allocation.guard';
@@ -66,6 +67,8 @@ export async function grantPartFromCode(
         select: {
           id: true,
           title: true,
+          status: true,
+          deletedAt: true,
           teachers: {
             select: {
               teacherId: true,
@@ -87,6 +90,36 @@ export async function grantPartFromCode(
   // throwing keeps the redemption working, which is the right outcome for a
   // student holding a legitimately sold card.
   if (!part) return null;
+
+  // The part may have been withdrawn, unpublished or deactivated since the card
+  // was printed, and the enclosing `redeemCode` call has already validated the
+  // *course*. Neither checked the part.
+  //
+  // This is the boundary, and it is the one place that decides it: the card's
+  // `coursePartId` is read from the database rather than the request, so a
+  // client cannot choose what it unlocks — but it also means a card printed
+  // months ago still points at whatever that part has become. A `DRAFT` or
+  // `HIDDEN` part is not offered to anyone, so honouring a card for it is
+  // selling something that was never put up for sale, by a route the catalogue
+  // does not show.
+  //
+  // `ARCHIVED` and `isActive: false` are treated identically: the schema defines
+  // an inactive part as retired-but-not-destroyed, explicitly "cannot be
+  // bought". What students already hold is untouched — a redemption that fails
+  // here leaves the card unspent, so nothing is lost and an administrator can
+  // still grant the part by hand through `grantByAdmin`.
+  assertPartOnSale(
+    { status: part.status, isActive: part.isActive, deletedAt: part.deletedAt },
+    part.id,
+  );
+
+  // A published part inside a draft course is still a draft course's content.
+  // The course check above is on the *card's* course, not necessarily this
+  // part's, so a card for one course must not unlock a part of another.
+  assertCourseAcquirable(
+    { status: part.course.status, deletedAt: part.course.deletedAt },
+    part.course.id,
+  );
 
   const existing = await tx.coursePartEntitlement.findUnique({
     where: {

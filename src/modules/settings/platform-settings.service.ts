@@ -6,6 +6,7 @@ import { AppException } from '../../common/errors/app.exception';
 import type { DeviceConfig } from '../../config/configuration';
 import { PrismaService } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
+import { StorageService } from '../storage/storage.service';
 
 /**
  * Every setting the dashboard can edit, with the value that reproduces the
@@ -116,6 +117,18 @@ const VALIDATORS: Partial<Record<SettingKey, (value: unknown) => string | null>>
   'teacher.canDeleteVideos': booleanCheck,
   'teacher.canEditVideoUrls': booleanCheck,
   'teacher.canEditCoursePrices': booleanCheck,
+  /**
+   * The value is used to build an **unsigned** CDN URL for every library part
+   * without a thumbnail of its own, so an arbitrary key here would point that
+   * URL at any object in the media bucket — `hls/<paidVideoId>/…` included.
+   * Empty string clears it, which is how `libraryDefaultThumbnailKey()` reads it
+   * back as null.
+   */
+  'library.defaultThumbnailKey': (value) =>
+    typeof value === 'string' &&
+    (value === '' || value.startsWith(StorageService.LIBRARY_DEFAULT_THUMBNAIL_PREFIX))
+      ? null
+      : `must be an object key issued by POST /storage/uploads/library-default-thumbnail, starting with "${StorageService.LIBRARY_DEFAULT_THUMBNAIL_PREFIX}" (or an empty string to clear it)`,
   'contact.phone': stringCheck(40),
   'contact.whatsapp': stringCheck(40),
   'contact.facebook': stringCheck(300),

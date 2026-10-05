@@ -112,8 +112,13 @@ export class MaintenanceProcessor extends WorkerHost {
   /**
    * Warns students three days before their access lapses.
    *
-   * Deliberately narrow: only enrollments whose end date falls inside a single
-   * 24-hour window, so re-running the job cannot spam the same student daily.
+   * The 24-hour window is a *narrowing* of the candidate set, not the thing that
+   * makes the send once-only — a sliding window re-selects the same enrollment
+   * on every run, so any run more often than daily (a retry, a manual re-run, a
+   * duplicated delivery) would message the student again. Idempotency comes from
+   * the `dedupeKey` constraint instead, and the window key is the UTC date bucket
+   * three days out, so a student is told once per lapsing period no matter how
+   * often the job runs.
    */
   private async sendExpiryReminders() {
     const start = new Date(Date.now() + 3 * 24 * 3600 * 1000);
@@ -124,30 +129,46 @@ export class MaintenanceProcessor extends WorkerHost {
         state: EnrollmentState.ACTIVE,
         accessEndsAt: { gte: start, lt: end },
       },
-      include: { course: { select: { id: true, title: true } } },
+      select: {
+        id: true,
+        userId: true,
+        courseId: true,
+        course: { select: { title: true } },
+      },
       take: 2000,
     });
 
-    let sent = 0;
+    if (expiring.length === 0) return { sent: 0, skipped: 0 };
 
-    for (const enrollment of expiring) {
-      await this.notifications
-        .createForUser({
-          userId: enrollment.userId,
-          kind: NotificationKind.COURSE_UPDATE,
-          title: 'Your course access ends soon',
-          titleAr: 'وصولك للكورس ينتهي قريبًا',
-          body: `Access to ${enrollment.course.title} ends in 3 days.`,
-          bodyAr: `ينتهي وصولك إلى ${enrollment.course.title} خلال ٣ أيام.`,
-          route: `/course/${enrollment.courseId}`,
-        })
-        .then(() => {
-          sent += 1;
-        })
-        .catch(() => undefined);
-    }
+    // Anchored to the day, not to this run's clock. Two runs a minute apart
+    // resolve to the same bucket and therefore to the same dedupe keys, which is
+    // the point: the second one is a no-op rather than a second reminder.
+    const windowKey = start.toISOString().slice(0, 10);
 
-    if (sent > 0) this.logger.log(`sent ${sent} expiry reminder(s)`);
-    return { sent };
+    // `skipped` is every row that was not inserted, so it needs no second
+    // tally here: `expiring.length - created - skipped` would be zero by
+    // construction and would report a healthy run even if writes were being
+    // rejected. Errors are allowed to propagate instead — a failing insert
+    // should fail the job so BullMQ can retry it and the failure is visible,
+    // rather than the previous behaviour of catching every error per row,
+    // logging nothing and never being retried.
+    const { created, skipped } = await this.notifications.createOnce(
+      expiring.map((enrollment) => ({
+        dedupeKey: `course-expiry:${enrollment.id}:${windowKey}`,
+        userId: enrollment.userId,
+        kind: NotificationKind.COURSE_UPDATE,
+        title: 'Your course access ends soon',
+        titleAr: 'وصولك للكورس ينتهي قريبًا',
+        body: `Access to ${enrollment.course.title} ends in 3 days.`,
+        bodyAr: `ينتهي وصولك إلى ${enrollment.course.title} خلال ٣ أيام.`,
+        route: `/course/${enrollment.courseId}`,
+      })),
+    );
+
+    this.logger.log(
+      `course expiry reminders: ${created} sent, ${skipped} not sent (already reminded this period)`,
+    );
+
+    return { sent: created, skipped };
   }
 }

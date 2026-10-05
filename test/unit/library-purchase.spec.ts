@@ -447,4 +447,21 @@ describe('quotes', () => {
     expect(quote.partsAlreadyOwned).toBe(3);
     expect(quote.fullyOwned).toBe(true);
   });
+
+  it('names how many package items are withdrawn before the student pays', async () => {
+    // A package at full price with a withdrawn part is a reduced bundle. The
+    // count mismatch alone is easy to miss; the quote must say it outright so
+    // the client can show "2 of 3 parts currently available" pre-payment.
+    const { service } = build({ withdrawnPartIds: ['lp_2'] });
+
+    const quote = await service.quote({
+      userId: 'usr_1',
+      kind: LibraryPurchaseKind.PACKAGE,
+      targetId: 'pkg_1',
+    });
+
+    expect(quote.partCount).toBe(2);
+    expect(quote.totalPartCount).toBe(3);
+    expect(quote.withdrawnPartCount).toBe(1);
+  });
 });

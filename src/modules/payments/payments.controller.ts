@@ -81,8 +81,9 @@ export class PaymentsController {
     description:
       'Includes period totals. Every amount is the value frozen at purchase time, never recomputed from the course’s current price.',
   })
-  list(@Query() query: ListPaymentsDto) {
+  list(@Query() query: ListPaymentsDto, @CurrentUser() actor: AuthenticatedUser) {
     return this.payments.listForAdmin({
+      actor,
       page: query.page,
       pageSize: query.pageSize,
       courseId: query.courseId,

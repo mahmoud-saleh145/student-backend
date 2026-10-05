@@ -2,9 +2,11 @@ import { plainToInstance, Transform, Type } from 'class-transformer';
 import {
   IsBoolean,
   IsEnum,
+  IsIn,
   IsInt,
   IsOptional,
   IsString,
+  Matches,
   Max,
   Min,
   MinLength,
@@ -105,6 +107,13 @@ export class EnvironmentVariables {
   @Type(() => Number) @IsInt() @Min(1) PLAYBACK_TICKETS_PER_HOUR = 60;
   @Type(() => Number) @IsInt() @Min(1) PLAYBACK_CAPTURE_STRIKES = 3;
 
+  // Read by config/configuration.ts. All three are anti-abuse rules, so the
+  // client is never trusted with them; they were previously undeclared, which
+  // meant `num()` silently swallowed a malformed value and used the default.
+  @Type(() => Number) @IsInt() @Min(1) @Max(100) PLAYBACK_MAX_PLAYS_PER_VIDEO = 3;
+  @Type(() => Number) @IsInt() @Min(0) @Max(86400) PLAYBACK_MIN_COUNTED_PLAY_SECONDS = 30;
+  @Type(() => Number) @IsInt() @Min(60) @Max(86400) PLAYBACK_PLAY_RESUME_WINDOW = 45 * 60;
+
   // --- storage --------------------------------------------------------------
   @IsOptional() @IsString() R2_ACCOUNT_ID?: string;
   @IsOptional() @IsString() R2_ACCESS_KEY_ID?: string;
@@ -162,6 +171,21 @@ export class EnvironmentVariables {
   @IsString() PUSH_PROVIDER = 'expo';
   @IsOptional() @IsString() EXPO_ACCESS_TOKEN?: string;
 
+  /**
+   * Active push tokens kept per account.
+   *
+   * Registration is otherwise unbounded, and every send fans out over the whole
+   * active set: a single account holding thousands of tokens turns one
+   * announcement into thousands of Expo messages, paid for by us and capped by
+   * Expo's own rate limit. One token per real handset is the honest number; the
+   * slack covers a reinstall that has not yet reaped its predecessor.
+   */
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(50)
+  PUSH_MAX_ACTIVE_TOKENS_PER_USER = 8;
+
   // --- throttling -----------------------------------------------------------
   @Type(() => Number) @IsInt() @Min(1) THROTTLE_TTL = 60;
   @Type(() => Number) @IsInt() @Min(1) THROTTLE_LIMIT = 120;
@@ -171,6 +195,48 @@ export class EnvironmentVariables {
   @IsString() LOG_LEVEL = 'info';
   @toBool() @IsBoolean() LOG_PRETTY = false;
   @IsOptional() @IsString() SENTRY_DSN?: string;
+
+  // --- queue polling ---------------------------------------------------------
+  //
+  // Read from jobs/queue.tuning.ts at module scope, which is why they cannot
+  // come from ConfigService. Each helper there falls back to a default on a
+  // value it cannot parse, so before this existed `QUEUE_DRAIN_DELAY_SECONDS=30s`
+  // became 30 and the operator learned nothing until the Redis request bill
+  // proved the setting had been ignored. Declared here, it is a boot failure.
+  @Type(() => Number) @IsInt() @Min(1) @Max(3600) QUEUE_DRAIN_DELAY_SECONDS = 30;
+  @Type(() => Number) @IsInt() @Min(1) @Max(3600) QUEUE_STALLED_INTERVAL_SECONDS = 60;
+  @Type(() => Number) @IsInt() @Min(1) @Max(3600) QUEUE_BACKGROUND_DRAIN_DELAY_SECONDS = 60;
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(86400)
+  QUEUE_BACKGROUND_STALLED_INTERVAL_SECONDS = 300;
+
+  // --- process topology -----------------------------------------------------
+  //
+  // Not operator knobs in the usual sense: worker.ts sets RUN_WORKERS itself
+  // before the module graph loads, because jobs.module.ts reads it to decide
+  // whether to register the BullMQ processors. Declared so that a stray value
+  // from the hosting platform's environment cannot quietly register a second
+  // set of processors on the API and double-execute jobs.
+  @IsIn(['true', 'false'])
+  RUN_WORKERS = 'false';
+
+  /**
+   * Swagger is off in production unless this is exactly 'true'. Left as a
+   * string comparison in main.ts so the opt-in cannot be widened by a truthy
+   * value like `1`.
+   */
+  @IsIn(['true', 'false'])
+  ENABLE_SWAGGER = 'false';
+
+  // --- maintenance schedules ------------------------------------------------
+  @IsString()
+  @Matches(/^\S+(\s+\S+){4,5}$/, {
+    message:
+      'ANNOUNCEMENT_SWEEP_CRON must be a 5- or 6-field cron expression, e.g. "* * * * *"',
+  })
+  ANNOUNCEMENT_SWEEP_CRON = '* * * * *';
 }
 
 /** Secrets that must never survive into a production deploy unchanged. */
@@ -209,6 +275,18 @@ export function validateEnv(raw: Record<string, unknown>): EnvironmentVariables 
       .map((e) => `  • ${e.property}: ${Object.values(e.constraints ?? {}).join(', ')}`)
       .join('\n');
     throw new Error(`Invalid environment configuration:\n${detail}`);
+  }
+
+  // A resume window at or below the ticket lifetime defeats the setting's only
+  // purpose: the ticket would expire before the window that exists to absorb
+  // that expiry, so a student who reads past the TTL starts a second play and
+  // loses one of their three attempts to a technical failure.
+  if (config.PLAYBACK_PLAY_RESUME_WINDOW <= config.PLAYBACK_TICKET_TTL) {
+    throw new Error(
+      `PLAYBACK_PLAY_RESUME_WINDOW (${config.PLAYBACK_PLAY_RESUME_WINDOW}s) must be greater than ` +
+        `PLAYBACK_TICKET_TTL (${config.PLAYBACK_TICKET_TTL}s), otherwise a ticket expiring ` +
+        'mid-lesson costs the student one of their counted plays.',
+    );
   }
 
   if (config.NODE_ENV === NodeEnv.Production) {

@@ -15,8 +15,10 @@ import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
 import { paginated } from '../../common/types/api-response';
 import type { PaymentConfig } from '../../config/configuration';
-import { MONEY_TX_OPTIONS, PrismaService } from '../../database/prisma.service';
+import { PrismaService } from '../../database/prisma.service';
+import { withSerializableRetry } from '../../database/serializable-retry';
 import { AuditService } from '../audit/audit.service';
+import { CourseAccessService } from '../courses/course-access.service';
 
 export interface CheckoutSession {
   paymentId: string;
@@ -57,6 +59,7 @@ export class PaymentsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    private readonly access: CourseAccessService,
     config: ConfigService,
   ) {
     this.cfg = config.getOrThrow<PaymentConfig>('payment');
@@ -221,7 +224,7 @@ export class PaymentsService {
     actor?: { id: string; role: UserRole };
     note?: string;
   }) {
-    const result = await this.prisma.$transaction(async (tx) => {
+    const result = await withSerializableRetry(this.prisma, async (tx) => {
       const payment = await tx.payment.findUnique({
         where: { id: params.paymentId },
         include: {
@@ -344,7 +347,7 @@ export class PaymentsService {
       });
 
       return { payment: updated, alreadyPaid: false, enrollmentId: payment.enrollmentId };
-    }, MONEY_TX_OPTIONS);
+    });
 
     if (!result.alreadyPaid) {
       await this.audit.record({
@@ -410,6 +413,10 @@ export class PaymentsService {
       return { id: paymentId, status: payment.status };
     }
 
+    // Not Serializable, and deliberately left that way: a single-row status write
+    // with a companion ledger row has no read-then-write on shared state, so
+    // there is no write conflict to retry. Raising the isolation level here
+    // would only add serialization failures to the webhook path.
     const updated = await this.prisma.$transaction(async (tx) => {
       const p = await tx.payment.update({
         where: { id: paymentId },
@@ -441,7 +448,7 @@ export class PaymentsService {
     input: { amount?: number; reason: string },
     actor: { id: string; role: UserRole },
   ) {
-    const result = await this.prisma.$transaction(async (tx) => {
+    const result = await withSerializableRetry(this.prisma, async (tx) => {
       const payment = await tx.payment.findUnique({
         where: { id: paymentId },
         include: { course: { select: { title: true } }, revenue: true },
@@ -528,7 +535,7 @@ export class PaymentsService {
       }
 
       return { payment: updated, requested, fullyRefunded };
-    }, MONEY_TX_OPTIONS);
+    });
 
     await this.audit.record({
       actorId: actor.id,
@@ -580,14 +587,48 @@ export class PaymentsService {
   async listForAdmin(params: {
     page: number;
     pageSize: number;
+    /**
+     * The staff member asking. A payment row carries the student's name and
+     * phone, and the totals block is platform revenue, so visibility follows
+     * the same `canViewRevenue` assignment capability analytics already
+     * enforces rather than a second, laxer rule living in this method.
+     */
+    actor: { id: string; role: UserRole };
     courseId?: string;
     userId?: string;
     status?: PaymentStatus;
     from?: Date;
     to?: Date;
   }) {
+    // `null` = master/admin, unrestricted. A teacher sees only the courses
+    // whose assignment grants `revenue`, so the totals aggregate exactly the
+    // rows they are allowed to see — never a platform-wide figure.
+    const readable = await this.access.readableCourseIds(
+      params.actor.id,
+      params.actor.role,
+      'revenue',
+    );
+
+    if (readable !== null && readable.length === 0) {
+      const empty = paginated([], 0, params.page, params.pageSize);
+      return {
+        ...empty,
+        meta: { ...empty.meta, totals: { paid: 0, refunded: 0, net: 0 } },
+      };
+    }
+
+    // One composed `courseId`, not two spread keys that would overwrite.
+    // Intersecting a requested courseId keeps probing outside the assignment
+    // indistinguishable from probing a course that does not exist.
+    const courseCondition: Prisma.PaymentWhereInput['courseId'] =
+      readable === null
+        ? params.courseId
+        : params.courseId
+          ? { in: readable.filter((id) => id === params.courseId) }
+          : { in: readable };
+
     const where: Prisma.PaymentWhereInput = {
-      ...(params.courseId ? { courseId: params.courseId } : {}),
+      ...(courseCondition ? { courseId: courseCondition } : {}),
       ...(params.userId ? { userId: params.userId } : {}),
       ...(params.status ? { status: params.status } : {}),
       ...(params.from || params.to

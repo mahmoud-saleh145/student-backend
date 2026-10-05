@@ -4,7 +4,10 @@ import { ApiOperation, ApiTags } from '@nestjs/swagger';
 
 import { Public } from '../../common/decorators/public.decorator';
 import type { AppConfig, StorageConfig } from '../../config/configuration';
-import { readWorkerHeartbeat } from '../../jobs/worker-heartbeat';
+import {
+  readWorkerHeartbeat,
+  WORKER_HEARTBEAT_TTL_SECONDS,
+} from '../../jobs/worker-heartbeat';
 import { PrismaService } from '../../database/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { StorageService } from '../storage/storage.service';
@@ -88,7 +91,7 @@ export class HealthController {
           ? worker.ffmpeg && worker.ffprobe
             ? undefined
             : 'A worker is running but cannot execute ffmpeg/ffprobe — every transcode will fail'
-          : 'No queue worker has checked in within 60s — uploaded videos stay QUEUED and scheduled jobs do not run',
+          : `No queue worker has checked in within ${WORKER_HEARTBEAT_TTL_SECONDS}s — uploaded videos stay QUEUED and scheduled jobs do not run`,
       },
       // Where the video pipeline stands, so "why is it still QUEUED?" has an
       // answer without opening the database.

@@ -1,5 +1,20 @@
 # Running the production video worker on a Windows PC (temporary)
 
+> **This is a stopgap, not a deployment.** A worker on your PC works right up
+> until the laptop sleeps, the VPN drops, or you reboot. The API only *enqueues*,
+> so nothing fails loudly at the moment it stops: uploads keep succeeding, video
+> rows stay `QUEUED`, and no lecture becomes watchable.
+>
+> It is not invisible, though, and the difference matters. Within three minutes
+> `/api/v1/meta/health/deep` reports `"worker": false` with an explanatory note,
+> and `notes.videoPipeline.worker` goes `null`. That is detection on a dashboard
+> someone has to be watching — it is not paging anyone at 3am. Before real
+> users, deploy the worker as its own service (Step 11 of
+> [`MANUAL_STEPS.md`](MANUAL_STEPS.md)) — same image, same command, 4 vCPU /
+> 8 GB / 100 GB disk, `RUN_WORKERS=true`. Nothing about this document's
+> configuration is special to a PC; it is the same environment, which is why it
+> transfers directly. Keep this page only for pilots and local debugging.
+
 This runs **only the background worker** on your PC, using the existing
 production Docker image. Everything else stays where it is:
 
@@ -16,6 +31,26 @@ no port, so nothing on your PC is exposed to the internet.
 No code changes are needed for this. The worker entry point
 (`dist/src/worker.js`), the Dockerfile and the environment validation already
 support it; everything below is runtime configuration.
+
+**Liveness.** Check it from the API rather than guessing — the worker writes a
+heartbeat that `/api/v1/meta/health/deep` reports:
+
+```powershell
+curl https://<your-api>/api/v1/meta/health/deep
+```
+
+`checks.worker: true` means a worker checked in within the last three minutes;
+`false` comes with a note saying scheduled jobs are not running, and
+`videoPipeline.worker` shows the last beat's host and PID while it is healthy.
+To check the container directly:
+
+```powershell
+docker exec <container> node dist/scripts/healthcheck.js
+echo $LASTEXITCODE   # 0 alive, 1 dead or Redis unreachable
+```
+
+A wrong `REDIS_PREFIX` is the usual reason a healthy worker looks dead: the
+worker writes `edu:worker:heartbeat` while the check reads a different prefix.
 
 ---
 

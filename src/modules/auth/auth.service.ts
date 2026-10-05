@@ -541,9 +541,17 @@ export class AuthService {
         where: { userId, revokedAt: null },
         data: { revokedAt: now, revokedReason: reason },
       }),
-      this.prisma.playbackTicket.updateMany({
+this.prisma.playbackTicket.updateMany({
         where: { userId, status: 'ACTIVE' },
-        data: { status: 'REVOKED', revokedAt: now, revokedReason: reason },
+        data: { status: 'REVOKED', releasedAt: now, revokedReason: reason },
+      }),
+      // Everywhere means everywhere. Revoking the sessions while the push
+      // tokens stayed live left every handset still receiving announcements
+      // after the account was locked out — which is the case this is used for.
+      // Re-login re-registers, so nothing is lost permanently.
+      this.prisma.pushToken.updateMany({
+        where: { userId, isActive: true },
+        data: { isActive: false },
       }),
     ]);
 

@@ -99,6 +99,7 @@ export class EnrollmentsController {
   ) {
     return this.enrollments.join({
       userId: user.id,
+      role: user.role,
       courseId,
       method: dto.method,
       ip: req.ip ?? null,
@@ -125,6 +126,7 @@ export class EnrollmentsController {
   ) {
     return this.enrollments.redeemCode({
       userId: user.id,
+      role: user.role,
       courseId,
       code: dto.code,
       ip: req.ip ?? null,
@@ -137,8 +139,9 @@ export class EnrollmentsController {
   @Get('admin/enrollments')
   @StaffOnly()
   @ApiOperation({ summary: 'List enrollments' })
-  list(@Query() query: ListEnrollmentsDto) {
+  list(@Query() query: ListEnrollmentsDto, @CurrentUser() actor: AuthenticatedUser) {
     return this.enrollments.list({
+      actor,
       page: query.page,
       pageSize: query.pageSize,
       courseId: query.courseId,

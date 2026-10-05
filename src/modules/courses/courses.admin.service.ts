@@ -13,9 +13,13 @@ import { AppException } from '../../common/errors/app.exception';
 import { assertPriceChangeKeepsAllocationValid } from '../course-parts/part-allocation.guard';
 import { ErrorCode } from '../../common/errors/error-codes';
 import { paginated } from '../../common/types/api-response';
-import { MONEY_TX_OPTIONS, PrismaService, notDeleted } from '../../database/prisma.service';
+import { PrismaService, notDeleted } from '../../database/prisma.service';
+import { withSerializableRetry } from '../../database/serializable-retry';
 import { AuditService } from '../audit/audit.service';
-import { StorageService } from '../storage/storage.service';
+import {
+  assertObjectKeyInNamespace,
+  StorageService,
+} from '../storage/storage.service';
 
 import { CourseAccessService } from './course-access.service';
 import { CoursesService } from './courses.service';
@@ -83,6 +87,21 @@ export class CoursesAdminService {
     private readonly audit: AuditService,
     private readonly storage: StorageService,
   ) { }
+
+  /**
+   * Holds a submitted thumbnail key to the namespace it was issued from.
+   *
+   * Returns the key unchanged so it can be used inline in an object literal.
+   * `null`/`undefined` pass through: clearing a thumbnail is legitimate.
+   */
+  private assertCourseThumbnailKey(
+    key: string | null | undefined,
+    namespace: string,
+  ): string | null | undefined {
+    if (key === null || key === undefined) return key;
+    assertObjectKeyInNamespace(key, namespace, 'thumbnailKey');
+    return key;
+  }
 
   // ---------------------------------------------------------------------------
   // Listing (staff)
@@ -254,6 +273,13 @@ export class CoursesAdminService {
     const slug = await this.uniqueSlug(input.title);
     const leadId = input.leadTeacherId ?? input.teacherIds[0]!;
 
+    // The slug, and so the course id, do not exist yet, so the key cannot be
+    // checked against this course's own prefix here. It can still be held to
+    // the course-thumbnail namespace, which is what keeps a client from
+    // pointing a thumbnail at `hls/<paidVideoId>/…` and having
+    // publicAssetUrl mint an unsigned public URL for protected video.
+    this.assertCourseThumbnailKey(input.thumbnailKey, 'thumbnails/courses/');
+
     const course = await this.prisma.$transaction(async (tx) => {
       const created = await tx.course.create({
         data: {
@@ -403,7 +429,11 @@ export class CoursesAdminService {
       titleAr: input.titleAr?.trim(),
       shortDescription: input.shortDescription?.trim(),
       description: input.description?.trim(),
-      thumbnailKey: input.thumbnailKey,
+      thumbnailKey: (this.assertCourseThumbnailKey(
+        input.thumbnailKey,
+        StorageService.courseThumbnailPrefix(before.id),
+      ),
+      input.thumbnailKey),
       requirements: input.requirements,
       outcomes: input.outcomes,
       enrollmentMethods: input.enrollmentMethods,
@@ -509,7 +539,7 @@ export class CoursesAdminService {
       throw AppException.validation({ amount: ['must not be negative'] });
     }
 
-    const result = await this.prisma.$transaction(async (tx) => {
+    const result = await withSerializableRetry(this.prisma, async (tx) => {
       // Fixed-price parts do not float with the course price, which is the
       // whole point of choosing them — and that means a price change can
       // silently strand them: 300 + 400 + 300 was the course price yesterday
@@ -557,7 +587,7 @@ export class CoursesAdminService {
       });
 
       return { previous: current, created };
-    }, MONEY_TX_OPTIONS);
+    });
 
     await this.audit.record({
       actorId: actor.id,

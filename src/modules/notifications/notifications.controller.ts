@@ -28,6 +28,7 @@ import { AdminOnly } from '../../common/decorators/roles.decorator';
 import { PaginationDto } from '../../common/dto/pagination.dto';
 import type { AuthenticatedUser } from '../../common/types/request-context';
 
+import { AnnouncementsService } from './announcements.service';
 import { NotificationsService } from './notifications.service';
 
 class ListNotificationsDto extends PaginationDto {
@@ -78,7 +79,10 @@ class CreateAnnouncementDto {
 @ApiBearerAuth('access-token')
 @Controller('notifications')
 export class NotificationsController {
-  constructor(private readonly notifications: NotificationsService) {}
+  constructor(
+    private readonly notifications: NotificationsService,
+    private readonly announcements: AnnouncementsService,
+  ) {}
 
   @Get()
   @ApiOperation({
@@ -180,16 +184,26 @@ export class NotificationsController {
   @ApiOperation({
     summary: 'Broadcast an announcement',
     description:
-      'Targets all active students, or narrows by course, university or academic year. Fans out to per-student inbox rows plus one bulk push job.',
+      'Targets all active students, or narrows by course, university or academic year. Shares one publication path with the scheduled announcements: the occurrence is claimed first, the audience is resolved from a stored rule, and the fan-out is paged — so publishing twice sends once.',
   })
   announce(@Body() dto: CreateAnnouncementDto, @CurrentUser() actor: AuthenticatedUser) {
-    return this.notifications.createAnnouncement(dto, actor);
+    // A direct message to one student is a notification, not a broadcast: there
+    // is no audience to record, so no Announcement row is written.
+    if (dto.userId) {
+      return this.notifications.messageStudent(dto, actor);
+    }
+
+    return this.announcements.createLegacy(dto, actor);
   }
 
   @Post('announcements/:id/publish')
   @AdminOnly()
-  @ApiOperation({ summary: 'Publish a drafted announcement' })
+  @ApiOperation({
+    summary: 'Publish a drafted announcement',
+    description:
+      'Refused once the announcement has been published. The draft is a one-shot, and a second publish would otherwise broadcast the same message to everyone a second time.',
+  })
   publish(@Param('id') id: string) {
-    return this.notifications.publishAnnouncement(id);
+    return this.announcements.publishLegacy(id);
   }
 }

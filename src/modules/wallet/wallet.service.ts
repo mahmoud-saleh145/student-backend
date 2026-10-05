@@ -13,7 +13,8 @@ import {
 import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
 import { paginated } from '../../common/types/api-response';
-import { MONEY_TX_OPTIONS, PrismaService } from '../../database/prisma.service';
+import { PrismaService } from '../../database/prisma.service';
+import { withSerializableRetry } from '../../database/serializable-retry';
 import { AuditService } from '../audit/audit.service';
 
 import { fromPiastres, parseAmount, toEgpNumber, toPiastres } from './money';
@@ -333,7 +334,7 @@ export class WalletService {
   }) {
     const normalized = params.rawCode.trim().toUpperCase().replace(/\s+/g, '');
 
-    const result = await this.prisma.$transaction(async (tx) => {
+    const result = await withSerializableRetry(this.prisma, async (tx) => {
       const code = await tx.accessCode.findUnique({
         where: { code: normalized },
         include: { batch: { select: { id: true, name: true } } },
@@ -453,7 +454,7 @@ export class WalletService {
         currency: wallet.currency,
         transactionId: entry?.id ?? null,
       };
-    }, MONEY_TX_OPTIONS);
+    });
 
     await this.audit.record({
       actorId: params.userId,
@@ -492,7 +493,7 @@ export class WalletService {
     });
     if (!student) throw AppException.notFound('Student', params.userId);
 
-    const entry = await this.prisma.$transaction(async (tx) => {
+    const entry = await withSerializableRetry(this.prisma, async (tx) => {
       const request = {
         userId: params.userId,
         amount: params.amount,
@@ -505,7 +506,7 @@ export class WalletService {
       return params.direction === WalletTxDirection.CREDIT
         ? this.credit(tx, request)
         : this.debit(tx, request);
-    }, MONEY_TX_OPTIONS);
+    });
 
     await this.audit.record({
       actorId: params.actor.id,

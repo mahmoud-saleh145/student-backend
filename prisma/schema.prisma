@@ -1714,7 +1714,9 @@ model AccessCode {
   redemptions AccessCodeRedemption[]
 
   rechargeRevenue RechargeRevenue?
-  partAcquisition CoursePartPurchase? @relation("PartAcquiredByCode")
+  /// One row per student who redeemed this card. A multi-use card has many;
+  /// see the note on `CoursePartPurchase.accessCodeId`.
+  partAcquisitions CoursePartPurchase[] @relation("PartAcquiredByCode")
 
   @@index([courseId, status])
   @@index([batchId])
@@ -1912,6 +1914,11 @@ model PlaybackTicket {
   @@index([videoId, issuedAt])
   @@index([status, expiresAt])
   @@index([playId])
+  /// Serves `ProgressService.observePlayback`, which sums watchedSeconds and
+  /// takes the furthest position across every grant this user holds for one
+  /// video. Without this the query has only `userId` to work with, so a student
+  /// with a long history scans every ticket they have ever been issued.
+  @@index([userId, videoId])
   @@map("playback_tickets")
 }
 
@@ -2028,6 +2035,19 @@ model Notification {
   /// Set when this notification came from a broadcast announcement.
   announcementId String?
 
+  /// Set by a generator that must produce this exact notification at most once.
+  ///
+  /// A reminder that is only *meant* to fire once a day still fires twice if the
+  /// job is re-run, retried, or delivered twice, so the guarantee has to live in
+  /// the database rather than in the cron expression that triggered it. The
+  /// uniqueness constraint is what enforces it: writers use `skipDuplicates`, so
+  /// a repeat run silently inserts nothing instead of messaging the student
+  /// again.
+  ///
+  /// Nullable, so ordinary notifications are unaffected — Postgres allows any
+  /// number of NULLs under a unique index.
+  dedupeKey String? @unique
+
   createdAt DateTime @default(now())
 
   user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -2095,6 +2115,10 @@ model Announcement {
 
   @@index([publishedAt])
   @@index([status, nextOccurrenceAt])
+  /// Admin listing: filtered by status, newest first. The offset pagination on
+  /// `list()` sorts on `createdAt`, so without the status column leading the
+  /// index the filter cannot narrow and the sort falls back to the whole table.
+  @@index([status, createdAt])
   @@map("announcements")
 }
 
@@ -2122,6 +2146,17 @@ model AnnouncementDispatch {
 
   @@unique([announcementId, occurrenceAt])
   @@index([occurrenceAt])
+  /// Drives the abandoned-claim sweep, which runs every dispatcher tick looking
+  /// for `finishedAt IS NULL AND startedAt < cutoff`.
+  ///
+  /// `finishedAt` leads because unfinished rows are a transient minority: they
+  /// only exist between a claim and the moment it is settled. Postgres sorts
+  /// NULLs first, so the sweep reads one small, contiguous range instead of
+  /// every claim ever made. That matters more than the index size suggests —
+  /// this table holds one row per occurrence per announcement and is never
+  /// pruned, so an unindexed sweep is a full scan of the entire history of
+  /// sends, on a timer.
+  @@index([finishedAt, startedAt])
   @@map("announcement_dispatches")
 }
 
@@ -2616,13 +2651,33 @@ model CoursePartPurchase {
   /// Library only and nothing new is ever written to this column.
   ///
   /// The `@relation` on each is not decoration. Declaring a column and its
-  /// unique index without one leaves Prisma unaware of the foreign key, which
-  /// it then removes as drift the next time a migration runs.
+  /// index without one leaves Prisma unaware of the foreign key, which it then
+  /// removes as drift the next time a migration runs.
+  ///
+  /// ## Why `accessCodeId` is indexed but NOT unique
+  ///
+  /// A part card is frequently multi-use: one code, `maxRedemptions` copies
+  /// sold, one redemption per student. It therefore has to be one-to-many with
+  /// its purchases, and it used to be declared `@unique` — which made a card
+  /// good for exactly one student. The first redemption wrote
+  /// `course_part_purchases.accessCodeId = <code>`, and the second student's
+  /// insert hit the unique index, aborted the whole Serializable redemption, and
+  /// surfaced as a 500 rather than a message anybody could act on. A batch of
+  /// fifty printed cards could only ever be redeemed once.
+  ///
+  /// Uniqueness lives where it actually belongs: `idempotencyKey`, which is
+  /// `partcode:<codeId>:<userId>` and so permits exactly one purchase per
+  /// student per card. That is the invariant worth enforcing, and it was
+  /// enforced correctly all along.
+  ///
+  /// `walletTransactionId` stays unique: a wallet transaction is one purchase,
+  /// so 1:1 is the right shape for it.
   walletTransactionId String? @unique
-  accessCodeId        String? @unique
+  accessCodeId        String?
 
-  /// `part:<partId>:<userId>`. Makes a retried request return the original
-  /// purchase instead of buying twice.
+  /// `partcode:<codeId>:<userId>` for a card, `part:<partId>:<userId>` for a
+  /// wallet purchase. Makes a retried request return the original purchase
+  /// instead of buying twice.
   idempotencyKey String @unique
 
   purchasedAt DateTime @default(now())
@@ -2641,6 +2696,8 @@ model CoursePartPurchase {
   @@index([coursePartId, purchasedAt])
   @@index([teacherId, purchasedAt])
   @@index([purchasedAt])
+  /// One row per student per card. Not unique — see the note on `accessCodeId`.
+  @@index([accessCodeId])
   @@map("course_part_purchases")
 }
 

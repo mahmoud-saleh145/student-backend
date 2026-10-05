@@ -16,7 +16,10 @@ import { CourseAccessService } from '../courses/course-access.service';
 import { toAttachment } from '../courses/course.serializer';
 import { DevicesService } from '../devices/devices.service';
 import { SecurityEventService } from '../security/security-event.service';
-import { StorageService } from '../storage/storage.service';
+import {
+  assertObjectKeyInNamespace,
+  StorageService,
+} from '../storage/storage.service';
 
 /** Matches the mobile app's `AttachmentTicket` type. */
 export interface AttachmentTicketResponse {
@@ -238,6 +241,20 @@ export class AttachmentsService {
 
     const isProtected = input.isProtected ?? true;
 
+    // Held to this course's own attachment prefix.
+    //
+    // Two reasons, and the second is the one that bites. The download path
+    // resolves an attachment against the uploads bucket, and the delete path
+    // infers the bucket from the key itself — `attachments/` means uploads,
+    // anything else means the media bucket. An off-namespace key therefore turns
+    // "delete this course material" into "delete that object", which reaches
+    // HLS renditions and other courses' images.
+    assertObjectKeyInNamespace(
+      input.objectKey,
+      StorageService.attachmentPrefix(input.courseId),
+      'objectKey',
+    );
+
     const attachment = await this.prisma.attachment.create({
       data: {
         courseId: input.courseId,
@@ -334,8 +351,13 @@ export class AttachmentsService {
       data: { deletedAt: new Date() },
     });
 
-    const bucket = attachment.objectKey.startsWith('attachments/') ? 'uploads' : 'media';
-    await this.storage.deleteObject(bucket, attachment.objectKey).catch(() => undefined);
+    // Course materials are always issued into the uploads bucket, and create now
+    // refuses an off-namespace key, so the bucket is a fact rather than a guess.
+    // Guessing it from the key is what previously let "delete this material"
+    // reach into the media bucket and remove an HLS rendition instead.
+    await this.storage
+      .deleteObject('uploads', attachment.objectKey)
+      .catch(() => undefined);
 
     await this.audit.record({
       actorId: actor.id,

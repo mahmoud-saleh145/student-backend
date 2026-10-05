@@ -647,9 +647,16 @@ export class UsersService {
         where: { userId, revokedAt: null },
         data: { revokedAt: now, revokedReason: reason },
       }),
-      this.prisma.playbackTicket.updateMany({
+this.prisma.playbackTicket.updateMany({
         where: { userId, status: 'ACTIVE' },
-        data: { status: 'REVOKED', revokedAt: now, revokedReason: 'Account deleted' },
+        data: { status: 'REVOKED', releasedAt: now, revokedReason: 'Account deleted' },
+      }),
+      // Push tokens outlive the account unless they are revoked here. New
+      // notifications already skip a DISABLED user, but jobs already sitting in
+      // the queue would still be delivered to a deleted account's devices.
+      this.prisma.pushToken.updateMany({
+        where: { userId, isActive: true },
+        data: { isActive: false },
       }),
     ]);
 

@@ -5,7 +5,10 @@ import { AppException } from '../../common/errors/app.exception';
 import { paginated } from '../../common/types/api-response';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
-import { StorageService } from '../storage/storage.service';
+import {
+  assertObjectKeyInNamespace,
+  StorageService,
+} from '../storage/storage.service';
 import { PlatformSettingsService } from '../settings/platform-settings.service';
 
 /**
@@ -34,6 +37,32 @@ export class LibraryService {
     // without risking a cycle back into the library.
     private readonly settings: PlatformSettingsService,
   ) {}
+
+  /**
+   * Holds a submitted document/thumbnail key to the namespace it was issued from.
+   *
+   * The document key matters most: it is the thing an entitlement check is later
+   * performed against, so a key from anywhere but `library/` would let a part
+   * point at an object that was never uploaded as part of this material. The
+   * thumbnail key feeds an **unsigned** CDN URL, so without this it could name
+   * any object in the bucket at all.
+   */
+  private assertLibraryPartKeys(
+    objectKey: string | null | undefined,
+    thumbnailKey: string | null | undefined,
+    thumbnailNamespace: string,
+  ): void {
+    if (objectKey) {
+      assertObjectKeyInNamespace(
+        objectKey,
+        StorageService.LIBRARY_DOCUMENT_PREFIX,
+        'objectKey',
+      );
+    }
+    if (thumbnailKey) {
+      assertObjectKeyInNamespace(thumbnailKey, thumbnailNamespace, 'thumbnailKey');
+    }
+  }
 
   /**
    * The image to show for a library part.
@@ -629,6 +658,8 @@ export class LibraryService {
     });
     if (!material) throw AppException.notFound('Library material', materialId);
 
+    this.assertLibraryPartKeys(input.objectKey, input.thumbnailKey, `thumbnails/library/${materialId}/`);
+
     const part = await this.prisma.$transaction(async (tx) => {
       const last = await tx.libraryPart.findFirst({
         where: { materialId, ...notDeleted },
@@ -700,6 +731,12 @@ export class LibraryService {
       where: { id: partId, ...notDeleted },
     });
     if (!part) throw AppException.notFound('Library part', partId);
+
+    this.assertLibraryPartKeys(
+      input.objectKey,
+      input.thumbnailKey,
+      `thumbnails/library/${part.materialId}/`,
+    );
 
     if (input.objectKey && input.objectKey !== part.objectKey) {
       const holders = await this.prisma.libraryEntitlement.count({

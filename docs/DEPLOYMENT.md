@@ -191,10 +191,37 @@ simultaneously and both running migrations is a race with an unpleasant
 resolution.
 
 ```bash
-# release job
+# release job, inside the built image
 npx prisma migrate deploy
+npm run db:gate:prod      # must exit 0 before the new version rolls
 # then roll the API, then the worker
 ```
+
+Two spellings, one gate. `db:gate:prod` runs the compiled
+`dist/scripts/migration-gate.js` and is the one that works in the production
+image, where dev dependencies were pruned. `db:gate` runs the TypeScript source
+through `ts-node` and is for a working copy. Same file, same three outcomes.
+
+`npm run db:gate` applies nothing. It reports whether the database already
+matches the migrations in this checkout and exits non-zero when it does not, so
+a release that skipped the deploy step stops before the bad version starts
+rather than after. Three outcomes:
+
+| Exit | Meaning | Response |
+|------|---------|----------|
+| 0 | Schema matches this build | Roll |
+| 1 | Unapplied migrations | Run `migrate deploy`, re-check, roll |
+| 2 | Drift, a failed migration, or the database unreachable | Stop. `migrate deploy` will not fix this — reconcile by hand |
+
+Exit 2 is also what you get when `DATABASE_URL` is missing or the database is
+unreachable. The gate fails closed on purpose: "I could not check" is never
+reported as "safe to roll". Use `-- --json` to get the same result as a single
+object for a pipeline.
+
+The rule is enforced in two places, because documentation alone is not a
+control: `main.ts` and `worker.ts` never call a migration function, and the gate
+above fails the release. If you are adding a container command that migrates,
+stop — that is the one change that makes a rolling deploy unsafe.
 
 Migrations must be backwards-compatible with the version currently running,
 because for a few minutes both are live. The expand/contract pattern:
@@ -209,12 +236,19 @@ old replicas during the rollout.
 ### Order of operations for a release
 
 1. `prisma migrate deploy`
-2. Roll the API (rolling, health-gated)
-3. Roll the worker
-4. Verify `/api/v1/meta/health/deep`
+2. `npm run db:gate:prod` — abort the release unless it exits 0
+3. Roll the API (rolling, health-gated)
+4. Roll the worker
+5. Verify `/api/v1/meta/health/deep`
 
 Worker last, because a new worker may enqueue job shapes an old API cannot
 serve, and the reverse is safe.
+
+Step 4 is the one people skip, and skipping it is invisible: uploads keep
+succeeding, video rows say `QUEUED`, and nothing ever transcodes them. Step 5
+is what catches it - `/meta/health/deep` reports `checks.worker: false` once the
+heartbeat has expired, so a Worker that failed to boot is visible on the
+dashboard rather than discovered by a lecture that never became watchable.
 
 ---
 
@@ -232,6 +266,48 @@ take the API offline.
 
 Suggested probe timings: readiness every 10 s with a 3 s timeout; liveness
 every 30 s with 3 failures before a restart; start period 20 s.
+
+### The background Worker has no endpoint, so it is checked differently
+
+The transcoding Worker calls `createApplicationContext` and opens **no** HTTP
+port. Pointing a container healthcheck at a port it does not listen on marks it
+`unhealthy` permanently, and an orchestrator that trusts that signal will restart
+it in a loop — the Worker then never transcodes anything and never explains why.
+
+The image handles this itself. `scripts/healthcheck.ts` follows the role:
+
+| Role | How it decides |
+| --- | --- |
+| API (`RUN_WORKERS` unset) | `GET /api/v1/meta/health` |
+| Worker (`RUN_WORKERS=true`) | its own `worker:heartbeat` key in Redis |
+
+`RUN_WORKERS` has to be set on the **container**, not merely inside the Worker
+process. `src/worker.ts` assigns it for itself before the module graph loads, but
+the healthcheck is a separate process that never imports that file, so it cannot
+inherit the assignment. A Worker container missing the variable is classified as
+the API and asked to probe a port it deliberately does not serve — reporting
+`unhealthy` while transcoding normally, which is the worst direction for a health
+signal to fail in. Both `docker-compose.yml` and the production Worker service set
+it explicitly; do not let it come from a shared `.env`, or the API replicas would
+start consuming queues too.
+
+The Worker writes that key once a minute with a 180-second TTL, so a missing key
+means "no Worker has checked in for three minutes" — a wedged or dead Worker, and
+exactly the state worth restarting. The same key is what `/api/v1/meta/health/deep` reports (`checks.worker`, with
+`videoPipeline.worker` carrying the last beat's host and PID), so the container
+check and the dashboard can never disagree about whether the Worker is alive.
+
+To check it by hand:
+
+```bash
+docker run --rm -e RUN_WORKERS=true -e REDIS_URL=redis://host:6379 \
+  -e REDIS_PREFIX=edu <image> node dist/scripts/healthcheck.js
+echo $?   # 0 alive, 1 dead or unreachable
+```
+
+A Worker that cannot run ffmpeg still reports alive and prints `ffmpeg=false`.
+That is deliberate: a missing binary is not fixed by restarting, so failing the
+check would only turn a clear diagnosis into a crash loop.
 
 ---
 
