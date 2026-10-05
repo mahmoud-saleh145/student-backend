@@ -83,21 +83,37 @@ export default {
    * @param {ExecutionContext} ctx
    */
   async fetch(request, env, ctx) {
+    const origin = allowedOrigin(request, env);
+
+    // hls.js and pdf.js send Range, which makes the request non-simple and
+    // triggers a preflight. Without an answer here the real request is never
+    // sent at all.
+    if (request.method === 'OPTIONS') {
+      if (!origin) return deny(405, 'method_not_allowed', origin);
+      const headers = new Headers({
+        'access-control-allow-methods': 'GET, HEAD, OPTIONS',
+        'access-control-allow-headers': 'range',
+        'access-control-max-age': '86400',
+        'cache-control': 'no-store',
+      });
+      return new Response(null, { status: 204, headers: applyCors(headers, origin) });
+    }
+
     if (request.method !== 'GET' && request.method !== 'HEAD') {
-      return deny(405, 'method_not_allowed');
+      return deny(405, 'method_not_allowed', origin);
     }
 
     const url = new URL(request.url);
     // Strip the leading slash: object keys are stored without one.
     const objectKey = decodeURIComponent(url.pathname.replace(/^\/+/, ''));
 
-    if (!objectKey) return deny(404, 'not_found');
+    if (!objectKey) return deny(404, 'not_found', origin);
 
     // Defence in depth: never serve the source upload, whatever the signature
     // says. Originals live under uploads/ and are only ever read by the
     // transcoding worker, using bucket credentials rather than this route.
     if (objectKey.startsWith('uploads/') || objectKey.includes('/source/')) {
-      return deny(403, 'forbidden_prefix');
+      return deny(403, 'forbidden_prefix', origin);
     }
 
     const exp = Number(url.searchParams.get('exp') ?? 0);
@@ -108,18 +124,18 @@ export default {
     const mh = Number(url.searchParams.get('mh') ?? 0);
     const sig = url.searchParams.get('sig') ?? '';
 
-    if (!sig || !exp || !uid) return deny(403, 'unsigned');
+    if (!sig || !exp || !uid) return deny(403, 'unsigned', origin);
 
     // --- expiry -------------------------------------------------------------
     // Checked before the HMAC so an expired URL costs one comparison rather
     // than a crypto operation.
-    if (exp * 1000 <= Date.now()) return deny(403, 'expired');
+    if (exp * 1000 <= Date.now()) return deny(403, 'expired', origin);
 
     // --- signature ----------------------------------------------------------
     const canonical = [objectKey, exp, uid, sid, did, tid, mh].join('\n');
     const expected = await hmacBase64Url(env.MEDIA_SIGNING_KEY, canonical);
 
-    if (!timingSafeEqual(expected, sig)) return deny(403, 'bad_signature');
+    if (!timingSafeEqual(expected, sig)) return deny(403, 'bad_signature', origin);
 
     // --- quality ceiling ----------------------------------------------------
     // The API decides which renditions a given grant may fetch (it can lower
@@ -127,7 +143,7 @@ export default {
     // object key, so it is checked here rather than trusted to the player.
     if (mh > 0) {
       const height = renditionHeight(objectKey);
-      if (height !== null && height > mh) return deny(403, 'quality_ceiling');
+      if (height !== null && height > mh) return deny(403, 'quality_ceiling', origin);
     }
 
     // --- live ticket check --------------------------------------------------
@@ -137,7 +153,7 @@ export default {
     // to the API closes that gap.
     if (env.TICKET_CHECK === 'true' && tid && env.API_ORIGIN) {
       const live = await ticketIsLive(env, ctx, tid, uid);
-      if (!live) return deny(403, 'ticket_revoked');
+      if (!live) return deny(403, 'ticket_revoked', origin);
     }
 
     // --- serve --------------------------------------------------------------
@@ -157,7 +173,7 @@ export default {
       range: range ? parseRange(range) : undefined,
     });
 
-    if (!object) return deny(404, 'not_found');
+    if (!object) return deny(404, 'not_found', origin);
 
     const headers = new Headers();
     object.writeHttpMetadata(headers);
@@ -169,9 +185,13 @@ export default {
     // would defeat the entire scheme.
     headers.set('cache-control', 'private, no-store, max-age=0');
     headers.set('x-content-type-options', 'nosniff');
-    // Playlists and segments are fetched by the app's own player, never
-    // embedded in a page, so nothing needs cross-origin read access.
+    // Default to same-site, which is what the mobile app and a bare <video>
+    // need. applyCors relaxes it to cross-origin only for an allowlisted web
+    // origin, because a browser reading these bytes with fetch — hls.js for a
+    // segment, pdf.js for a document — is blocked by CORP before CORS is even
+    // consulted.
     headers.set('cross-origin-resource-policy', 'same-site');
+    applyCors(headers, origin);
 
     if (object.range) {
       const { offset = 0, length = object.size } = object.range;
@@ -196,14 +216,51 @@ export default {
 // Helpers
 // -----------------------------------------------------------------------------
 
-function deny(status, reason) {
+/**
+ * Cross-origin reads, for the web client only.
+ *
+ * This Worker was written when the only client was the mobile app, where the
+ * player fetches media from native code and no browser is enforcing an origin.
+ * The note that "nothing needs cross-origin read access" stopped being true the
+ * moment a browser became a client: hls.js reads playlists and segments with
+ * fetch, and pdf.js reads a Library document the same way. Both are blocked by
+ * the same-origin policy unless this responds with an explicit allowance — so
+ * on the web, video and documents failed before any signature was even checked.
+ *
+ * The allowance is an exact-match allowlist from WEB_ORIGINS, never a wildcard,
+ * and never with credentials: the URL already proves who the viewer is, and
+ * echoing an arbitrary origin would let any page read a signed URL it managed
+ * to obtain. Requests without an Origin — the mobile app, curl, the <video>
+ * element itself — are answered exactly as before.
+ */
+function allowedOrigin(request, env) {
+  const origin = request.headers.get('origin');
+  if (!origin || !env.WEB_ORIGINS) return null;
+  const allowed = env.WEB_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean);
+  return allowed.includes(origin) ? origin : null;
+}
+
+function applyCors(headers, origin) {
+  if (!origin) return headers;
+  headers.set('access-control-allow-origin', origin);
+  // The allowance depends on the request's Origin, so any cache must key on it.
+  headers.append('vary', 'Origin');
+  // Range matters: a player seeking into a video, and pdf.js reading a document
+  // in pieces, both need the ranged response to be readable.
+  headers.set('access-control-expose-headers', 'content-length, content-range, accept-ranges, x-deny-reason');
+  // CORP would otherwise block the read even with CORS in place.
+  headers.set('cross-origin-resource-policy', 'cross-origin');
+  return headers;
+}
+
+function deny(status, reason, origin) {
   // The reason is returned as a header, not a body: a player receiving JSON
   // where it expected a playlist produces a confusing error. The header is
   // enough for curl-based debugging.
-  return new Response(null, {
-    status,
-    headers: { 'x-deny-reason': reason, 'cache-control': 'no-store' },
-  });
+  const headers = new Headers({ 'x-deny-reason': reason, 'cache-control': 'no-store' });
+  // The reason has to survive the browser's filter too, or a blocked web player
+  // reports an opaque network failure instead of "ticket_revoked".
+  return new Response(null, { status, headers: applyCors(headers, origin) });
 }
 
 async function hmacBase64Url(secret, message) {

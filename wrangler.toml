@@ -69,6 +69,18 @@ bucket_name = "edu-library"
 # tickets kept streaming until their signed URLs expired.
 API_ORIGIN = "https://student-backend-814y.onrender.com"
 
+# Browser origins allowed to READ media and documents with fetch.
+#
+# Exact matches, comma-separated, scheme and port included. Only the web client
+# needs this: hls.js and pdf.js read these bytes with fetch, which the
+# same-origin policy blocks without an explicit allowance. The mobile app sends
+# no Origin and is unaffected either way.
+#
+# Leave a origin out and that site simply cannot play video or open documents —
+# which is the safe direction to fail in. Never set this to "*": the URL carries
+# one viewer's grant, and a wildcard would let any page that obtained one read it.
+WEB_ORIGINS = "http://localhost:3002"
+
 # Compared as the string "true" (cloudflare-worker.js:134), so it is quoted.
 # With this on, a signed URL that was copied elsewhere still fails once the
 # ticket is revoked, instead of working until its expiry.
