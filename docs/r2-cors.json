@@ -3,6 +3,7 @@
     {
       "allowed": {
         "origins": [
+          "https://student-web-gray.vercel.app",
           "https://student-dashoard.vercel.app",
           "http://localhost:3001",
           "http://localhost:3002"
