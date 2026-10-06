@@ -729,8 +729,8 @@ export class PlaybackService {
         ticketId: ticket.id,
         message: 'Client reported no secure surface during playback',
       });
-      await this.revokeTicket(ticket.id, 'Secure surface unavailable');
-      return { ok: false, terminate: { reason: 'DEVICE_INTEGRITY_FAILED' } };
+      // await this.revokeTicket(ticket.id, 'Secure surface unavailable');
+      // return { ok: false, terminate: { reason: 'DEVICE_INTEGRITY_FAILED' } };
     }
 
     // --- live re-authorization ----------------------------------------------
@@ -1107,16 +1107,16 @@ export class PlaybackService {
     // Find the live grant this report belongs to.
     const ticket = params.ticketId
       ? await this.prisma.playbackTicket.findFirst({
-          where: { id: params.ticketId, userId: params.user.id },
-        })
+        where: { id: params.ticketId, userId: params.user.id },
+      })
       : await this.prisma.playbackTicket.findFirst({
-          where: {
-            userId: params.user.id,
-            status: PlaybackTicketStatus.ACTIVE,
-            ...(params.videoId ? { videoId: params.videoId } : {}),
-          },
-          orderBy: { issuedAt: 'desc' },
-        });
+        where: {
+          userId: params.user.id,
+          status: PlaybackTicketStatus.ACTIVE,
+          ...(params.videoId ? { videoId: params.videoId } : {}),
+        },
+        orderBy: { issuedAt: 'desc' },
+      });
 
     if (!ticket) return { ok: true, action: 'logged' };
 
