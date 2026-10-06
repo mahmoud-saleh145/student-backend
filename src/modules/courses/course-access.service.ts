@@ -16,6 +16,8 @@ import {
   type TeacherCapability,
 } from '../settings/platform-settings.service';
 
+import { COURSE_TARGETING_ENABLED } from './course-targeting.config';
+
 /** Mirrors the mobile app's `AccessState` union exactly. */
 export type AccessState =
   | 'NOT_ENROLLED'
@@ -68,6 +70,13 @@ export interface AccessDecision {
 @Injectable()
 export class CourseAccessService {
   private readonly logger = new Logger(CourseAccessService.name);
+
+  /**
+   * Whether `assertCourseTargeting` refuses students outside a course's
+   * academic group. Read from the single switch in course-targeting.config.ts;
+   * an instance field only so tests can exercise both states.
+   */
+  targetingEnforced: boolean = COURSE_TARGETING_ENABLED;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -599,6 +608,10 @@ export class CourseAccessService {
     role: UserRole,
     courseId: string,
   ): Promise<void> {
+    // Enforcement is switched off by product decision — see
+    // course-targeting.config.ts. The rule itself (isTargetedToStudent) is
+    // unchanged and still evaluates correctly when this is turned back on.
+    if (!this.targetingEnforced) return;
     if (role !== UserRole.STUDENT) return;
     if (await this.isTargetedToStudent(userId, courseId, role)) return;
 

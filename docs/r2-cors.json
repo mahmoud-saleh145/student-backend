@@ -4,7 +4,8 @@
       "allowed": {
         "origins": [
           "https://student-dashoard.vercel.app",
-          "http://localhost:3001"
+          "http://localhost:3001",
+          "http://localhost:3002"
         ],
         "methods": [
           "PUT"

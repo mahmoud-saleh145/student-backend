@@ -2,6 +2,7 @@ import { CourseStatus, UserRole } from '@prisma/client';
 
 import { CourseAccessService } from '../../src/modules/courses/course-access.service';
 import { ErrorCode } from '../../src/common/errors/error-codes';
+import { COURSE_TARGETING_ENABLED } from '../../src/modules/courses/course-targeting.config';
 
 /**
  * Course targeting.
@@ -200,9 +201,43 @@ describe('isTargetedToStudent', () => {
   });
 });
 
-describe('assertCourseTargeting', () => {
-  it('throws COURSE_NOT_TARGETED for a student outside the group', async () => {
+describe('targeting enforcement switch (product decision 2026-10-06: off)', () => {
+  it('ships with enforcement disabled', () => {
+    expect(COURSE_TARGETING_ENABLED).toBe(false);
+    const { service } = buildService(UNTARGETED, null);
+    expect(service.targetingEnforced).toBe(false);
+  });
+
+  it('lets a student outside the group through while enforcement is off', async () => {
+    const { service, prisma } = buildService(
+      { ...UNTARGETED, departments: [{ departmentId: 'dep_civil' }], academicYearId: 'yr_1' },
+      { universityId: 'uni_2', facultyId: 'fac_x', departmentId: 'dep_mech', academicYearId: 'yr_4' },
+    );
+
+    await expect(service.assertCourseTargeting('usr_1', STUDENT, OTHER)).resolves.toBeUndefined();
+    // Disabled means not evaluated at all on the join path.
+    expect(prisma.course.findFirst).not.toHaveBeenCalled();
+  });
+
+  it('keeps the rule itself intact while enforcement is off', async () => {
     const { service } = buildService(
+      { ...UNTARGETED, departments: [{ departmentId: 'dep_civil' }] },
+      { universityId: 'uni_1', facultyId: 'fac_eng', departmentId: 'dep_mech', academicYearId: null },
+    );
+
+    await expect(service.isTargetedToStudent('usr_1', OTHER, STUDENT)).resolves.toBe(false);
+  });
+});
+
+/** With enforcement switched back on — what flipping the flag restores. */
+describe('assertCourseTargeting (enforcement enabled)', () => {
+  const enforced = (built: ReturnType<typeof buildService>) => {
+    built.service.targetingEnforced = true;
+    return built;
+  };
+
+  it('throws COURSE_NOT_TARGETED for a student outside the group', async () => {
+    const { service } = enforced(buildService(
       { ...UNTARGETED, departments: [{ departmentId: 'dep_civil' }] },
       {
         universityId: 'uni_1',
@@ -210,7 +245,7 @@ describe('assertCourseTargeting', () => {
         departmentId: 'dep_mech',
         academicYearId: null,
       },
-    );
+    ));
 
     await expect(service.assertCourseTargeting('usr_1', STUDENT, OTHER)).rejects.toMatchObject({
       code: ErrorCode.COURSE_NOT_TARGETED,
@@ -219,10 +254,10 @@ describe('assertCourseTargeting', () => {
 
   it('does not query anything for staff', async () => {
     // The override path must not depend on a student profile existing.
-    const { service, prisma } = buildService(
+    const { service, prisma } = enforced(buildService(
       { ...UNTARGETED, departments: [{ departmentId: 'dep_civil' }] },
       null,
-    );
+    ));
 
     await expect(service.assertCourseTargeting('adm_1', UserRole.ADMIN, OTHER)).resolves.toBeUndefined();
     expect(prisma.course.findFirst).not.toHaveBeenCalled();
@@ -230,7 +265,7 @@ describe('assertCourseTargeting', () => {
   });
 
   it('passes a student who matches', async () => {
-    const { service } = buildService(
+    const { service } = enforced(buildService(
       { ...UNTARGETED, departments: [{ departmentId: 'dep_mech' }] },
       {
         universityId: 'uni_1',
@@ -238,7 +273,7 @@ describe('assertCourseTargeting', () => {
         departmentId: 'dep_mech',
         academicYearId: null,
       },
-    );
+    ));
 
     await expect(service.assertCourseTargeting('usr_1', STUDENT, OTHER)).resolves.toBeUndefined();
   });
