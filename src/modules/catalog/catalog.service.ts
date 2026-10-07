@@ -191,8 +191,14 @@ export class CatalogService {
 
     // One query, then pick in precedence order — cheaper than up to four
     // round trips, and the list is tiny.
+    //
+    // Ordered oldest-first so that when several platform-wide structures exist
+    // the fallback is the default ladder created by the migration, not whichever
+    // row Postgres happened to return. Without this the inherited list could
+    // change between two identical requests.
     const found = await this.prisma.academicStructure.findMany({
       where: { scopeKey: { in: candidates }, isActive: true },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
       select: { id: true, kind: true, scopeKey: true },
     });
 
@@ -206,7 +212,9 @@ export class CatalogService {
   /** Every structure with its entries. Admin view. */
   async academicStructures() {
     return this.prisma.academicStructure.findMany({
-      orderBy: [{ scopeKey: 'asc' }],
+      // Several platform-wide structures can exist, so they share a scopeKey.
+      // createdAt/id keep them in a stable order instead of an arbitrary one.
+      orderBy: [{ scopeKey: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }],
       select: {
         id: true,
         kind: true,
@@ -233,17 +241,26 @@ export class CatalogService {
     assertSingleAcademicOwner(input);
     const scopeKey = academicScopeKey(input);
 
+    // Scoped units still get exactly one structure: a second ladder for the
+    // same faculty is a mistake, because nothing would say which one governs.
     // Checked before the insert so the Admin gets a field error rather than a
-    // unique-violation surfaced as a 500. The unique index still has the last
-    // word if two Admins race.
-    const existing = await this.prisma.academicStructure.findUnique({
-      where: { scopeKey },
-      select: { id: true },
-    });
-    if (existing) {
-      throw AppException.validation({
-        scope: ['this unit already has an academic structure; edit that one instead'],
+    // unique-violation surfaced as a 500. The partial unique index still has
+    // the last word if two Admins race.
+    //
+    // The platform scope is deliberately NOT checked. Several platform-wide
+    // structures may coexist (a YEAR ladder and a LEVEL ladder, or a second
+    // default alongside the first), which is why the index in the
+    // allow_multiple_platform_academic_structures migration exempts 'platform'.
+    if (scopeKey !== PLATFORM_SCOPE_KEY) {
+      const existing = await this.prisma.academicStructure.findFirst({
+        where: { scopeKey },
+        select: { id: true },
       });
+      if (existing) {
+        throw AppException.validation({
+          scope: ['this unit already has an academic structure; edit that one instead'],
+        });
+      }
     }
 
     const created = await this.prisma.academicStructure.create({
@@ -542,8 +559,13 @@ export class CatalogService {
     // existing dashboard form keep working untouched.
     let structureId = data.structureId;
     if (!structureId) {
-      const platform = await this.prisma.academicStructure.findUnique({
+      const platform = await this.prisma.academicStructure.findFirst({
         where: { scopeKey: PLATFORM_SCOPE_KEY },
+        // Several platform-wide structures may now exist, so 'platform' is no
+        // longer a unique key. Ordering keeps this endpoint pointed at the
+        // default ladder the migration created; picking an arbitrary row would
+        // silently move the platform's year list between calls.
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
         select: { id: true },
       });
       if (!platform) {

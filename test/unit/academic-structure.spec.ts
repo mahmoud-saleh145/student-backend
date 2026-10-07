@@ -31,6 +31,15 @@ import {
 
 const ACTOR = { id: 'usr_admin', role: UserRole.ADMIN };
 
+/**
+ * The exact field error a duplicate scoped structure produces. Asserted by
+ * value rather than by regex because `AppException.validation` puts the text in
+ * `fields` and leaves `message` as the generic "Request validation failed" —
+ * matching on `message` would pass even if the wording regressed.
+ */
+const DUPLICATE_SCOPE_MESSAGE =
+  'this unit already has an academic structure; edit that one instead';
+
 interface Options {
   /** Structures the database would return for the candidate scopeKeys. */
   structures?: { id: string; kind: AcademicStructureKind; scopeKey: string }[];
@@ -51,7 +60,8 @@ function build(options: Options = {}) {
   // an empty parameter tuple, which makes `mock.calls[0][0]` a type error
   // under `strict`.
   const structureFindMany = jest.fn(
-    async (_args: { where: unknown; select: unknown }) => options.structures ?? [],
+    async (_args: { where: unknown; orderBy?: unknown; select: unknown }) =>
+      options.structures ?? [],
   );
   // One mock, because the service reaches `academicStructure.findUnique` for
   // two different purposes: the duplicate-scope check (by scopeKey) and
@@ -59,6 +69,19 @@ function build(options: Options = {}) {
   // shape keeps both honest instead of having the second silently answer the
   // first's fixture.
   const structureFindUnique = jest.fn(
+    async (args: { where: Record<string, unknown>; select?: unknown }) => {
+      if ('scopeKey' in args.where) {
+        return options.existingByScope === undefined ? null : options.existingByScope;
+      }
+      return options.structureWithEntries === undefined ? null : options.structureWithEntries;
+    },
+  );
+  // `scopeKey` is no longer a unique column — several platform-wide structures
+  // may share the key — so the duplicate pre-check and the platform default
+  // lookup both go through `findFirst`. Dispatching on the `where` shape keeps
+  // this mock honest rather than letting it answer every question with the
+  // same fixture.
+  const structureFindFirst = jest.fn(
     async (args: { where: Record<string, unknown>; select?: unknown }) => {
       if ('scopeKey' in args.where) {
         return options.existingByScope === undefined ? null : options.existingByScope;
@@ -106,6 +129,7 @@ function build(options: Options = {}) {
     academicStructure: {
       findMany: structureFindMany,
       findUnique: structureFindUnique,
+      findFirst: structureFindFirst,
       create: structureCreate,
       update: structureUpdate,
     },
@@ -143,6 +167,7 @@ function build(options: Options = {}) {
     yearUpdateMany,
     yearFindMany,
     structureFindUnique,
+    structureFindFirst,
   };
 }
 
@@ -309,6 +334,151 @@ describe('creating a structure', () => {
     const { service, audit } = build({ existingByScope: null });
     await service.createAcademicStructure({ kind: AcademicStructureKind.YEAR }, ACTOR);
     expect(audit.record).toHaveBeenCalled();
+  });
+});
+
+/**
+ * The rule change: several platform-wide structures may coexist.
+ *
+ * This used to 422 with "this unit already has an academic structure; edit that
+ * one instead". It was rejected twice over — by the service's duplicate
+ * pre-check and by a blanket UNIQUE index on `scopeKey`, which every
+ * platform-wide row shares. Only the platform scope changed: a university,
+ * faculty or department still gets exactly one structure.
+ *
+ * The tests below drive the same mock the other cases use, with
+ * `existingByScope` standing in for "a row with that key is already in the
+ * table". For the platform cases that row is present and the create must still
+ * succeed — which is the regression, since it previously threw.
+ */
+describe('several platform-wide structures may coexist', () => {
+  const platformWide = { kind: AcademicStructureKind.YEAR };
+
+  it('creates the first platform-wide structure', async () => {
+    const { service, structureCreate } = build({ existingByScope: null });
+
+    const created = await service.createAcademicStructure(platformWide, ACTOR);
+
+    expect(created).toMatchObject({ scopeKey: PLATFORM_SCOPE_KEY });
+    const call = structureCreate.mock.calls[0];
+    if (!call) throw new Error('academicStructure.create was never called');
+    expect(call[0].data).toMatchObject({
+      scopeKey: PLATFORM_SCOPE_KEY,
+      universityId: null,
+      facultyId: null,
+      departmentId: null,
+    });
+  });
+
+  it('creates a second platform-wide structure even though one already exists', async () => {
+    // The regression. `existingByScope` says the table already holds a platform
+    // row; before the change this threw HTTP 422.
+    const { service, structureCreate } = build({ existingByScope: { id: 'as_platform_1' } });
+
+    const created = await service.createAcademicStructure(platformWide, ACTOR);
+
+    expect(created).toMatchObject({ scopeKey: PLATFORM_SCOPE_KEY });
+    expect(structureCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it('creates a third platform-wide structure too', async () => {
+    const { service, structureCreate } = build({ existingByScope: { id: 'as_platform_2' } });
+
+    await expect(service.createAcademicStructure(platformWide, ACTOR)).resolves.toMatchObject({
+      scopeKey: PLATFORM_SCOPE_KEY,
+    });
+    expect(structureCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not even ask the database whether a platform structure exists', async () => {
+    // Proof that the fix is in the service and not a coincidence of the mock:
+    // the duplicate pre-check is skipped outright for the platform scope, so a
+    // row already holding that key cannot cause a rejection.
+    const { service, structureFindFirst } = build({ existingByScope: { id: 'as_platform_1' } });
+
+    await service.createAcademicStructure(platformWide, ACTOR);
+
+    const platformLookups = structureFindFirst.mock.calls.filter((call) => {
+      const where = (call[0] as { where: { scopeKey?: unknown } }).where;
+      return where.scopeKey === PLATFORM_SCOPE_KEY;
+    });
+    expect(platformLookups).toHaveLength(0);
+  });
+
+  it('still refuses a second structure for a university', async () => {
+    const { service, structureCreate } = build({ existingByScope: { id: 'as_uni' } });
+
+    await expect(
+      service.createAcademicStructure(
+        { kind: AcademicStructureKind.YEAR, universityId: 'u1' },
+        ACTOR,
+      ),
+    ).rejects.toMatchObject({ fields: { scope: [DUPLICATE_SCOPE_MESSAGE] } });
+    expect(structureCreate).not.toHaveBeenCalled();
+  });
+
+  it('still refuses a second structure for a faculty', async () => {
+    const { service, structureCreate } = build({ existingByScope: { id: 'as_fac' } });
+
+    await expect(
+      service.createAcademicStructure({ kind: AcademicStructureKind.LEVEL, facultyId: 'f1' }, ACTOR),
+    ).rejects.toMatchObject({ fields: { scope: [DUPLICATE_SCOPE_MESSAGE] } });
+    expect(structureCreate).not.toHaveBeenCalled();
+  });
+
+  it('still refuses a second structure for a department', async () => {
+    const { service, structureCreate } = build({ existingByScope: { id: 'as_dept' } });
+
+    await expect(
+      service.createAcademicStructure(
+        { kind: AcademicStructureKind.YEAR, departmentId: 'd1' },
+        ACTOR,
+      ),
+    ).rejects.toMatchObject({ fields: { scope: [DUPLICATE_SCOPE_MESSAGE] } });
+    expect(structureCreate).not.toHaveBeenCalled();
+  });
+
+  it('still allows a first structure for each scoped unit', async () => {
+    // The counterpart to the cases above: relaxing the platform scope must not
+    // have relaxed anything else.
+    for (const scope of [{ universityId: 'u1' }, { facultyId: 'f1' }, { departmentId: 'd1' }]) {
+      const { service, structureCreate } = build({ existingByScope: null });
+      await expect(
+        service.createAcademicStructure({ kind: AcademicStructureKind.YEAR, ...scope }, ACTOR),
+      ).resolves.toBeDefined();
+      expect(structureCreate).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('still rejects a scope naming two owners', async () => {
+    // Untouched by this change, and worth pinning: allowing multiple
+    // platform-wide structures must not weaken the single-owner rule.
+    const { service, structureCreate } = build({ existingByScope: null });
+    await expect(
+      service.createAcademicStructure(
+        { kind: AcademicStructureKind.YEAR, universityId: 'u1', facultyId: 'f1' },
+        ACTOR,
+      ),
+    ).rejects.toMatchObject({
+      fields: {
+        scope: ['an academic structure belongs to one unit: a university, a faculty or a department'],
+      },
+    });
+    expect(structureCreate).not.toHaveBeenCalled();
+  });
+
+  it('resolves the oldest platform structure as the inherited fallback', async () => {
+    // Several platform rows now match the fallback key, so resolution has to be
+    // ordered or the inherited ladder could differ between two identical calls.
+    const { service, structureFindMany } = build({
+      structures: [{ id: 'as_plat', kind: AcademicStructureKind.YEAR, scopeKey: 'platform' }],
+    });
+
+    await service.resolveAcademicStructure({});
+
+    const call = structureFindMany.mock.calls[0];
+    if (!call) throw new Error('academicStructure.findMany was never called');
+    expect(call[0].orderBy).toEqual([{ createdAt: 'asc' }, { id: 'asc' }]);
   });
 });
 

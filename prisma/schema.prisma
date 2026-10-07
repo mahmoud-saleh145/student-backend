@@ -751,11 +751,16 @@ model CourseDepartment {
 /// four is a convention, not a rule.
 ///
 /// Ownership is expressed as three nullable FKs, at most one of which is set.
-/// `scopeKey` is the denormalised form of that choice and carries the unique
-/// constraint, because Postgres treats NULLs as distinct: a UNIQUE over the
-/// nullable FKs would happily accept two platform-wide structures, which is
-/// precisely the duplicate this model exists to prevent. The service is the
-/// only writer of `scopeKey` and derives it from the FKs.
+/// `scopeKey` is the denormalised form of that choice, and the service is the
+/// only writer of it — it derives the key from the FKs.
+///
+/// `scopeKey` carries uniqueness for the SCOPED keys only, enforced by a
+/// PARTIAL unique index that exempts `'platform'` (see the
+/// allow_multiple_platform_academic_structures migration). A partial index is
+/// used rather than a plain UNIQUE because the rule is asymmetric: a university,
+/// faculty or department may have exactly one structure, while the platform may
+/// hold several default ladders. `scopeKey` is therefore a plain index here —
+/// Prisma cannot express a partial index, so the constraint lives in SQL.
 model AcademicStructure {
   id   String                @id @default(cuid())
   kind AcademicStructureKind @default(YEAR)
@@ -765,7 +770,11 @@ model AcademicStructure {
   departmentId String?
 
   /// "platform" | "university:<id>" | "faculty:<id>" | "department:<id>".
-  scopeKey String @unique
+  ///
+  /// Uniqueness for the scoped keys is enforced by a partial unique index in
+  /// the migration, not by `@unique`: the `platform` key is deliberately
+  /// allowed to repeat.
+  scopeKey String
 
   isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
@@ -777,6 +786,7 @@ model AcademicStructure {
 
   entries AcademicYear[]
 
+  @@index([scopeKey])
   @@index([universityId])
   @@index([facultyId])
   @@index([departmentId])

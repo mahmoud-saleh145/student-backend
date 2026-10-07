@@ -174,15 +174,24 @@ async function seedAcademicStructure() {
   // every university inherits until it defines its own; the migration creates
   // the same row with the same fixed id, so seeding a migrated database finds
   // it rather than making a second one.
-  const platformStructure = await prisma.academicStructure.upsert({
-    where: { scopeKey: 'platform' },
-    update: {},
-    create: {
-      id: 'acadstruct_platform_default',
-      kind: 'YEAR',
-      scopeKey: 'platform',
-    },
-  });
+  //
+  // find-then-create rather than `upsert`: `scopeKey` is no longer a unique
+  // column (the partial index exempts 'platform', so several platform-wide
+  // structures may exist), and Prisma requires a unique field in an upsert's
+  // `where`. Ordering by createdAt/id keeps this pointed at the same default
+  // ladder the application resolves to.
+  const platformStructure =
+    (await prisma.academicStructure.findFirst({
+      where: { scopeKey: 'platform' },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+    })) ??
+    (await prisma.academicStructure.create({
+      data: {
+        id: 'acadstruct_platform_default',
+        kind: 'YEAR',
+        scopeKey: 'platform',
+      },
+    }));
 
   const years = await Promise.all(
     [
@@ -202,11 +211,14 @@ async function seedAcademicStructure() {
 
   // A second, LEVEL-kind structure on one faculty, so the seeded database
   // actually exercises both systems side by side rather than only Years.
-  const medicineLevels = await prisma.academicStructure.upsert({
-    where: { scopeKey: `faculty:${medicine.id}` },
-    update: {},
-    create: { kind: 'LEVEL', scopeKey: `faculty:${medicine.id}`, facultyId: medicine.id },
-  });
+  // Scoped keys are still unique, so this is a genuine one-per-faculty lookup.
+  const medicineLevels =
+    (await prisma.academicStructure.findFirst({
+      where: { scopeKey: `faculty:${medicine.id}` },
+    })) ??
+    (await prisma.academicStructure.create({
+      data: { kind: 'LEVEL', scopeKey: `faculty:${medicine.id}`, facultyId: medicine.id },
+    }));
   await Promise.all(
     [1, 2, 3, 4, 5, 6].map((n) =>
       prisma.academicYear.upsert({
