@@ -103,6 +103,39 @@ export class CoursesAdminService {
     return key;
   }
 
+  /**
+   * Removes a course's previous thumbnail once the row points somewhere else.
+   *
+   * Every upload mints a fresh UUID rather than overwriting, deliberately — so a
+   * URL a client already cached keeps resolving. The cost of that choice is that
+   * the old object is now unreferenced, and R2 has no lifecycle rule to collect
+   * it, so replacing an image without this line leaks the file forever.
+   *
+   * The namespace check is load-bearing, not tidiness. `before.thumbnailKey` is
+   * whatever is in the database, and the write path validates the key it is
+   * *given* — nothing stops a row that was hand-edited or written by an older
+   * build from naming `hls/<paidVideoId>/360p/index.m3u8`. Deleting on trust
+   * would destroy paid video. So the old key is held to the course-thumbnail
+   * prefix first, and anything outside it is left alone.
+   *
+   * Best-effort by design: the row has already moved, so a storage failure here
+   * is an orphaned file, not a lost one — never worth failing an edit over.
+   */
+  private async discardReplacedThumbnail(
+    courseId: string,
+    previousKey: string | null,
+    nextKey: string | null | undefined,
+  ): Promise<void> {
+    if (!previousKey) return;
+    // Absent means "leave it alone"; equal means nothing changed.
+    if (nextKey === undefined || nextKey === previousKey) return;
+    if (!previousKey.startsWith(StorageService.courseThumbnailPrefix(courseId))) return;
+
+    await this.storage
+      .deleteObject('media', previousKey)
+      .catch(() => undefined);
+  }
+
   // ---------------------------------------------------------------------------
   // Listing (staff)
   // ---------------------------------------------------------------------------
@@ -380,7 +413,15 @@ export class CoursesAdminService {
 
   async update(
     courseId: string,
-    input: Partial<CreateCourseInput> & { status?: CourseStatus },
+    input: Partial<Omit<CreateCourseInput, 'thumbnailKey'>> & {
+      /**
+       * Widened from `CreateCourseInput` for one reason: a PATCH needs to say
+       * "clear the image", which is `null`. Create has no such state, so only
+       * the update side carries it — see `UpdateCourseDto`.
+       */
+      thumbnailKey?: string | null;
+      status?: CourseStatus;
+    },
     actor: { id: string; role: UserRole },
   ) {
     await this.access.assertCanManageCourse(actor.id, actor.role, courseId, 'content');
@@ -501,6 +542,16 @@ export class CoursesAdminService {
 
       return course;
     });
+
+    // Only once the row has actually moved. Doing this inside the transaction
+    // would delete the object a still-open read is resolving.
+    //
+    // `input.thumbnailKey`, not `updated.thumbnailKey`: the question is whether
+    // the caller moved the pointer, and Prisma's echo is an indirect way to ask
+    // that — it reports the stored value, which for an absent field is simply
+    // the old one. Reading the intent directly keeps "absent", "unchanged" and
+    // "replaced" distinguishable without depending on update semantics.
+    await this.discardReplacedThumbnail(courseId, before.thumbnailKey, input.thumbnailKey);
 
     await this.audit.record({
       actorId: actor.id,

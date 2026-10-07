@@ -154,7 +154,15 @@ export class UpdateCourseDto {
   @IsOptional() @IsString() @MaxLength(32) facultyId?: string;
   @IsOptional() @IsString() @MaxLength(32) academicYearId?: string;
   @IsOptional() @IsString() @MaxLength(32) subjectId?: string;
-  @IsOptional() @IsString() @MaxLength(400) thumbnailKey?: string;
+  /**
+   * `null` clears the image; absent leaves it alone.
+   *
+   * The three states have to stay distinguishable — an unrelated edit must not
+   * wipe the card, and "clear it" is a real action. `@IsOptional()` already
+   * skips a `null`, so this widens the declared type to match what the service
+   * has always done, and matches `UpdateCoursePartDto`.
+   */
+  @IsOptional() @IsString() @MaxLength(400) thumbnailKey?: string | null;
   @IsOptional() @IsArray() @IsString({ each: true }) requirements?: string[];
   @IsOptional() @IsArray() @IsString({ each: true }) outcomes?: string[];
 

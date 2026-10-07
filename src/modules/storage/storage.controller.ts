@@ -101,6 +101,10 @@ class UploadThumbnailQueryDto {
   @IsIn(IMAGE_TYPES) contentType!: string;
 }
 
+class UploadCourseThumbnailQueryDto extends UploadThumbnailQueryDto {
+  @IsString() @MaxLength(32) courseId!: string;
+}
+
 class UploadCoursePartThumbnailQueryDto extends UploadThumbnailQueryDto {
   @IsString() @MaxLength(32) courseId!: string;
   @IsString() @MaxLength(32) partId!: string;
@@ -349,6 +353,38 @@ export class StorageController {
   // to storage rather than buffering, and it needs the length up front. A
   // request without one is refused rather than read into memory to measure.
   // -------------------------------------------------------------------------
+
+  @Post('uploads/course-thumbnail/content')
+  @StaffOnly()
+  @ApiOperation({
+    summary: 'Upload a course thumbnail through the API',
+    description:
+      'Raw request body. Returns the object key to register on the course with ' +
+      'POST /admin/courses or PATCH /admin/courses/:courseId. This is the streaming ' +
+      'counterpart of the presign route above, and exists for the same reason the other ' +
+      'thumbnail routes have one: the media bucket has no CORS policy, so a browser cannot ' +
+      'PUT to it directly.',
+  })
+  async courseThumbnailContent(
+    @Query() query: UploadCourseThumbnailQueryDto,
+    @Req() req: Request,
+  ) {
+    const declared = this.requireLength(req, MAX_THUMBNAIL_BYTES);
+    const objectKey = StorageService.keys.courseThumbnail(
+      query.courseId,
+      extensionFor(query.contentType),
+    );
+
+    await this.storage.putStream({
+      bucket: 'media',
+      objectKey,
+      body: req,
+      contentLength: declared,
+      contentType: query.contentType,
+    });
+
+    return { objectKey, sizeBytes: declared };
+  }
 
   @Post('uploads/course-part-thumbnail/content')
   @StaffOnly()
