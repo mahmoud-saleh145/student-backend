@@ -288,6 +288,7 @@ function buildAdminService(options: { before?: Record<string, unknown> } = {}) {
       publicAssetUrl: jest.fn(async () => null),
       deleteObject,
     } as never,
+    { resolveAcademicStructure: jest.fn(async () => ({ id: 'as_1', kind: 'YEAR' })) } as never,
   );
 
   return { service, deleteObject, courseUpdate };

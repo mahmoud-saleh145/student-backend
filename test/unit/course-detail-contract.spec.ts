@@ -76,6 +76,7 @@ function buildService(row: Record<string, unknown> | null = courseRow()) {
     access as never,
     { record: jest.fn() } as never,
     storage as never,
+    { resolveAcademicStructure: jest.fn(async () => ({ id: 'as_1', kind: 'YEAR' })) } as never,
   );
 
   return { service, prisma, access };

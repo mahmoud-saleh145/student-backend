@@ -115,6 +115,7 @@ function buildService(storedDepartmentIds: string[] = []) {
     { assertCanManageCourse: jest.fn(), staffMayViewCourse: jest.fn(async () => true) } as never,
     { record: jest.fn() } as never,
     { publicAssetUrl: jest.fn(async () => null) } as never,
+    { resolveAcademicStructure: jest.fn(async () => ({ id: 'as_1', kind: 'YEAR' })) } as never,
   );
 
   return { service, prisma, courseCreate, courseDepartment };

@@ -136,6 +136,7 @@ function buildService(over: { prisma?: unknown; access?: unknown } = {}) {
     (over.access ?? access) as never,
     audit as never,
     storage as never,
+    { resolveAcademicStructure: jest.fn(async () => ({ id: 'as_1', kind: 'YEAR' })) } as never,
   );
 
   return { service, prisma, courseCreate, access, audit, courses };

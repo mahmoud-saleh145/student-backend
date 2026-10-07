@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import {
   AccountStatus,
+  AcademicStructureKind,
   AuditAction,
   CourseStatus,
   type EnrollmentMethod,
@@ -16,6 +17,7 @@ import { paginated } from '../../common/types/api-response';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { withSerializableRetry } from '../../database/serializable-retry';
 import { AuditService } from '../audit/audit.service';
+import { CatalogService } from '../catalog/catalog.service';
 import {
   assertObjectKeyInNamespace,
   StorageService,
@@ -86,6 +88,7 @@ export class CoursesAdminService {
     private readonly access: CourseAccessService,
     private readonly audit: AuditService,
     private readonly storage: StorageService,
+    private readonly catalog: CatalogService,
   ) { }
 
   /**
@@ -292,6 +295,12 @@ export class CoursesAdminService {
       facultyId: input.facultyId,
       departmentIds: input.departmentIds,
     });
+    await this.assertAcademicYearBelongsToStructure({
+      universityId: input.universityId,
+      facultyId: input.facultyId,
+      departmentIds: input.departmentIds,
+      academicYearId: input.academicYearId,
+    });
 
     const isFree = input.isFree ?? (input.price ?? 0) <= 0;
     if (!isFree && (input.price === undefined || input.price <= 0)) {
@@ -451,6 +460,15 @@ export class CoursesAdminService {
     };
 
     await this.assertAcademicStructure(effective);
+
+    // The rung is checked against the structure as it will be *after* this
+    // edit, merged over the stored values — otherwise moving a course into a
+    // college that counts in levels would leave it filed under a year.
+    await this.assertAcademicYearBelongsToStructure({
+      ...effective,
+      academicYearId:
+        input.academicYearId !== undefined ? input.academicYearId : before.academicYearId,
+    });
 
     if (before.status === CourseStatus.ARCHIVED) {
       throw new AppException(ErrorCode.COURSE_ARCHIVED, {
@@ -799,9 +817,25 @@ export class CoursesAdminService {
   // ---------------------------------------------------------------------------
 
   /**
-   * Publishing is gated on the course being coherent. Shipping an empty
-   * course to the catalogue is a worse failure than a rejected publish, and
-   * these checks are cheap.
+   * Publishing is gated on the course being *sellable*, not on it being filled.
+   *
+   * A course with no sections and no lessons used to be refused. That was a
+   * deliberate rule once, and it was wrong for how the catalogue is actually
+   * run: a course is often announced and made joinable before its lectures are
+   * recorded, and the instructor then adds them under the same URL. Requiring
+   * content meant that sequence was impossible — you had to upload first and
+   * announce later, so nobody could ever tell students "enrol now, lessons
+   * coming".
+   *
+   * Both student-facing clients already render an empty course properly (the
+   * outline shows "no content yet"), and every read path here is empty-safe:
+   * `loadSections` returns `[]`, `computeCourseProgress` guards its division.
+   * So an empty published course is a real, coherent thing rather than a broken
+   * one, and it is what gets listed.
+   *
+   * What is still refused: a course nobody teaches, a paid course with no
+   * price, and one with no way to join. Those make the listing unusable or
+   * unjoinable, which is a different failure from "the lessons are not ready".
    */
   async publish(courseId: string, actor: { id: string; role: UserRole }) {
     await this.access.assertCanManageCourse(actor.id, actor.role, courseId, 'publish');
@@ -809,16 +843,13 @@ export class CoursesAdminService {
     const course = await this.prisma.course.findFirst({
       where: { id: courseId, ...notDeleted },
       include: {
-        sections: { where: { deletedAt: null }, select: { id: true } },
         prices: { where: { isCurrent: true }, take: 1 },
-        _count: { select: { lessons: { where: { deletedAt: null } }, teachers: true } },
+        _count: { select: { teachers: true } },
       },
     });
     if (!course) throw AppException.notFound('Course', courseId);
 
     const problems: string[] = [];
-    if (course.sections.length === 0) problems.push('the course has no sections');
-    if (course._count.lessons === 0) problems.push('the course has no lessons');
     if (course._count.teachers === 0) problems.push('no teacher is assigned');
     if (!course.isFree && Number(course.prices[0]?.amount ?? 0) <= 0) {
       problems.push('a paid course needs a price greater than zero');
@@ -1331,6 +1362,68 @@ export class CoursesAdminService {
 
     if (Object.keys(fields).length > 0) {
       throw AppException.validation(fields);
+    }
+  }
+
+  /**
+   * A rung must belong to the ladder that will actually govern this course.
+   *
+   * `academicYearId` used to be stored without a word of checking, which is how
+   * a course ended up filed under "First Year" while living in a faculty whose
+   * ladder counts in levels: the year existed, the course was valid, and nothing
+   * ever said the two belonged together. The dashboard dropdown hid it by
+   * always listing the platform ladder, so an administrator had no way to see
+   * or fix it.
+   *
+   * Resolution goes through `CatalogService.resolveAcademicStructure` rather
+   * than a second copy of the department -> faculty -> university -> platform
+   * precedence. One implementation of "which ladder governs this unit" is the
+   * whole point of that method; duplicating it here is how the two would drift.
+   *
+   * A course offered to several departments is resolved from the first, which
+   * is what the API can express at all — `academicYears` takes exactly one
+   * owner. Departments under one college share a ladder in every realistic
+   * installation, so this is right in practice and never silently wrong.
+   */
+  private async assertAcademicYearBelongsToStructure(input: {
+    universityId?: string | null;
+    facultyId?: string | null;
+    departmentIds?: string[] | null;
+    academicYearId?: string | null;
+  }): Promise<void> {
+    const academicYearId = input.academicYearId;
+    if (!academicYearId) return;
+
+    const departmentId = [...new Set(input.departmentIds ?? [])].sort()[0];
+
+    const structure = await this.catalog.resolveAcademicStructure({
+      departmentId: departmentId ?? null,
+      facultyId: departmentId ? null : (input.facultyId ?? null),
+      universityId:
+        departmentId || input.facultyId ? null : (input.universityId ?? null),
+    });
+
+    // No ladder anywhere up the chain: there is nothing to belong to, and the
+    // row cannot be rendered by anything that lists years.
+    if (!structure) {
+      throw AppException.validation({
+        academicYearId: ['no academic structure covers this course; create one first'],
+      });
+    }
+
+    const rung = await this.prisma.academicYear.findFirst({
+      where: { id: academicYearId, structureId: structure.id },
+      select: { id: true },
+    });
+
+    if (!rung) {
+      throw AppException.validation({
+        academicYearId: [
+          structure.kind === AcademicStructureKind.LEVEL
+            ? 'that level is not part of this course academic structure'
+            : 'that year is not part of this course academic structure',
+        ],
+      });
     }
   }
 
