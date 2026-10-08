@@ -390,6 +390,7 @@ describe('deleting an account', () => {
       {} as never, // passwords
       audit as never,
       {} as never, // settings
+      {} as never, // catalog
     );
 
     return { service, audit, pushToken, session, refreshToken, playbackTicket };

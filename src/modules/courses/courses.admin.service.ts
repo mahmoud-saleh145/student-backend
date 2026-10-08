@@ -19,10 +19,7 @@ import { withSerializableRetry } from '../../database/serializable-retry';
 import { AuditService } from '../audit/audit.service';
 import { CatalogService } from '../catalog/catalog.service';
 import { CloudinaryService } from '../storage/cloudinary.service';
-import {
-  assertObjectKeyInNamespace,
-  StorageService,
-} from '../storage/storage.service';
+import { assertObjectKeyInNamespace, StorageService } from '../storage/storage.service';
 
 import { CourseAccessService } from './course-access.service';
 import { CoursesService } from './courses.service';
@@ -91,7 +88,7 @@ export class CoursesAdminService {
     private readonly storage: StorageService,
     private readonly catalog: CatalogService,
     private readonly cloudinary: CloudinaryService,
-  ) { }
+  ) {}
 
   /**
    * Holds a submitted thumbnail key to the namespace it was issued from.
@@ -154,16 +151,16 @@ export class CoursesAdminService {
         // Guarded here rather than relying on the callee to swallow its own
         // failures: this is best-effort cleanup after the row has already
         // moved, and it must never be the thing that fails an edit.
-        await Promise.resolve(this.cloudinary.deleteByKey(previousKey)).catch(() => undefined);
+        await Promise.resolve(this.cloudinary.deleteByKey(previousKey)).catch(
+          () => undefined,
+        );
       }
       return;
     }
 
     if (!previousKey.startsWith(StorageService.courseThumbnailPrefix(courseId))) return;
 
-    await this.storage
-      .deleteObject('media', previousKey)
-      .catch(() => undefined);
+    await this.storage.deleteObject('media', previousKey).catch(() => undefined);
   }
 
   // ---------------------------------------------------------------------------
@@ -194,7 +191,9 @@ export class CoursesAdminService {
       ...notDeleted,
       ...(scopeIds ? { id: { in: scopeIds } } : {}),
       ...(params.status ? { status: params.status } : {}),
-      ...(params.teacherId ? { teachers: { some: { teacherId: params.teacherId } } } : {}),
+      ...(params.teacherId
+        ? { teachers: { some: { teacherId: params.teacherId } } }
+        : {}),
       ...(params.universityId ? { universityId: params.universityId } : {}),
       ...(params.facultyId ? { facultyId: params.facultyId } : {}),
       ...(params.academicYearId ? { academicYearId: params.academicYearId } : {}),
@@ -331,7 +330,9 @@ export class CoursesAdminService {
 
     const isFree = input.isFree ?? (input.price ?? 0) <= 0;
     if (!isFree && (input.price === undefined || input.price <= 0)) {
-      throw AppException.validation({ price: ['a paid course requires a positive price'] });
+      throw AppException.validation({
+        price: ['a paid course requires a positive price'],
+      });
     }
     if (input.enrollmentMethods.length === 0) {
       throw AppException.validation({
@@ -515,11 +516,12 @@ export class CoursesAdminService {
       titleAr: input.titleAr?.trim(),
       shortDescription: input.shortDescription?.trim(),
       description: input.description?.trim(),
-      thumbnailKey: (this.assertCourseThumbnailKey(
-        input.thumbnailKey,
-        StorageService.courseThumbnailPrefix(before.id),
-      ),
-      input.thumbnailKey),
+      thumbnailKey:
+        (this.assertCourseThumbnailKey(
+          input.thumbnailKey,
+          StorageService.courseThumbnailPrefix(before.id),
+        ),
+        input.thumbnailKey),
       requirements: input.requirements,
       outcomes: input.outcomes,
       enrollmentMethods: input.enrollmentMethods,
@@ -530,24 +532,32 @@ export class CoursesAdminService {
       completionThreshold: input.completionThreshold,
       completionRequireContiguous: input.completionRequireContiguous,
       ...(input.universityId !== undefined
-        ? { university: input.universityId ? { connect: { id: input.universityId } } : { disconnect: true } }
+        ? {
+            university: input.universityId
+              ? { connect: { id: input.universityId } }
+              : { disconnect: true },
+          }
         : {}),
       ...(input.facultyId !== undefined
         ? {
-          faculty: input.facultyId ? { connect: { id: input.facultyId } } : { disconnect: true },
-        }
+            faculty: input.facultyId
+              ? { connect: { id: input.facultyId } }
+              : { disconnect: true },
+          }
         : {}),
       ...(input.academicYearId !== undefined
         ? {
-          academicYear: input.academicYearId
-            ? { connect: { id: input.academicYearId } }
-            : { disconnect: true },
-        }
+            academicYear: input.academicYearId
+              ? { connect: { id: input.academicYearId } }
+              : { disconnect: true },
+          }
         : {}),
       ...(input.subjectId !== undefined
         ? {
-          subject: input.subjectId ? { connect: { id: input.subjectId } } : { disconnect: true },
-        }
+            subject: input.subjectId
+              ? { connect: { id: input.subjectId } }
+              : { disconnect: true },
+          }
         : {}),
     };
 
@@ -596,7 +606,11 @@ export class CoursesAdminService {
     // that — it reports the stored value, which for an absent field is simply
     // the old one. Reading the intent directly keeps "absent", "unchanged" and
     // "replaced" distinguishable without depending on update semantics.
-    await this.discardReplacedThumbnail(courseId, before.thumbnailKey, input.thumbnailKey);
+    await this.discardReplacedThumbnail(
+      courseId,
+      before.thumbnailKey,
+      input.thumbnailKey,
+    );
 
     await this.audit.record({
       actorId: actor.id,
@@ -625,7 +639,12 @@ export class CoursesAdminService {
    */
   async changePrice(
     courseId: string,
-    input: { amount: number; currency?: string; compareAtAmount?: number; reason?: string },
+    input: {
+      amount: number;
+      currency?: string;
+      compareAtAmount?: number;
+      reason?: string;
+    },
     actor: { id: string; role: UserRole },
   ) {
     await this.access.assertCanManageCourse(actor.id, actor.role, courseId, 'pricing');
@@ -1023,7 +1042,10 @@ export class CoursesAdminService {
       // Enrollments move to ARCHIVED so the student sees the right state, but
       // the rows — and their payment links — remain.
       await tx.enrollment.updateMany({
-        where: { courseId, state: { in: [EnrollmentState.ACTIVE, EnrollmentState.PENDING_APPROVAL] } },
+        where: {
+          courseId,
+          state: { in: [EnrollmentState.ACTIVE, EnrollmentState.PENDING_APPROVAL] },
+        },
         data: { state: EnrollmentState.ARCHIVED },
       });
 
@@ -1069,7 +1091,9 @@ export class CoursesAdminService {
     const course = await this.prisma.course.findFirst({ where: { id: courseId } });
     if (!course) throw AppException.notFound('Course', courseId);
     if (course.status !== CourseStatus.ARCHIVED) {
-      throw new AppException(ErrorCode.INVALID_STATE, { message: 'Course is not archived' });
+      throw new AppException(ErrorCode.INVALID_STATE, {
+        message: 'Course is not archived',
+      });
     }
 
     await this.prisma.$transaction(async (tx) => {
@@ -1179,7 +1203,10 @@ export class CoursesAdminService {
       });
 
       await tx.enrollment.updateMany({
-        where: { courseId, state: { in: [EnrollmentState.ACTIVE, EnrollmentState.PENDING_APPROVAL] } },
+        where: {
+          courseId,
+          state: { in: [EnrollmentState.ACTIVE, EnrollmentState.PENDING_APPROVAL] },
+        },
         data: { state: EnrollmentState.ARCHIVED },
       });
 
@@ -1268,7 +1295,12 @@ export class CoursesAdminService {
               orderBy: { sortOrder: 'asc' },
               include: {
                 video: {
-                  select: { id: true, status: true, durationSeconds: true, deletedAt: true },
+                  select: {
+                    id: true,
+                    status: true,
+                    durationSeconds: true,
+                    deletedAt: true,
+                  },
                 },
               },
             },
@@ -1333,9 +1365,7 @@ export class CoursesAdminService {
         sections: course.sectionCount,
         lessons: course.lessonCount,
       },
-      price: current
-        ? { amount: current.amount, currency: current.currency }
-        : null,
+      price: current ? { amount: current.amount, currency: current.currency } : null,
       // Flattened out of the join rows: a consumer wants the departments, not
       // the fact that they arrive through a link table.
       departments: course.departments.map((link) => link.department),
@@ -1375,9 +1405,9 @@ export class CoursesAdminService {
 
     const faculty = facultyId
       ? await this.prisma.faculty.findFirst({
-        where: { id: facultyId, ...notDeleted },
-        select: { id: true, universityId: true },
-      })
+          where: { id: facultyId, ...notDeleted },
+          select: { id: true, universityId: true },
+        })
       : null;
 
     if (facultyId && !faculty) {
@@ -1394,8 +1424,12 @@ export class CoursesAdminService {
       } else {
         const found = await this.prisma.department.findMany({
           where: { id: { in: departmentIds }, ...notDeleted },
-          select: { id: true, facultyId: true },
+          select: { id: true, facultyId: true, studyType: true },
         });
+
+        if (new Set(found.map((d) => d.studyType)).size > 1) {
+          fields.departmentIds = ['General and Programs departments cannot be combined'];
+        }
 
         const missing = departmentIds.filter((id) => !found.some((d) => d.id === id));
         const foreign = found.filter((d) => d.facultyId !== facultyId);
@@ -1403,7 +1437,9 @@ export class CoursesAdminService {
         if (missing.length > 0) {
           fields.departmentIds = ['one or more departments do not exist'];
         } else if (foreign.length > 0) {
-          fields.departmentIds = ['one or more departments do not belong to the selected college'];
+          fields.departmentIds = [
+            'one or more departments do not belong to the selected college',
+          ];
         }
       }
     }
@@ -1428,10 +1464,8 @@ export class CoursesAdminService {
    * precedence. One implementation of "which ladder governs this unit" is the
    * whole point of that method; duplicating it here is how the two would drift.
    *
-   * A course offered to several departments is resolved from the first, which
-   * is what the API can express at all — `academicYears` takes exactly one
-   * owner. Departments under one college share a ladder in every realistic
-   * installation, so this is right in practice and never silently wrong.
+   * A course offered to several departments must use a rung that belongs to
+   * every selected department ladder. Separate ladders cannot be combined.
    */
   private async assertAcademicYearBelongsToStructure(input: {
     universityId?: string | null;
@@ -1442,13 +1476,19 @@ export class CoursesAdminService {
     const academicYearId = input.academicYearId;
     if (!academicYearId) return;
 
-    const departmentId = [...new Set(input.departmentIds ?? [])].sort()[0];
+    const departmentIds = [...new Set(input.departmentIds ?? [])].sort();
+    const departmentId = departmentIds[0];
+    for (const additionalDepartment of departmentIds.slice(1)) {
+      await this.assertAcademicYearBelongsToStructure({
+        ...input,
+        departmentIds: [additionalDepartment],
+      });
+    }
 
     const structure = await this.catalog.resolveAcademicStructure({
       departmentId: departmentId ?? null,
       facultyId: departmentId ? null : (input.facultyId ?? null),
-      universityId:
-        departmentId || input.facultyId ? null : (input.universityId ?? null),
+      universityId: departmentId || input.facultyId ? null : (input.universityId ?? null),
     });
 
     // No ladder anywhere up the chain: there is nothing to belong to, and the

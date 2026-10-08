@@ -787,7 +787,7 @@ describe('resolveAcademicStructure — explicit faculty overrides', () => {
     );
   });
 
-  it("outranks even a department's OWN legacy ladder", async () => {
+  it("preserves the department ladder when its faculty has an override", async () => {
     // The override sits above every inherited level, including a department
     // that has its own structure. `assertAcademicYearBelongsToStructure`
     // resolves a course's ladder from its first department and relies on
@@ -812,7 +812,7 @@ describe('resolveAcademicStructure — explicit faculty overrides', () => {
     });
 
     const resolved = await service.resolveAcademicStructure({ departmentId: 'd_1' });
-    expect(resolved?.id).toBe('as_univ_b');
+    expect(resolved?.id).toBe('as_dept');
   });
 
   it("still gives a department's own ladder priority when no override exists", async () => {

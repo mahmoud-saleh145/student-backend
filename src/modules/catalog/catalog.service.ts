@@ -67,7 +67,9 @@ export function assertSingleAcademicOwner(scope: AcademicScope): void {
   );
   if (owners.length > 1) {
     throw AppException.validation({
-      scope: ['an academic structure belongs to one unit: a university, a faculty or a department'],
+      scope: [
+        'an academic structure belongs to one unit: a university, a faculty or a department',
+      ],
     });
   }
 }
@@ -107,15 +109,26 @@ export class CatalogService {
     );
   }
 
-  async departments(facultyId: string) {
+  async departments(facultyId: string, studyType?: 'GENERAL' | 'PROGRAMS') {
     return this.redis.remember(
-      `catalog:departments:${facultyId}`,
+      `catalog:departments:${facultyId}:${studyType ?? 'all'}`,
       CACHE_TTL_SECONDS,
       () =>
         this.prisma.department.findMany({
-          where: { facultyId, isActive: true, ...notDeleted },
+          where: {
+            facultyId,
+            ...(studyType ? { studyType } : {}),
+            isActive: true,
+            ...notDeleted,
+          },
           orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
-          select: { id: true, facultyId: true, name: true, nameAr: true },
+          select: {
+            id: true,
+            facultyId: true,
+            studyType: true,
+            name: true,
+            nameAr: true,
+          },
         }),
     );
   }
@@ -153,48 +166,9 @@ export class CatalogService {
   // ---------------------------------------------------------------------------
 
   /**
-   * The structure that governs a unit, most specific first.
-   *
-   * A department inherits its faculty's structure, a faculty its university's,
-   * and a university the platform's. That inheritance is what stops an Admin
-   * having to redefine the same four years for every department, and it is
-   * resolved here rather than denormalised onto rows so that defining a
-   * structure lower down takes effect immediately.
-   *
-   * On top of that inheritance sits one explicit assignment: a faculty pinned
-   * to a structure via `AcademicStructureFaculty` uses that structure instead
-   * of the one it would inherit, even if the structure belongs to a different
-   * university or to no university at all. Full precedence:
-   *
-   *   1. an explicit override on the faculty (this faculty, or the department's)
-   *   2. the department's OWN structure
-   *   3. a structure OWNED by that faculty
-   *   4. the university's structure
-   *   5. the platform structure
-   *
-   * The override sits at the TOP, above even a department's own structure, and
-   * that ordering is load-bearing rather than a preference:
-   *
-   *   * `assertAcademicYearBelongsToStructure` resolves a course's ladder from
-   *     its first department and documents the rule it relies on — "departments
-   *     under one college share a ladder in every realistic installation". If a
-   *     department-owned structure outranked the pin, a course targeted at a
-   *     pinned college would resolve to one ladder and a course targeted at a
-   *     department of that same college to another. Two courses in one college
-   *     on different year lists is the exact failure that comment rules out.
-   *   * Registration resolves the student's year list from their department.
-   *     A student under a pinned college would be offered years from the old
-   *     ladder while the college's courses were filed under the new one, so
-   *     their placement could never match a course's.
-   *   * An override the admin can see listed on the dashboard, that silently
-   *     fails to reach some of the college's departments, is not an override.
-   *     Nothing in the UI could explain the exemption, because there is no
-   *     control that creates it: department-owned structures can no longer be
-   *     created at all.
-   *
-   * Existing data is unaffected either way. The two can only disagree once an
-   * Admin creates an override, and the override table starts empty — so with no
-   * overrides stored the order collapses to exactly what it was before.
+   * Department ladders take precedence so preparatory years and program levels
+   * remain separate. Otherwise use the faculty override, then the owning
+   * faculty, university and platform ladder in that order.
    */
   async resolveAcademicStructure(scope: AcademicScope) {
     assertSingleAcademicOwner(scope);
@@ -242,6 +216,11 @@ export class CatalogService {
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
       select: { id: true, kind: true, scopeKey: true },
     });
+
+    const departmentStructure = scope.departmentId
+      ? found.find((f) => f.scopeKey === `department:${scope.departmentId}`)
+      : undefined;
+    if (departmentStructure) return departmentStructure;
 
     if (overrideFacultyId) {
       const override = await this.prisma.academicStructureFaculty.findUnique({
@@ -334,7 +313,9 @@ export class CatalogService {
     });
     if (!structure) throw AppException.notFound('academic structure');
 
-    const wanted = [...new Set(facultyIds.filter((id) => typeof id === 'string' && id !== ''))];
+    const wanted = [
+      ...new Set(facultyIds.filter((id) => typeof id === 'string' && id !== '')),
+    ];
 
     // Every id must name a live faculty. Checked in one query so a typo is a
     // field error rather than a foreign-key violation surfaced as a 500.
@@ -492,7 +473,9 @@ export class CatalogService {
       throw AppException.validation({ entries: ['two entries share the same order'] });
     }
     if (orders.some((o) => !Number.isInteger(o) || o < 1)) {
-      throw AppException.validation({ entries: ['order must be a whole number from 1 up'] });
+      throw AppException.validation({
+        entries: ['order must be a whole number from 1 up'],
+      });
     }
 
     const keep = new Set(orders);
@@ -633,7 +616,13 @@ export class CatalogService {
   }
 
   async createDepartment(
-    data: { facultyId: string; name: string; nameAr: string; sortOrder?: number },
+    data: {
+      facultyId: string;
+      studyType?: 'GENERAL' | 'PROGRAMS';
+      name: string;
+      nameAr: string;
+      sortOrder?: number;
+    },
     actor: { id: string; role: UserRole },
   ) {
     const faculty = await this.prisma.faculty.findFirst({
@@ -690,7 +679,9 @@ export class CatalogService {
     data: { name?: string; nameAr?: string; sortOrder?: number; isActive?: boolean },
     actor: { id: string; role: UserRole },
   ) {
-    const before = await this.prisma.department.findFirst({ where: { id, ...notDeleted } });
+    const before = await this.prisma.department.findFirst({
+      where: { id, ...notDeleted },
+    });
     if (!before) throw AppException.notFound('Department', id);
 
     const updated = await this.prisma.department.update({ where: { id }, data });
@@ -803,12 +794,20 @@ export class CatalogService {
    * the flag, because the list queries filter on `deletedAt` and a row that
    * only regained `isActive` would stay invisible.
    */
-  async deactivate(entity: CatalogEntity, id: string, actor: { id: string; role: UserRole }) {
+  async deactivate(
+    entity: CatalogEntity,
+    id: string,
+    actor: { id: string; role: UserRole },
+  ) {
     return this.setActive(entity, id, false, actor);
   }
 
   /** Puts a deactivated catalogue entity back into service. */
-  async reactivate(entity: CatalogEntity, id: string, actor: { id: string; role: UserRole }) {
+  async reactivate(
+    entity: CatalogEntity,
+    id: string,
+    actor: { id: string; role: UserRole },
+  ) {
     return this.setActive(entity, id, true, actor);
   }
 

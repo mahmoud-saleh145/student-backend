@@ -14,6 +14,7 @@ import { paginated, type Paginated } from '../../common/types/api-response';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { PlatformSettingsService } from '../settings/platform-settings.service';
+import { CatalogService } from '../catalog/catalog.service';
 import { PasswordService } from '../auth/password.service';
 
 /** Selection that produces exactly the mobile app's `User` shape. */
@@ -36,7 +37,9 @@ const PUBLIC_USER_SELECT = {
     select: {
       university: { select: { id: true, name: true, nameAr: true, logoUrl: true } },
       faculty: { select: { id: true, universityId: true, name: true, nameAr: true } },
-      department: { select: { id: true, facultyId: true, name: true, nameAr: true } },
+      department: {
+        select: { id: true, facultyId: true, studyType: true, name: true, nameAr: true },
+      },
       academicYear: { select: { id: true, order: true, name: true, nameAr: true } },
     },
   },
@@ -54,6 +57,7 @@ export class UsersService {
     private readonly passwords: PasswordService,
     private readonly audit: AuditService,
     private readonly settings: PlatformSettingsService,
+    private readonly catalog: CatalogService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -115,7 +119,12 @@ export class UsersService {
     lastLoginAt?: Date | null;
     updatedAt?: Date | null;
     studentProfile?: {
-      university: { id: string; name: string; nameAr: string; logoUrl: string | null } | null;
+      university: {
+        id: string;
+        name: string;
+        nameAr: string;
+        logoUrl: string | null;
+      } | null;
       faculty: { id: string; universityId: string; name: string; nameAr: string } | null;
       department: { id: string; facultyId: string; name: string; nameAr: string } | null;
       academicYear: { id: string; order: number; name: string; nameAr: string } | null;
@@ -170,6 +179,7 @@ export class UsersService {
    * so a student cannot end up filed under a department of another university.
    */
   async assertAcademicSelectionIsCoherent(input: {
+    studyType?: 'GENERAL' | 'PROGRAMS';
     universityId: string;
     facultyId: string;
     departmentId: string;
@@ -186,7 +196,7 @@ export class UsersService {
       }),
       this.prisma.department.findFirst({
         where: { id: input.departmentId, isActive: true, ...notDeleted },
-        select: { id: true, facultyId: true },
+        select: { id: true, facultyId: true, studyType: true },
       }),
       this.prisma.academicYear.findFirst({
         where: { id: input.academicYearId, isActive: true },
@@ -205,6 +215,24 @@ export class UsersService {
     }
     if (department && faculty && department.facultyId !== faculty.id) {
       fields.departmentId = ['does not belong to the selected faculty'];
+    }
+
+    if (department && input.studyType && department.studyType !== input.studyType) {
+      fields.departmentId = ['does not belong to the selected study type'];
+    }
+    if (department && year) {
+      const structure = await this.catalog.resolveAcademicStructure({
+        departmentId: department.id,
+      });
+      if (structure) {
+        const rung = await this.prisma.academicYear.findFirst({
+          where: { id: year.id, structureId: structure.id, isActive: true },
+          select: { id: true },
+        });
+        if (!rung) fields.academicYearId = ['does not belong to the selected department'];
+      } else {
+        fields.academicYearId = ['no academic structure covers the selected department'];
+      }
     }
 
     if (Object.keys(fields).length > 0) {
@@ -259,6 +287,16 @@ export class UsersService {
       if (!year) {
         throw AppException.validation({ academicYearId: ['unknown academic year'] });
       }
+
+      const profile = await this.prisma.studentProfile.findUnique({ where: { userId } });
+      if (!profile?.universityId || !profile.facultyId || !profile.departmentId)
+        throw AppException.validation({ academicYearId: ['student profile required'] });
+      await this.assertAcademicSelectionIsCoherent({
+        universityId: profile.universityId,
+        facultyId: profile.facultyId,
+        departmentId: profile.departmentId,
+        academicYearId: year.id,
+      });
 
       await this.prisma.studentProfile.update({
         where: { userId },
@@ -352,7 +390,12 @@ export class UsersService {
       role: UserRole;
       gender?: Gender;
       email?: string;
-      teacher?: { title?: string; titleAr?: string; bio?: string; revenueSharePercent?: number };
+      teacher?: {
+        title?: string;
+        titleAr?: string;
+        bio?: string;
+        revenueSharePercent?: number;
+      };
     },
     actor: { id: string; role: UserRole },
   ) {
@@ -431,7 +474,12 @@ export class UsersService {
       facultyId?: string;
       departmentId?: string;
       academicYearId?: string;
-      teacher?: { title?: string; bio?: string; revenueSharePercent?: number; isPublic?: boolean };
+      teacher?: {
+        title?: string;
+        bio?: string;
+        revenueSharePercent?: number;
+        isPublic?: boolean;
+      };
     },
     actor: { id: string; role: UserRole },
   ) {
@@ -443,6 +491,18 @@ export class UsersService {
 
     this.assertCanManage(actor, target.role);
 
+    if (
+      target.role === UserRole.STUDENT &&
+      (dto.universityId || dto.facultyId || dto.departmentId || dto.academicYearId)
+    ) {
+      const profile = await this.prisma.studentProfile.findUnique({ where: { userId } });
+      await this.assertAcademicSelectionIsCoherent({
+        universityId: dto.universityId ?? profile?.universityId ?? '',
+        facultyId: dto.facultyId ?? profile?.facultyId ?? '',
+        departmentId: dto.departmentId ?? profile?.departmentId ?? '',
+        academicYearId: dto.academicYearId ?? profile?.academicYearId ?? '',
+      });
+    }
     const updated = await this.prisma.$transaction(async (tx) => {
       const user = await tx.user.update({
         where: { id: userId },
@@ -584,7 +644,11 @@ export class UsersService {
    * Soft delete. Financial and audit history references this row with
    * onDelete: Restrict, so a hard delete is impossible by design.
    */
-  async softDelete(userId: string, actor: { id: string; role: UserRole }, reason: string) {
+  async softDelete(
+    userId: string,
+    actor: { id: string; role: UserRole },
+    reason: string,
+  ) {
     const target = await this.prisma.user.findFirst({
       where: { id: userId, ...notDeleted },
       select: { id: true, role: true, phone: true },
@@ -597,7 +661,9 @@ export class UsersService {
     this.assertCanManage(actor, target.role);
 
     if (target.id === actor.id) {
-      throw new AppException(ErrorCode.INVALID_STATE, { message: 'You cannot delete your own account' });
+      throw new AppException(ErrorCode.INVALID_STATE, {
+        message: 'You cannot delete your own account',
+      });
     }
 
     // A course with no teacher cannot be managed or published. Deleting its
@@ -647,7 +713,7 @@ export class UsersService {
         where: { userId, revokedAt: null },
         data: { revokedAt: now, revokedReason: reason },
       }),
-this.prisma.playbackTicket.updateMany({
+      this.prisma.playbackTicket.updateMany({
         where: { userId, status: 'ACTIVE' },
         data: { status: 'REVOKED', releasedAt: now, revokedReason: 'Account deleted' },
       }),
@@ -705,7 +771,9 @@ this.prisma.playbackTicket.updateMany({
           id: true,
           fullName: true,
           avatarUrl: true,
-          teacherProfile: { select: { title: true, titleAr: true, bio: true, bioAr: true } },
+          teacherProfile: {
+            select: { title: true, titleAr: true, bio: true, bioAr: true },
+          },
         },
         orderBy: { fullName: 'asc' },
         skip: (params.page - 1) * params.pageSize,

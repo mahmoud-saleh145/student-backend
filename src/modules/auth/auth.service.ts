@@ -100,6 +100,7 @@ export class AuthService {
     await this.users.assertAcademicSelectionIsCoherent({
       universityId: dto.universityId,
       facultyId: dto.facultyId,
+      studyType: dto.studyType,
       departmentId: dto.departmentId,
       academicYearId: dto.academicYearId,
     });
@@ -189,7 +190,9 @@ export class AuthService {
     if (user.lockedUntil && user.lockedUntil.getTime() > Date.now()) {
       throw new AppException(ErrorCode.RATE_LIMITED, {
         message: 'Too many failed attempts; try again later',
-        details: { retryAfterSeconds: Math.ceil((user.lockedUntil.getTime() - Date.now()) / 1000) },
+        details: {
+          retryAfterSeconds: Math.ceil((user.lockedUntil.getTime() - Date.now()) / 1000),
+        },
       });
     }
 
@@ -202,7 +205,10 @@ export class AuthService {
 
     // Status is checked AFTER the password so a disabled-account response
     // can't be used to enumerate valid numbers.
-    if (user.status === AccountStatus.DISABLED || user.status === AccountStatus.SUSPENDED) {
+    if (
+      user.status === AccountStatus.DISABLED ||
+      user.status === AccountStatus.SUSPENDED
+    ) {
       throw new AppException(ErrorCode.ACCOUNT_DISABLED, {
         message: `Account is ${user.status.toLowerCase()}`,
       });
@@ -269,12 +275,10 @@ export class AuthService {
   ): Promise<AuthResult> {
     const user = await this.users.findAuthUser(userId);
 
-    const resolution = await this.devices.resolveOnLogin(
-      userId,
-      user.role,
-      meta.device,
-      { ip: meta.ip, userAgent: meta.userAgent },
-    );
+    const resolution = await this.devices.resolveOnLogin(userId, user.role, meta.device, {
+      ip: meta.ip,
+      userAgent: meta.userAgent,
+    });
 
     const session = await this.prisma.session.create({
       data: {
@@ -400,7 +404,9 @@ export class AuthService {
     }
 
     if (stored.expiresAt.getTime() <= Date.now()) {
-      throw new AppException(ErrorCode.SESSION_EXPIRED, { message: 'Refresh token expired' });
+      throw new AppException(ErrorCode.SESSION_EXPIRED, {
+        message: 'Refresh token expired',
+      });
     }
 
     if (stored.session.status !== SessionStatus.ACTIVE) {
@@ -408,7 +414,11 @@ export class AuthService {
     }
 
     const user = stored.user;
-    if (user.deletedAt || user.status === AccountStatus.DISABLED || user.status === AccountStatus.SUSPENDED) {
+    if (
+      user.deletedAt ||
+      user.status === AccountStatus.DISABLED ||
+      user.status === AccountStatus.SUSPENDED
+    ) {
       throw new AppException(ErrorCode.ACCOUNT_DISABLED);
     }
 
@@ -502,13 +512,21 @@ export class AuthService {
   // Logout & session management
   // ---------------------------------------------------------------------------
 
-  async logout(userId: string, sessionId: string, meta: RequestMeta): Promise<{ ok: true }> {
+  async logout(
+    userId: string,
+    sessionId: string,
+    meta: RequestMeta,
+  ): Promise<{ ok: true }> {
     const now = new Date();
 
     await this.prisma.$transaction([
       this.prisma.session.updateMany({
         where: { id: sessionId, userId },
-        data: { status: SessionStatus.REVOKED, revokedAt: now, revokedReason: 'User logout' },
+        data: {
+          status: SessionStatus.REVOKED,
+          revokedAt: now,
+          revokedReason: 'User logout',
+        },
       }),
       this.prisma.refreshToken.updateMany({
         where: { sessionId, revokedAt: null },
@@ -529,7 +547,10 @@ export class AuthService {
     return { ok: true };
   }
 
-  async logoutAll(userId: string, reason = 'User signed out everywhere'): Promise<{ ok: true; sessions: number }> {
+  async logoutAll(
+    userId: string,
+    reason = 'User signed out everywhere',
+  ): Promise<{ ok: true; sessions: number }> {
     const now = new Date();
 
     const [sessions] = await this.prisma.$transaction([
@@ -541,7 +562,7 @@ export class AuthService {
         where: { userId, revokedAt: null },
         data: { revokedAt: now, revokedReason: reason },
       }),
-this.prisma.playbackTicket.updateMany({
+      this.prisma.playbackTicket.updateMany({
         where: { userId, status: 'ACTIVE' },
         data: { status: 'REVOKED', releasedAt: now, revokedReason: reason },
       }),
@@ -656,7 +677,11 @@ this.prisma.playbackTicket.updateMany({
       }),
       this.prisma.session.updateMany({
         where: { userId, status: SessionStatus.ACTIVE },
-        data: { status: SessionStatus.REVOKED, revokedAt: now, revokedReason: 'Password changed' },
+        data: {
+          status: SessionStatus.REVOKED,
+          revokedAt: now,
+          revokedReason: 'Password changed',
+        },
       }),
     ]);
 

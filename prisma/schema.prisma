@@ -703,7 +703,13 @@ model Faculty {
   @@map("faculties")
 }
 
+enum StudyType {
+  GENERAL
+  PROGRAMS
+}
+
 model Department {
+  studyType StudyType @default(GENERAL)
   id        String   @id @default(cuid())
   facultyId String
   name      String
@@ -721,6 +727,7 @@ model Department {
 
   @@unique([facultyId, name])
   @@index([facultyId, isActive])
+  @@index([facultyId, studyType, isActive])
   @@map("departments")
 }
 

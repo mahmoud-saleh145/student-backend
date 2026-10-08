@@ -108,9 +108,13 @@ export class CoursesService {
       ...(filters.universityId ? { universityId: filters.universityId } : {}),
       ...(filters.facultyId ? { facultyId: filters.facultyId } : {}),
       ...(filters.academicYearId ? { academicYearId: filters.academicYearId } : {}),
-      ...(filters.teacherId ? { teachers: { some: { teacherId: filters.teacherId } } } : {}),
+      ...(filters.teacherId
+        ? { teachers: { some: { teacherId: filters.teacherId } } }
+        : {}),
       ...(filters.free === true ? { isFree: true } : {}),
     };
+
+    Object.assign(where, await this.access.studentCourseWhere(params.userId));
 
     const orderBy = this.orderFor(filters.sort);
 
@@ -125,7 +129,10 @@ export class CoursesService {
       this.prisma.course.count({ where }),
     ]);
 
-    const items = await this.decorateSummaries(courses as CourseWithRelations[], params.userId);
+    const items = await this.decorateSummaries(
+      courses as CourseWithRelations[],
+      params.userId,
+    );
 
     return paginated(items, total, params.page, params.pageSize);
   }
@@ -139,7 +146,9 @@ export class CoursesService {
    * denormalised `sortPrice` column (kept in sync on price change) is used for
    * the global ordering.
    */
-  private orderFor(sort?: CourseListFilters['sort']): Prisma.CourseOrderByWithRelationInput[] {
+  private orderFor(
+    sort?: CourseListFilters['sort'],
+  ): Prisma.CourseOrderByWithRelationInput[] {
     switch (sort) {
       case 'popular':
         return [{ studentCount: 'desc' }, { publishedAt: 'desc' }];
@@ -179,6 +188,8 @@ export class CoursesService {
       },
     };
 
+    Object.assign(where, await this.access.studentCourseWhere(params.userId));
+
     const [courses, total] = await this.prisma.$transaction([
       this.prisma.course.findMany({
         where,
@@ -190,7 +201,10 @@ export class CoursesService {
       this.prisma.course.count({ where }),
     ]);
 
-    const items = await this.decorateSummaries(courses as CourseWithRelations[], params.userId);
+    const items = await this.decorateSummaries(
+      courses as CourseWithRelations[],
+      params.userId,
+    );
     return paginated(items, total, params.page, params.pageSize);
   }
 
@@ -267,7 +281,11 @@ export class CoursesService {
 
     // A draft or hidden course is invisible to students even by direct id —
     // otherwise a guessed id leaks unpublished content.
-    if (!isStaff && course.status !== CourseStatus.PUBLISHED && course.status !== CourseStatus.ARCHIVED) {
+    if (
+      !isStaff &&
+      course.status !== CourseStatus.PUBLISHED &&
+      course.status !== CourseStatus.ARCHIVED
+    ) {
       throw new AppException(ErrorCode.COURSE_NOT_AVAILABLE);
     }
 
@@ -298,7 +316,11 @@ export class CoursesService {
     const summary = toCourseSummary({
       course,
       currentPrice: course.prices?.[0] ?? null,
-      access: this.access.toCourseAccess(decision, course.enrollmentMethods, course.status),
+      access: this.access.toCourseAccess(
+        decision,
+        course.enrollmentMethods,
+        course.status,
+      ),
       progress: computeCourseProgress(course.lessonCount, progressRows),
       thumbnailUrl: await this.storage.publicAssetUrl(course.thumbnailKey),
     });

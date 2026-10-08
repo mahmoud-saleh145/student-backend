@@ -1,5 +1,11 @@
 import { Injectable } from '@nestjs/common';
-import { ContentStatus, CourseStatus, EnrollmentState, type Prisma, UserRole } from '@prisma/client';
+import {
+  ContentStatus,
+  CourseStatus,
+  EnrollmentState,
+  type Prisma,
+  UserRole,
+} from '@prisma/client';
 
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { RedisService } from '../../redis/redis.service';
@@ -95,10 +101,14 @@ export class SearchService {
     }
   }
 
-  private async searchCourses(query: string, userId: string | null): Promise<SearchResultGroup> {
+  private async searchCourses(
+    query: string,
+    userId: string | null,
+  ): Promise<SearchResultGroup> {
     const where: Prisma.CourseWhereInput = {
       ...notDeleted,
       status: CourseStatus.PUBLISHED,
+      ...(await this.access.studentCourseWhere(userId)),
       OR: [
         { title: { contains: query, mode: 'insensitive' } },
         { titleAr: { contains: query, mode: 'insensitive' } },
@@ -151,11 +161,18 @@ export class SearchService {
     return { entity: 'COURSE', total, items };
   }
 
-  private async searchLessons(query: string, userId: string | null): Promise<SearchResultGroup> {
+  private async searchLessons(
+    query: string,
+    userId: string | null,
+  ): Promise<SearchResultGroup> {
     const where: Prisma.LessonWhereInput = {
       ...notDeleted,
       status: ContentStatus.PUBLISHED,
-      course: { status: CourseStatus.PUBLISHED, deletedAt: null },
+      course: {
+        status: CourseStatus.PUBLISHED,
+        deletedAt: null,
+        ...(await this.access.studentCourseWhere(userId)),
+      },
       OR: [
         { title: { contains: query, mode: 'insensitive' } },
         { titleAr: { contains: query, mode: 'insensitive' } },
@@ -196,8 +213,7 @@ export class SearchService {
       subtitle: row.course.title,
       thumbnailUrl: null,
       route: `/lesson/${row.id}`,
-      locked:
-        !row.isPreview && !accessMap.get(row.course.id)?.decision.canAccessContent,
+      locked: !row.isPreview && !accessMap.get(row.course.id)?.decision.canAccessContent,
     }));
 
     return { entity: 'LESSON', total, items };
@@ -261,6 +277,7 @@ export class SearchService {
     const where: Prisma.AttachmentWhereInput = {
       ...notDeleted,
       courseId: { in: enrolled.map((e) => e.courseId) },
+      course: await this.access.studentCourseWhere(userId),
       title: { contains: query, mode: 'insensitive' },
     };
 
@@ -297,23 +314,28 @@ export class SearchService {
    * Typeahead suggestions. Cached briefly because the same prefixes are typed
    * constantly and the result changes only when the catalogue does.
    */
-  async suggestions(query: string): Promise<string[]> {
+  async suggestions(query: string, userId: string | null = null): Promise<string[]> {
     const trimmed = query.trim();
     if (trimmed.length < MIN_QUERY_LENGTH) return [];
 
-    return this.redis.remember(`search:suggest:${trimmed.toLowerCase()}`, 300, async () => {
-      const rows = await this.prisma.course.findMany({
-        where: {
-          ...notDeleted,
-          status: CourseStatus.PUBLISHED,
-          title: { contains: trimmed, mode: 'insensitive' },
-        },
-        take: 8,
-        orderBy: { studentCount: 'desc' },
-        select: { title: true },
-      });
+    return this.redis.remember(
+      `search:suggest:${userId ?? 'anonymous'}:${trimmed.toLowerCase()}`,
+      300,
+      async () => {
+        const rows = await this.prisma.course.findMany({
+          where: {
+            ...notDeleted,
+            status: CourseStatus.PUBLISHED,
+            ...(await this.access.studentCourseWhere(userId)),
+            title: { contains: trimmed, mode: 'insensitive' },
+          },
+          take: 8,
+          orderBy: { studentCount: 'desc' },
+          select: { title: true },
+        });
 
-      return rows.map((r) => r.title);
-    });
+        return rows.map((r) => r.title);
+      },
+    );
   }
 }

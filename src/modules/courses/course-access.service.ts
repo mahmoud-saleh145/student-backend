@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   CourseStatus,
+  type Prisma,
   type Enrollment,
   EnrollmentMethod,
   EnrollmentState,
@@ -129,7 +130,11 @@ export class CourseAccessService {
     // Staff bypass enrollment, but not the archive: an archived course is
     // archived for everyone, which is what makes the state meaningful.
     if (params.role && params.role !== UserRole.STUDENT) {
-      const staffAllowed = await this.staffMayViewCourse(params.userId!, params.role, course.id);
+      const staffAllowed = await this.staffMayViewCourse(
+        params.userId!,
+        params.role,
+        course.id,
+      );
       if (staffAllowed) {
         return {
           state: course.status === CourseStatus.ARCHIVED ? 'ARCHIVED' : 'ACTIVE',
@@ -137,7 +142,9 @@ export class CourseAccessService {
           enrollment: null,
           expiresAt: null,
           denialCode:
-            course.status === CourseStatus.ARCHIVED ? ErrorCode.COURSE_ARCHIVED : undefined,
+            course.status === CourseStatus.ARCHIVED
+              ? ErrorCode.COURSE_ARCHIVED
+              : undefined,
         };
       }
     }
@@ -151,6 +158,12 @@ export class CourseAccessService {
         denialCode: ErrorCode.UNAUTHORIZED,
       };
     }
+
+    await this.assertCourseTargeting(
+      params.userId,
+      params.role ?? UserRole.STUDENT,
+      course.id,
+    );
 
     const enrollment = await this.prisma.enrollment.findUnique({
       where: { userId_courseId: { userId: params.userId, courseId: params.courseId } },
@@ -345,7 +358,11 @@ export class CourseAccessService {
    */
   async resolveMany(
     userId: string | null,
-    courses: { id: string; status: CourseStatus; enrollmentMethods: EnrollmentMethod[] }[],
+    courses: {
+      id: string;
+      status: CourseStatus;
+      enrollmentMethods: EnrollmentMethod[];
+    }[],
   ): Promise<Map<string, { decision: AccessDecision; access: CourseAccess }>> {
     const result = new Map<string, { decision: AccessDecision; access: CourseAccess }>();
 
@@ -381,7 +398,11 @@ export class CourseAccessService {
       // Only offer join methods when joining is actually possible. An archived
       // or already-active course returns an empty array, which is what makes
       // the app hide the join button without needing its own rules.
-      availableMethods: this.availableMethods(decision.state, enrollmentMethods, courseStatus),
+      availableMethods: this.availableMethods(
+        decision.state,
+        enrollmentMethods,
+        courseStatus,
+      ),
     };
   }
 
@@ -570,6 +591,36 @@ export class CourseAccessService {
    * Staff are not subject to this: an administrator enrolling a student by hand
    * is a deliberate override, which is why callers pass the role through.
    */
+  /** Shared SQL eligibility filter keeps pagination, search and recommendations consistent. */
+  async studentCourseWhere(userId: string | null): Promise<Prisma.CourseWhereInput> {
+    if (!userId) return {};
+    const profile = await this.prisma.studentProfile.findUnique({ where: { userId } });
+    if (!profile)
+      return {
+        universityId: null,
+        facultyId: null,
+        academicYearId: null,
+        departments: { none: {} },
+      };
+    return {
+      AND: [
+        { OR: [{ universityId: null }, { universityId: profile.universityId }] },
+        { OR: [{ facultyId: null }, { facultyId: profile.facultyId }] },
+        { OR: [{ academicYearId: null }, { academicYearId: profile.academicYearId }] },
+        {
+          OR: [
+            { departments: { none: {} } },
+            {
+              departments: {
+                some: { departmentId: profile.departmentId ?? '__unclassified__' },
+              },
+            },
+          ],
+        },
+      ],
+    };
+  }
+
   async isTargetedToStudent(
     userId: string,
     courseId: string,
@@ -618,10 +669,14 @@ export class CourseAccessService {
     // filled in. Undetermined, and undetermined is not a match.
     if (!profile) return false;
 
-    if (constrainsDepartment && !course.departments.some((d) => d.departmentId === profile.departmentId)) {
+    if (
+      constrainsDepartment &&
+      !course.departments.some((d) => d.departmentId === profile.departmentId)
+    ) {
       return false;
     }
-    if (constrainsUniversity && course.universityId !== profile.universityId) return false;
+    if (constrainsUniversity && course.universityId !== profile.universityId)
+      return false;
     if (constrainsFaculty && course.facultyId !== profile.facultyId) return false;
     if (constrainsYear && course.academicYearId !== profile.academicYearId) return false;
 
@@ -715,6 +770,8 @@ export class CourseAccessService {
    * confused with unrestricted access.
    */
   async allowedSectionIds(userId: string, courseId: string): Promise<string[] | null> {
+    await this.assertCourseTargeting(userId, UserRole.STUDENT, courseId);
+
     const enrollment = await this.prisma.enrollment.findUnique({
       where: { userId_courseId: { userId, courseId } },
       select: {

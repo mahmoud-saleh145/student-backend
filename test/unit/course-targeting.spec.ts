@@ -201,11 +201,11 @@ describe('isTargetedToStudent', () => {
   });
 });
 
-describe('targeting enforcement switch (product decision 2026-10-06: off)', () => {
-  it('ships with enforcement disabled', () => {
-    expect(COURSE_TARGETING_ENABLED).toBe(false);
+describe('targeting enforcement switch', () => {
+  it('ships with enforcement enabled', () => {
+    expect(COURSE_TARGETING_ENABLED).toBe(true);
     const { service } = buildService(UNTARGETED, null);
-    expect(service.targetingEnforced).toBe(false);
+    expect(service.targetingEnforced).toBe(true);
   });
 
   it('lets a student outside the group through while enforcement is off', async () => {
@@ -214,6 +214,7 @@ describe('targeting enforcement switch (product decision 2026-10-06: off)', () =
       { universityId: 'uni_2', facultyId: 'fac_x', departmentId: 'dep_mech', academicYearId: 'yr_4' },
     );
 
+    service.targetingEnforced = false;
     await expect(service.assertCourseTargeting('usr_1', STUDENT, OTHER)).resolves.toBeUndefined();
     // Disabled means not evaluated at all on the join path.
     expect(prisma.course.findFirst).not.toHaveBeenCalled();

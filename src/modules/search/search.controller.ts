@@ -47,7 +47,7 @@ export class SearchController {
   @Get('suggestions')
   @Public()
   @ApiOperation({ summary: 'Typeahead suggestions' })
-  suggest(@Query() query: SuggestQueryDto) {
-    return this.search.suggestions(query.q);
+  suggest(@Query() query: SuggestQueryDto, @Req() req: Request) {
+    return this.search.suggestions(query.q, req.user?.id ?? null);
   }
 }

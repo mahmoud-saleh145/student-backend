@@ -1,4 +1,14 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Put, Query } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  Patch,
+  Post,
+  Put,
+  Query,
+} from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { AcademicStructureKind, AuditAction } from '@prisma/client';
 import { Type } from 'class-transformer';
@@ -85,6 +95,8 @@ class CreateFacultyDto {
 }
 
 class CreateDepartmentDto {
+  @IsOptional() @IsEnum({ GENERAL: 'GENERAL', PROGRAMS: 'PROGRAMS' }) studyType?:
+    'GENERAL' | 'PROGRAMS';
   @IsString() @MaxLength(32) facultyId!: string;
   @IsString() @MaxLength(160) name!: string;
   @IsString() @MaxLength(160) nameAr!: string;
@@ -196,8 +208,13 @@ export class CatalogController {
   @Get('faculties/:facultyId/departments')
   @Public()
   @ApiOperation({ summary: 'List departments of a faculty' })
-  departments(@Param('facultyId') facultyId: string) {
-    return this.catalog.departments(facultyId);
+  departments(
+    @Param('facultyId') facultyId: string,
+    @Query('studyType') studyType?: 'GENERAL' | 'PROGRAMS',
+  ) {
+    if (studyType && !['GENERAL', 'PROGRAMS'].includes(studyType))
+      throw AppException.validation({ studyType: ['must be GENERAL or PROGRAMS'] });
+    return this.catalog.departments(facultyId, studyType);
   }
 
   @Get('academic-years')
@@ -205,7 +222,7 @@ export class CatalogController {
   @ApiOperation({
     summary: 'List academic years or levels, ordered',
     description:
-      'With no query parameters this returns the platform-wide list, exactly as before academic structures existed. Passing a university, faculty or department returns that unit\'s own list, inheriting upwards when it has none of its own. Each entry carries the structure\'s `kind` so the UI can label the control Year or Level.',
+      "With no query parameters this returns the platform-wide list, exactly as before academic structures existed. Passing a university, faculty or department returns that unit's own list, inheriting upwards when it has none of its own. Each entry carries the structure's `kind` so the UI can label the control Year or Level.",
   })
   academicYears(@Query() query: AcademicScopeQueryDto) {
     return this.catalog.academicYears(query);
@@ -290,7 +307,10 @@ export class CatalogController {
   @AdminOnly()
   @Audit({ action: AuditAction.CREATE, entity: 'university' })
   @ApiOperation({ summary: 'Create a university' })
-  createUniversity(@Body() dto: CreateUniversityDto, @CurrentUser() actor: AuthenticatedUser) {
+  createUniversity(
+    @Body() dto: CreateUniversityDto,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
     return this.catalog.createUniversity(dto, actor);
   }
 
@@ -315,7 +335,10 @@ export class CatalogController {
   @Post('departments')
   @AdminOnly()
   @ApiOperation({ summary: 'Create a department' })
-  createDepartment(@Body() dto: CreateDepartmentDto, @CurrentUser() actor: AuthenticatedUser) {
+  createDepartment(
+    @Body() dto: CreateDepartmentDto,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
     return this.catalog.createDepartment(dto, actor);
   }
 
