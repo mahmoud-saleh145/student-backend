@@ -62,15 +62,60 @@ const EXIT_OK = 0;
 const EXIT_UNAPPLIED = 1;
 const EXIT_DRIFT = 2;
 
-/** `prisma migrate status` prints this when the schema history is not intact. */
+/**
+ * `prisma migrate status` prints one of these when the history is not intact.
+ *
+ * "have not yet been applied" is deliberately NOT here. It is how Prisma
+ * describes PENDING migrations, and with two or more pending it pluralises to
+ * "Following migrations have not yet been applied" — which this list used to
+ * match, classifying a routine pending state as drift. That sends the operator
+ * to "reconcile by hand" when the answer is `migrate deploy`. Pending is
+ * detected from the status table by `pendingFrom`, not from prose.
+ */
 const DRIFT_MARKERS = [
   'drift detected',
-  'migrations have not yet been applied',
-  'failed migrations',
+  // Singular so it matches "failed migration" and "failed migrations" alike.
+  'failed migration',
   'migration history is modified',
 ];
 
-/** Runs the Prisma CLI and returns stdout, or null if it could not be run. */
+/**
+ * Phrases that only ever appear in a real status report.
+ *
+ * This is what separates "Prisma ran and told us something" from "Prisma could
+ * not run". It matters because `prisma migrate status` exits NON-ZERO in two
+ * very different situations: when migrations are pending (a report we must
+ * read), and when it failed outright — a missing `DATABASE_URL`, an unreachable
+ * database, a blocked engine download. Both land in the same `catch`.
+ */
+const REPORT_MARKERS = [
+  'pending migration',
+  'have not yet been applied',
+  'up to date',
+  'drift detected',
+  'failed migration',
+  'migration history',
+  'database schema is in sync',
+];
+
+/**
+ * Runs the Prisma CLI and returns its report, or `null` when there is no report
+ * to read.
+ *
+ * `null` is the fail-closed answer, and `evaluate` turns it into exit 2.
+ * DEPLOYMENT.md states the contract this restores: *"The gate fails closed on
+ * purpose: 'I could not check' is never reported as 'safe to roll'."*
+ *
+ * It previously returned whatever the failed process had printed, as though it
+ * were a report. With the database unreachable, Prisma prints an error carrying
+ * no status table — no drift marker, no pending row — so `evaluate` read it as
+ * a clean report and answered "up-to-date / safe to roll". The gate meant to
+ * catch "the database is behind this build" green-lit exactly that.
+ *
+ * The rule: a zero exit is trusted; a non-zero exit is trusted only if the
+ * output actually looks like a status report, which is what keeps the
+ * legitimate pending case (also non-zero) working.
+ */
 function migrateStatus(): string | null {
   try {
     return execFileSync('npx', ['prisma', 'migrate', 'status'], {
@@ -80,13 +125,17 @@ function migrateStatus(): string | null {
       timeout: 120_000,
     });
   } catch (error) {
-    // A non-zero exit still prints a useful report, so read what we can before
-    // deciding this is "unknown".
     const output = `${(error as { stdout?: string }).stdout ?? ''}${
       (error as { stderr?: string }).stderr ?? ''
     }`;
-    return output.length > 0 ? output : null;
+    return looksLikeReport(output) ? output : null;
   }
+}
+
+/** Whether output from a failed run still carries a readable status report. */
+export function looksLikeReport(output: string): boolean {
+  const lowered = output.toLowerCase();
+  return REPORT_MARKERS.some((marker) => lowered.includes(marker));
 }
 
 /**

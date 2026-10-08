@@ -1,4 +1,4 @@
-import { evaluate } from '../../scripts/migration-gate';
+import { evaluate, looksLikeReport } from '../../scripts/migration-gate';
 
 /**
  * The migration gate.
@@ -172,5 +172,136 @@ describe('exit codes are usable by a pipeline', () => {
     ].map((output) => evaluate(output).exitCode === 0);
 
     expect(passing).toEqual([true, false, false, false]);
+  });
+});
+/**
+ * The gate must fail closed when Prisma did not actually run.
+ *
+ * `prisma migrate status` exits NON-ZERO in two unrelated situations: when
+ * migrations are pending (a report to read), and when it could not run at all —
+ * no `DATABASE_URL`, an unreachable database, a blocked engine download. Both
+ * reach the same `catch`, and the gate used to hand whatever had been printed to
+ * `evaluate` as though it were a report. An error message carries no status
+ * table, so it parsed as "nothing pending" and the gate answered exit 0,
+ * "safe to roll" — from the one control that exists to stop a release going out
+ * ahead of its schema.
+ *
+ * DEPLOYMENT.md states the contract: "The gate fails closed on purpose: 'I
+ * could not check' is never reported as 'safe to roll'."
+ */
+describe('output from a failed run is not mistaken for a report', () => {
+  /** Verbatim from a run where the engine download was blocked. */
+  const ENGINE_BLOCKED = [
+    'warn The configuration property `package.json#prisma` is deprecated and will be removed in Prisma 7.',
+    '',
+    'Error: Failed to fetch sha256 checksum at',
+    'https://binaries.prisma.sh/all_commits/c2990dca/debian-openssl-3.0.x/schema-engine.sha256 - 403 Forbidden',
+    '',
+    'If you need to ignore this error (e.g. in an offline environment), set the',
+    'PRISMA_ENGINES_CHECKSUM_IGNORE_MISSING environment variable to a truthy value.',
+  ].join('\n');
+
+  const NO_DATABASE_URL = [
+    'Error: Environment variable not found: DATABASE_URL.',
+    '  -->  prisma/schema.prisma:33',
+  ].join('\n');
+
+  const UNREACHABLE = [
+    "Error: P1001: Can't reach database server at `ep-xxxx.eu-central-1.aws.neon.tech:5432`",
+    'Please make sure your database server is running at the above address.',
+  ].join('\n');
+
+  it.each([
+    ['a blocked engine download', ENGINE_BLOCKED],
+    ['a missing DATABASE_URL', NO_DATABASE_URL],
+    ['an unreachable database', UNREACHABLE],
+  ])('does not look like a report: %s', (_label, output) => {
+    expect(looksLikeReport(output)).toBe(false);
+  });
+
+  it.each([
+    ['a blocked engine download', ENGINE_BLOCKED],
+    ['a missing DATABASE_URL', NO_DATABASE_URL],
+    ['an unreachable database', UNREACHABLE],
+  ])('is never "safe to roll": %s', (_label, output) => {
+    // Through the real path the gate takes: unreadable output becomes `null`,
+    // and `evaluate(null)` is the fail-closed branch.
+    const result = evaluate(looksLikeReport(output) ? output : null);
+
+    expect(result.status).toBe('unknown');
+    expect(result.exitCode).toBe(2);
+    expect(result.message).not.toMatch(/safe to roll/i);
+  });
+
+  it('still reads a real report that happens to exit non-zero', () => {
+    // The pending case also exits non-zero. Failing closed must not break it,
+    // or the gate would stop every release that legitimately needs a deploy.
+    const pending = [
+      'Following migration have not yet been applied:',
+      '20261008120000_academic_structure_faculty_overrides',
+      '',
+      '│ 20261008120000_academic_structure_faculty_overrides │ pending migration │',
+    ].join('\n');
+
+    expect(looksLikeReport(pending)).toBe(true);
+    expect(evaluate(pending).status).toBe('unapplied');
+    expect(evaluate(pending).exitCode).toBe(1);
+  });
+});
+
+/**
+ * Prisma's own wording for pending migrations, which used to be read as drift.
+ *
+ * With two or more pending, Prisma pluralises to "Following migrations have not
+ * yet been applied". That phrase sat in `DRIFT_MARKERS`, so the routine case
+ * this gate exists for was reported as drift — "reconcile by hand" — when the
+ * answer is `migrate deploy`. The spec's own fixture says "migration(s)", which
+ * is why it never caught this.
+ */
+describe("Prisma's real pending wording", () => {
+  function realReport(names: string[]): string {
+    const plural = names.length === 1 ? 'migration' : 'migrations';
+    return [
+      `Following ${plural} have not yet been applied:`,
+      ...names,
+      '',
+      ...names.map((n) => `│ ${n} │ pending migration │`),
+      '',
+      'To apply migrations in production run prisma migrate deploy.',
+    ].join('\n');
+  }
+
+  it('reads one pending migration as unapplied', () => {
+    const result = evaluate(realReport(['20261008120000_academic_structure_faculty_overrides']));
+
+    expect(result.status).toBe('unapplied');
+    expect(result.exitCode).toBe(1);
+  });
+
+  it('reads TWO pending migrations as unapplied, not as drift', () => {
+    const result = evaluate(
+      realReport([
+        '20261007120000_allow_multiple_platform_academic_structures',
+        '20261008120000_academic_structure_faculty_overrides',
+      ])
+    );
+
+    expect(result.status).toBe('unapplied');
+    expect(result.exitCode).toBe(1);
+    expect(result.pending).toHaveLength(2);
+  });
+
+  it('still reports genuine drift as drift', () => {
+    const drifted = [
+      'Drift detected: your database schema is not in sync with your migration history.',
+    ].join('\n');
+
+    expect(evaluate(drifted).status).toBe('drift');
+    expect(evaluate(drifted).exitCode).toBe(2);
+  });
+
+  it('still reports a failed migration as drift, singular or plural', () => {
+    expect(evaluate('The failed migration 20260101_init was found.').status).toBe('drift');
+    expect(evaluate('There are failed migrations in the database.').status).toBe('drift');
   });
 });

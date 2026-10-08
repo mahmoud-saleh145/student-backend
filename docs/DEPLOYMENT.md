@@ -250,6 +250,38 @@ is what catches it - `/meta/health/deep` reports `checks.worker: false` once the
 heartbeat has expired, so a Worker that failed to boot is visible on the
 dashboard rather than discovered by a lecture that never became watchable.
 
+### Where steps 1 and 2 actually run on Render
+
+Steps 1 and 2 above are a *release job*. Render's name for that is the
+**Pre-Deploy Command**: it runs once, in the freshly built image, after the
+build and before the new instance receives traffic, and a non-zero exit aborts
+the deploy instead of rolling it. That is precisely the shape this section
+asks for — once, before the roll, never per-replica.
+
+Set it on the API service (Render → the service → Settings → Pre-Deploy
+Command):
+
+```
+npx prisma migrate deploy && npm run db:gate:prod
+```
+
+Nothing in this repository can enforce it. There is no `render.yaml` here, and
+a Blueprint file would not apply to a service created in the dashboard; adding
+the command to the Dockerfile is the one change this document tells you not to
+make, because `CMD` runs per replica. So the setting lives in the Render
+dashboard, and this is where it is written down.
+
+**If the Pre-Deploy Command is empty, deploys advance the code and never the
+schema.** `prisma generate` runs in the build (so the generated client knows
+the new tables) while the database stays where it was — which surfaces as
+`The table public.<name> does not exist in the current database` on the first
+request that touches a new model. The failure is in the application, several
+steps after the mistake, which is what makes it worth a dashboard field.
+
+The worker service needs no Pre-Deploy Command: the API's release job has
+already migrated the one database they share, and a second concurrent
+`migrate deploy` is the race this section opens by warning about.
+
 ---
 
 ## 6. Health checks
