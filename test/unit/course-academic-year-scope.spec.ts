@@ -1,6 +1,7 @@
 import { AcademicStructureKind, UserRole } from '@prisma/client';
 
 import { CoursesAdminService } from '../../src/modules/courses/courses.admin.service';
+import { cloudinaryDouble } from './cloudinary-double';
 
 /**
  * A course's rung must belong to the ladder that governs its unit.
@@ -101,6 +102,7 @@ function buildService(options: {
     { record: jest.fn(async () => undefined) } as never,
     { publicAssetUrl: jest.fn(async () => null) } as never,
     { resolveAcademicStructure } as never,
+    cloudinaryDouble(),
   );
 
   return { service, resolveAcademicStructure, yearFindFirst };
@@ -283,6 +285,7 @@ describe('a rung must belong to the course own ladder', () => {
       { record: jest.fn(async () => undefined) } as never,
       { publicAssetUrl: jest.fn(async () => null) } as never,
       { resolveAcademicStructure } as never,
+      cloudinaryDouble(),
     );
 
     await expectFieldError(

@@ -127,6 +127,27 @@ export class EnvironmentVariables {
 
   @IsOptional() @IsString() MEDIA_CDN_BASE_URL?: string;
 
+  // --- Cloudinary (course thumbnails) ---------------------------------------
+  //
+  // Course thumbnails are the one asset class that is public by design: they
+  // appear on catalogue cards for signed-out visitors, so they want a plain
+  // public https URL rather than the viewer-bound signed media above. They used
+  // to live in R2, which cannot serve them — the media gate answers 403
+  // `unsigned` to anything without a signature, and a signature means nothing
+  // for a public image. Hence Cloudinary.
+  //
+  // All three are required together and optional as a set: absent, the
+  // Cloudinary feature reports itself unconfigured and course thumbnails fall
+  // back to R2 rather than crashing at boot. Never log the secret.
+  @IsOptional() @IsString() CLOUDINARY_CLOUD_NAME?: string;
+  @IsOptional() @IsString() CLOUDINARY_API_KEY?: string;
+  @IsOptional() @IsString() CLOUDINARY_API_SECRET?: string;
+  /**
+   * Folder every course thumbnail is filed under. Defaults to
+   * `courses`; changing it does not move assets already uploaded.
+   */
+  @IsOptional() @IsString() CLOUDINARY_COURSES_FOLDER = 'courses';
+
   /**
    * Serve media from this API instead of a CDN. See storageConfig.localOrigin.
    * Defaults on in non-production when no CDN is configured.
@@ -344,6 +365,31 @@ export function validateEnv(raw: Record<string, unknown>): EnvironmentVariables 
         '[config] R2_BUCKET_LIBRARY is not set: Library documents fall back into the uploads ' +
           'bucket, while the media Worker reads library/ keys from its LIBRARY binding ' +
           '(edu-library) — uploaded PDFs will not open. Set R2_BUCKET_LIBRARY=edu-library.',
+      );
+    }
+
+    // Cloudinary is all-or-nothing: a partial set would produce an upload that
+    // appears to succeed and a delivery URL that 404s, which is exactly the
+    // "broken image" this move is meant to end. Refused at boot, and named
+    // without echoing any value.
+    const cloudinaryKeys = [
+      'CLOUDINARY_CLOUD_NAME',
+      'CLOUDINARY_API_KEY',
+      'CLOUDINARY_API_SECRET',
+    ] as const;
+    const cloudinarySet = cloudinaryKeys.filter((key) => Boolean(raw[key]));
+    if (cloudinarySet.length > 0 && cloudinarySet.length < cloudinaryKeys.length) {
+      const missing = cloudinaryKeys.filter((key) => !raw[key]);
+      throw new Error(
+        `Cloudinary is configured but incomplete: ${missing.join(', ')} missing. ` +
+          'Set all three or none.',
+      );
+    }
+    if (cloudinarySet.length === 0) {
+      console.error(
+        '[config] Cloudinary is not configured: course thumbnails fall back to R2, whose media ' +
+          'gate rejects unsigned requests with 403, so those images will not display. Set ' +
+          'CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET.',
       );
     }
 

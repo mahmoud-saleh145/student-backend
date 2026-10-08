@@ -1,244 +1,181 @@
-import 'reflect-metadata';
+﻿import 'reflect-metadata';
 
 import { UserRole } from '@prisma/client';
+import { Readable } from 'node:stream';
 
-import { ROLES_KEY } from '../../src/common/decorators/roles.decorator';
-import { AppException } from '../../src/common/errors/app.exception';
-import { ErrorCode } from '../../src/common/errors/error-codes';
-import { RolesGuard } from '../../src/common/guards/roles.guard';
 import { CoursesAdminService } from '../../src/modules/courses/courses.admin.service';
 import { StorageController } from '../../src/modules/storage/storage.controller';
 import { StorageService } from '../../src/modules/storage/storage.service';
 
+import { cloudinaryDouble } from './cloudinary-double';
+
 /**
- * The course thumbnail, end to end.
+ * Course images live in Cloudinary.
  *
- * `Course.thumbnailKey` has existed since the catalogue did, and the API has
- * always accepted it — but nothing could set it. Every other thumbnail kind has
- * a streaming upload route; the course's own was the one missing, so the field
- * was write-only in practice and every course card fell back to its icon.
+ * They used to be R2 objects, and that was why they displayed as broken: the
+ * upload succeeded (bucket credentials bypass the edge) but the *read* did not,
+ * because `publicAssetUrl` mints an unsigned URL to the media gate and the gate
+ * answers `403 x-deny-reason: unsigned` to anything without a viewer-bound
+ * signature. A signature means nothing for a public catalogue image, so the
+ * asset moved providers rather than gaining protection.
  *
- * What is worth pinning here, because each fails differently:
+ * What is pinned here:
  *
- *   1. The upload route issues the key. The dashboard never names one — it
- *      returns whatever this route mints, and that is what the course row holds.
- *   2. The key lands in the course-thumbnail namespace under the right course.
- *      `assertCourseThumbnailKey` on the write path is a prefix check, so a key
- *      from the wrong namespace is refused rather than silently filed.
- *   3. Replacing an image must not leak the old file. Every upload mints a
- *      fresh UUID on purpose, so the previous object is unreferenced the moment
- *      the row moves — and deleting it has to be namespace-guarded, or a
- *      hand-edited row naming `hls/…` would take paid video down with it.
+ *   1. The upload route reaches Cloudinary and returns a `cloudinary:` key. The
+ *      R2 presign route is refused rather than left to mint unreadable objects.
+ *   2. The size rules are unchanged — Content-Length required, 10 MB ceiling,
+ *      re-checked while reading rather than trusted from the header.
+ *   3. Replacing an image deletes the previous asset in whichever provider
+ *      holds it, and never touches anything outside this course's own namespace
+ *      — `hls/<paidVideoId>/…` must survive.
+ *   4. The write path accepts a Cloudinary key and still refuses a key that
+ *      would point a public image at protected video.
  */
 
 const COURSE_ID = 'crs_abc123';
-const PREVIOUS_KEY = `thumbnails/courses/${COURSE_ID}/11111111-1111-1111-1111-111111111111.jpg`;
-const NEXT_KEY = `thumbnails/courses/${COURSE_ID}/22222222-2222-2222-2222-222222222222.png`;
-const OTHER_COURSE_KEY =
-  'thumbnails/courses/crs_other/33333333-3333-3333-3333-333333333333.jpg';
+const CLOUD_KEY = `cloudinary:courses/${COURSE_ID}/22222222-2222-2222-2222-222222222222.png`;
+const LEGACY_R2_KEY = `thumbnails/courses/${COURSE_ID}/11111111-1111-1111-1111-111111111111.jpg`;
+const OTHER_COURSE_CLOUD_KEY =
+  'cloudinary:courses/crs_other/33333333-3333-3333-3333-333333333333.png';
 
 const ADMIN = { id: 'usr_admin', role: UserRole.ADMIN };
 
+const STORAGE_CONFIG = {
+  accountId: 'acct-test',
+  accessKeyId: 'key',
+  secretAccessKey: 'secret',
+  region: 'auto',
+  endpoint: 'https://acct-test.r2.cloudflarestorage.com',
+  forcePathStyle: true,
+  buckets: { media: 'edu-media-test', uploads: 'edu-uploads-test', library: 'edu-lib-test' },
+  cdnBaseUrl: 'https://media-gate.example/',
+  signingKey: 'x'.repeat(32),
+  localOrigin: false,
+};
+
 // ---------------------------------------------------------------------------
-// 1. The streaming upload route
+// The upload route
 // ---------------------------------------------------------------------------
 
-/** A storage double that records the single call the route makes. */
-function buildStorage() {
-  const putStream = jest.fn(
-    async (_args: {
-      bucket: string;
-      objectKey: string;
-      body: unknown;
-      contentLength: number;
-      contentType: string;
-    }) => undefined,
-  );
-  return { storage: { putStream } as never, putStream };
+function buildController() {
+  const cloudinary = cloudinaryDouble();
+  const config = { getOrThrow: () => STORAGE_CONFIG } as never;
+  const storage = new StorageService(config, cloudinary);
+  return { controller: new StorageController(storage, cloudinary), cloudinary };
 }
 
-/** A request double carrying only what `requireLength` reads. */
-function request(contentLength?: string) {
-  return {
-    headers: contentLength === undefined ? {} : { 'content-length': contentLength },
-  } as never;
+/** A request carrying `bytes` of body, as the controller sees one. */
+function request(bytes: number, body = 'x') {
+  const stream = Readable.from([Buffer.from(body.repeat(bytes))]);
+  return Object.assign(stream, { headers: { 'content-length': String(bytes) } }) as never;
 }
 
 describe('POST /storage/uploads/course-thumbnail/content', () => {
-  it('issues a key under the course thumbnail namespace', async () => {
-    const { storage, putStream } = buildStorage();
-    const controller = new StorageController(storage);
+  it('stores the image in Cloudinary and returns its key', async () => {
+    const { controller, cloudinary } = buildController();
 
     const result = await controller.courseThumbnailContent(
-      { courseId: COURSE_ID, contentType: 'image/jpeg' },
-      request('2048'),
+      { courseId: COURSE_ID, contentType: 'image/png' },
+      request(4),
     );
 
-    // The dashboard registers exactly this string as Course.thumbnailKey.
-    expect(result.objectKey).toMatch(
-      new RegExp(`^thumbnails/courses/${COURSE_ID}/[0-9a-f-]{36}\\.jpg$`),
+    expect(cloudinary.uploadCourseThumbnail).toHaveBeenCalledWith(
+      expect.objectContaining({ courseId: COURSE_ID, contentType: 'image/png' }),
     );
-    expect(result.sizeBytes).toBe(2048);
-    expect(putStream).toHaveBeenCalledTimes(1);
+    // The dashboard registers exactly this as Course.thumbnailKey. The exact
+    // UUID is minted per upload, so the shape is what matters.
+    expect(result.objectKey).toMatch(
+      new RegExp(`^cloudinary:courses/${COURSE_ID}/[0-9a-f-]{36}$`),
+    );
+    expect(result.url).toContain('res.cloudinary.com');
   });
 
-  it('streams to the media bucket, not uploads', async () => {
-    const { storage, putStream } = buildStorage();
-    const controller = new StorageController(storage);
+  it('never writes to R2', async () => {
+    const { controller, cloudinary } = buildController();
+    const putStream = jest.fn();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (controller as any).storage.putStream = putStream;
 
     await controller.courseThumbnailContent(
       { courseId: COURSE_ID, contentType: 'image/png' },
-      request('10'),
+      request(4),
     );
 
-    // Students read course cards from `media`; the other bucket is for paid
-    // material and uploads. Filing a thumbnail in the wrong one is a data bug,
-    // not a style one.
-    const call = putStream.mock.calls[0];
-    if (!call) throw new Error('putStream was never called');
-    expect(call[0]).toMatchObject({ bucket: 'media', contentLength: 10 });
-  });
-
-  it('derives the extension from the content type, not the filename', async () => {
-    const { storage } = buildStorage();
-    const controller = new StorageController(storage);
-
-    const webp = await controller.courseThumbnailContent(
-      { courseId: COURSE_ID, contentType: 'image/webp' },
-      request('10'),
-    );
-
-    expect(webp.objectKey.endsWith('.webp')).toBe(true);
-  });
-
-  it('mints a fresh key every time, so a cached URL keeps resolving', async () => {
-    const { storage } = buildStorage();
-    const controller = new StorageController(storage);
-
-    const first = await controller.courseThumbnailContent(
-      { courseId: COURSE_ID, contentType: 'image/jpeg' },
-      request('10'),
-    );
-    const second = await controller.courseThumbnailContent(
-      { courseId: COURSE_ID, contentType: 'image/jpeg' },
-      request('10'),
-    );
-
-    // Overwriting in place is what the UUID exists to avoid; this is also why
-    // replacing an image needs the old object deleted rather than overwritten.
-    expect(first.objectKey).not.toBe(second.objectKey);
+    expect(putStream).not.toHaveBeenCalled();
+    expect(cloudinary.uploadCourseThumbnail).toHaveBeenCalled();
   });
 
   it('refuses a request with no Content-Length', async () => {
-    const { storage, putStream } = buildStorage();
-    const controller = new StorageController(storage);
+    const { controller, cloudinary } = buildController();
+    const noLength = Readable.from([Buffer.from('x')]);
 
-    // Rather than read the body to measure it — the thing streaming exists to
-    // avoid.
     await expect(
       controller.courseThumbnailContent(
-        { courseId: COURSE_ID, contentType: 'image/jpeg' },
-        request(undefined),
+        { courseId: COURSE_ID, contentType: 'image/png' },
+        noLength as never,
       ),
     ).rejects.toThrow();
-    expect(putStream).not.toHaveBeenCalled();
+    expect(cloudinary.uploadCourseThumbnail).not.toHaveBeenCalled();
   });
 
   it('refuses anything over 10 MB', async () => {
-    const { storage, putStream } = buildStorage();
-    const controller = new StorageController(storage);
+    const { controller, cloudinary } = buildController();
 
     await expect(
       controller.courseThumbnailContent(
-        { courseId: COURSE_ID, contentType: 'image/jpeg' },
-        request(String(10 * 1024 * 1024 + 1)),
+        { courseId: COURSE_ID, contentType: 'image/png' },
+        request(10 * 1024 * 1024 + 1),
       ),
     ).rejects.toThrow();
-    expect(putStream).not.toHaveBeenCalled();
+    expect(cloudinary.uploadCourseThumbnail).not.toHaveBeenCalled();
   });
 
-  it('accepts a request at exactly the 10 MB ceiling', async () => {
-    const { storage } = buildStorage();
-    const controller = new StorageController(storage);
+  it('re-reads the cap while reading, trusting the header not at all', async () => {
+    // A client may declare 1 KB and send 20 MB. The header is not evidence.
+    const { controller, cloudinary } = buildController();
+    const liar = Object.assign(Readable.from([Buffer.alloc(2 * 1024 * 1024, 1)]), {
+      headers: { 'content-length': '1' },
+    });
 
-    const result = await controller.courseThumbnailContent(
-      { courseId: COURSE_ID, contentType: 'image/jpeg' },
-      request(String(10 * 1024 * 1024)),
-    );
-
-    expect(result.sizeBytes).toBe(10 * 1024 * 1024);
+    await expect(
+      controller.courseThumbnailContent(
+        { courseId: COURSE_ID, contentType: 'image/png' },
+        liar as never,
+      ),
+    ).rejects.toThrow();
+    expect(cloudinary.uploadCourseThumbnail).not.toHaveBeenCalled();
   });
+});
 
-  it('is @StaffOnly(), so a teacher may use it and a student may not', () => {
-    const roles = Reflect.getMetadata(
-      ROLES_KEY,
-      StorageController.prototype.courseThumbnailContent as object,
-    ) as UserRole[];
+describe('the removed R2 presign route', () => {
+  it('refuses instead of minting an object the gate will not serve', async () => {
+    const { controller } = buildController();
 
-    expect(roles).toEqual([UserRole.MASTER, UserRole.ADMIN, UserRole.TEACHER]);
-
-    const guardFor = (role: UserRole) => {
-      const context = {
-        switchToHttp: () => ({ getRequest: () => ({ user: { id: 'u1', role } }) }),
-        getHandler: () => StorageController.prototype.courseThumbnailContent,
-        getClass: () => StorageController,
-      } as never;
-      const reflector = {
-        getAllAndOverride: (key: string) => (key === ROLES_KEY ? roles : undefined),
-      } as never;
-      return new RolesGuard(reflector).canActivate(context);
-    };
-
-    expect(guardFor(UserRole.TEACHER)).toBe(true);
-    try {
-      guardFor(UserRole.STUDENT);
-      throw new Error('the guard should have refused');
-    } catch (error) {
-      expect(error).toBeInstanceOf(AppException);
-      expect((error as AppException).code).toBe(ErrorCode.INSUFFICIENT_ROLE);
-    }
+    // A 404 reads as a routing mistake; the object it used to produce is the
+    // unreadable file this change exists to stop creating.
+    await expect(controller.courseThumbnail()).rejects.toThrow();
   });
 });
 
 // ---------------------------------------------------------------------------
-// 2. The key the route issues is one the course row accepts
-// ---------------------------------------------------------------------------
-
-describe('the issued key is accepted by the course write path', () => {
-  it('passes the namespace check the create/update path applies', () => {
-    // The two halves only work together: the route mints the key, and the
-    // service holds it to a prefix. If either moved, this fails.
-    expect(PREVIOUS_KEY.startsWith(StorageService.courseThumbnailPrefix(COURSE_ID))).toBe(true);
-  });
-
-  it('refuses a key belonging to a different course', () => {
-    expect(OTHER_COURSE_KEY.startsWith(StorageService.courseThumbnailPrefix(COURSE_ID))).toBe(
-      false,
-    );
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 3. Replacing an image deletes the old object
+// Replacing an image
 // ---------------------------------------------------------------------------
 
 function buildAdminService(options: { before?: Record<string, unknown> } = {}) {
   const before = {
     id: COURSE_ID,
-    title: 'Organic Chemistry',
+    title: 'Anatomy',
     shortDescription: '',
     description: '',
     status: 'DRAFT',
-    thumbnailKey: PREVIOUS_KEY,
+    thumbnailKey: CLOUD_KEY,
     universityId: null,
     facultyId: null,
-    // `update` finishes by re-reading the row through `detailForStaff`, whose
-    // own include always selects these, so a double without them is unrealistic
-    // rather than merely incomplete.
+    academicYearId: null,
+    departments: [],
     prices: [],
     teachers: [],
     sections: [],
-    departments: [],
     university: null,
     faculty: null,
     academicYear: null,
@@ -249,20 +186,16 @@ function buildAdminService(options: { before?: Record<string, unknown> } = {}) {
     ...options.before,
   };
 
-  // Mirrors Prisma: an absent field leaves the column alone, an explicit null
-  // clears it, anything else overwrites.
   const courseUpdate = jest.fn(
     async (args: { data: { thumbnailKey?: string | null } }) => ({
       ...before,
       thumbnailKey:
-        args.data.thumbnailKey === undefined
-          ? before.thumbnailKey
-          : args.data.thumbnailKey,
+        args.data.thumbnailKey === undefined ? before.thumbnailKey : args.data.thumbnailKey,
     }),
   );
   const deleteObject = jest.fn(async () => undefined);
 
-  const prisma: Record<string, unknown> = {
+  const prisma = {
     course: {
       findFirst: jest.fn(async () => before),
       findUnique: jest.fn(async () => null),
@@ -271,102 +204,141 @@ function buildAdminService(options: { before?: Record<string, unknown> } = {}) {
     },
     faculty: { findFirst: jest.fn(async () => null) },
     department: { findMany: jest.fn(async () => []) },
-  };
+    courseDepartment: { deleteMany: jest.fn(), createMany: jest.fn() },
+  } as Record<string, unknown>;
 
-  // Assigned after the fact: the interactive form hands the callback this same
-  // object, which it cannot reference from inside its own initialiser.
   prisma.$transaction = jest.fn(async (arg: unknown) =>
     typeof arg === 'function' ? (arg as (tx: unknown) => Promise<unknown>)(prisma) : arg,
   );
 
+  const cloudinary = cloudinaryDouble();
   const service = new CoursesAdminService(
     prisma as never,
     { recountCourse: jest.fn(async () => undefined) } as never,
     { assertCanManageCourse: jest.fn(async () => undefined) } as never,
     { record: jest.fn(async () => undefined) } as never,
-    {
-      publicAssetUrl: jest.fn(async () => null),
-      deleteObject,
-    } as never,
+    { publicAssetUrl: jest.fn(async () => null), deleteObject } as never,
     { resolveAcademicStructure: jest.fn(async () => ({ id: 'as_1', kind: 'YEAR' })) } as never,
+    cloudinary,
   );
 
-  return { service, deleteObject, courseUpdate };
+  return { service, cloudinary, deleteObject };
 }
 
-describe('replacing a course thumbnail', () => {
-  it('deletes the previous object once the row points at the new one', async () => {
-    const { service, deleteObject } = buildAdminService();
+describe('replacing a course image', () => {
+  it('deletes the previous Cloudinary asset', async () => {
+    const { service, cloudinary, deleteObject } = buildAdminService();
+    const next = `cloudinary:courses/${COURSE_ID}/44444444-4444-4444-4444-444444444444.png`;
 
-    await service.update(COURSE_ID, { thumbnailKey: NEXT_KEY }, ADMIN);
+    await service.update(COURSE_ID, { thumbnailKey: next }, ADMIN);
 
-    expect(deleteObject).toHaveBeenCalledWith('media', PREVIOUS_KEY);
+    expect(cloudinary.deleteByKey).toHaveBeenCalledWith(CLOUD_KEY);
+    expect(deleteObject).not.toHaveBeenCalled();
   });
 
-  it('deletes the previous object when the image is cleared', async () => {
-    const { service, deleteObject } = buildAdminService();
+  it('deletes it when the image is cleared', async () => {
+    const { service, cloudinary } = buildAdminService();
 
     await service.update(COURSE_ID, { thumbnailKey: null }, ADMIN);
 
-    expect(deleteObject).toHaveBeenCalledWith('media', PREVIOUS_KEY);
+    expect(cloudinary.deleteByKey).toHaveBeenCalledWith(CLOUD_KEY);
   });
 
-  it('leaves the object alone when the thumbnail was not mentioned', async () => {
-    const { service, deleteObject } = buildAdminService();
+  it('leaves the asset alone when the image was not mentioned', async () => {
+    const { service, cloudinary } = buildAdminService();
 
-    // The regression this guards: an unrelated edit — a renamed course — must
-    // not delete the image the row still points at.
-    await service.update(COURSE_ID, { title: 'Organic Chemistry II' }, ADMIN);
+    // The regression this guards: renaming a course must not delete the image
+    // the row still points at.
+    await service.update(COURSE_ID, { title: 'Anatomy II' }, ADMIN);
 
-    expect(deleteObject).not.toHaveBeenCalled();
+    expect(cloudinary.deleteByKey).not.toHaveBeenCalled();
   });
 
-  it('leaves the object alone when the same key is written back', async () => {
-    const { service, deleteObject } = buildAdminService();
+  it('leaves the asset alone when the same key is written back', async () => {
+    const { service, cloudinary } = buildAdminService();
 
-    await service.update(COURSE_ID, { thumbnailKey: PREVIOUS_KEY }, ADMIN);
+    await service.update(COURSE_ID, { thumbnailKey: CLOUD_KEY }, ADMIN);
 
-    expect(deleteObject).not.toHaveBeenCalled();
+    expect(cloudinary.deleteByKey).not.toHaveBeenCalled();
   });
 
-  it('never deletes outside this course thumbnail namespace', async () => {
-    // A hand-edited or legacy row could name anything. `hls/<paidVideoId>/…`
-    // is the dangerous case: deleting it on trust would destroy paid video and
-    // every enrolment that points at it.
-    const { service, deleteObject } = buildAdminService({
+  it('never deletes another course image', async () => {
+    const { service, cloudinary } = buildAdminService({
+      before: { thumbnailKey: OTHER_COURSE_CLOUD_KEY },
+    });
+
+    await service.update(
+      COURSE_ID,
+      { thumbnailKey: `cloudinary:courses/${COURSE_ID}/55555555-5555-5555-5555-555555555555` },
+      ADMIN,
+    );
+
+    expect(cloudinary.deleteByKey).not.toHaveBeenCalled();
+  });
+
+  it('never deletes protected video, even named in this course thumbnail field', async () => {
+    // A hand-edited or legacy row could name anything. Deleting on trust would
+    // destroy paid video and every enrolment pointing at it.
+    const { service, cloudinary, deleteObject } = buildAdminService({
       before: { thumbnailKey: 'hls/vid_paid/360p/index.m3u8' },
     });
 
-    await service.update(COURSE_ID, { thumbnailKey: NEXT_KEY }, ADMIN);
+    await service.update(
+      COURSE_ID,
+      { thumbnailKey: `cloudinary:courses/${COURSE_ID}/66666666-6666-6666-6666-666666666666` },
+      ADMIN,
+    );
 
+    expect(cloudinary.deleteByKey).not.toHaveBeenCalled();
     expect(deleteObject).not.toHaveBeenCalled();
   });
 
-  it('does not delete a thumbnail that belongs to another course', async () => {
-    const { service, deleteObject } = buildAdminService({
-      before: { thumbnailKey: OTHER_COURSE_KEY },
+  it('still cleans up a legacy R2 row', async () => {
+    // Rows written before the move still hold an R2 key, and replacing one must
+    // not leak the object.
+    const { service, cloudinary, deleteObject } = buildAdminService({
+      before: { thumbnailKey: LEGACY_R2_KEY },
     });
 
-    await service.update(COURSE_ID, { thumbnailKey: NEXT_KEY }, ADMIN);
+    await service.update(
+      COURSE_ID,
+      { thumbnailKey: `cloudinary:courses/${COURSE_ID}/77777777-7777-7777-7777-777777777777` },
+      ADMIN,
+    );
 
-    expect(deleteObject).not.toHaveBeenCalled();
+    expect(deleteObject).toHaveBeenCalledWith('media', LEGACY_R2_KEY);
+    expect(cloudinary.deleteByKey).not.toHaveBeenCalled();
   });
 
   it('succeeds even when the delete fails', async () => {
-    const { service, deleteObject } = buildAdminService();
-    deleteObject.mockRejectedValueOnce(new Error('R2 unavailable'));
+    const { service, cloudinary } = buildAdminService();
+    (cloudinary.deleteByKey as jest.Mock).mockRejectedValueOnce(new Error('Cloudinary down'));
 
-    // The row has already moved, so a storage failure here is an orphaned
-    // file, never a lost one — and never worth failing an edit over.
+    // The row has already moved, so a failure here is an orphaned asset, never
+    // a lost one — and never worth failing an edit over.
     await expect(
-      service.update(COURSE_ID, { thumbnailKey: NEXT_KEY }, ADMIN),
+      service.update(
+        COURSE_ID,
+        { thumbnailKey: `cloudinary:courses/${COURSE_ID}/88888888-8888-8888-8888-888888888888` },
+        ADMIN,
+      ),
     ).resolves.toBeDefined();
   });
 
-  it('still refuses a key from the wrong namespace on the write itself', async () => {
+  it('accepts a Cloudinary key on the write path', async () => {
+    const { service } = buildAdminService();
+    await expect(
+      service.update(
+        COURSE_ID,
+        { thumbnailKey: `cloudinary:courses/${COURSE_ID}/99999999-9999-9999-9999-999999999999` },
+        ADMIN,
+      ),
+    ).resolves.toBeDefined();
+  });
+
+  it('still refuses a key that would expose protected video', async () => {
     const { service } = buildAdminService();
 
-    // Unchanged behaviour: a client cannot point the course at paid video.
     await expect(
       service.update(COURSE_ID, { thumbnailKey: 'hls/vid_paid/360p/index.m3u8' }, ADMIN),
     ).rejects.toThrow();

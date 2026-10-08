@@ -1,6 +1,7 @@
 import { AcademicStructureKind, CourseStatus, UserRole } from '@prisma/client';
 
 import { CoursesAdminService } from '../../src/modules/courses/courses.admin.service';
+import { cloudinaryDouble } from './cloudinary-double';
 
 /**
  * Publishing a course.
@@ -61,6 +62,7 @@ function buildService(overrides: Overrides = {}) {
     { record } as never,
     { publicAssetUrl: jest.fn(async () => null) } as never,
     { resolveAcademicStructure: jest.fn(async () => ({ id: 'as_1', kind: AcademicStructureKind.YEAR })) } as never,
+    cloudinaryDouble(),
   );
 
   return { service, courseUpdate, record, assertCanManageCourse };
@@ -200,6 +202,7 @@ describe('publishing side effects', () => {
       { record: jest.fn(async () => undefined) } as never,
       { publicAssetUrl: jest.fn(async () => null) } as never,
       { resolveAcademicStructure: jest.fn(async () => null) } as never,
+      cloudinaryDouble(),
     );
 
     await expect(service.publish('crs_missing', ADMIN)).rejects.toThrow();

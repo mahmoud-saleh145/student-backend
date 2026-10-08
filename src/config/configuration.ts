@@ -135,6 +135,31 @@ export const storageConfig = registerAs('storage', () => {
   };
 });
 
+/**
+ * Cloudinary, for course images.
+ *
+ * Its own namespace rather than a key inside `storage`, because it is a
+ * different provider with different semantics: R2 is private and served through
+ * a signed edge gate, while a Cloudinary delivery URL is public and static. A
+ * course image is shown on a catalogue card to signed-out visitors, so it
+ * belongs to the second kind — that mismatch is precisely why they were
+ * displaying as broken.
+ *
+ * `enabled` is all three present. A partial set is rejected in
+ * `env.validation.ts`, so this cannot silently be half-configured.
+ */
+export const cloudinaryConfig = registerAs('cloudinary', () => ({
+  enabled: Boolean(
+    process.env.CLOUDINARY_CLOUD_NAME &&
+      process.env.CLOUDINARY_API_KEY &&
+      process.env.CLOUDINARY_API_SECRET,
+  ),
+  cloudName: process.env.CLOUDINARY_CLOUD_NAME ?? '',
+  apiKey: process.env.CLOUDINARY_API_KEY ?? '',
+  apiSecret: process.env.CLOUDINARY_API_SECRET ?? '',
+  coursesFolder: (process.env.CLOUDINARY_COURSES_FOLDER ?? 'courses').replace(/^\/+|\/+$/g, ''),
+}));
+
 export const videoConfig = registerAs('video', () => ({
   ffmpegPath: process.env.FFMPEG_PATH ?? 'ffmpeg',
   ffprobePath: process.env.FFPROBE_PATH ?? 'ffprobe',
@@ -201,6 +226,7 @@ export const configurations = [
   deviceConfig,
   playbackConfig,
   storageConfig,
+  cloudinaryConfig,
   videoConfig,
   paymentConfig,
   notificationConfig,

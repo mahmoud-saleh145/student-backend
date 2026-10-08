@@ -11,6 +11,7 @@ import type { AuthenticatedUser } from '../../common/types/request-context';
 
 import type { Request } from 'express';
 
+import { CloudinaryService } from './cloudinary.service';
 import { StorageService } from './storage.service';
 
 /** Ceiling for a Library document, shared by both upload transports. */
@@ -164,7 +165,10 @@ class PresignAttachmentDto {
 @ApiBearerAuth('access-token')
 @Controller('storage')
 export class StorageController {
-  constructor(private readonly storage: StorageService) {}
+  constructor(
+    private readonly storage: StorageService,
+    private readonly cloudinary: CloudinaryService,
+  ) {}
 
   @Post('uploads/avatar')
   @ApiOperation({ summary: 'Presign an avatar upload' })
@@ -178,16 +182,21 @@ export class StorageController {
     });
   }
 
+  /**
+   * @deprecated Course thumbnails moved to Cloudinary.
+   *
+   * Presigning an R2 upload for this asset produced an object the media gate
+   * would then refuse to serve, because a course thumbnail is public and the
+   * gate only answers signed requests. Refused outright rather than left to
+   * fail later: a 404 here would look like a routing mistake, and the object it
+   * used to mint is exactly the unreadable file being fixed.
+   */
   @Post('uploads/course-thumbnail')
   @StaffOnly()
-  @ApiOperation({ summary: 'Presign a course thumbnail upload' })
-  async courseThumbnail(@Body() dto: PresignCourseThumbnailDto) {
-    const ext = extensionFor(dto.contentType);
-    return this.storage.presignUpload({
-      bucket: 'media',
-      objectKey: StorageService.keys.courseThumbnail(dto.courseId, ext),
-      contentType: dto.contentType,
-      expiresIn: 900,
+  @ApiOperation({ summary: 'Removed — course images are uploaded to Cloudinary' })
+  async courseThumbnail() {
+    throw new AppException(ErrorCode.NOT_FOUND, {
+      message: 'Course images are uploaded to /storage/uploads/course-thumbnail/content (Cloudinary).',
     });
   }
 
@@ -357,33 +366,30 @@ export class StorageController {
   @Post('uploads/course-thumbnail/content')
   @StaffOnly()
   @ApiOperation({
-    summary: 'Upload a course thumbnail through the API',
+    summary: 'Upload a course image through the API',
     description:
-      'Raw request body. Returns the object key to register on the course with ' +
-      'POST /admin/courses or PATCH /admin/courses/:courseId. This is the streaming ' +
-      'counterpart of the presign route above, and exists for the same reason the other ' +
-      'thumbnail routes have one: the media bucket has no CORS policy, so a browser cannot ' +
-      'PUT to it directly.',
+      'Raw request body, stored in Cloudinary. Returns the object key to register on the ' +
+      'course with POST /admin/courses or PATCH /admin/courses/:courseId, and the public ' +
+      'delivery URL. Unlike the other thumbnail routes this does not stream to R2: a course ' +
+      'image is public by design and the media gate refuses unsigned requests.',
   })
   async courseThumbnailContent(
     @Query() query: UploadCourseThumbnailQueryDto,
     @Req() req: Request,
   ) {
     const declared = this.requireLength(req, MAX_THUMBNAIL_BYTES);
-    const objectKey = StorageService.keys.courseThumbnail(
-      query.courseId,
-      extensionFor(query.contentType),
-    );
 
-    await this.storage.putStream({
-      bucket: 'media',
-      objectKey,
-      body: req,
-      contentLength: declared,
+    // Buffered rather than streamed: Cloudinary's upload API wants the whole
+    // payload to decide a format, and the route has already bounded it to 10 MB.
+    const body = await this.readBody(req, declared);
+
+    const stored = await this.cloudinary.uploadCourseThumbnail({
+      courseId: query.courseId,
+      body,
       contentType: query.contentType,
     });
 
-    return { objectKey, sizeBytes: declared };
+    return { objectKey: stored.objectKey, url: stored.url, sizeBytes: declared };
   }
 
   @Post('uploads/course-part-thumbnail/content')
@@ -520,6 +526,38 @@ export class StorageController {
     }
 
     return declared;
+  }
+
+  /**
+   * Reads a bounded request body into memory.
+   *
+   * Only the Cloudinary path uses this, and only for images already capped at
+   * 10 MB by `requireLength`. The R2 uploads stream instead, because they move
+   * 200 MB documents and video where a socket's worth of memory is the whole
+   * point. This exists because the image is small, bounded, and Cloudinary wants
+   * the complete payload.
+   *
+   * The cap is enforced again while reading rather than trusted from the header:
+   * a client may declare 10 MB and send more.
+   */
+  private async readBody(req: Request, max: number): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    let total = 0;
+
+    for await (const chunk of req) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+      total += buffer.length;
+
+      if (total > max) {
+        throw new AppException(ErrorCode.VALIDATION_ERROR, {
+          fields: { body: [`upload exceeds the ${max} byte limit`] },
+        });
+      }
+
+      chunks.push(buffer);
+    }
+
+    return Buffer.concat(chunks);
   }
 }
 

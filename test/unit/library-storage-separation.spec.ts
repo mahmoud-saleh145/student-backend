@@ -2,6 +2,7 @@ import { Readable } from 'node:stream';
 
 import { StorageController } from '../../src/modules/storage/storage.controller';
 import { StorageService } from '../../src/modules/storage/storage.service';
+import { cloudinaryDouble } from './cloudinary-double';
 
 /**
  * Library documents live in their own bucket, and are read back from it.
@@ -38,12 +39,12 @@ const STORAGE_CONFIG = {
 };
 
 function buildController() {
-  const storage = new StorageService({ getOrThrow: () => STORAGE_CONFIG } as never);
+  const storage = new StorageService({ getOrThrow: () => STORAGE_CONFIG } as never, cloudinaryDouble());
   const putStream = jest
     .spyOn(storage, 'putStream')
     .mockResolvedValue(undefined as never);
 
-  return { controller: new StorageController(storage), putStream };
+  return { controller: new StorageController(storage, cloudinaryDouble()), putStream };
 }
 
 /** A request carrying `bytes` of body, as the controller sees one. */

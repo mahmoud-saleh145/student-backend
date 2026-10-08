@@ -13,6 +13,7 @@ import {
   StorageController,
 } from '../../src/modules/storage/storage.controller';
 import { StorageService } from '../../src/modules/storage/storage.service';
+import { cloudinaryDouble } from './cloudinary-double';
 
 /**
  * Presigning a Library document upload.
@@ -66,10 +67,10 @@ const STORAGE_CONFIG = {
 function buildController(overrides: Partial<typeof STORAGE_CONFIG> = {}) {
   const cfg = { ...STORAGE_CONFIG, ...overrides };
   const config = { getOrThrow: () => cfg };
-  const storage = new StorageService(config as never);
+  const storage = new StorageService(config as never, cloudinaryDouble());
   const presignSpy = jest.spyOn(storage, 'presignUpload');
 
-  return { controller: new StorageController(storage), storage, presignSpy };
+  return { controller: new StorageController(storage, cloudinaryDouble()), storage, presignSpy };
 }
 
 const PDF = 'application/pdf';

@@ -18,6 +18,7 @@ import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { withSerializableRetry } from '../../database/serializable-retry';
 import { AuditService } from '../audit/audit.service';
 import { CatalogService } from '../catalog/catalog.service';
+import { CloudinaryService } from '../storage/cloudinary.service';
 import {
   assertObjectKeyInNamespace,
   StorageService,
@@ -89,6 +90,7 @@ export class CoursesAdminService {
     private readonly audit: AuditService,
     private readonly storage: StorageService,
     private readonly catalog: CatalogService,
+    private readonly cloudinary: CloudinaryService,
   ) { }
 
   /**
@@ -102,24 +104,33 @@ export class CoursesAdminService {
     namespace: string,
   ): string | null | undefined {
     if (key === null || key === undefined) return key;
+
+    // A Cloudinary public ID is already namespaced by its own provider prefix,
+    // so the R2 prefix check does not apply to it. The security reasoning still
+    // holds: this key is what `publicAssetUrl` turns into a URL, so it must not
+    // be able to name a protected R2 object.
+    if (CloudinaryService.isCloudinaryKey(key)) return key;
+
     assertObjectKeyInNamespace(key, namespace, 'thumbnailKey');
     return key;
   }
 
   /**
-   * Removes a course's previous thumbnail once the row points somewhere else.
+   * Removes a course's previous image once the row points somewhere else.
    *
    * Every upload mints a fresh UUID rather than overwriting, deliberately — so a
    * URL a client already cached keeps resolving. The cost of that choice is that
-   * the old object is now unreferenced, and R2 has no lifecycle rule to collect
-   * it, so replacing an image without this line leaks the file forever.
+   * the old asset is now unreferenced, and neither Cloudinary nor R2 has a
+   * lifecycle rule here, so replacing an image without this line leaks the file
+   * forever.
    *
    * The namespace check is load-bearing, not tidiness. `before.thumbnailKey` is
    * whatever is in the database, and the write path validates the key it is
    * *given* — nothing stops a row that was hand-edited or written by an older
    * build from naming `hls/<paidVideoId>/360p/index.m3u8`. Deleting on trust
-   * would destroy paid video. So the old key is held to the course-thumbnail
-   * prefix first, and anything outside it is left alone.
+   * would destroy paid video. So the old key must belong to this course's own
+   * thumbnail namespace in whichever provider holds it, and anything else is
+   * left alone.
    *
    * Best-effort by design: the row has already moved, so a storage failure here
    * is an orphaned file, not a lost one — never worth failing an edit over.
@@ -132,6 +143,22 @@ export class CoursesAdminService {
     if (!previousKey) return;
     // Absent means "leave it alone"; equal means nothing changed.
     if (nextKey === undefined || nextKey === previousKey) return;
+
+    // Cloudinary first: its key carries the provider prefix, and the folder it
+    // was minted into is this course's.
+    if (CloudinaryService.isCloudinaryKey(previousKey)) {
+      const publicId = CloudinaryService.publicIdFrom(previousKey) ?? '';
+      const folder = `${this.cloudinary.coursesFolder}/`;
+      // Only this course's assets. Anything else in the folder is left alone.
+      if (publicId.startsWith(folder) && publicId.includes(`/${courseId}/`)) {
+        // Guarded here rather than relying on the callee to swallow its own
+        // failures: this is best-effort cleanup after the row has already
+        // moved, and it must never be the thing that fails an edit.
+        await Promise.resolve(this.cloudinary.deleteByKey(previousKey)).catch(() => undefined);
+      }
+      return;
+    }
+
     if (!previousKey.startsWith(StorageService.courseThumbnailPrefix(courseId))) return;
 
     await this.storage

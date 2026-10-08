@@ -31,6 +31,7 @@ import { VideoProcessor } from '../../src/jobs/processors/video.processor';
 import { QUEUE_NAMES, VIDEO_JOBS } from '../../src/jobs/queue.constants';
 import { ManifestService } from '../../src/modules/playback/manifest.service';
 import { StorageService } from '../../src/modules/storage/storage.service';
+import { cloudinaryDouble } from '../unit/cloudinary-double';
 import { VideosService } from '../../src/modules/videos/videos.service';
 
 const hasTools =
@@ -142,7 +143,7 @@ maybe('video pipeline (real Redis, BullMQ, ffmpeg, Worker code)', () => {
       app: { publicUrl: 'http://127.0.0.1:0', apiPrefix: 'api', apiVersion: '1' },
       playback: { ticketTtl: 300 },
     });
-    const storage = new LocalStorage(config);
+    const storage = new LocalStorage(config, cloudinaryDouble());
 
     // VideosService stand-in: only the three calls the worker makes.
     const videos = {
@@ -283,7 +284,11 @@ maybe('video pipeline (real Redis, BullMQ, ffmpeg, Worker code)', () => {
       app: { publicUrl: `http://127.0.0.1:${port}`, apiPrefix: 'api', apiVersion: '1' },
       playback: { ticketTtl: 300 },
     });
-    manifest = new ManifestService(prisma as never, new LocalStorage(appCfg), appCfg);
+    manifest = new ManifestService(
+      prisma as never,
+      new LocalStorage(appCfg, cloudinaryDouble()),
+      appCfg,
+    );
     (ticket.video as { renditions: unknown[] }).renditions = [];
     (globalThis as Record<string, unknown>).__ticket = ticket;
     (globalThis as Record<string, unknown>).__manifest = () => manifest;

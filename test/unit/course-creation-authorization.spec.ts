@@ -10,6 +10,7 @@ import { CourseAccessService } from '../../src/modules/courses/course-access.ser
 import { CoursesAdminController } from '../../src/modules/courses/courses.admin.controller';
 import { CoursePartsAdminController } from '../../src/modules/course-parts/course-parts.controller';
 import { CoursesAdminService } from '../../src/modules/courses/courses.admin.service';
+import { cloudinaryDouble } from './cloudinary-double';
 
 /**
  * Who may bring a course into existence.
@@ -137,6 +138,7 @@ function buildService(over: { prisma?: unknown; access?: unknown } = {}) {
     audit as never,
     storage as never,
     { resolveAcademicStructure: jest.fn(async () => ({ id: 'as_1', kind: 'YEAR' })) } as never,
+    cloudinaryDouble(),
   );
 
   return { service, prisma, courseCreate, access, audit, courses };

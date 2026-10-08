@@ -1,6 +1,7 @@
 import { UserRole } from '@prisma/client';
 
 import { CoursesAdminService } from '../../src/modules/courses/courses.admin.service';
+import { cloudinaryDouble } from './cloudinary-double';
 
 /**
  * The staff course-detail response shape.
@@ -77,6 +78,7 @@ function buildService(row: Record<string, unknown> | null = courseRow()) {
     { record: jest.fn() } as never,
     storage as never,
     { resolveAcademicStructure: jest.fn(async () => ({ id: 'as_1', kind: 'YEAR' })) } as never,
+    cloudinaryDouble(),
   );
 
   return { service, prisma, access };

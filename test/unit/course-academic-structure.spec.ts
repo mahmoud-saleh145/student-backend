@@ -1,6 +1,7 @@
 import { UserRole } from '@prisma/client';
 
 import { CoursesAdminService } from '../../src/modules/courses/courses.admin.service';
+import { cloudinaryDouble } from './cloudinary-double';
 
 /**
  * University → College → Department, enforced where it counts.
@@ -116,6 +117,7 @@ function buildService(storedDepartmentIds: string[] = []) {
     { record: jest.fn() } as never,
     { publicAssetUrl: jest.fn(async () => null) } as never,
     { resolveAcademicStructure: jest.fn(async () => ({ id: 'as_1', kind: 'YEAR' })) } as never,
+    cloudinaryDouble(),
   );
 
   return { service, prisma, courseCreate, courseDepartment };

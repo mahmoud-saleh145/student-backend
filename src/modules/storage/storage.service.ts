@@ -21,6 +21,8 @@ import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
 import type { StorageConfig } from '../../config/configuration';
 
+import { CloudinaryService } from './cloudinary.service';
+
 /**
  * The three object stores this platform uses.
  *
@@ -109,7 +111,7 @@ export class StorageService {
   private readonly cfg: StorageConfig;
   private readonly client: S3Client;
 
-  constructor(config: ConfigService) {
+  constructor(config: ConfigService, private readonly cloudinary: CloudinaryService) {
     this.cfg = config.getOrThrow<StorageConfig>('storage');
 
     this.client = new S3Client({
@@ -574,12 +576,22 @@ export class StorageService {
   }
 
   /**
-   * Public-ish URL for non-sensitive assets (course thumbnails, avatars).
-   * Still signed, just with a long expiry and no viewer binding — a leaked
-   * thumbnail URL is not a security event.
+   * Public-ish URL for non-sensitive assets (avatars, video thumbnails).
+   *
+   * R2 keys are still signed here, with a long expiry and no viewer binding — a
+   * leaked URL is not a security event. Note that with a CDN configured this
+   * builds an *unsigned* URL to the media gate, which answers 403 `unsigned`;
+   * that branch only works when no CDN is set. Course images no longer rely on
+   * it at all, which is the reason they moved to Cloudinary.
    */
   async publicAssetUrl(objectKey: string | null): Promise<string | null> {
     if (!objectKey) return null;
+
+    // Course images live in Cloudinary and are public there, so their delivery
+    // URL is returned untouched. Everything below builds an R2 URL and has
+    // nothing to say about a key from another provider.
+    const cloudinaryUrl = this.cloudinary.resolveStoredKey(objectKey);
+    if (cloudinaryUrl) return cloudinaryUrl;
 
     if (this.cfg.cdnBaseUrl) {
       return new URL(objectKey, this.ensureTrailingSlash(this.cfg.cdnBaseUrl)).toString();
