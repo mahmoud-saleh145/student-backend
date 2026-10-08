@@ -39,12 +39,21 @@ const STORAGE_CONFIG = {
 };
 
 function buildController() {
-  const storage = new StorageService({ getOrThrow: () => STORAGE_CONFIG } as never, cloudinaryDouble());
+  const storage = new StorageService(
+    { getOrThrow: () => STORAGE_CONFIG } as never,
+    cloudinaryDouble(),
+  );
   const putStream = jest
     .spyOn(storage, 'putStream')
     .mockResolvedValue(undefined as never);
 
-  return { controller: new StorageController(storage, cloudinaryDouble()), putStream };
+  return {
+    controller: new StorageController(storage, cloudinaryDouble(), {
+      // Never reached: nothing in this file calls the course-image route.
+      assertCourseExistsAndManageable: jest.fn(async () => undefined),
+    } as never),
+    putStream,
+  };
 }
 
 /** A request carrying `bytes` of body, as the controller sees one. */
@@ -77,7 +86,9 @@ describe('StorageService.bucketForKey', () => {
   });
 
   it('is not fooled by "library" appearing later in a key', () => {
-    expect(StorageService.bucketForKey('attachments/crs_1/library-notes.pdf')).toBe('media');
+    expect(StorageService.bucketForKey('attachments/crs_1/library-notes.pdf')).toBe(
+      'media',
+    );
     expect(StorageService.bucketForKey('hls/library/master.m3u8')).toBe('media');
   });
 });

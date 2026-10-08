@@ -208,3 +208,63 @@ describe('publishing side effects', () => {
     await expect(service.publish('crs_missing', ADMIN)).rejects.toThrow();
   });
 });
+
+/**
+ * ARCHIVED is a one-way door: the only way out is `restore`.
+ *
+ * Neither `publish` nor `unpublish` used to check the current status, so an
+ * archived course could be moved straight back to PUBLISHED or DRAFT. Two
+ * things went wrong when that happened, and the second is the serious one:
+ *
+ *   1. `archivedAt` stayed set on a row whose status was no longer ARCHIVED —
+ *      a combination nothing else in the codebase expects, and one that only
+ *      `restore` clears.
+ *   2. `restore` is also where enrollments are re-evaluated: those whose access
+ *      window still holds come back ACTIVE, the rest become EXPIRED. Skipping
+ *      it leaves students whose window lapsed during the archive sitting on a
+ *      live course with stale ACTIVE access.
+ *
+ * So both endpoints now refuse, and say which endpoint to use instead.
+ */
+describe('archived courses leave only via restore', () => {
+  it('refuses to publish an archived course', async () => {
+    const { service, courseUpdate } = buildService({ status: CourseStatus.ARCHIVED });
+
+    await expect(service.publish('crs_1', ADMIN)).rejects.toMatchObject({
+      message: expect.stringMatching(/restored/i),
+    });
+    // Nothing was written: the refusal happens before the update.
+    expect(courseUpdate).not.toHaveBeenCalled();
+  });
+
+  it('refuses to unpublish an archived course', async () => {
+    const { service, courseUpdate } = buildService({ status: CourseStatus.ARCHIVED });
+
+    await expect(
+      service.unpublish('crs_1', ADMIN, CourseStatus.DRAFT as 'DRAFT'),
+    ).rejects.toMatchObject({ message: expect.stringMatching(/restored/i) });
+    expect(courseUpdate).not.toHaveBeenCalled();
+  });
+
+  it('still publishes from every non-archived status', async () => {
+    // The guard must be narrow. DRAFT, HIDDEN and SUSPENDED all still publish,
+    // and so does re-publishing something already PUBLISHED.
+    for (const status of [
+      CourseStatus.DRAFT,
+      CourseStatus.HIDDEN,
+      CourseStatus.SUSPENDED,
+      CourseStatus.PUBLISHED,
+    ]) {
+      const { service } = buildService({ status });
+      await expect(service.publish('crs_1', ADMIN)).resolves.toMatchObject({
+        status: CourseStatus.PUBLISHED,
+      });
+    }
+  });
+
+  it('still unpublishes from a published state', async () => {
+    const { service, courseUpdate } = buildService({ status: CourseStatus.PUBLISHED });
+    await service.unpublish('crs_1', ADMIN, CourseStatus.HIDDEN as 'HIDDEN');
+    expect(courseUpdate).toHaveBeenCalled();
+  });
+});

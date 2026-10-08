@@ -876,6 +876,17 @@ export class CoursesAdminService {
     });
     if (!course) throw AppException.notFound('Course', courseId);
 
+    // An archived course must come back through `restore`, not through here.
+    // Publishing it directly would leave `archivedAt` set on a PUBLISHED row —
+    // a combination nothing else in the codebase expects — and would skip the
+    // enrollment re-evaluation `restore` performs, so a student whose access
+    // window lapsed during the archive would be left ACTIVE on a live course.
+    if (course.status === CourseStatus.ARCHIVED) {
+      throw new AppException(ErrorCode.INVALID_STATE, {
+        message: 'An archived course must be restored before it can be published',
+      });
+    }
+
     const problems: string[] = [];
     if (course._count.teachers === 0) problems.push('no teacher is assigned');
     if (!course.isFree && Number(course.prices[0]?.amount ?? 0) <= 0) {
@@ -926,6 +937,16 @@ export class CoursesAdminService {
       select: { status: true },
     });
     if (!before) throw AppException.notFound('Course', courseId);
+
+    // Same reasoning as `publish`: ARCHIVED leaves only via `restore`, which
+    // clears `archivedAt` and re-evaluates enrollments. Moving an archived
+    // course straight to DRAFT/HIDDEN/SUSPENDED here would strand `archivedAt`
+    // on a non-archived row and skip that re-evaluation.
+    if (before.status === CourseStatus.ARCHIVED) {
+      throw new AppException(ErrorCode.INVALID_STATE, {
+        message: 'An archived course must be restored before its status can change',
+      });
+    }
 
     const updated = await this.prisma.course.update({
       where: { id: courseId },

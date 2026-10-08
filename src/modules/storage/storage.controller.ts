@@ -11,6 +11,8 @@ import type { AuthenticatedUser } from '../../common/types/request-context';
 
 import type { Request } from 'express';
 
+import { CourseAccessService } from '../courses/course-access.service';
+
 import { CloudinaryService } from './cloudinary.service';
 import { StorageService } from './storage.service';
 
@@ -168,6 +170,12 @@ export class StorageController {
   constructor(
     private readonly storage: StorageService,
     private readonly cloudinary: CloudinaryService,
+    /**
+     * The same authority every course mutation goes through. `CoursesModule` is
+     * `@Global`, so it arrives without an import — the pattern
+     * `course-parts.module.ts` already documents.
+     */
+    private readonly courseAccess: CourseAccessService,
   ) {}
 
   @Post('uploads/avatar')
@@ -374,9 +382,26 @@ export class StorageController {
       'image is public by design and the media gate refuses unsigned requests.',
   })
   async courseThumbnailContent(
+    @CurrentUser() actor: AuthenticatedUser,
     @Query() query: UploadCourseThumbnailQueryDto,
     @Req() req: Request,
   ) {
+    // `courseId` is not a label here — it becomes the Cloudinary folder
+    // (`courses/<courseId>/<uuid>`), and that folder is what
+    // `discardReplacedThumbnail` later scopes its deletes to. So the id has to
+    // name a real course this actor may manage BEFORE anything is minted or a
+    // byte is read: `@StaffOnly()` alone would let any teacher write into any
+    // course's namespace, and an admin into one that does not exist.
+    //
+    // Checked before `requireLength`/`readBody` deliberately, so an
+    // unauthorised caller is refused without being allowed to stream 10 MB.
+    await this.courseAccess.assertCourseExistsAndManageable(
+      actor.id,
+      actor.role,
+      query.courseId,
+      'content',
+    );
+
     const declared = this.requireLength(req, MAX_THUMBNAIL_BYTES);
 
     // Buffered rather than streamed: Cloudinary's upload API wants the whole

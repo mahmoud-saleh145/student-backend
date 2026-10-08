@@ -160,11 +160,48 @@ export class CatalogService {
    * having to redefine the same four years for every department, and it is
    * resolved here rather than denormalised onto rows so that defining a
    * structure lower down takes effect immediately.
+   *
+   * On top of that inheritance sits one explicit assignment: a faculty pinned
+   * to a structure via `AcademicStructureFaculty` uses that structure instead
+   * of the one it would inherit, even if the structure belongs to a different
+   * university or to no university at all. Full precedence:
+   *
+   *   1. an explicit override on the faculty (this faculty, or the department's)
+   *   2. the department's OWN structure
+   *   3. a structure OWNED by that faculty
+   *   4. the university's structure
+   *   5. the platform structure
+   *
+   * The override sits at the TOP, above even a department's own structure, and
+   * that ordering is load-bearing rather than a preference:
+   *
+   *   * `assertAcademicYearBelongsToStructure` resolves a course's ladder from
+   *     its first department and documents the rule it relies on — "departments
+   *     under one college share a ladder in every realistic installation". If a
+   *     department-owned structure outranked the pin, a course targeted at a
+   *     pinned college would resolve to one ladder and a course targeted at a
+   *     department of that same college to another. Two courses in one college
+   *     on different year lists is the exact failure that comment rules out.
+   *   * Registration resolves the student's year list from their department.
+   *     A student under a pinned college would be offered years from the old
+   *     ladder while the college's courses were filed under the new one, so
+   *     their placement could never match a course's.
+   *   * An override the admin can see listed on the dashboard, that silently
+   *     fails to reach some of the college's departments, is not an override.
+   *     Nothing in the UI could explain the exemption, because there is no
+   *     control that creates it: department-owned structures can no longer be
+   *     created at all.
+   *
+   * Existing data is unaffected either way. The two can only disagree once an
+   * Admin creates an override, and the override table starts empty — so with no
+   * overrides stored the order collapses to exactly what it was before.
    */
   async resolveAcademicStructure(scope: AcademicScope) {
     assertSingleAcademicOwner(scope);
 
     const candidates: string[] = [];
+    /** The faculty whose override applies, if any. */
+    let overrideFacultyId: string | null = null;
 
     if (scope.departmentId) {
       candidates.push(`department:${scope.departmentId}`);
@@ -173,10 +210,14 @@ export class CatalogService {
         select: { facultyId: true, faculty: { select: { universityId: true } } },
       });
       if (dept) {
+        // A department inherits its faculty's override as it inherits
+        // everything else from the faculty.
+        overrideFacultyId = dept.facultyId;
         candidates.push(`faculty:${dept.facultyId}`);
         candidates.push(`university:${dept.faculty.universityId}`);
       }
     } else if (scope.facultyId) {
+      overrideFacultyId = scope.facultyId;
       candidates.push(`faculty:${scope.facultyId}`);
       const faculty = await this.prisma.faculty.findUnique({
         where: { id: scope.facultyId },
@@ -201,6 +242,21 @@ export class CatalogService {
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
       select: { id: true, kind: true, scopeKey: true },
     });
+
+    if (overrideFacultyId) {
+      const override = await this.prisma.academicStructureFaculty.findUnique({
+        where: { facultyId: overrideFacultyId },
+        select: {
+          structure: { select: { id: true, kind: true, scopeKey: true, isActive: true } },
+        },
+      });
+      // A deactivated structure is not a valid answer — the faculty falls back
+      // to inheritance rather than being left with an empty year list.
+      if (override?.structure.isActive) {
+        const { isActive: _isActive, ...structure } = override.structure;
+        return structure;
+      }
+    }
 
     for (const key of candidates) {
       const hit = found.find((f) => f.scopeKey === key);
@@ -230,8 +286,109 @@ export class CatalogService {
           orderBy: { order: 'asc' },
           select: { id: true, order: true, name: true, nameAr: true, isActive: true },
         },
+        // The faculties pinned to this ladder. The faculty's own university
+        // rides along because an override may name a faculty from a different
+        // university than the one that owns the structure — without it the
+        // admin screen would show two identically-named colleges and no way to
+        // tell them apart.
+        facultyOverrides: {
+          orderBy: { createdAt: 'asc' },
+          select: {
+            facultyId: true,
+            faculty: {
+              select: {
+                id: true,
+                name: true,
+                nameAr: true,
+                universityId: true,
+                university: { select: { id: true, name: true, nameAr: true } },
+              },
+            },
+          },
+        },
       },
     });
+  }
+
+  /**
+   * Replaces the set of faculties explicitly pinned to one structure.
+   *
+   * Deliberately NOT restricted to faculties of the structure's own university:
+   * pinning University A's college to University B's ladder is the whole point
+   * of the feature.
+   *
+   * A faculty already pinned elsewhere is MOVED here rather than rejected.
+   * `facultyId` is unique platform-wide, so it can only point at one ladder,
+   * and refusing would force the Admin to go and unpin it from the other
+   * structure first for no benefit. The audit row records the before and after
+   * sets, so the move is traceable.
+   */
+  async setStructureFacultyOverrides(
+    structureId: string,
+    facultyIds: string[],
+    actor: { id: string; role: UserRole },
+  ) {
+    const structure = await this.prisma.academicStructure.findUnique({
+      where: { id: structureId },
+      select: { id: true, facultyOverrides: { select: { facultyId: true } } },
+    });
+    if (!structure) throw AppException.notFound('academic structure');
+
+    const wanted = [...new Set(facultyIds.filter((id) => typeof id === 'string' && id !== ''))];
+
+    // Every id must name a live faculty. Checked in one query so a typo is a
+    // field error rather than a foreign-key violation surfaced as a 500.
+    if (wanted.length > 0) {
+      const existing = await this.prisma.faculty.findMany({
+        where: { id: { in: wanted }, ...notDeleted },
+        select: { id: true },
+      });
+      if (existing.length !== wanted.length) {
+        const found = new Set(existing.map((f) => f.id));
+        throw AppException.validation({
+          facultyIds: [
+            `unknown or deleted faculty: ${wanted.filter((id) => !found.has(id)).join(', ')}`,
+          ],
+        });
+      }
+    }
+
+    const before = structure.facultyOverrides.map((o) => o.facultyId).sort();
+
+    await this.prisma.$transaction([
+      // 1. Drop this structure's rows for faculties no longer wanted. Written
+      //    as an explicit where rather than `notIn: []`, whose meaning for an
+      //    empty array is a Prisma implementation detail: with nothing wanted
+      //    this must clear the structure's whole set.
+      this.prisma.academicStructureFaculty.deleteMany({
+        where:
+          wanted.length > 0
+            ? { structureId, facultyId: { notIn: wanted } }
+            : { structureId },
+      }),
+      // 2. Release the wanted faculties from whichever structure holds them —
+      //    including this one, so the insert below is unconditional and the
+      //    unique index can never be hit.
+      this.prisma.academicStructureFaculty.deleteMany({
+        where: { facultyId: { in: wanted } },
+      }),
+      this.prisma.academicStructureFaculty.createMany({
+        data: wanted.map((facultyId) => ({ structureId, facultyId })),
+      }),
+    ]);
+
+    await this.bust();
+    await this.audit.record({
+      actorId: actor.id,
+      actorRole: actor.role,
+      action: AuditAction.UPDATE,
+      entity: 'academic_structure',
+      entityId: structureId,
+      before: { facultyOverrides: before },
+      after: { facultyOverrides: [...wanted].sort() },
+    });
+
+    return { id: structureId, facultyIds: wanted };
   }
 
   async createAcademicStructure(

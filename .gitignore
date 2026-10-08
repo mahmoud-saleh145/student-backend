@@ -15,3 +15,6 @@ prisma/*.db
 
 # compiled output of the offline verification harness
 tools/offline-verify/out/
+
+# scratch archives used to mirror the repo into a sandbox — never project content
+_mirror-*.tgz

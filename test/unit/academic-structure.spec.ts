@@ -53,6 +53,28 @@ interface Options {
     entries: { id: string; order: number }[];
   } | null;
   entries?: { id: string; order: number; name: string; nameAr: string; isActive: boolean }[];
+  /**
+   * The explicit faculty -> structure pin `academicStructureFaculty.findUnique`
+   * answers with. Left `undefined` it means "no override stored", which is the
+   * state every installation is in until an Admin creates one — so every
+   * pre-existing test in this file still exercises the unchanged inheritance
+   * path, which is the point.
+   */
+  facultyOverride?: {
+    structure: {
+      id: string;
+      kind: AcademicStructureKind;
+      scopeKey: string;
+      isActive: boolean;
+    };
+  } | null;
+  /** Live faculties `faculty.findMany` resolves, for override validation. */
+  liveFaculties?: { id: string }[];
+  /** The structure `setStructureFacultyOverrides` is editing. */
+  structureWithOverrides?: {
+    id: string;
+    facultyOverrides: { facultyId: string }[];
+  } | null;
 }
 
 function build(options: Options = {}) {
@@ -69,9 +91,17 @@ function build(options: Options = {}) {
   // shape keeps both honest instead of having the second silently answer the
   // first's fixture.
   const structureFindUnique = jest.fn(
-    async (args: { where: Record<string, unknown>; select?: unknown }) => {
+    async (args: { where: Record<string, unknown>; select?: Record<string, unknown> }) => {
       if ('scopeKey' in args.where) {
         return options.existingByScope === undefined ? null : options.existingByScope;
+      }
+      // Three callers now load a structure by id, and they want different
+      // shapes. Dispatching on the requested `select` keeps each fixture
+      // answering only its own question instead of one standing in for all.
+      if (args.select && 'facultyOverrides' in args.select) {
+        return options.structureWithOverrides === undefined
+          ? null
+          : options.structureWithOverrides;
       }
       return options.structureWithEntries === undefined ? null : options.structureWithEntries;
     },
@@ -121,6 +151,20 @@ function build(options: Options = {}) {
     async (_args: { where: unknown; select: unknown }) =>
       options.faculty === undefined ? null : options.faculty,
   );
+  const facultyFindMany = jest.fn(
+    async (_args: { where: unknown; select: unknown }) => options.liveFaculties ?? [],
+  );
+
+  // The explicit faculty pin. `findUnique` is keyed on `facultyId`, which is
+  // unique platform-wide precisely so this lookup has one answer.
+  const overrideFindUnique = jest.fn(
+    async (_args: { where: unknown; select: unknown }) =>
+      options.facultyOverride === undefined ? null : options.facultyOverride,
+  );
+  const overrideDeleteMany = jest.fn(async (_args: { where: unknown }) => ({ count: 0 }));
+  const overrideCreateMany = jest.fn(
+    async (args: { data: readonly unknown[] }) => ({ count: args.data.length }),
+  );
 
   // Only the array form is modelled: the callback form would have to hand the
   // callback a client, which means referencing `prisma` inside its own
@@ -140,7 +184,12 @@ function build(options: Options = {}) {
       create: yearCreate,
     },
     department: { findUnique: departmentFindUnique },
-    faculty: { findUnique: facultyFindUnique },
+    faculty: { findUnique: facultyFindUnique, findMany: facultyFindMany },
+    academicStructureFaculty: {
+      findUnique: overrideFindUnique,
+      deleteMany: overrideDeleteMany,
+      createMany: overrideCreateMany,
+    },
     $transaction: jest.fn(async (operations: readonly unknown[]) => Promise.all(operations)),
   };
 
@@ -168,6 +217,10 @@ function build(options: Options = {}) {
     yearFindMany,
     structureFindUnique,
     structureFindFirst,
+    facultyFindMany,
+    overrideFindUnique,
+    overrideDeleteMany,
+    overrideCreateMany,
   };
 }
 
@@ -585,5 +638,330 @@ describe('defining the rungs', () => {
     const { service, redis } = build({ structureWithEntries: structure });
     await service.replaceStructureEntries('as_1', [{ order: 1, name: 'A', nameAr: 'أ' }], ACTOR);
     expect(redis.delByPattern).toHaveBeenCalledWith('catalog:*');
+  });
+});
+
+/**
+ * Explicit faculty overrides.
+ *
+ * The feature exists because inheritance alone cannot say "this faculty,
+ * wherever it sits, uses THAT ladder". Four properties are worth pinning,
+ * because each is a way the override could look finished and be wrong:
+ *
+ *   1. The override must BEAT the university ladder — otherwise it is a no-op
+ *      for the only case anyone would use it for.
+ *   2. It must work ACROSS universities. The whole request was to pin
+ *      University A's college to University B's ladder, and a same-university
+ *      guard would quietly forbid exactly that.
+ *   3. It must not fire when nothing is pinned, or every installation's
+ *      current behaviour changes the moment this code ships.
+ *   4. A deactivated target must fall through, not strand the faculty with an
+ *      empty year list.
+ */
+describe('resolveAcademicStructure — explicit faculty overrides', () => {
+  const UNIVERSITY_LADDER = {
+    id: 'as_univ_a',
+    kind: AcademicStructureKind.YEAR,
+    scopeKey: 'university:u_a',
+  };
+  const PLATFORM_LADDER = {
+    id: 'as_platform',
+    kind: AcademicStructureKind.YEAR,
+    scopeKey: PLATFORM_SCOPE_KEY,
+  };
+
+  it('prefers the pinned structure over the faculty\'s own university ladder', async () => {
+    const { service } = build({
+      faculty: { universityId: 'u_a' },
+      structures: [UNIVERSITY_LADDER, PLATFORM_LADDER],
+      facultyOverride: {
+        structure: {
+          id: 'as_univ_b',
+          kind: AcademicStructureKind.LEVEL,
+          scopeKey: 'university:u_b',
+          isActive: true,
+        },
+      },
+    });
+
+    const resolved = await service.resolveAcademicStructure({ facultyId: 'f_x' });
+
+    // Without the override this would be `as_univ_a`: that is the assertion.
+    expect(resolved?.id).toBe('as_univ_b');
+    expect(resolved?.kind).toBe(AcademicStructureKind.LEVEL);
+  });
+
+  it('pins a faculty to a ladder owned by a DIFFERENT university', async () => {
+    // Faculty X belongs to University A; the pinned ladder belongs to B. The
+    // resolver must not care, and must not consult A at all.
+    const { service } = build({
+      faculty: { universityId: 'u_a' },
+      structures: [UNIVERSITY_LADDER, PLATFORM_LADDER],
+      facultyOverride: {
+        structure: {
+          id: 'as_univ_b',
+          kind: AcademicStructureKind.YEAR,
+          scopeKey: 'university:u_b',
+          isActive: true,
+        },
+      },
+    });
+
+    const resolved = await service.resolveAcademicStructure({ facultyId: 'f_x' });
+    expect(resolved?.scopeKey).toBe('university:u_b');
+  });
+
+  it('pins a faculty to a platform-wide ladder', async () => {
+    const { service } = build({
+      faculty: { universityId: 'u_a' },
+      structures: [UNIVERSITY_LADDER, PLATFORM_LADDER],
+      facultyOverride: {
+        structure: {
+          id: 'as_global',
+          kind: AcademicStructureKind.LEVEL,
+          scopeKey: PLATFORM_SCOPE_KEY,
+          isActive: true,
+        },
+      },
+    });
+
+    // Note this is a *different* platform row from the one inheritance would
+    // have reached, so the id is what proves the override was honoured.
+    const resolved = await service.resolveAcademicStructure({ facultyId: 'f_x' });
+    expect(resolved?.id).toBe('as_global');
+  });
+
+  it('leaves inheritance untouched when the faculty is not pinned', async () => {
+    // The state of every existing installation. If this regresses, shipping the
+    // feature changes answers for data nobody edited.
+    const { service, overrideFindUnique } = build({
+      faculty: { universityId: 'u_a' },
+      structures: [UNIVERSITY_LADDER, PLATFORM_LADDER],
+    });
+
+    const resolved = await service.resolveAcademicStructure({ facultyId: 'f_x' });
+
+    expect(resolved?.id).toBe('as_univ_a');
+    expect(overrideFindUnique).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { facultyId: 'f_x' } }),
+    );
+  });
+
+  it('falls back to inheritance when the pinned structure is deactivated', async () => {
+    const { service } = build({
+      faculty: { universityId: 'u_a' },
+      structures: [UNIVERSITY_LADDER, PLATFORM_LADDER],
+      facultyOverride: {
+        structure: {
+          id: 'as_univ_b',
+          kind: AcademicStructureKind.YEAR,
+          scopeKey: 'university:u_b',
+          isActive: false,
+        },
+      },
+    });
+
+    const resolved = await service.resolveAcademicStructure({ facultyId: 'f_x' });
+    expect(resolved?.id).toBe('as_univ_a');
+  });
+
+  it('applies the faculty\'s override to that faculty\'s departments', async () => {
+    const { service, overrideFindUnique } = build({
+      department: { facultyId: 'f_x', faculty: { universityId: 'u_a' } },
+      structures: [UNIVERSITY_LADDER, PLATFORM_LADDER],
+      facultyOverride: {
+        structure: {
+          id: 'as_univ_b',
+          kind: AcademicStructureKind.YEAR,
+          scopeKey: 'university:u_b',
+          isActive: true,
+        },
+      },
+    });
+
+    const resolved = await service.resolveAcademicStructure({ departmentId: 'd_1' });
+
+    expect(resolved?.id).toBe('as_univ_b');
+    expect(overrideFindUnique).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { facultyId: 'f_x' } }),
+    );
+  });
+
+  it("outranks even a department's OWN legacy ladder", async () => {
+    // The override sits above every inherited level, including a department
+    // that has its own structure. `assertAcademicYearBelongsToStructure`
+    // resolves a course's ladder from its first department and relies on
+    // departments under one college sharing a ladder; if the department's own
+    // structure won here, a course targeted at the college and a course
+    // targeted at one of its departments would land on different year lists.
+    const { service } = build({
+      department: { facultyId: 'f_x', faculty: { universityId: 'u_a' } },
+      structures: [
+        { id: 'as_dept', kind: AcademicStructureKind.YEAR, scopeKey: 'department:d_1' },
+        UNIVERSITY_LADDER,
+        PLATFORM_LADDER,
+      ],
+      facultyOverride: {
+        structure: {
+          id: 'as_univ_b',
+          kind: AcademicStructureKind.YEAR,
+          scopeKey: 'university:u_b',
+          isActive: true,
+        },
+      },
+    });
+
+    const resolved = await service.resolveAcademicStructure({ departmentId: 'd_1' });
+    expect(resolved?.id).toBe('as_univ_b');
+  });
+
+  it("still gives a department's own ladder priority when no override exists", async () => {
+    // The demotion above must be caused by the pin and nothing else: with no
+    // override stored, department -> faculty -> university -> platform is
+    // untouched. This is the case every existing installation is in.
+    const { service } = build({
+      department: { facultyId: 'f_x', faculty: { universityId: 'u_a' } },
+      structures: [
+        { id: 'as_dept', kind: AcademicStructureKind.YEAR, scopeKey: 'department:d_1' },
+        UNIVERSITY_LADDER,
+        PLATFORM_LADDER,
+      ],
+    });
+
+    const resolved = await service.resolveAcademicStructure({ departmentId: 'd_1' });
+    expect(resolved?.id).toBe('as_dept');
+  });
+
+  it("falls back to the department's own ladder when the pinned one is inactive", async () => {
+    const { service } = build({
+      department: { facultyId: 'f_x', faculty: { universityId: 'u_a' } },
+      structures: [
+        { id: 'as_dept', kind: AcademicStructureKind.YEAR, scopeKey: 'department:d_1' },
+        UNIVERSITY_LADDER,
+        PLATFORM_LADDER,
+      ],
+      facultyOverride: {
+        structure: {
+          id: 'as_univ_b',
+          kind: AcademicStructureKind.YEAR,
+          scopeKey: 'university:u_b',
+          isActive: false,
+        },
+      },
+    });
+
+    const resolved = await service.resolveAcademicStructure({ departmentId: 'd_1' });
+    expect(resolved?.id).toBe('as_dept');
+  });
+
+  it('never consults the override table for a university-only scope', async () => {
+    // A university is not a faculty; looking one up would be a wasted query and
+    // a sign the scope handling had blurred.
+    const { service, overrideFindUnique } = build({
+      structures: [UNIVERSITY_LADDER, PLATFORM_LADDER],
+    });
+
+    await service.resolveAcademicStructure({ universityId: 'u_a' });
+    expect(overrideFindUnique).not.toHaveBeenCalled();
+  });
+});
+
+describe('setStructureFacultyOverrides', () => {
+  const structure = { id: 'as_1', facultyOverrides: [{ facultyId: 'f_old' }] };
+
+  it('replaces the whole set and releases faculties pinned elsewhere', async () => {
+    const { service, overrideDeleteMany, overrideCreateMany } = build({
+      structureWithOverrides: structure,
+      liveFaculties: [{ id: 'f_a' }, { id: 'f_b' }],
+    });
+
+    await service.setStructureFacultyOverrides('as_1', ['f_a', 'f_b'], ACTOR);
+
+    // Two deletes, in this order: drop this structure's unwanted rows, then
+    // release the wanted ids from whichever structure holds them — so the
+    // insert cannot collide with the unique index.
+    expect(overrideDeleteMany).toHaveBeenCalledTimes(2);
+    expect(overrideDeleteMany.mock.calls[0]?.[0].where).toEqual({
+      structureId: 'as_1',
+      facultyId: { notIn: ['f_a', 'f_b'] },
+    });
+    expect(overrideDeleteMany.mock.calls[1]?.[0].where).toEqual({
+      facultyId: { in: ['f_a', 'f_b'] },
+    });
+    expect(overrideCreateMany.mock.calls[0]?.[0].data).toEqual([
+      { structureId: 'as_1', facultyId: 'f_a' },
+      { structureId: 'as_1', facultyId: 'f_b' },
+    ]);
+  });
+
+  it('clears every override when given an empty list', async () => {
+    const { service, overrideDeleteMany, overrideCreateMany } = build({
+      structureWithOverrides: structure,
+    });
+
+    await service.setStructureFacultyOverrides('as_1', [], ACTOR);
+
+    // An unqualified `structureId` delete, not `notIn: []` — whose meaning for
+    // an empty array is a Prisma implementation detail rather than a contract.
+    expect(overrideDeleteMany.mock.calls[0]?.[0].where).toEqual({ structureId: 'as_1' });
+    expect(overrideCreateMany.mock.calls[0]?.[0].data).toEqual([]);
+  });
+
+  it('de-duplicates repeated ids rather than tripping the unique index', async () => {
+    const { service, overrideCreateMany } = build({
+      structureWithOverrides: structure,
+      liveFaculties: [{ id: 'f_a' }],
+    });
+
+    await service.setStructureFacultyOverrides('as_1', ['f_a', 'f_a', ''], ACTOR);
+
+    expect(overrideCreateMany.mock.calls[0]?.[0].data).toEqual([
+      { structureId: 'as_1', facultyId: 'f_a' },
+    ]);
+  });
+
+  it('rejects an unknown faculty with a field error, not a foreign-key 500', async () => {
+    const { service, overrideCreateMany } = build({
+      structureWithOverrides: structure,
+      liveFaculties: [{ id: 'f_a' }],
+    });
+
+    await expect(
+      service.setStructureFacultyOverrides('as_1', ['f_a', 'f_missing'], ACTOR),
+    ).rejects.toThrow();
+    expect(overrideCreateMany).not.toHaveBeenCalled();
+  });
+
+  it('404s for a structure that does not exist', async () => {
+    const { service } = build({ structureWithOverrides: null });
+    await expect(
+      service.setStructureFacultyOverrides('as_nope', ['f_a'], ACTOR),
+    ).rejects.toThrow();
+  });
+
+  it('busts the catalogue cache so the year picker reflects the new pin', async () => {
+    const { service, redis } = build({
+      structureWithOverrides: structure,
+      liveFaculties: [{ id: 'f_a' }],
+    });
+
+    await service.setStructureFacultyOverrides('as_1', ['f_a'], ACTOR);
+    expect(redis.delByPattern).toHaveBeenCalledWith('catalog:*');
+  });
+
+  it('records the before and after sets, so a move between ladders is traceable', async () => {
+    const { service, audit } = build({
+      structureWithOverrides: structure,
+      liveFaculties: [{ id: 'f_a' }],
+    });
+
+    await service.setStructureFacultyOverrides('as_1', ['f_a'], ACTOR);
+
+    const entry = audit.record.mock.calls[0]?.[0] as {
+      before: { facultyOverrides: string[] };
+      after: { facultyOverrides: string[] };
+    };
+    expect(entry.before.facultyOverrides).toEqual(['f_old']);
+    expect(entry.after.facultyOverrides).toEqual(['f_a']);
   });
 });

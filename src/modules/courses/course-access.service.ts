@@ -509,6 +509,39 @@ export class CourseAccessService {
   }
 
   /**
+   * `assertCanManageCourse`, plus the existence check it deliberately omits.
+   *
+   * `assertCanManageCourse` answers only "may this actor manage course X", and
+   * for an admin or master it answers without touching the database — so on its
+   * own it says nothing about whether X exists. Every mutation in
+   * `CoursesAdminService` loads the course first and so never needs more.
+   *
+   * A route that uses a `courseId` to *derive a storage path* does need more.
+   * Without an existence check an admin could mint objects under an arbitrary
+   * id, and a teacher's refusal would read "you are not assigned to this
+   * course" when the truth is that no such course exists. Pairing the two here
+   * keeps the authority in one place instead of repeating `findFirst` + assert
+   * at each such call site, and leaves the capability vocabulary unchanged.
+   *
+   * Soft-deleted courses are treated as absent, matching every other admin
+   * path (`notDeleted`).
+   */
+  async assertCourseExistsAndManageable(
+    userId: string,
+    role: UserRole,
+    courseId: string,
+    capability: 'content' | 'pricing' | 'publish' | 'students' | 'revenue' = 'content',
+  ): Promise<void> {
+    const course = await this.prisma.course.findFirst({
+      where: { id: courseId, ...notDeleted },
+      select: { id: true },
+    });
+    if (!course) throw AppException.notFound('Course', courseId);
+
+    await this.assertCanManageCourse(userId, role, courseId, capability);
+  }
+
+  /**
    * Whether a course is offered to a given academic group.
    *
    * A course is filed against an optional `universityId`, `facultyId`,

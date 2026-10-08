@@ -694,6 +694,9 @@ model Faculty {
   courses     Course[]
   libraryMaterials LibraryMaterial[]
   academicStructures AcademicStructure[]
+  /// Set when an Admin has pinned this faculty to a specific ladder, which
+  /// then wins over the one it would inherit from its university.
+  academicStructureOverride AcademicStructureFaculty?
 
   @@unique([universityId, name])
   @@index([universityId, isActive])
@@ -786,11 +789,45 @@ model AcademicStructure {
 
   entries AcademicYear[]
 
+  /// Faculties explicitly pinned to this structure, overriding whatever they
+  /// would otherwise inherit. Deliberately NOT restricted to faculties of
+  /// `universityId`: a faculty of one university may be pinned to another
+  /// university's structure, or to a platform-wide one.
+  facultyOverrides AcademicStructureFaculty[]
+
   @@index([scopeKey])
   @@index([universityId])
   @@index([facultyId])
   @@index([departmentId])
   @@map("academic_structures")
+}
+
+/// An explicit "this faculty uses this ladder" assignment.
+///
+/// Why a join table rather than reusing `AcademicStructure.facultyId`: that
+/// column expresses OWNERSHIP and holds exactly one faculty, while an override
+/// list is many faculties per structure and must be able to name a faculty
+/// belonging to a different university than the structure's owner. The
+/// single-owner CHECK constraint also forbids a row carrying both a university
+/// and a faculty, which is exactly the combination this feature needs.
+///
+/// `facultyId` is unique across the whole table, not per structure: a faculty
+/// pinned to two ladders would have no defined answer, so reassigning a faculty
+/// moves its row rather than adding a second one.
+model AcademicStructureFaculty {
+  id          String @id @default(cuid())
+  structureId String
+  /// Unique platform-wide — one override per faculty, whichever structure it
+  /// points at.
+  facultyId String @unique
+
+  createdAt DateTime @default(now())
+
+  structure AcademicStructure @relation(fields: [structureId], references: [id], onDelete: Cascade)
+  faculty   Faculty           @relation(fields: [facultyId], references: [id], onDelete: Cascade)
+
+  @@index([structureId])
+  @@map("academic_structure_faculties")
 }
 
 /// One rung of an AcademicStructure — "Third Year", "Level 2".

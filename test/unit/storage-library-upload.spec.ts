@@ -70,7 +70,14 @@ function buildController(overrides: Partial<typeof STORAGE_CONFIG> = {}) {
   const storage = new StorageService(config as never, cloudinaryDouble());
   const presignSpy = jest.spyOn(storage, 'presignUpload');
 
-  return { controller: new StorageController(storage, cloudinaryDouble()), storage, presignSpy };
+  return {
+    controller: new StorageController(storage, cloudinaryDouble(), {
+      // Never reached: nothing in this file calls the course-image route.
+      assertCourseExistsAndManageable: jest.fn(async () => undefined),
+    } as never),
+    storage,
+    presignSpy,
+  };
 }
 
 const PDF = 'application/pdf';
@@ -99,8 +106,7 @@ async function invalidFields(plain: Record<string, unknown>): Promise<string[]> 
   return errors.map((error) => error.property).sort();
 }
 
-const UUID_V4 =
-  '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const UUID_V4 = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 
 // ---------------------------------------------------------------------------
 // 1. Key construction
@@ -317,9 +323,9 @@ describe('POST /storage/uploads/library-document — traversal guard', () => {
     async (filename) => {
       const { controller, presignSpy } = buildController();
 
-      await expect(controller.libraryDocument(body({ filename }) as never)).rejects.toThrow(
-        AppException,
-      );
+      await expect(
+        controller.libraryDocument(body({ filename }) as never),
+      ).rejects.toThrow(AppException);
       expect(presignSpy).not.toHaveBeenCalled();
     },
   );

@@ -1,4 +1,4 @@
-import { CourseStatus, type Enrollment, EnrollmentState } from '@prisma/client';
+import { CourseStatus, type Enrollment, EnrollmentState, UserRole } from '@prisma/client';
 
 import { ErrorCode } from '../../src/common/errors/error-codes';
 import { CourseAccessService } from '../../src/modules/courses/course-access.service';
@@ -260,5 +260,122 @@ describe('CourseAccessService.decide', () => {
       const result = service.decide(CourseStatus.PUBLISHED, enrollment({ state }));
       expect(allowed).toContain(result.state);
     });
+  });
+});
+
+/**
+ * `assertCourseExistsAndManageable` — the pair the course-image upload route
+ * needs.
+ *
+ * `assertCanManageCourse` answers only "may this actor manage course X", and
+ * for an admin it answers without a query, so it says nothing about whether X
+ * exists. Every course mutation loads the row first and so never needed more.
+ * A route that turns `courseId` into a storage path does: without the existence
+ * check an admin could mint objects under an arbitrary id.
+ *
+ * This service gets its own Prisma double here rather than the `null as never`
+ * the `decide()` block uses deliberately — this method is the one that *must*
+ * query.
+ */
+describe('CourseAccessService.assertCourseExistsAndManageable', () => {
+  function build(options: { course?: { id: string } | null; assignment?: unknown } = {}) {
+    const courseFindFirst = jest.fn(
+      async (_args: { where: Record<string, unknown>; select: unknown }) =>
+        options.course === undefined ? { id: 'crs_1' } : options.course,
+    );
+    const courseTeacherFindUnique = jest.fn(
+      async (_args: { where: unknown }) => options.assignment ?? null,
+    );
+    const prisma = {
+      course: { findFirst: courseFindFirst },
+      courseTeacher: { findUnique: courseTeacherFindUnique },
+    };
+    const service = new CourseAccessService(prisma as never, null as never, null as never);
+    return { service, courseFindFirst, courseTeacherFindUnique };
+  }
+
+  it('passes for an admin when the course exists', async () => {
+    const { service, courseFindFirst } = build();
+
+    await expect(
+      service.assertCourseExistsAndManageable('usr_admin', UserRole.ADMIN, 'crs_1', 'content'),
+    ).resolves.toBeUndefined();
+
+    // Soft-deleted courses must read as absent, as they do on every other
+    // admin path.
+    expect(courseFindFirst.mock.calls[0]?.[0].where).toEqual({
+      id: 'crs_1',
+      deletedAt: null,
+    });
+  });
+
+  it('404s when the course does not exist, before asking about permissions', async () => {
+    const { service, courseTeacherFindUnique } = build({ course: null });
+
+    await expect(
+      service.assertCourseExistsAndManageable('usr_admin', UserRole.ADMIN, 'crs_nope'),
+    ).rejects.toMatchObject({ code: ErrorCode.NOT_FOUND });
+
+    // The order is the point: a missing course is a 404, never "you are not
+    // assigned to this course".
+    expect(courseTeacherFindUnique).not.toHaveBeenCalled();
+  });
+
+  it('404s for a soft-deleted course', async () => {
+    // `findFirst` with `deletedAt: null` returns nothing for one, so the
+    // existence branch covers it without a separate check.
+    const { service } = build({ course: null });
+
+    await expect(
+      service.assertCourseExistsAndManageable('usr_admin', UserRole.ADMIN, 'crs_deleted'),
+    ).rejects.toMatchObject({ code: ErrorCode.NOT_FOUND });
+  });
+
+  it('refuses a teacher who is not assigned to the course', async () => {
+    const { service } = build({ assignment: null });
+
+    await expect(
+      service.assertCourseExistsAndManageable('usr_teacher', UserRole.TEACHER, 'crs_1'),
+    ).rejects.toMatchObject({ code: ErrorCode.NOT_COURSE_TEACHER });
+  });
+
+  it('refuses an assigned teacher whose assignment lacks the capability', async () => {
+    const { service } = build({
+      assignment: {
+        canEditContent: false,
+        canEditPricing: false,
+        canPublish: false,
+        canViewStudents: false,
+        canViewRevenue: false,
+      },
+    });
+
+    await expect(
+      service.assertCourseExistsAndManageable('usr_teacher', UserRole.TEACHER, 'crs_1', 'content'),
+    ).rejects.toMatchObject({ code: ErrorCode.FORBIDDEN });
+  });
+
+  it('passes an assigned teacher who holds the capability', async () => {
+    const { service } = build({
+      assignment: {
+        canEditContent: true,
+        canEditPricing: false,
+        canPublish: false,
+        canViewStudents: false,
+        canViewRevenue: false,
+      },
+    });
+
+    await expect(
+      service.assertCourseExistsAndManageable('usr_teacher', UserRole.TEACHER, 'crs_1', 'content'),
+    ).resolves.toBeUndefined();
+  });
+
+  it('refuses a student outright', async () => {
+    const { service } = build();
+
+    await expect(
+      service.assertCourseExistsAndManageable('usr_student', UserRole.STUDENT, 'crs_1'),
+    ).rejects.toMatchObject({ code: ErrorCode.INSUFFICIENT_ROLE });
   });
 });

@@ -156,6 +156,19 @@ class ReplaceStructureEntriesDto {
 }
 
 /**
+ * The faculties explicitly pinned to a structure.
+ *
+ * `ArrayMinSize` is deliberately absent: an empty array is how every override
+ * is cleared, handing those faculties back to inheritance.
+ */
+class SetStructureFacultiesDto {
+  @IsArray()
+  @ArrayMaxSize(500)
+  @IsString({ each: true })
+  facultyIds!: string[];
+}
+
+/**
  * Public catalogue reads + administrative writes.
  *
  * The read paths are public because the registration screen needs them before
@@ -247,6 +260,21 @@ export class CatalogController {
     @CurrentUser() actor: AuthenticatedUser,
   ) {
     return this.catalog.replaceStructureEntries(id, dto.entries, actor);
+  }
+
+  @Put('academic-structures/:id/faculties')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Pin specific faculties to this structure, overriding inheritance',
+    description:
+      "Replaces the whole set. A pinned faculty uses this structure instead of the one it would inherit from its university, and may belong to ANY university — pinning one university's college to another's ladder is supported on purpose. A faculty pinned elsewhere is moved here, because a faculty can only have one structure. Send an empty array to clear every override and return those faculties to inheritance.",
+  })
+  setStructureFaculties(
+    @Param('id') id: string,
+    @Body() dto: SetStructureFacultiesDto,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    return this.catalog.setStructureFacultyOverrides(id, dto.facultyIds, actor);
   }
 
   @Get('tree')
