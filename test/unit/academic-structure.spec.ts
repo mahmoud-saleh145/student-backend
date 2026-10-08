@@ -356,7 +356,7 @@ describe('the list a student picks from', () => {
 
 describe('creating a structure', () => {
   it('stores the derived scopeKey and the single owner', async () => {
-    const { service, structureCreate } = build({ existingByScope: null });
+    const { service, structureCreate } = build({ existingByScope: null, department: { facultyId: 'f1', faculty: { universityId: 'u1' } } });
 
     await service.createAcademicStructure(
       { kind: AcademicStructureKind.LEVEL, facultyId: 'f1' },
@@ -408,7 +408,7 @@ describe('several platform-wide structures may coexist', () => {
   const platformWide = { kind: AcademicStructureKind.YEAR };
 
   it('creates the first platform-wide structure', async () => {
-    const { service, structureCreate } = build({ existingByScope: null });
+    const { service, structureCreate } = build({ existingByScope: null, department: { facultyId: 'f1', faculty: { universityId: 'u1' } } });
 
     const created = await service.createAcademicStructure(platformWide, ACTOR);
 
@@ -495,7 +495,7 @@ describe('several platform-wide structures may coexist', () => {
     // The counterpart to the cases above: relaxing the platform scope must not
     // have relaxed anything else.
     for (const scope of [{ universityId: 'u1' }, { facultyId: 'f1' }, { departmentId: 'd1' }]) {
-      const { service, structureCreate } = build({ existingByScope: null });
+      const { service, structureCreate } = build({ existingByScope: null, department: { facultyId: 'f1', faculty: { universityId: 'u1' } } });
       await expect(
         service.createAcademicStructure({ kind: AcademicStructureKind.YEAR, ...scope }, ACTOR),
       ).resolves.toBeDefined();
@@ -506,7 +506,7 @@ describe('several platform-wide structures may coexist', () => {
   it('still rejects a scope naming two owners', async () => {
     // Untouched by this change, and worth pinning: allowing multiple
     // platform-wide structures must not weaken the single-owner rule.
-    const { service, structureCreate } = build({ existingByScope: null });
+    const { service, structureCreate } = build({ existingByScope: null, department: { facultyId: 'f1', faculty: { universityId: 'u1' } } });
     await expect(
       service.createAcademicStructure(
         { kind: AcademicStructureKind.YEAR, universityId: 'u1', facultyId: 'f1' },

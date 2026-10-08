@@ -90,6 +90,7 @@ describe('auth', () => {
       phone: '01099887766',
       password: TEST_PASSWORD,
       gender: 'MALE',
+      studyType: 'GENERAL',
     };
     const valid = () => ({ ...base, ...catalog });
 

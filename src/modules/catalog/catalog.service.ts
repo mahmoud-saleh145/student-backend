@@ -372,6 +372,13 @@ export class CatalogService {
     return { id: structureId, facultyIds: wanted };
   }
 
+  private async assertDepartmentStructureKind(departmentId: string, kind: AcademicStructureKind) {
+    const department = await this.prisma.department.findUnique({ where: { id: departmentId }, select: { studyType: true } });
+    if (!department) throw AppException.notFound('department');
+    const expected = department.studyType === 'PROGRAMS' ? AcademicStructureKind.LEVEL : AcademicStructureKind.YEAR;
+    if (kind !== expected) throw AppException.validation({ kind: ['General departments use years; Programs use levels'] });
+  }
+
   async createAcademicStructure(
     input: { kind: AcademicStructureKind } & AcademicScope,
     actor: { id: string; role: UserRole },
@@ -400,6 +407,8 @@ export class CatalogService {
         });
       }
     }
+
+    if (input.departmentId) await this.assertDepartmentStructureKind(input.departmentId, input.kind);
 
     const created = await this.prisma.academicStructure.create({
       data: {
@@ -430,6 +439,7 @@ export class CatalogService {
   ) {
     const before = await this.prisma.academicStructure.findUnique({ where: { id } });
     if (!before) throw AppException.notFound('academic structure');
+    if (before.departmentId && data.kind) await this.assertDepartmentStructureKind(before.departmentId, data.kind);
 
     const updated = await this.prisma.academicStructure.update({ where: { id }, data });
 

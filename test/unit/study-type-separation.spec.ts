@@ -1,7 +1,7 @@
 import { UsersService } from '../../src/modules/users/users.service';
 import { CatalogService } from '../../src/modules/catalog/catalog.service';
 import { CourseAccessService } from '../../src/modules/courses/course-access.service';
-import { StudyType, UserRole } from '@prisma/client';
+import { AcademicStructureKind, StudyType, UserRole } from '@prisma/client';
 
 const selection = {
   universityId: 'u',
@@ -107,5 +107,18 @@ describe('study type separation', () => {
       service.resolve({ userId: 'student', role: UserRole.STUDENT, courseId: 'course' }),
     ).rejects.toThrow();
     expect(enrollment).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('department ladder kind', () => {
+  it.each([
+    [StudyType.GENERAL, AcademicStructureKind.LEVEL],
+    [StudyType.PROGRAMS, AcademicStructureKind.YEAR],
+  ])('rejects a %s department using %s', async (studyType, kind) => {
+    const create = jest.fn();
+    const service = new CatalogService({ department: { findUnique: jest.fn(async () => ({ studyType })) }, academicStructure: { create, findFirst: jest.fn(async () => null) } } as never, {} as never, {} as never);
+    await expect(service.createAcademicStructure({ departmentId: 'd', kind }, { id: 'admin', role: UserRole.ADMIN })).rejects.toThrow();
+    expect(create).not.toHaveBeenCalled();
   });
 });
