@@ -271,6 +271,42 @@ export class StorageService {
     };
   }
 
+  /**
+   * A short-lived, server-to-server read URL for ONE private object.
+   *
+   * Deliberately not `signMediaUrl`. That produces a *viewer-bound* CDN URL
+   * carrying `uid`/`sid`/`tid` and verified by the edge Worker
+   * (docs/cloudflare-worker.js) - correct for a student streaming a lesson,
+   * wrong for a third-party transcoder fetching an original.
+   *
+   * The Worker denies the source namespace outright ("never serve the source
+   * upload, whatever the signature says", cloudflare-worker.js:112-117), so
+   * handing it a `source/videos/...` URL means handing the transcoder a URL the
+   * edge is designed to refuse. That is why asset creation succeeded and then
+   * failed immediately with ERR_ASSET_NOT_FOUND: Gumlet could not fetch the
+   * input at all, and no encoding was ever attempted.
+   *
+   * This is a plain SigV4 presign straight at the private bucket. It grants
+   * read on exactly one key, expires, and never touches the CDN. Nothing
+   * becomes public, no viewer rule is weakened, and the `/source/` deny rule
+   * stays exactly as it is.
+   */
+  async presignIngestionUrl(params: {
+    bucket: Bucket;
+    objectKey: string;
+    expiresIn?: number;
+  }): Promise<string> {
+    this.assertConfigured();
+
+    const expiresIn = params.expiresIn ?? 3600;
+
+    return getSignedUrl(
+      this.client,
+      new GetObjectCommand({ Bucket: this.bucketName(params.bucket), Key: params.objectKey }),
+      { expiresIn },
+    );
+  }
+
   /** Server-side upload, used by the transcoding worker for HLS output. */
   async putObject(params: {
     bucket: Bucket;

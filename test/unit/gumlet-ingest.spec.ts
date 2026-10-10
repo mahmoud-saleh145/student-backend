@@ -17,6 +17,7 @@ type Row = {
   gumletStatus: string | null;
   gumletError: string | null;
   lesson?: { title: string } | null;
+  sourceKey?: string | null;
 };
 
 const DRM_MANIFEST = `<?xml version="1.0" encoding="UTF-8"?>
@@ -64,7 +65,11 @@ function build(opts: {
   };
 
   const storage = {
-    signMediaUrl: jest.fn(async () => 'https://r2.example/source?sig=REDACTED'),
+    // The adoption flow must use the server-to-server presign, NOT the
+    // viewer-bound `signMediaUrl`. It stays here so a test can assert it is
+    // never called for ingestion.
+    signMediaUrl: jest.fn(async () => 'https://cdn.example/source?sig=SHOULD-NOT-BE-USED'),
+    presignIngestionUrl: jest.fn(async () => 'https://r2.example/ingest?X-Amz-Signature=REDACTED'),
   };
 
   const gumlet = {
@@ -219,3 +224,106 @@ function baseRow(): Row {
     sourceKey: 'uploads/v1/source.mp4',
   } as Row;
 }
+
+describe('the ingestion URL handed to Gumlet', () => {
+  // Regression cover for the production failure: adopt() built a VIEWER-bound
+  // CDN URL (uid/sid/tid + HMAC, verified by the edge Worker) and handed it to
+  // Gumlet as the transcoder input. The Worker denies the `source/` namespace
+  // outright - cloudflare-worker.js:112-117 - so Gumlet got a URL the edge is
+  // designed to refuse and asset creation failed within seconds with
+  // ERR_ASSET_NOT_FOUND. The input must be a server-to-server presign instead.
+
+  const SOURCE = 'source/videos/v1/abc-123.mp4';
+
+  function row(over: Partial<Row> = {}): Row {
+    return {
+      id: 'v1',
+      status: 'READY',
+      drmProvider: null,
+      gumletAssetId: null,
+      gumletWorkspaceId: null,
+      gumletStatus: null,
+      gumletError: null,
+      lesson: { title: 'Lesson' },
+      sourceKey: SOURCE,
+      ...over,
+    } as Row;
+  }
+
+  it('presigns the source with a server-to-server URL', async () => {
+    const { service, storage, gumlet } = build({ row: row() });
+
+    await service.adopt('v1');
+
+    expect(storage.presignIngestionUrl).toHaveBeenCalledTimes(1);
+    expect(gumlet.createAsset).toHaveBeenCalledTimes(1);
+    expect((gumlet.createAsset.mock.calls[0] as unknown as [{ sourceUrl: string }])[0].sourceUrl).toBe(
+      'https://r2.example/ingest?X-Amz-Signature=REDACTED',
+    );
+  });
+
+  it('never builds a viewer-bound URL for a machine transcoder', async () => {
+    const { service, storage } = build({ row: row() });
+
+    await service.adopt('v1');
+
+    // The CDN URL carries uid/sid/tid and is verified by the Worker, which
+    // refuses `source/`. Using it here is the defect this suite exists to stop.
+    expect(storage.signMediaUrl).not.toHaveBeenCalled();
+  });
+
+  it('scopes the presign to the uploads bucket and this video own key', async () => {
+    const { service, storage } = build({ row: row() });
+
+    await service.adopt('v1');
+
+    expect(storage.presignIngestionUrl).toHaveBeenCalledWith(
+      expect.objectContaining({ bucket: 'uploads', objectKey: SOURCE }),
+    );
+  });
+
+  it('keeps the presign short-lived rather than long-lived', async () => {
+    const { service, storage } = build({ row: row() });
+
+    await service.adopt('v1');
+
+    const call = (storage.presignIngestionUrl.mock.calls[0] as unknown as [{ expiresIn: number }])[0];
+    expect(call.expiresIn).toBe(3600);
+    expect(call.expiresIn).toBeLessThanOrEqual(3600);
+  });
+
+  it('refuses to adopt when there is no stored source to hand over', async () => {
+    const { service, gumlet, storage } = build({ row: row({ sourceKey: null }) });
+
+    await expect(service.adopt('v1')).rejects.toThrow(/no uploaded source/i);
+
+    // Nothing was presigned and no asset was requested.
+    expect(storage.presignIngestionUrl).not.toHaveBeenCalled();
+    expect(gumlet.createAsset).not.toHaveBeenCalled();
+  });
+
+  it('re-syncs an already-adopted video instead of creating a second asset', async () => {
+    const { service, gumlet, storage } = build({
+      row: row({ gumletAssetId: 'asset_existing' }),
+      asset: { status: 'ready', dashPlaybackUrl: 'https://video.gumlet.io/ws/a1/main.mpd' },
+      manifestBody: DRM_MANIFEST,
+    });
+
+    const result = await service.adopt('v1');
+
+    expect(result.assetId).toBe('asset_existing');
+    // A second asset would be a second chargeable object on the account.
+    expect(gumlet.createAsset).not.toHaveBeenCalled();
+    expect(storage.presignIngestionUrl).not.toHaveBeenCalled();
+  });
+
+  it('still refuses when the Gumlet asset API is not configured', async () => {
+    const { service, gumlet, storage } = build({ row: row() });
+    gumlet.isAssetApiConfigured = () => false;
+
+    await expect(service.adopt('v1')).rejects.toThrow(/not configured/i);
+
+    expect(storage.presignIngestionUrl).not.toHaveBeenCalled();
+    expect(gumlet.createAsset).not.toHaveBeenCalled();
+  });
+});

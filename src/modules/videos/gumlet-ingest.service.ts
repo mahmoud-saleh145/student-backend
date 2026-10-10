@@ -95,15 +95,18 @@ export class GumletIngestService {
       });
     }
 
-    // A short-lived, viewer-unbound URL Gumlet can fetch exactly once.
-    const sourceUrl = await this.storage.signMediaUrl({
+    // A short-lived, single-object read URL that Gumlet's servers can actually
+    // fetch. This is NOT `signMediaUrl`: that builds a viewer-bound CDN URL
+    // (uid/sid/tid + HMAC) which the edge Worker refuses for the `source/`
+    // namespace by design - cloudflare-worker.js:112-117, "never serve the
+    // source upload, whatever the signature says". Handing Gumlet that URL is
+    // what made asset creation succeed and then fail instantly with
+    // ERR_ASSET_NOT_FOUND. A SigV4 presign bypasses the CDN and stays scoped
+    // to this one private object until it expires.
+    const sourceUrl = await this.storage.presignIngestionUrl({
+      bucket: 'uploads',
       objectKey: video.sourceKey,
-      expiresInSeconds: 3600,
-      userId: 'system',
-      sessionId: 'system',
-      deviceId: null,
-      ticketId: null,
-      maxHeight: null,
+      expiresIn: 3600,
     });
 
     const created = await this.gumlet.createAsset({
