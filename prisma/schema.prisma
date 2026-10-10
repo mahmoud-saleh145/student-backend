@@ -30,7 +30,18 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
+  // Runtime traffic. In production this is Neon's `-pooler` (PgBouncer) endpoint.
+  url = env("DATABASE_URL")
+
+  /// Migrations bypass the pooler.
+  ///
+  /// `prisma migrate deploy` takes a session-level advisory lock and issues
+  /// DDL. Over a transaction-mode pooler that either hangs or fails, so
+  /// migrations must reach Postgres directly while the API keeps using the
+  /// pooler. Without this the only way to migrate is to override DATABASE_URL
+  /// by hand, which is how the database fell behind the client in the first
+  /// place.
+  directUrl = env("DIRECT_URL")
 }
 
 // =============================================================================

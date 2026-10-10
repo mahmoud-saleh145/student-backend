@@ -1,0 +1,21 @@
+# Prisma migrations are NEVER line-ending-normalized.
+#
+# `core.autocrlf=true` on Windows stores LF (as this repo already does) but then
+# checks out CRLF. That is harmless for source files and actively dangerous for
+# migrations: Prisma computes the `checksum` column of `_prisma_migrations` from
+# the *bytes of the migration file as it exists on disk*, so a CRLF checkout
+# hashes differently from the LF that was applied. `prisma migrate status` then
+# reports drift on an already-applied migration that is, content for content,
+# identical — and the natural-looking response ("resolve --applied", or worse
+# "migrate reset" to make it agree) would corrupt history to fix a line ending.
+#
+# Verified for this repository: the blob git stores for
+# `20261008120000_engineering_study_types` is `f3d31d7c` (LF), which is what
+# production recorded, while a fresh checkout of it was CRLF.
+#
+# `text` + `eol=lf` pins the worktree to LF as well as the object store, so the
+# file a developer and a CI runner see is byte-identical to the one that was
+# applied. Only Prisma migrations are scoped here: changing the rule globally
+# would re-normalise every text file in the repo and produce an unrelated diff.
+
+prisma/migrations/**/*.sql text eol=lf

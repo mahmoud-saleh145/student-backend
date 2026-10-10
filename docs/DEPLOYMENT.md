@@ -233,43 +233,210 @@ because for a few minutes both are live. The expand/contract pattern:
 A single migration that renames a column will break every request served by the
 old replicas during the rollout.
 
-### Order of operations for a release
+### Manual deployment runbook
 
-1. `prisma migrate deploy`
-2. `npm run db:gate:prod` — abort the release unless it exits 0
-3. Roll the API (rolling, health-gated)
-4. Roll the worker
-5. Verify `/api/v1/meta/health/deep`
+Use this when a release is applied by hand rather than through the Pre-Deploy
+Command. It exists because that is how this release will be applied, and the
+steps that are easy to skip are the ones whose failure is invisible.
+
+Every command below is **yours to run**. OpenCode verified the ones marked
+*verified* against a schema-and-data clone of production restored into a local
+Postgres 18 container; it did not run any of them against production.
+
+**0. Backup first, and do not skip it.**
+
+Create a Neon branch (instant, copy-on-write, free):
+
+```
+Render and Neon are dashboards, so this is done there:
+Neon Console → your project → Branches → New branch from `production`
+name it pre-<migration-name>-backup
+```
+
+Keep it until the release is signed off. It is the only rollback that does not
+involve a restore-from-backup.
+
+**1. Confirm the target database and the two connection strings.**
+
+```bash
+# The pooled endpoint serves the API.
+psql "$DATABASE_URL" -c "select current_database(), current_user;"
+# The direct endpoint is what migrations must use.
+psql "$DIRECT_URL" -c "select current_database(), current_user;"
+```
+
+*Verified:* production answers `neondb | neondb_owner`, PostgreSQL 18.6. If the
+first command's host contains `-pooler` and the second does not, they are the
+right way round. Never migrate through `DATABASE_URL`.
+
+What matters here is that both point at the **same** database. If they do not,
+stop — this is how a migration is applied to the wrong project.
+
+**2. Verify migration history, twice.**
+
+```bash
+npx prisma migrate status
+```
+
+*Verified:* against the production clone this printed **16 migrations found …
+one pending: `20261009000000_academic_system_default_and_college_override`** and
+no drift. Two things must be true before continuing:
+
+- no line reading `Drift detected` or `migration history is modified`
+- the pending set is **exactly** the migrations this release intends to apply
+
+If either is false, **stop and report** — do not run `migrate deploy` to make a
+drift message go away.
+
+### The audited pending set
+
+The second condition is a human check against a list, not a wildcard. For the
+2026-10-10 database release it is exactly these two, and nothing else:
+
+```
+20261009000000_academic_system_default_and_college_override
+20261009120000_gumlet_drm_per_video_provider
+```
+
+Both are additive: six nullable columns on `videos`, one nullable column on
+`universities`, one nullable column on `faculties`, one partial index and one
+trigger. No table, column, row or enum is dropped, and neither rewrites a table.
+The academic migration's backfill was dry-run against production on 2026-10-10 and
+writes exactly one `faculties.academicSystemOverride` cell; the diagnostic in
+`inspect-academic-systems.sql` returns 0 rows for sections 5 and 6.
+
+**A third pending migration means stop and report.** It is not covered by the
+audit above, and it is the thing this check exists to catch. When a release
+legitimately changes the pending set, amend this list in the same commit as the
+migration it authorises — never by relaxing the rule.
+
+> **The release gate reports; `migrate status` decides.** `npm run db:gate` /
+> `db:gate:prod` parses both forms Prisma emits — the plain pending list that a
+> piped stdout produces under Prisma 6, and the `pending migration` table rows a
+> TTY produces — and merges them. It exits **1** and names each pending migration,
+> **0** only on a positive up-to-date marker, and **2** for drift, a failed
+> migration, or output it does not recognise. It runs Prisma's own JS entry point
+> rather than the `npx` shim, so it behaves the same on Windows as elsewhere.
+>
+> None of that makes it the authority. The gate answers *is the database behind
+> this build?* and has no notion of which migrations this release intends to
+> apply — the allowlist above is a human judgement it cannot make. `migrate
+> status` is the authority on state; the gate is what a pipeline reads to stop.
+
+**3. Apply the pending migration on the direct connection.**
+
+```powershell
+$env:DATABASE_URL = "<the DIRECT URL>"   # cmd: set DATABASE_URL=<...>
+npx prisma migrate deploy
+```
+
+*Verified on the clone:* `Applying migration
+20261009000000_academic_system_default_and_college_override` then
+`All migrations have been successfully applied.` The migration is entirely
+additive — two columns, two `UPDATE`s that together touch **one** faculty, one
+partial index, one trigger. No table, column, row or enum is dropped, and no
+demo data is inserted. Re-running it is a no-op: every statement is
+`IF NOT EXISTS` or `CREATE OR REPLACE`.
+
+Use `migrate deploy`, never `migrate dev` (which can offer a reset on drift) and
+never `db push` (which rewrites the schema without recording history).
+
+**4. Confirm the schema changed, exactly once.**
+
+```sql
+-- run after deploy, read-only
+SELECT column_name FROM information_schema.columns
+ WHERE table_name = 'universities'
+   AND column_name = 'defaultAcademicSystem';
+-- expect exactly one row
+
+SELECT f.name AS college, f."academicSystemOverride" AS override,
+       u."defaultAcademicSystem" AS university_default
+  FROM faculties f JOIN universities u ON u.id = f."universityId";
+```
+
+*Verified on the clone:* `Faculty of Engineering (General)` inherits `YEAR`;
+`Faculty of Engineering (Programs)` carries an explicit `LEVEL` override. Both
+should match what you saw before the deploy; the only new information is which
+college now carries an override.
+
+**5. Run the diagnostic.**
+
+```bash
+psql "$DIRECT_URL" -f inspect-academic-systems.sql
+```
+
+*Verified on the clone:*
+
+| Section | Expected |
+|---|---|
+| 5. Ladder/vocabulary mismatches | **0 rows** |
+| 6. Students on a rung their college no longer governs | **0 rows** |
+| 3. Colleges that override | 1 (the Programs college) |
+
+Sections 5 and 6 returning rows means real students are filed under a rung
+their college no longer uses. **Stop and report; do not auto-fix.** Fixing it
+means reassigning students, which is a human decision.
+
+**6. Roll the backend, then the worker.**
+
+```
+1. migrate deploy          (above)
+2. Roll the API            (rolling, health-gated)
+3. Roll the worker
+```
 
 Worker last, because a new worker may enqueue job shapes an old API cannot
-serve, and the reverse is safe.
+serve, and the reverse is safe. Verify `/api/v1/meta/health/deep`; it reports
+`checks.worker: false` once the heartbeat expires, which is the only signal that
+a failed Worker is visible at all.
 
-Step 4 is the one people skip, and skipping it is invisible: uploads keep
-succeeding, video rows say `QUEUED`, and nothing ever transcodes them. Step 5
-is what catches it - `/meta/health/deep` reports `checks.worker: false` once the
-heartbeat has expired, so a Worker that failed to boot is visible on the
-dashboard rather than discovered by a lecture that never became watchable.
+**7. Roll the clients.** Dashboard and student-web before the mobile build is
+released, because they talk to the endpoints this migration adds
+(`/catalog/academic-systems`, `/catalog/academic-selection`). Student-web has
+its own outage path: an older build that still sends `studyType` is accepted and
+ignored, so the client rollout order does not gate the backend release.
 
-### Where steps 1 and 2 actually run on Render
+**8. Smoke tests.** With one account per system:
 
-Steps 1 and 2 above are a *release job*. Render's name for that is the
-**Pre-Deploy Command**: it runs once, in the freshly built image, after the
-build and before the new instance receives traffic, and a non-zero exit aborts
-the deploy instead of rolling it. That is precisely the shape this section
-asks for — once, before the roll, never per-replica.
+- [ ] admin: Other data → Academic systems lists universities and colleges, and
+      inheriting colleges read *Inherited* rather than *Override*
+- [ ] admin: Other data → Years & levels opens a ladder and shows its entries
+- [ ] web `/register`: university → college → department changes the final field
+      to *Level* or *Academic year*, and only one is ever shown
+- [ ] mobile registration: the same flow in the app
+- [ ] the student's existing academic year still shows on their profile
+- [ ] `/api/v1/meta/health` and `/meta/health/deep`
 
-Set it on the API service (Render → the service → Settings → Pre-Deploy
-Command):
+**9. If the migration fails.**
 
+Everything Prisma does for a migration happens in one transaction, so a failure
+rolls the whole file back and no partially-applied state is left behind. Then:
+
+```bash
+# How far did it get, if at all?
+psql "$DIRECT_URL" -f prod-schema-diagnostic.sql
+psql "$DIRECT_URL" -f inspect-academic-systems.sql
+# Only after reading both:
+npx prisma migrate resolve --rolled-back 20261009000000_academic_system_default_and_college_override
+# or, if it actually applied and only the bookkeeping failed:
+npx prisma migrate resolve --applied 20261009000000_academic_system_default_and_college_override
 ```
-npx prisma migrate deploy && npm run db:gate:prod
-```
 
-Nothing in this repository can enforce it. There is no `render.yaml` here, and
-a Blueprint file would not apply to a service created in the dashboard; adding
-the command to the Dockerfile is the one change this document tells you not to
-make, because `CMD` runs per replica. So the setting lives in the Render
-dashboard, and this is where it is written down.
+Pick the one that matches reality — `--rolled-back` if nothing landed, `--applied`
+if it did. Guessing here desynchronises the history from the schema, which is
+the one failure from which there is no safe automatic escape. Do not run
+`prisma migrate reset` against production under any circumstances.
+
+**10. Rolling back.**
+
+Delete the Neon branch only after sign-off. For the database itself, the
+rollback is restoring from that branch — there is no down-migration, because this
+change only ADDS columns. Removing them once clients depend on them would break
+the clients, so a code rollback is not sufficient and the schema rollback is the
+real one.
+
+
 
 **If the Pre-Deploy Command is empty, deploys advance the code and never the
 schema.** `prisma generate` runs in the build (so the generated client knows
@@ -281,6 +448,11 @@ steps after the mistake, which is what makes it worth a dashboard field.
 The worker service needs no Pre-Deploy Command: the API's release job has
 already migrated the one database they share, and a second concurrent
 `migrate deploy` is the race this section opens by warning about.
+
+> **Do not use the Pre-Deploy Command as a substitute for the runbook above.**
+> `db:gate:prod` correctly reports unapplied migrations, but it cannot tell an
+> *audited* pending migration from an *unexpected* one — that judgement is the
+> allowlist in step 2, and it is a human's. See the manual runbook.
 
 ---
 
