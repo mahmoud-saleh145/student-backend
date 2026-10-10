@@ -181,12 +181,16 @@ export class GumletDrmService {
 
     return {
       licenseUrl: `${WIDEVINE_LICENSE_BASE}${stringToSign}?${runtime.toString()}`,
-      // Gumlet's docs list the prefix as `.../certificate/<ORG_ID>` but the
-      // runnable sample prints `.../certificate/<ORG_ID>/`. The sample is the
-      // concrete artifact, so that form is used. Untested against a live
-      // FairPlay credential - see the "Not yet verified" section of the
-      // integration doc.
-      certificateUrl: this.cfg.orgId ? `${FAIRPLAY_CERT_BASE}/${this.cfg.orgId}/` : null,
+      // NO trailing slash.
+      //
+      // Gumlet's own materials disagree with each other: the prefix declaration
+      // reads `.../certificate/<ORG_ID>` while the runnable JS and PHP samples
+      // both print `.../certificate/<ORG_ID>/`. Resolved in favour of the form
+      // without the slash, because that is what this account's DRM Credentials
+      // page actually displays — the dashboard is the value the provider hands
+      // you for your own organisation, so it outranks a copy-paste sample.
+      // Verified against the live account on 2026-10-10.
+      certificateUrl: this.cfg.orgId ? `${FAIRPLAY_CERT_BASE}/${this.cfg.orgId}` : null,
       manifestUrl: null,
       expires,
       expiresIso: new Date(expires).toISOString(),
