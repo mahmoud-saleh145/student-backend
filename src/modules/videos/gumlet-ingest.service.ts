@@ -127,6 +127,22 @@ export class GumletIngestService {
         gumletUpdatedAt: new Date(),
         // The video is not playable until Gumlet reports ready.
         status: VideoStatus.PROCESSING,
+        // No local transcode job is in flight for a Gumlet-backed video, so the
+        // previous pipeline's job fields must not survive into this state.
+        //
+        // recoverStrandedVideos() treats PROCESSING rows whose
+        // processingStartedAt is older than three hours as abandoned work and
+        // marks them FAILED. Left carrying a timestamp from an earlier local
+        // transcode, a freshly adopted video matched that predicate on the very
+        // next sweep and was failed while its Gumlet asset was still healthy -
+        // observed in production as "Processing was interrupted (job missing)".
+        //
+        // null rather than "now": SQL never satisfies `NULL < cutoff`, so this
+        // is a permanent guard instead of a three-hour reprieve. It is also
+        // accurate - the worker path still sets its own timestamp through
+        // markProcessing(), so a genuinely stuck local job is still recovered.
+        processingStartedAt: null,
+        processingJobId: null,
       },
     });
 

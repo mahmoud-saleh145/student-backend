@@ -326,4 +326,26 @@ describe('the ingestion URL handed to Gumlet', () => {
     expect(storage.presignIngestionUrl).not.toHaveBeenCalled();
     expect(gumlet.createAsset).not.toHaveBeenCalled();
   });
+it('clears the stale local-job fields when it moves the row to PROCESSING', async () => {
+    // Regression cover for a production race. adopt() set status=PROCESSING but
+    // left processingStartedAt / processingJobId carrying values from an earlier
+    // LOCAL transcode. recoverStrandedVideos() reads exactly those fields to
+    // decide a job was abandoned, so the freshly adopted row matched its stale
+    // predicate and was marked FAILED within a minute while the Gumlet asset was
+    // still processing normally.
+    const { service, updates } = build({ row: row() });
+
+    await service.adopt('v1');
+
+    // The double records each update's data object directly.
+    const data = updates.find((u) => u.drmProvider === 'gumlet') as
+      | Record<string, unknown>
+      | undefined;
+    expect(data).toBeDefined();
+
+    expect((data as Record<string, unknown>).status).toBe('PROCESSING');
+    // Both must be cleared, not merely overwritten with a new timestamp.
+    expect(data).toHaveProperty('processingStartedAt', null);
+    expect(data).toHaveProperty('processingJobId', null);
+  });
 });
