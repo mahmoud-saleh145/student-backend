@@ -618,10 +618,19 @@ export class PlaybackService {
       : bundle.licenseUrl;
 
     return {
-      manifestUrl: this.gumlet.dashManifestUrl({
-        assetId,
-        workspaceId: video.gumletWorkspaceId,
-      }),
+      // Manifest choice follows the DRM system. Gumlet offers FairPlay for HLS
+      // only - their DASH manifests carry a Widevine PSSH and no FairPlay
+      // signalling - so an Apple client must be handed the HLS playlist. Every
+      // other client keeps DASH, unchanged.
+      manifestUrl: useFairPlay
+        ? this.gumlet.hlsManifestUrl({
+            assetId,
+            workspaceId: video.gumletWorkspaceId,
+          })
+        : this.gumlet.dashManifestUrl({
+            assetId,
+            workspaceId: video.gumletWorkspaceId,
+          }),
       // The DASH manifest is served by Gumlet's CDN and needs no viewer-bound
       // headers. Access is enforced at ticket issuance and by the licence
       // token, not by a header here.

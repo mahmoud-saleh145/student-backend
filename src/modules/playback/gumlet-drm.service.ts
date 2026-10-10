@@ -219,13 +219,34 @@ export class GumletDrmService {
    * asset was created by hand.
    */
   dashManifestUrl(params: { assetId: string; workspaceId?: string | null }): string {
+    return `${this.assetBaseUrl(params)}/main.mpd`;
+  }
+
+  /**
+   * HLS manifest URL for a Gumlet-backed video. Used for FairPlay only.
+   *
+   * Gumlet publishes FairPlay for HLS only: their compatibility matrix has a
+   * `HLS FairPlay` column and no `DASH FairPlay` column at all. A DASH manifest
+   * from Gumlet carries a Widevine PSSH and nothing an Apple CDM can negotiate,
+   * so Safari cannot play it. The FairPlay keys are instead signalled in the
+   * HLS playlists via `KEYFORMAT=com.apple.streamingkeydelivery` with `skd://`
+   * init data, which is the form Shaka's default init-data transform handles.
+   *
+   * Same construction convention as the DASH URL above, with `main.m3u8`.
+   */
+  hlsManifestUrl(params: { assetId: string; workspaceId?: string | null }): string {
+    return `${this.assetBaseUrl(params)}/main.m3u8`;
+  }
+
+  /** Shared workspace resolution and base path for Gumlet playback URLs. */
+  private assetBaseUrl(params: { assetId: string; workspaceId?: string | null }): string {
     const workspaceId = params.workspaceId ?? this.cfg.workspaceId;
     if (!workspaceId) {
       throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
         message: 'Gumlet workspace ID is not configured',
       });
     }
-    return `https://video.gumlet.io/${workspaceId}/${params.assetId}/main.mpd`;
+    return `https://video.gumlet.io/${workspaceId}/${params.assetId}`;
   }
 
   // ---------------------------------------------------------------------------

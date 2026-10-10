@@ -105,16 +105,21 @@ function makeService(opts: {
  * of ticket minting, not API surface. Accessing it through a typed view keeps
  * that encapsulation in production while still exercising the real logic here.
  */
-function resolve(service: PlaybackService, video: VideoRow) {
+function resolve(
+  service: PlaybackService,
+  video: VideoRow,
+  platform?: 'ios' | 'android' | 'web',
+) {
   return (
     service as unknown as {
       resolvePlaybackTarget: (
         ticketId: string,
         video: VideoRow,
         expiresAt: Date,
+        platform?: 'ios' | 'android' | 'web',
       ) => Promise<{ manifestUrl: string; playbackHeaders: Record<string, string>; drm: unknown }>;
     }
-  ).resolvePlaybackTarget('t_1', video, new Date(Date.now() + 300_000));
+  ).resolvePlaybackTarget('t_1', video, new Date(Date.now() + 300_000), platform);
 }
 
 const legacyVideo: VideoRow = {
@@ -262,6 +267,96 @@ describe('a correctly configured Gumlet video', () => {
     expect(serialised).not.toContain(SECRET_B64);
     expect(serialised).not.toContain('GUMLET_SIGN_SECRET');
     expect(serialised).not.toContain('GUMLET_API_KEY');
+    expect(serialised).not.toContain('api-key-for-tests');
+  });
+});
+
+/**
+ * Gumlet publishes FairPlay for HLS only: their compatibility matrix has an
+ * `HLS FairPlay` column and no `DASH FairPlay` column. Serving a DASH manifest
+ * to Safari therefore guarantees failure at key-system negotiation, because
+ * that manifest carries a Widevine PSSH and nothing an Apple CDM can use.
+ */
+describe('manifest selection follows the DRM system', () => {
+  it('serves HLS to iOS, because that is the only FairPlay signalling Gumlet emits', async () => {
+    const t = makeService({ drmEnabled: true, provider: 'gumlet' });
+
+    const result = await resolve(t.service, gumletVideo, 'ios');
+    const drm = result.drm as { scheme: string; licenseUrl: string; certificateUrl: string | null };
+
+    expect(result.manifestUrl).toBe('https://video.gumlet.io/ws_1/asset_1/main.m3u8');
+    expect(drm.scheme).toBe('fairplay');
+    expect(drm.licenseUrl).toContain('fairplay.gumlet.com');
+    // FairPlay needs the application certificate; Widevine clients get none.
+    expect(drm.certificateUrl).toBe('https://fairplay.gumlet.com/certificate/org_1');
+    expect(t.manifest.buildMasterUrl).not.toHaveBeenCalled();
+  });
+
+  it('keeps DASH for Chrome, Edge and Android', async () => {
+    for (const platform of ['web', 'android'] as const) {
+      const t = makeService({ drmEnabled: true, provider: 'gumlet' });
+
+      const result = await resolve(t.service, gumletVideo, platform);
+      const drm = result.drm as { scheme: string; licenseUrl: string; certificateUrl: string | null };
+
+      expect(result.manifestUrl).toBe('https://video.gumlet.io/ws_1/asset_1/main.mpd');
+      expect(drm.scheme).toBe('widevine');
+      expect(drm.licenseUrl).toContain('widevine.gumlet.com');
+      expect(drm.certificateUrl).toBeNull();
+    }
+  });
+
+  it('still resolves the workspace for the HLS branch', async () => {
+    const t = makeService({ drmEnabled: true, provider: 'gumlet' });
+
+    const fromRow = await resolve(t.service, gumletVideo, 'ios');
+    expect(fromRow.manifestUrl).toContain('/ws_1/');
+
+    const fromConfig = await resolve(t.service, { ...gumletVideo, gumletWorkspaceId: null }, 'ios');
+    expect(fromConfig.manifestUrl).toBe('https://video.gumlet.io/ws/asset_1/main.m3u8');
+  });
+
+  it('fails closed for iOS when no workspace can be determined', async () => {
+    const t = makeService({ drmEnabled: true, provider: 'gumlet' });
+    (t.gumlet as unknown as { cfg: { workspaceId: string | null } }).cfg.workspaceId = null;
+
+    await expect(
+      resolve(t.service, { ...gumletVideo, gumletWorkspaceId: null }, 'ios'),
+    ).rejects.toThrow(/workspace/i);
+  });
+
+  it('issues both licences from the same signed token, scoped to the same asset', async () => {
+    const t = makeService({ drmEnabled: true, provider: 'gumlet' });
+
+    const widevine = t.gumlet.signLicenseUrl({ assetId: 'asset_1' }).licenseUrl;
+    const fairplay = t.gumlet.signFairPlayLicenseUrl({ assetId: 'asset_1' });
+    const widevineParsed = new URL(widevine);
+    const fairplayParsed = new URL(fairplay);
+
+    for (const parsed of [widevineParsed, fairplayParsed]) {
+      expect(parsed.pathname).toBe(`/licence/${ORG}/asset_1`);
+      expect(parsed.searchParams.get('token')).toBeTruthy();
+      expect(parsed.searchParams.get('expires')).toBeTruthy();
+    }
+
+    // FairPlay is the SAME signed token on a different host: only the licence
+    // base changes. If these ever diverge, one of the two would be unsigned.
+    expect(fairplayParsed.searchParams.get('token')).toBe(
+      widevineParsed.searchParams.get('token'),
+    );
+    expect(fairplayParsed.searchParams.get('expires')).toBe(
+      widevineParsed.searchParams.get('expires'),
+    );
+    expect(widevineParsed.host).not.toBe(fairplayParsed.host);
+  });
+
+  it('never leaks the signing secret into the iOS ticket', async () => {
+    const t = makeService({ drmEnabled: true, provider: 'gumlet' });
+
+    const result = await resolve(t.service, gumletVideo, 'ios');
+    const serialised = JSON.stringify(result);
+
+    expect(serialised).not.toContain(SECRET_B64);
     expect(serialised).not.toContain('api-key-for-tests');
   });
 });
