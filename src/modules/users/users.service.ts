@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import {
   AccountStatus,
+  type AcademicStructureKind,
   AuditAction,
   type Gender,
   Prisma,
@@ -40,7 +41,21 @@ const PUBLIC_USER_SELECT = {
       department: {
         select: { id: true, facultyId: true, studyType: true, name: true, nameAr: true },
       },
-      academicYear: { select: { id: true, order: true, name: true, nameAr: true } },
+      /*
+      `structure.kind` rides along so a client can label the profile's rung
+      "Year" or "Level" from the data rather than guessing from the department's
+      study type — the two used to be conflated, so a level-based college's
+      student was shown "Academic year: Level 100".
+    */
+      academicYear: {
+        select: {
+          id: true,
+          order: true,
+          name: true,
+          nameAr: true,
+          structure: { select: { kind: true } },
+        },
+      },
     },
   },
   teacherProfile: {
@@ -126,8 +141,22 @@ export class UsersService {
         logoUrl: string | null;
       } | null;
       faculty: { id: string; universityId: string; name: string; nameAr: string } | null;
-      department: { id: string; facultyId: string; name: string; nameAr: string } | null;
-      academicYear: { id: string; order: number; name: string; nameAr: string } | null;
+      department: {
+        id: string;
+        facultyId: string;
+        name: string;
+        nameAr: string;
+        /** Descriptive only — it never decides the academic system. */
+        studyType?: 'GENERAL' | 'PROGRAMS';
+      } | null;
+      academicYear: {
+        id: string;
+        order: number;
+        name: string;
+        nameAr: string;
+        /** The ladder's vocabulary, so a client can label it Year or Level. */
+        structure?: { kind: AcademicStructureKind } | null;
+      } | null;
     } | null;
     teacherProfile?: {
       title: string | null;
@@ -178,6 +207,19 @@ export class UsersService {
    * together — faculty belongs to the university, department to the faculty —
    * so a student cannot end up filed under a department of another university.
    */
+  /**
+   * Verifies the whole academic chain hangs together, independently of the
+   * client.
+   *
+   * Frontend filtering is not an integrity boundary. A client can post any ids
+   * it likes, including a department belonging to a different university or a
+   * rung from another college's ladder, so every relationship is re-checked here
+   * from the database.
+   *
+   * `studyType` is optional and, when supplied, is only cross-checked against
+   * the department's own value — it never participates in resolving the academic
+   * system, which comes from the college's configuration.
+   */
   async assertAcademicSelectionIsCoherent(input: {
     studyType?: 'GENERAL' | 'PROGRAMS';
     universityId: string;
@@ -217,6 +259,9 @@ export class UsersService {
       fields.departmentId = ['does not belong to the selected faculty'];
     }
 
+    // Backward compatibility with a client still sending the field. It is
+    // checked for honesty and then ignored: it is descriptive metadata, not the
+    // source of the academic system.
     if (department && input.studyType && department.studyType !== input.studyType) {
       fields.departmentId = ['does not belong to the selected study type'];
     }
@@ -238,6 +283,21 @@ export class UsersService {
     if (Object.keys(fields).length > 0) {
       throw AppException.validation(fields, 'Academic selection is not coherent');
     }
+  }
+
+  /**
+   * The same check, plus the college's resolved academic system.
+   *
+   * Registration additionally reports which system the student has been filed
+   * under, so the client can confirm it without a second round trip and an
+   * Admin can see it in the audit trail.
+   */
+  async resolveRegistrationAcademicSystem(input: {
+    universityId: string;
+    facultyId: string;
+    departmentId: string;
+  }) {
+    return this.catalog.resolveAcademicSystem({ departmentId: input.departmentId });
   }
 
   // ---------------------------------------------------------------------------

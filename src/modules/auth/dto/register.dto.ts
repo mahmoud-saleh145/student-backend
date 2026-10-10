@@ -57,8 +57,23 @@ export class RegisterDto {
   )
   fullName!: string;
 
+  /**
+   * Removed.
+   *
+   * This used to be REQUIRED and to decide whether the app labelled the control
+   * "Academic year" or "Level". That is the student choosing their own academic
+   * progression system, which the product rules out: the system is the college's
+   * configuration, resolved from its override or its university's default.
+   *
+   * The field is tolerated rather than rejected so that an older published build
+   * * of the web or mobile app keeps working during a rollout. It is validated
+   * against the department when present (a student cannot claim PROGRAMS for a
+   * GENERAL department) but it never influences the resolved system. Remove it
+   * *and* `whitelist` it once both clients are on a version that omits it.
+   */
+  @IsOptional()
   @IsIn(['GENERAL', 'PROGRAMS'])
-  studyType!: 'GENERAL' | 'PROGRAMS';
+  studyType?: 'GENERAL' | 'PROGRAMS';
 
   @ApiProperty({ example: '01001234567' })
   @IsString()

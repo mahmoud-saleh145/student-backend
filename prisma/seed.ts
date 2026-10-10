@@ -98,6 +98,14 @@ async function assertSafeToSeed(): Promise<void> {
 async function seedAcademicStructure() {
   console.log('  · universities, faculties, departments, academic years');
 
+  /*
+   * The universities' DEFAULT academic systems, set explicitly rather than left
+   * to the column default, so a reader of the seed can see the configuration
+   * that makes the two universities behave differently.
+   *
+   * `update` is intentionally empty: re-seeding must not overwrite an
+   * administrator's later change. The `create` branch is where the intent lives.
+   */
   const cairo = await prisma.university.upsert({
     where: { code: 'CU' },
     update: {},
@@ -106,6 +114,9 @@ async function seedAcademicStructure() {
       name: 'Cairo University',
       nameAr: 'جامعة القاهرة',
       sortOrder: 1,
+      // نظام الفرق. Engineering inherits years; Medicine overrides itself to
+      // levels further down, which is the case the product is really about.
+      defaultAcademicSystem: 'YEAR',
     },
   });
 
@@ -117,6 +128,8 @@ async function seedAcademicStructure() {
       name: 'Ain Shams University',
       nameAr: 'جامعة عين شمس',
       sortOrder: 2,
+      // نظام الليفلز — a level-based university whose colleges inherit it.
+      defaultAcademicSystem: 'LEVEL',
     },
   });
 
@@ -233,6 +246,24 @@ async function seedAcademicStructure() {
       }),
     ),
   );
+
+  /*
+   * The Medicine college OVERRIDES its university to levels.
+   *
+   * The case the product is really about: a level-based college inside a
+   * year-based university. Without this the seeded Level ladder would be
+   * unreachable — Cairo defaults to years and Medicine would inherit them.
+   * Note the direction: nothing about Cairo being a government university takes
+   * part in this decision.
+   *
+   * Written AFTER the ladder above exists, so the seeded database is internally
+   * consistent by the time any reader sees it: a college claiming LEVEL while
+   * its ladder is still YEAR is precisely the mismatch the API refuses to create.
+   */
+  await prisma.faculty.update({
+    where: { id: medicine.id },
+    data: { academicSystemOverride: 'LEVEL' },
+  });
 
   return { cairo, ainShams, engineering, medicine, departments, years };
 }

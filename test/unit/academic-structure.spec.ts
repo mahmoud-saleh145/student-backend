@@ -52,7 +52,13 @@ interface Options {
     id: string;
     entries: { id: string; order: number }[];
   } | null;
-  entries?: { id: string; order: number; name: string; nameAr: string; isActive: boolean }[];
+  entries?: {
+    id: string;
+    order: number;
+    name: string;
+    nameAr: string;
+    isActive: boolean;
+  }[];
   /**
    * The explicit faculty -> structure pin `academicStructureFaculty.findUnique`
    * answers with. Left `undefined` it means "no override stored", which is the
@@ -75,6 +81,34 @@ interface Options {
     id: string;
     facultyOverrides: { facultyId: string }[];
   } | null;
+  /**
+   * The academic system configuration `resolveAcademicSystem` reads.
+   *
+   * Left undefined the lookups answer null, which is the "not configured yet"
+   * state; the ladder/kind agreement checks then stand aside instead of
+   * rejecting a create. Tests about YEAR vs LEVEL agreement set both values.
+   */
+  facultySystem?: {
+    id: string;
+    academicSystemOverride: AcademicStructureKind | null;
+    university: { id: string; defaultAcademicSystem: AcademicStructureKind };
+  } | null;
+  universitySystem?: {
+    id: string;
+    defaultAcademicSystem: AcademicStructureKind;
+  } | null;
+  /**
+   * The department row as `resolveAcademicSystem` asks for it: the parent
+   * faculty carrying its override, and that faculty's university default.
+   */
+  departmentSystem?: {
+    facultyId: string;
+    faculty: {
+      id: string;
+      academicSystemOverride: AcademicStructureKind | null;
+      university: { id: string; defaultAcademicSystem: AcademicStructureKind };
+    };
+  } | null;
 }
 
 function build(options: Options = {}) {
@@ -91,7 +125,10 @@ function build(options: Options = {}) {
   // shape keeps both honest instead of having the second silently answer the
   // first's fixture.
   const structureFindUnique = jest.fn(
-    async (args: { where: Record<string, unknown>; select?: Record<string, unknown> }) => {
+    async (args: {
+      where: Record<string, unknown>;
+      select?: Record<string, unknown>;
+    }) => {
       if ('scopeKey' in args.where) {
         return options.existingByScope === undefined ? null : options.existingByScope;
       }
@@ -103,7 +140,9 @@ function build(options: Options = {}) {
           ? null
           : options.structureWithOverrides;
       }
-      return options.structureWithEntries === undefined ? null : options.structureWithEntries;
+      return options.structureWithEntries === undefined
+        ? null
+        : options.structureWithEntries;
     },
   );
   // `scopeKey` is no longer a unique column — several platform-wide structures
@@ -116,7 +155,9 @@ function build(options: Options = {}) {
       if ('scopeKey' in args.where) {
         return options.existingByScope === undefined ? null : options.existingByScope;
       }
-      return options.structureWithEntries === undefined ? null : options.structureWithEntries;
+      return options.structureWithEntries === undefined
+        ? null
+        : options.structureWithEntries;
     },
   );
   const structureCreate = jest.fn(async (args: { data: Record<string, unknown> }) => ({
@@ -143,16 +184,67 @@ function build(options: Options = {}) {
     ...args.data,
   }));
 
+  /**
+   * The department lookup, dispatched on the requested `select`.
+   *
+   * `resolveAcademicSystem` asks for the parent faculty's override and its
+   * university's default (`departmentSystem`); the ladder resolver asks only for
+   * `facultyId` and `universityId` (`department`). One standing fixture answering
+   * both would make one of the two assertions vacuous.
+   */
   const departmentFindUnique = jest.fn(
-    async (_args: { where: unknown; select: unknown }) =>
-      options.department === undefined ? null : options.department,
-  );
-  const facultyFindUnique = jest.fn(
-    async (_args: { where: unknown; select: unknown }) =>
-      options.faculty === undefined ? null : options.faculty,
+    async (args: { where: unknown; select?: Record<string, unknown> }) => {
+      // Two different `select` shapes ask two different questions of the same
+      // table. Distinguished by whether the caller wants the parent faculty's
+      // system columns, which only `resolveAcademicSystem` asks for.
+      // Three `select` shapes ask this table three different questions, and they are
+      // told apart by their exact shape rather than by which fixture happens to
+      // be set — otherwise one standing fixture would answer all three and two of
+      // the assertions would be vacuous:
+      //
+      //   { faculty: { universityId } }              -> the ladder resolver
+      //   { id }                                     -> existence only
+      //   { faculty: { id, academicSystemOverride,
+      //                university: { id, defaultAcademicSystem } } }
+      //                                                -> the system resolver
+      const select = args.select ?? {};
+      const facultyRelation = (select.faculty ?? null) as {
+        select?: Record<string, unknown>;
+      } | null;
+      const wantsSystem =
+        !!facultyRelation?.select && 'academicSystemOverride' in facultyRelation.select;
+      if (wantsSystem) {
+        return options.departmentSystem ?? null;
+      }
+      if (!facultyRelation) {
+        return options.department ? { id: 'd1' } : null;
+      }
+      return options.department ?? null;
+    },
   );
   const facultyFindMany = jest.fn(
     async (_args: { where: unknown; select: unknown }) => options.liveFaculties ?? [],
+  );
+  const universityFindUnique = jest.fn(
+    async (_args: { where: unknown; select: unknown }) =>
+      options.universitySystem === undefined ? null : options.universitySystem,
+  );
+
+  /**
+   * The system-configured shape of the faculty lookup.
+   *
+   * `resolveAcademicSystem` asks for the override and the parent university's
+   * default in one `select`, while the legacy ladder resolver asks only for
+   * `universityId`. Dispatching on the requested `select` keeps each fixture
+   * answering only its own question.
+   */
+  const facultyFindUnique = jest.fn(
+    async (args: { where: unknown; select?: Record<string, unknown> }) => {
+      if (args.select && 'academicSystemOverride' in args.select) {
+        return options.facultySystem === undefined ? null : options.facultySystem;
+      }
+      return options.faculty === undefined ? null : options.faculty;
+    },
   );
 
   // The explicit faculty pin. `findUnique` is keyed on `facultyId`, which is
@@ -162,9 +254,9 @@ function build(options: Options = {}) {
       options.facultyOverride === undefined ? null : options.facultyOverride,
   );
   const overrideDeleteMany = jest.fn(async (_args: { where: unknown }) => ({ count: 0 }));
-  const overrideCreateMany = jest.fn(
-    async (args: { data: readonly unknown[] }) => ({ count: args.data.length }),
-  );
+  const overrideCreateMany = jest.fn(async (args: { data: readonly unknown[] }) => ({
+    count: args.data.length,
+  }));
 
   // Only the array form is modelled: the callback form would have to hand the
   // callback a client, which means referencing `prisma` inside its own
@@ -185,19 +277,22 @@ function build(options: Options = {}) {
     },
     department: { findUnique: departmentFindUnique },
     faculty: { findUnique: facultyFindUnique, findMany: facultyFindMany },
+    university: { findUnique: universityFindUnique },
     academicStructureFaculty: {
       findUnique: overrideFindUnique,
       deleteMany: overrideDeleteMany,
       createMany: overrideCreateMany,
     },
-    $transaction: jest.fn(async (operations: readonly unknown[]) => Promise.all(operations)),
+    $transaction: jest.fn(async (operations: readonly unknown[]) =>
+      Promise.all(operations),
+    ),
   };
 
   // `remember` must actually invoke the producer, or every read test would
   // assert against an empty cache rather than the query.
   const redis = {
-    remember: jest.fn(async (_key: string, _ttl: number, producer: () => Promise<unknown>) =>
-      producer(),
+    remember: jest.fn(
+      async (_key: string, _ttl: number, producer: () => Promise<unknown>) => producer(),
     ),
     delByPattern: jest.fn(async (_pattern: string) => 0),
   };
@@ -226,7 +321,9 @@ function build(options: Options = {}) {
 
 describe('academicScopeKey', () => {
   it('names the most specific owner', () => {
-    expect(academicScopeKey({ departmentId: 'd1', facultyId: null })).toBe('department:d1');
+    expect(academicScopeKey({ departmentId: 'd1', facultyId: null })).toBe(
+      'department:d1',
+    );
     expect(academicScopeKey({ facultyId: 'f1' })).toBe('faculty:f1');
     expect(academicScopeKey({ universityId: 'u1' })).toBe('university:u1');
   });
@@ -235,9 +332,9 @@ describe('academicScopeKey', () => {
     // This is the string the unique index relies on. Were it derived as an
     // empty value, or omitted, two platform structures could coexist.
     expect(academicScopeKey({})).toBe(PLATFORM_SCOPE_KEY);
-    expect(academicScopeKey({ universityId: null, facultyId: null, departmentId: null })).toBe(
-      'platform',
-    );
+    expect(
+      academicScopeKey({ universityId: null, facultyId: null, departmentId: null }),
+    ).toBe('platform');
   });
 });
 
@@ -253,7 +350,9 @@ describe('assertSingleAcademicOwner', () => {
   });
 
   it('rejects two owners', () => {
-    expect(() => assertSingleAcademicOwner({ universityId: 'u1', facultyId: 'f1' })).toThrow();
+    expect(() =>
+      assertSingleAcademicOwner({ universityId: 'u1', facultyId: 'f1' }),
+    ).toThrow();
   });
 });
 
@@ -268,7 +367,9 @@ describe('resolving which structure governs a unit', () => {
       ],
     });
 
-    await expect(service.resolveAcademicStructure({ departmentId: 'd1' })).resolves.toMatchObject({
+    await expect(
+      service.resolveAcademicStructure({ departmentId: 'd1' }),
+    ).resolves.toMatchObject({
       id: 'as_dept',
     });
   });
@@ -289,10 +390,14 @@ describe('resolving which structure governs a unit', () => {
   it('falls all the way through to the platform structure', async () => {
     const { service } = build({
       department: { facultyId: 'f1', faculty: { universityId: 'u1' } },
-      structures: [{ id: 'as_plat', kind: AcademicStructureKind.YEAR, scopeKey: 'platform' }],
+      structures: [
+        { id: 'as_plat', kind: AcademicStructureKind.YEAR, scopeKey: 'platform' },
+      ],
     });
 
-    await expect(service.resolveAcademicStructure({ departmentId: 'd1' })).resolves.toMatchObject({
+    await expect(
+      service.resolveAcademicStructure({ departmentId: 'd1' }),
+    ).resolves.toMatchObject({
       id: 'as_plat',
     });
   });
@@ -302,7 +407,9 @@ describe('resolving which structure governs a unit', () => {
     // real cost on a list this small; the candidates go in one `in` clause.
     const { service, structureFindMany } = build({
       department: { facultyId: 'f1', faculty: { universityId: 'u1' } },
-      structures: [{ id: 'as_plat', kind: AcademicStructureKind.YEAR, scopeKey: 'platform' }],
+      structures: [
+        { id: 'as_plat', kind: AcademicStructureKind.YEAR, scopeKey: 'platform' },
+      ],
     });
 
     await service.resolveAcademicStructure({ departmentId: 'd1' });
@@ -330,7 +437,9 @@ describe('the list a student picks from', () => {
     // Without this the app has to infer "Year" or "Level" from the names,
     // which breaks the moment an Admin writes them in Arabic only.
     const { service } = build({
-      structures: [{ id: 'as_fac', kind: AcademicStructureKind.LEVEL, scopeKey: 'faculty:f1' }],
+      structures: [
+        { id: 'as_fac', kind: AcademicStructureKind.LEVEL, scopeKey: 'faculty:f1' },
+      ],
       faculty: { universityId: 'u1' },
       entries: [
         { id: 'ay1', order: 1, name: 'Level 1', nameAr: 'المستوى الأول', isActive: true },
@@ -339,7 +448,11 @@ describe('the list a student picks from', () => {
 
     const list = await service.academicYears({ facultyId: 'f1' });
     expect(list).toEqual([
-      expect.objectContaining({ order: 1, name: 'Level 1', kind: AcademicStructureKind.LEVEL }),
+      expect.objectContaining({
+        order: 1,
+        name: 'Level 1',
+        kind: AcademicStructureKind.LEVEL,
+      }),
     ]);
   });
 
@@ -350,13 +463,18 @@ describe('the list a student picks from', () => {
 
   it('refuses a scope naming two units', async () => {
     const { service } = build();
-    await expect(service.academicYears({ universityId: 'u1', facultyId: 'f1' })).rejects.toThrow();
+    await expect(
+      service.academicYears({ universityId: 'u1', facultyId: 'f1' }),
+    ).rejects.toThrow();
   });
 });
 
 describe('creating a structure', () => {
   it('stores the derived scopeKey and the single owner', async () => {
-    const { service, structureCreate } = build({ existingByScope: null, department: { facultyId: 'f1', faculty: { universityId: 'u1' } } });
+    const { service, structureCreate } = build({
+      existingByScope: null,
+      department: { facultyId: 'f1', faculty: { universityId: 'u1' } },
+    });
 
     await service.createAcademicStructure(
       { kind: AcademicStructureKind.LEVEL, facultyId: 'f1' },
@@ -379,7 +497,10 @@ describe('creating a structure', () => {
     // error rather than a unique violation surfaced as a 500.
     const { service } = build({ existingByScope: { id: 'as_existing' } });
     await expect(
-      service.createAcademicStructure({ kind: AcademicStructureKind.YEAR, facultyId: 'f1' }, ACTOR),
+      service.createAcademicStructure(
+        { kind: AcademicStructureKind.YEAR, facultyId: 'f1' },
+        ACTOR,
+      ),
     ).rejects.toThrow();
   });
 
@@ -408,7 +529,10 @@ describe('several platform-wide structures may coexist', () => {
   const platformWide = { kind: AcademicStructureKind.YEAR };
 
   it('creates the first platform-wide structure', async () => {
-    const { service, structureCreate } = build({ existingByScope: null, department: { facultyId: 'f1', faculty: { universityId: 'u1' } } });
+    const { service, structureCreate } = build({
+      existingByScope: null,
+      department: { facultyId: 'f1', faculty: { universityId: 'u1' } },
+    });
 
     const created = await service.createAcademicStructure(platformWide, ACTOR);
 
@@ -426,7 +550,9 @@ describe('several platform-wide structures may coexist', () => {
   it('creates a second platform-wide structure even though one already exists', async () => {
     // The regression. `existingByScope` says the table already holds a platform
     // row; before the change this threw HTTP 422.
-    const { service, structureCreate } = build({ existingByScope: { id: 'as_platform_1' } });
+    const { service, structureCreate } = build({
+      existingByScope: { id: 'as_platform_1' },
+    });
 
     const created = await service.createAcademicStructure(platformWide, ACTOR);
 
@@ -435,9 +561,13 @@ describe('several platform-wide structures may coexist', () => {
   });
 
   it('creates a third platform-wide structure too', async () => {
-    const { service, structureCreate } = build({ existingByScope: { id: 'as_platform_2' } });
+    const { service, structureCreate } = build({
+      existingByScope: { id: 'as_platform_2' },
+    });
 
-    await expect(service.createAcademicStructure(platformWide, ACTOR)).resolves.toMatchObject({
+    await expect(
+      service.createAcademicStructure(platformWide, ACTOR),
+    ).resolves.toMatchObject({
       scopeKey: PLATFORM_SCOPE_KEY,
     });
     expect(structureCreate).toHaveBeenCalledTimes(1);
@@ -447,7 +577,9 @@ describe('several platform-wide structures may coexist', () => {
     // Proof that the fix is in the service and not a coincidence of the mock:
     // the duplicate pre-check is skipped outright for the platform scope, so a
     // row already holding that key cannot cause a rejection.
-    const { service, structureFindFirst } = build({ existingByScope: { id: 'as_platform_1' } });
+    const { service, structureFindFirst } = build({
+      existingByScope: { id: 'as_platform_1' },
+    });
 
     await service.createAcademicStructure(platformWide, ACTOR);
 
@@ -474,7 +606,10 @@ describe('several platform-wide structures may coexist', () => {
     const { service, structureCreate } = build({ existingByScope: { id: 'as_fac' } });
 
     await expect(
-      service.createAcademicStructure({ kind: AcademicStructureKind.LEVEL, facultyId: 'f1' }, ACTOR),
+      service.createAcademicStructure(
+        { kind: AcademicStructureKind.LEVEL, facultyId: 'f1' },
+        ACTOR,
+      ),
     ).rejects.toMatchObject({ fields: { scope: [DUPLICATE_SCOPE_MESSAGE] } });
     expect(structureCreate).not.toHaveBeenCalled();
   });
@@ -494,10 +629,20 @@ describe('several platform-wide structures may coexist', () => {
   it('still allows a first structure for each scoped unit', async () => {
     // The counterpart to the cases above: relaxing the platform scope must not
     // have relaxed anything else.
-    for (const scope of [{ universityId: 'u1' }, { facultyId: 'f1' }, { departmentId: 'd1' }]) {
-      const { service, structureCreate } = build({ existingByScope: null, department: { facultyId: 'f1', faculty: { universityId: 'u1' } } });
+    for (const scope of [
+      { universityId: 'u1' },
+      { facultyId: 'f1' },
+      { departmentId: 'd1' },
+    ]) {
+      const { service, structureCreate } = build({
+        existingByScope: null,
+        department: { facultyId: 'f1', faculty: { universityId: 'u1' } },
+      });
       await expect(
-        service.createAcademicStructure({ kind: AcademicStructureKind.YEAR, ...scope }, ACTOR),
+        service.createAcademicStructure(
+          { kind: AcademicStructureKind.YEAR, ...scope },
+          ACTOR,
+        ),
       ).resolves.toBeDefined();
       expect(structureCreate).toHaveBeenCalledTimes(1);
     }
@@ -506,7 +651,10 @@ describe('several platform-wide structures may coexist', () => {
   it('still rejects a scope naming two owners', async () => {
     // Untouched by this change, and worth pinning: allowing multiple
     // platform-wide structures must not weaken the single-owner rule.
-    const { service, structureCreate } = build({ existingByScope: null, department: { facultyId: 'f1', faculty: { universityId: 'u1' } } });
+    const { service, structureCreate } = build({
+      existingByScope: null,
+      department: { facultyId: 'f1', faculty: { universityId: 'u1' } },
+    });
     await expect(
       service.createAcademicStructure(
         { kind: AcademicStructureKind.YEAR, universityId: 'u1', facultyId: 'f1' },
@@ -514,7 +662,9 @@ describe('several platform-wide structures may coexist', () => {
       ),
     ).rejects.toMatchObject({
       fields: {
-        scope: ['an academic structure belongs to one unit: a university, a faculty or a department'],
+        scope: [
+          'an academic structure belongs to one unit: a university, a faculty or a department',
+        ],
       },
     });
     expect(structureCreate).not.toHaveBeenCalled();
@@ -524,7 +674,9 @@ describe('several platform-wide structures may coexist', () => {
     // Several platform rows now match the fallback key, so resolution has to be
     // ordered or the inherited ladder could differ between two identical calls.
     const { service, structureFindMany } = build({
-      structures: [{ id: 'as_plat', kind: AcademicStructureKind.YEAR, scopeKey: 'platform' }],
+      structures: [
+        { id: 'as_plat', kind: AcademicStructureKind.YEAR, scopeKey: 'platform' },
+      ],
     });
 
     await service.resolveAcademicStructure({});
@@ -572,7 +724,9 @@ describe('defining the rungs', () => {
 
     const call = yearUpsert.mock.calls[0];
     if (!call) throw new Error('academicYear.upsert was never called');
-    expect(call[0].where).toEqual({ structureId_order: { structureId: 'as_1', order: 3 } });
+    expect(call[0].where).toEqual({
+      structureId_order: { structureId: 'as_1', order: 3 },
+    });
     expect(call[0].update).toMatchObject({ name: 'Year Three', isActive: true });
   });
 
@@ -627,16 +781,28 @@ describe('defining the rungs', () => {
   it('rejects a non-positive or fractional order', async () => {
     const { service } = build({ structureWithEntries: structure });
     await expect(
-      service.replaceStructureEntries('as_1', [{ order: 0, name: 'A', nameAr: 'أ' }], ACTOR),
+      service.replaceStructureEntries(
+        'as_1',
+        [{ order: 0, name: 'A', nameAr: 'أ' }],
+        ACTOR,
+      ),
     ).rejects.toThrow();
     await expect(
-      service.replaceStructureEntries('as_1', [{ order: 1.5, name: 'A', nameAr: 'أ' }], ACTOR),
+      service.replaceStructureEntries(
+        'as_1',
+        [{ order: 1.5, name: 'A', nameAr: 'أ' }],
+        ACTOR,
+      ),
     ).rejects.toThrow();
   });
 
   it('busts the catalogue cache, so the picker does not serve a stale list', async () => {
     const { service, redis } = build({ structureWithEntries: structure });
-    await service.replaceStructureEntries('as_1', [{ order: 1, name: 'A', nameAr: 'أ' }], ACTOR);
+    await service.replaceStructureEntries(
+      'as_1',
+      [{ order: 1, name: 'A', nameAr: 'أ' }],
+      ACTOR,
+    );
     expect(redis.delByPattern).toHaveBeenCalledWith('catalog:*');
   });
 });
@@ -670,7 +836,7 @@ describe('resolveAcademicStructure — explicit faculty overrides', () => {
     scopeKey: PLATFORM_SCOPE_KEY,
   };
 
-  it('prefers the pinned structure over the faculty\'s own university ladder', async () => {
+  it("prefers the pinned structure over the faculty's own university ladder", async () => {
     const { service } = build({
       faculty: { universityId: 'u_a' },
       structures: [UNIVERSITY_LADDER, PLATFORM_LADDER],
@@ -765,7 +931,7 @@ describe('resolveAcademicStructure — explicit faculty overrides', () => {
     expect(resolved?.id).toBe('as_univ_a');
   });
 
-  it('applies the faculty\'s override to that faculty\'s departments', async () => {
+  it("applies the faculty's override to that faculty's departments", async () => {
     const { service, overrideFindUnique } = build({
       department: { facultyId: 'f_x', faculty: { universityId: 'u_a' } },
       structures: [UNIVERSITY_LADDER, PLATFORM_LADDER],
@@ -787,7 +953,7 @@ describe('resolveAcademicStructure — explicit faculty overrides', () => {
     );
   });
 
-  it("preserves the department ladder when its faculty has an override", async () => {
+  it('preserves the department ladder when its faculty has an override', async () => {
     // The override sits above every inherited level, including a department
     // that has its own structure. `assertAcademicYearBelongsToStructure`
     // resolves a course's ladder from its first department and relies on

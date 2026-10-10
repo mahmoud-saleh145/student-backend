@@ -23,6 +23,7 @@ import {
   IsString,
   MaxLength,
   Min,
+  ValidateIf,
   ValidateNested,
 } from 'class-validator';
 
@@ -72,11 +73,38 @@ function parseEntity(value: string): CatalogEntity {
   return resolved as CatalogEntity;
 }
 
+/**
+ * Renaming a college or a department.
+ *
+ * No parent id: reparenting is not offered here — see
+ * `CatalogService.updateFaculty`. The shape is shared by both because the two
+ * rows carry the same editable fields.
+ */
+class UpdateCatalogNodeDto {
+  @IsOptional() @IsString() @MaxLength(160) name?: string;
+  @IsOptional() @IsString() @MaxLength(160) nameAr?: string;
+  @IsOptional() @IsBoolean() isActive?: boolean;
+  @IsOptional() @Type(() => Number) @IsInt() @Min(0) sortOrder?: number;
+}
+
+class UpdateDepartmentDto extends UpdateCatalogNodeDto {}
+
+/**
+ * Creating a university, including the academic progression system its colleges
+ * inherit.
+ *
+ * The field is named `defaultAcademicSystem` rather than `type` on purpose:
+ * "type" was the ambiguous label that made this look like a government/private
+ * flag, and the product keeps the two concepts separate.
+ */
 class CreateUniversityDto {
   @IsString() @MaxLength(160) name!: string;
   @IsString() @MaxLength(160) nameAr!: string;
   @IsOptional() @IsString() @MaxLength(32) code?: string;
   @IsOptional() @Type(() => Number) @IsInt() @Min(0) sortOrder?: number;
+  @IsOptional()
+  @IsEnum(AcademicStructureKind)
+  defaultAcademicSystem?: AcademicStructureKind;
 }
 
 class UpdateUniversityDto {
@@ -85,6 +113,23 @@ class UpdateUniversityDto {
   @IsOptional() @IsString() @MaxLength(500) logoUrl?: string;
   @IsOptional() @IsBoolean() isActive?: boolean;
   @IsOptional() @Type(() => Number) @IsInt() @Min(0) sortOrder?: number;
+  @IsOptional()
+  @IsEnum(AcademicStructureKind)
+  defaultAcademicSystem?: AcademicStructureKind;
+}
+
+/**
+ * A college's academic system override.
+ *
+ * `null` is meaningful and distinct from "field omitted": it clears the
+ * override and returns the college to inheritance. The field itself is optional
+ * so a caller can leave the setting untouched.
+ */
+class UpdateFacultyDto extends UpdateCatalogNodeDto {
+  @IsOptional()
+  @ValidateIf((_object, value) => value !== null)
+  @IsEnum(AcademicStructureKind)
+  academicSystemOverride?: AcademicStructureKind | null;
 }
 
 class CreateFacultyDto {
@@ -100,20 +145,6 @@ class CreateDepartmentDto {
   @IsString() @MaxLength(32) facultyId!: string;
   @IsString() @MaxLength(160) name!: string;
   @IsString() @MaxLength(160) nameAr!: string;
-  @IsOptional() @Type(() => Number) @IsInt() @Min(0) sortOrder?: number;
-}
-
-/**
- * Renaming a college or a department.
- *
- * No parent id: reparenting is not offered here — see
- * `CatalogService.updateFaculty`. The shape is shared by both because the two
- * rows carry the same editable fields.
- */
-class UpdateCatalogNodeDto {
-  @IsOptional() @IsString() @MaxLength(160) name?: string;
-  @IsOptional() @IsString() @MaxLength(160) nameAr?: string;
-  @IsOptional() @IsBoolean() isActive?: boolean;
   @IsOptional() @Type(() => Number) @IsInt() @Min(0) sortOrder?: number;
 }
 
@@ -226,6 +257,29 @@ export class CatalogController {
   })
   academicYears(@Query() query: AcademicScopeQueryDto) {
     return this.catalog.academicYears(query);
+  }
+
+  @Get('academic-selection')
+  @Public()
+  @ApiOperation({
+    summary: 'The resolved academic system and the matching year/level list',
+    description:
+      "The single call a registration or onboarding screen needs. `academicSystem` is the college's effective system — the college's override if one is configured, otherwise its university's default — reported with `source` so the UI can say whether it is inherited or an explicit override, and with the entries that match it in `academicYears`. The two cannot disagree because they come from one request. No government/private university classification is accepted or required anywhere in this flow.",
+  })
+  academicSelection(@Query() query: AcademicScopeQueryDto) {
+    return this.catalog.academicSelection(query);
+  }
+
+  @Get('academic-systems')
+  @AdminOnly()
+  @ApiOperation({
+    summary:
+      'Every university default and college override, with inheritance made explicit',
+    description:
+      'Each college reports its effective system, whether that value is inherited from its university or is an explicit override, and whether a stored override has gone stale by matching its university default.',
+  })
+  academicSystemOverview() {
+    return this.catalog.academicSystemOverview();
   }
 
   @Get('academic-structures')
@@ -345,15 +399,40 @@ export class CatalogController {
   @Patch('faculties/:id')
   @AdminOnly()
   @ApiOperation({
-    summary: 'Rename or reorder a college',
-    description: 'The parent university cannot be changed here — that is a migration.',
+    summary: 'Rename or reorder a college, or set its academic system override',
+    description:
+      "The parent university cannot be changed here — that is a migration. `academicSystemOverride` set to YEAR or LEVEL overrides the university's default for this college alone; set it to null to return the college to inheritance; omit it to leave it untouched. Sending a value equal to the university's current default is refused, because it records no decision and would survive the next change of that default.",
   })
   updateFaculty(
     @Param('id') id: string,
-    @Body() dto: UpdateCatalogNodeDto,
+    @Body() dto: UpdateFacultyDto,
     @CurrentUser() actor: AuthenticatedUser,
   ) {
     return this.catalog.updateFaculty(id, dto, actor);
+  }
+
+  /**
+   * The override on its own route as well, for a screen that saves the academic
+   * setting separately from the college's name and order. Same service call, so
+   * the two routes cannot drift.
+   */
+  @Put('faculties/:id/academic-system-override')
+  @AdminOnly()
+  @ApiOperation({
+    summary: "Set or clear a college's academic system override",
+    description:
+      'Send a YEAR or LEVEL value to override the university default for this college, or null to inherit. Independent of government/private ownership: any college of any university may be overridden in either direction.',
+  })
+  setFacultyAcademicSystemOverride(
+    @Param('id') id: string,
+    @Body() body: { academicSystemOverride?: AcademicStructureKind | null },
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    return this.catalog.setFacultyAcademicSystemOverride(
+      id,
+      body.academicSystemOverride ?? null,
+      actor,
+    );
   }
 
   @Patch('departments/:id')
@@ -364,7 +443,7 @@ export class CatalogController {
   })
   updateDepartment(
     @Param('id') id: string,
-    @Body() dto: UpdateCatalogNodeDto,
+    @Body() dto: UpdateDepartmentDto,
     @CurrentUser() actor: AuthenticatedUser,
   ) {
     return this.catalog.updateDepartment(id, dto, actor);

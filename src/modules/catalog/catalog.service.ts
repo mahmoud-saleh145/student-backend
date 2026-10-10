@@ -1,15 +1,16 @@
 import { Injectable } from '@nestjs/common';
-import {
-  AcademicStructureKind,
-  AuditAction,
-  type Prisma,
-  type UserRole,
-} from '@prisma/client';
+import { AcademicStructureKind, AuditAction, type UserRole } from '@prisma/client';
 
 import { AppException } from '../../common/errors/app.exception';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { AuditService } from '../audit/audit.service';
+
+import {
+  AcademicSystemConfigurationError,
+  resolveAcademicSystem,
+  type AcademicSystemResolution,
+} from './academic-system';
 
 /** Catalogue data changes a few times a year; cache it hard. */
 const CACHE_TTL_SECONDS = 15 * 60;
@@ -161,14 +162,257 @@ export class CatalogService {
     });
   }
 
+  /**
+   * The student's picker payload: the resolved system AND the entries.
+   *
+   * One endpoint rather than two, because the two answers must agree and the
+   * student app has no way to reconcile them. It renders the label from
+   * `academicSystem.system` and lists `academicYears`; a client that mixes the
+   * two up shows a student "Level 000" under a "Which year are you in?" heading.
+   *
+   * `academicSystem` is null only when no system is configured at all, which the
+   * UI shows as "this college is not set up yet" — an explicit state, not a
+   * silent guess.
+   *
+   * `ladderMatchesSystem` reports whether the ladder that actually governs this
+   * unit is expressed in the configured vocabulary. It is false after an
+   * administrator changes a university's default without reconfiguring its
+   * ladder — the rungs keep their old names, and nothing is renamed for them.
+   *
+   * `system` deliberately stays the CONFIGURED value even when it disagrees with
+   * the ladder. An earlier version silently rewrote it to the ladder's kind,
+   * which made the picker self-consistent and the configuration invisible: the
+   * admin who changed the default saw a working screen and no warning. Reporting
+   * the disagreement is what lets the admin screen tell them.
+   */
+  async academicSelection(scope: AcademicScope): Promise<{
+    academicSystem: AcademicSystemResolution | null;
+    academicYears: Awaited<ReturnType<CatalogService['academicYears']>>;
+    /**
+     * The vocabulary the governing ladder's own entries are written in.
+     *
+     * Null when there is no ladder at all. Clients use it to label the control
+     * so the entries never appear under a heading that contradicts them.
+     */
+    ladderKind: AcademicStructureKind | null;
+    /** False means the configuration and the ladder disagree. See above. */
+    ladderMatchesSystem: boolean;
+  }> {
+    assertSingleAcademicOwner(scope);
+
+    let academicSystem: AcademicSystemResolution | null = null;
+    try {
+      academicSystem = await this.resolveAcademicSystem(scope);
+    } catch (error) {
+      // A missing configuration must not take the whole picker down: the
+      // entries may still be readable and the admin needs to see them to
+      // diagnose the problem. The null says "no system", which is the signal
+      // the UI turns into a clear message.
+      if (!(error instanceof AppException)) throw error;
+    }
+
+    const academicYears = await this.academicYears(scope);
+    const ladderKind = academicYears[0]?.kind ?? null;
+
+    return {
+      academicSystem,
+      academicYears,
+      ladderKind,
+      // No ladder, or no configuration: nothing to disagree about.
+      ladderMatchesSystem:
+        academicSystem === null || ladderKind === null
+          ? true
+          : ladderKind === academicSystem.system,
+    };
+  }
+
+  /**
+   * Refuses a structure whose `kind` contradicts the college's configured system.
+   *
+   * The structure's `kind` says what its own entries are called; the college's
+   * system says what that college uses. When an Admin sets up a LEVEL college
+   * but attaches a YEAR ladder, the student would be shown "First Year" under a
+   * levels question. Catching it at write time keeps the stored data honest
+   * instead of relying on every reader to notice.
+   */
+  private async assertStructureKindMatchesSystem(
+    scope: AcademicScope,
+    kind: AcademicStructureKind,
+  ): Promise<void> {
+    // The platform-wide structure belongs to nobody, so there is no configured
+    // system for it to contradict. It is the ladder every unit falls back to
+    // before any of them has said anything, and refusing to create one would
+    // leave a fresh install with nowhere to put its first year.
+    if (!scope.universityId && !scope.facultyId && !scope.departmentId) return;
+
+    let resolution: AcademicSystemResolution;
+    try {
+      resolution = await this.resolveAcademicSystem(scope);
+    } catch (error) {
+      // A unit whose system is not configured yet gets to choose its own kind.
+      // The configuration error is real, but it is about the system, not about
+      // this ladder: refusing here would deadlock a new unit into being
+      // un-creatable — you cannot configure a system on a unit that has no
+      // ladder yet, and you cannot create a ladder on a unit with no system.
+      // The mismatch surfaces the moment the system is set, which is the first
+      // moment it can be reported meaningfully.
+      //
+      // A unit that does not exist is the same situation from here: the
+      // existence check belongs to the caller that actually has to write the
+      // row, and it runs before this.
+      if (error instanceof AcademicSystemConfigurationError) return;
+      if (error instanceof AppException) return;
+      throw error;
+    }
+
+    if (resolution.system === kind) return;
+
+    throw AppException.validation({
+      kind: [
+        resolution.source === 'COLLEGE_OVERRIDE'
+          ? `this college is configured to use ${
+              resolution.system === AcademicStructureKind.LEVEL ? 'levels' : 'years'
+            }, so its ladder must be a ${kind === AcademicStructureKind.LEVEL ? 'level' : 'year'} ladder`
+          : `this university is configured to use ${
+              resolution.system === AcademicStructureKind.LEVEL ? 'levels' : 'years'
+            }, so its ladder must be a ${kind === AcademicStructureKind.LEVEL ? 'level' : 'year'} ladder`,
+      ],
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // Academic structures
   // ---------------------------------------------------------------------------
+
+  // ---------------------------------------------------------------------------
+  // Academic system (YEAR vs LEVEL)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The one resolver for "which system does this college use".
+   *
+   * Loads the two configuration points and hands them to the pure rule in
+   * `academic-system.ts`. Every caller in the codebase goes through here, so the
+   * admin screen, the student picker and the registration validator cannot
+   * disagree about a college.
+   *
+   * Accepts a department scope as a convenience — a student picks a department
+   * long before they know which college it belongs to, and a department's
+   * system is its college's system. Departments do not override anything.
+   */
+  async resolveAcademicSystem(scope: AcademicScope): Promise<AcademicSystemResolution> {
+    assertSingleAcademicOwner(scope);
+
+    if (scope.departmentId) {
+      const department = await this.prisma.department.findUnique({
+        where: { id: scope.departmentId },
+        select: {
+          facultyId: true,
+          faculty: {
+            select: {
+              id: true,
+              academicSystemOverride: true,
+              university: { select: { id: true, defaultAcademicSystem: true } },
+            },
+          },
+        },
+      });
+      if (!department) throw AppException.notFound('department', scope.departmentId);
+
+      return this.resolveAcademicSystemForFaculty({
+        facultyId: department.faculty.id,
+        facultyOverride: department.faculty.academicSystemOverride,
+        universityId: department.faculty.university.id,
+        universityDefault: department.faculty.university.defaultAcademicSystem,
+      });
+    }
+
+    if (scope.facultyId) {
+      const faculty = await this.prisma.faculty.findUnique({
+        where: { id: scope.facultyId },
+        select: {
+          id: true,
+          academicSystemOverride: true,
+          university: { select: { id: true, defaultAcademicSystem: true } },
+        },
+      });
+      if (!faculty) throw AppException.notFound('faculty', scope.facultyId);
+
+      return this.resolveAcademicSystemForFaculty({
+        facultyId: faculty.id,
+        facultyOverride: faculty.academicSystemOverride,
+        universityId: faculty.university.id,
+        universityDefault: faculty.university.defaultAcademicSystem,
+      });
+    }
+
+    if (scope.universityId) {
+      // A university has no override of its own, so this is the default by
+      // definition. The university scope exists for the admin screen, which asks
+      // "what is this university's default?" directly.
+      const university = await this.prisma.university.findUnique({
+        where: { id: scope.universityId },
+        select: { id: true, defaultAcademicSystem: true },
+      });
+      if (!university) throw AppException.notFound('university', scope.universityId);
+
+      return resolveAcademicSystem({
+        universityId: university.id,
+        facultyId: null,
+        facultyOverride: null,
+        universityDefault: university.defaultAcademicSystem,
+      });
+    }
+
+    // The platform fallback. There is no university to inherit from, so this is
+    // only reachable by a caller that asked for no scope at all.
+    throw new AcademicSystemConfigurationError({ universityId: null, facultyId: null });
+  }
+
+  /**
+   * The faculty branch, shared by the faculty and department scopes.
+   *
+   * Translates the configuration error into an `AppException` carrying the
+   * offending ids, so an Admin gets a field error naming the unit to fix rather
+   * than a 500.
+   */
+  private resolveAcademicSystemForFaculty(input: {
+    facultyId: string;
+    facultyOverride: AcademicStructureKind | null;
+    universityId: string;
+    universityDefault: AcademicStructureKind | null;
+  }): AcademicSystemResolution {
+    try {
+      return resolveAcademicSystem({
+        facultyId: input.facultyId,
+        facultyOverride: input.facultyOverride,
+        universityId: input.universityId,
+        universityDefault: input.universityDefault,
+      });
+    } catch (error) {
+      if (error instanceof AcademicSystemConfigurationError) {
+        throw AppException.validation(
+          {
+            academicSystem: [
+              'no academic system is configured for this college: set its university default, or set an override on the college',
+            ],
+          },
+          'Academic structure is not configured',
+        );
+      }
+      throw error;
+    }
+  }
 
   /**
    * Department ladders take precedence so preparatory years and program levels
    * remain separate. Otherwise use the faculty override, then the owning
    * faculty, university and platform ladder in that order.
+   *
+   * NOTE: this answers "which LADDER supplies the entries", which is a separate
+   * question from `resolveAcademicSystem` ("whether that ladder is expressed in
+   * years or in levels"). They are kept apart on purpose — see
+   * `assertStructureKindMatchesSystem`.
    */
   async resolveAcademicStructure(scope: AcademicScope) {
     assertSingleAcademicOwner(scope);
@@ -372,11 +616,28 @@ export class CatalogService {
     return { id: structureId, facultyIds: wanted };
   }
 
-  private async assertDepartmentStructureKind(departmentId: string, kind: AcademicStructureKind) {
-    const department = await this.prisma.department.findUnique({ where: { id: departmentId }, select: { studyType: true } });
+  /**
+   * A department's ladder must be expressed in its COLLEGE's system.
+   *
+   * This used to be `studyType === 'PROGRAMS' ? LEVEL : YEAR`, which made the
+   * academic progression system a consequence of what a department is called.
+   * That is the assumption the product explicitly rules out: a programme
+   * department inside a year-based college must show years, and a general
+   * department inside a level-based college must show levels.
+   *
+   * `studyType` survives as descriptive metadata for the admin UI and for course
+   * targeting; it just no longer decides this.
+   */
+  private async assertDepartmentStructureKind(
+    departmentId: string,
+    kind: AcademicStructureKind,
+  ): Promise<void> {
+    const department = await this.prisma.department.findUnique({
+      where: { id: departmentId },
+      select: { id: true },
+    });
     if (!department) throw AppException.notFound('department');
-    const expected = department.studyType === 'PROGRAMS' ? AcademicStructureKind.LEVEL : AcademicStructureKind.YEAR;
-    if (kind !== expected) throw AppException.validation({ kind: ['General departments use years; Programs use levels'] });
+    await this.assertStructureKindMatchesSystem({ departmentId }, kind);
   }
 
   async createAcademicStructure(
@@ -408,7 +669,9 @@ export class CatalogService {
       }
     }
 
-    if (input.departmentId) await this.assertDepartmentStructureKind(input.departmentId, input.kind);
+    if (input.departmentId)
+      await this.assertDepartmentStructureKind(input.departmentId, input.kind);
+    else await this.assertStructureKindMatchesSystem(input, input.kind);
 
     const created = await this.prisma.academicStructure.create({
       data: {
@@ -439,7 +702,11 @@ export class CatalogService {
   ) {
     const before = await this.prisma.academicStructure.findUnique({ where: { id } });
     if (!before) throw AppException.notFound('academic structure');
-    if (before.departmentId && data.kind) await this.assertDepartmentStructureKind(before.departmentId, data.kind);
+    if (data.kind) {
+      if (before.departmentId)
+        await this.assertDepartmentStructureKind(before.departmentId, data.kind);
+      else await this.assertStructureKindMatchesSystem(before, data.kind);
+    }
 
     const updated = await this.prisma.academicStructure.update({ where: { id }, data });
 
@@ -565,10 +832,28 @@ export class CatalogService {
   }
 
   async createUniversity(
-    data: { name: string; nameAr: string; code?: string; sortOrder?: number },
+    data: {
+      name: string;
+      nameAr: string;
+      code?: string;
+      sortOrder?: number;
+      defaultAcademicSystem?: AcademicStructureKind;
+    },
     actor: { id: string; role: UserRole },
   ) {
-    const created = await this.prisma.university.create({ data });
+    const created = await this.prisma.university.create({
+      data: {
+        name: data.name,
+        nameAr: data.nameAr,
+        code: data.code,
+        sortOrder: data.sortOrder,
+        // Not written when absent: Prisma then applies the column default, and
+        // the row stays a valid inheritable configuration.
+        ...(data.defaultAcademicSystem
+          ? { defaultAcademicSystem: data.defaultAcademicSystem }
+          : {}),
+      },
+    });
     await this.bust();
     await this.audit.record({
       actorId: actor.id,
@@ -581,15 +866,52 @@ export class CatalogService {
     return created;
   }
 
+  /**
+   * Updates a university.
+   *
+   * Changing `defaultAcademicSystem` is a genuine inheritance event, not a
+   * rename: every college that has no override follows the university straight
+   * away, and every college that HAS one keeps what it had. Nothing is copied
+   * anywhere, which is what makes the change reversible and what stops the next
+   * university-wide change from being a no-op.
+   *
+   * A college whose override was recorded as the opposite system keeps working
+   * untouched. A college whose stored override would become redundant is left
+   * alone too — the database trigger only judges NEW or CHANGED override
+   * values, precisely so that flipping a university's default does not fail on
+   * a row that was legitimate a moment earlier. The admin screen surfaces the
+   * now-redundant overrides so an Admin can clear them; nothing breaks in the
+   * meantime.
+   */
   async updateUniversity(
     id: string,
-    data: Prisma.UniversityUpdateInput,
+    data: {
+      name?: string;
+      nameAr?: string;
+      logoUrl?: string;
+      isActive?: boolean;
+      sortOrder?: number;
+      defaultAcademicSystem?: AcademicStructureKind;
+    },
     actor: { id: string; role: UserRole },
   ) {
     const before = await this.prisma.university.findUnique({ where: { id } });
     if (!before) throw AppException.notFound('University', id);
 
-    const updated = await this.prisma.university.update({ where: { id }, data });
+    const updated = await this.prisma.university.update({
+      where: { id },
+      data: {
+        ...(data.name !== undefined ? { name: data.name } : {}),
+        ...(data.nameAr !== undefined ? { nameAr: data.nameAr } : {}),
+        ...(data.logoUrl !== undefined ? { logoUrl: data.logoUrl } : {}),
+        ...(data.isActive !== undefined ? { isActive: data.isActive } : {}),
+        ...(data.sortOrder !== undefined ? { sortOrder: data.sortOrder } : {}),
+        ...(data.defaultAcademicSystem !== undefined
+          ? { defaultAcademicSystem: data.defaultAcademicSystem }
+          : {}),
+      },
+    });
+
     await this.bust();
     await this.audit.record({
       actorId: actor.id,
@@ -601,6 +923,177 @@ export class CatalogService {
       after: updated,
     });
     return updated;
+  }
+
+  /**
+   * Sets or clears a college's academic system override.
+   *
+   * `null` is a first-class value here, not "field omitted": it is how an Admin
+   * returns a college to inheritance. Sending no field at all leaves the column
+   * alone.
+   *
+   * A redundant override is refused with a field error. Storing YEAR on a
+   * university that already defaults to YEAR records no decision, but it would
+   * survive the next change of that default and then mean something nobody
+   * asked for — so the honest instruction is to send null instead.
+   */
+  async setFacultyAcademicSystemOverride(
+    facultyId: string,
+    override: AcademicStructureKind | null,
+    actor: { id: string; role: UserRole },
+  ) {
+    const faculty = await this.prisma.faculty.findFirst({
+      where: { id: facultyId, ...notDeleted },
+      select: {
+        id: true,
+        academicSystemOverride: true,
+        university: { select: { id: true, defaultAcademicSystem: true } },
+      },
+    });
+    if (!faculty) throw AppException.notFound('Faculty', facultyId);
+
+    if (override && override === faculty.university.defaultAcademicSystem) {
+      throw AppException.validation({
+        academicSystemOverride: [
+          `this college already inherits ${override} from its university; clear the override instead of storing the same value`,
+        ],
+      });
+    }
+
+    const updated = await this.prisma.faculty.update({
+      where: { id: facultyId },
+      data: { academicSystemOverride: override },
+    });
+
+    await this.bust();
+    await this.audit.record({
+      actorId: actor.id,
+      actorRole: actor.role,
+      /*
+        UPDATE for both branches, deliberately.
+        `AuditAction.RESTORE` means one specific thing in this file — it is the
+        partner of `DELETE` for reactivating a soft-deleted row (see
+        `setActive`), and it is already emitted for the same `faculty` entity.
+        Reusing it to mean "cleared a field value" would put two unrelated events
+        under one filter, so anyone auditing "which colleges were reactivated"
+        would also be shown every override that was ever cleared.
+        Clearing an override is a mutation of a live row, which is what UPDATE
+        covers; the note already says which of the two it was.
+      */
+      action: AuditAction.UPDATE,
+      entity: 'faculty',
+      entityId: facultyId,
+      before: { academicSystemOverride: faculty.academicSystemOverride },
+      after: { academicSystemOverride: override },
+      note: override
+        ? 'College academic system override set'
+        : 'College academic system override cleared — inherits university default',
+    });
+
+    // The effective system is the useful answer for a UI that just saved.
+    return {
+      id: updated.id,
+      academicSystemOverride: updated.academicSystemOverride,
+      academicSystem: await this.resolveAcademicSystem({ facultyId }),
+    };
+  }
+
+  /**
+   * The Academic Structure screen's data.
+   *
+   * Every university with its default system, every college with its effective
+   * system AND whether that value is inherited or an override. The two are
+   * reported separately on purpose: an Admin looking at a college must be able
+   * to tell "Levels, inherited from Cairo University" from "Levels, set on this
+   * college", because only the second one survives a change of the default.
+   *
+   * `redundantOverride` marks a college whose stored override now equals its
+   * university's default — harmless, but stale, and worth clearing. The
+   * database cannot reject it retroactively (that would fail legitimate data on
+   * a default change), so it is reported instead.
+   */
+  async academicSystemOverview() {
+    const [universities, faculties] = await Promise.all([
+      this.prisma.university.findMany({
+        where: { ...notDeleted },
+        orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
+        select: {
+          id: true,
+          name: true,
+          nameAr: true,
+          isActive: true,
+          defaultAcademicSystem: true,
+          _count: { select: { faculties: { where: { ...notDeleted } } } },
+        },
+      }),
+      this.prisma.faculty.findMany({
+        where: { ...notDeleted },
+        orderBy: [{ name: 'asc' }],
+        select: {
+          id: true,
+          name: true,
+          nameAr: true,
+          isActive: true,
+          universityId: true,
+          academicSystemOverride: true,
+          university: { select: { id: true, name: true, defaultAcademicSystem: true } },
+        },
+      }),
+    ]);
+
+    return {
+      universities: universities.map((u) => ({
+        id: u.id,
+        name: u.name,
+        nameAr: u.nameAr,
+        isActive: u.isActive,
+        defaultAcademicSystem: u.defaultAcademicSystem,
+        collegeCount: u._count.faculties,
+      })),
+      faculties: await Promise.all(
+        faculties.map(async (f) => {
+          const resolution = resolveAcademicSystem({
+            facultyId: f.id,
+            facultyOverride: f.academicSystemOverride,
+            universityId: f.universityId,
+            universityDefault: f.university.defaultAcademicSystem,
+          });
+
+          /*
+            The vocabulary the college's ACTUAL ladder is written in, resolved
+            through the same precedence as `resolveAcademicStructure` — including
+            the explicit pin, which is how a college's ladder very often arrives.
+
+            The admin screen needs this to be honest about the consequence of
+            changing a university's default: the ladder does not move with the
+            configuration, so a college can legitimately be configured for levels
+            while its entries are still named "First Year". Reporting the
+            disagreement is the whole point; hiding it would make the screen
+            claim a change completed work that has not been done.
+          */
+          const structure = await this.resolveAcademicStructure({ facultyId: f.id });
+
+          return {
+            id: f.id,
+            name: f.name,
+            nameAr: f.nameAr,
+            isActive: f.isActive,
+            universityId: f.universityId,
+            universityName: f.university.name,
+            academicSystemOverride: f.academicSystemOverride,
+            effectiveAcademicSystem: resolution.system,
+            inherited: resolution.source === 'UNIVERSITY_DEFAULT',
+            /** The governing ladder's vocabulary, or null when it has none. */
+            ladderKind: structure?.kind ?? null,
+            /** True when the ladder's vocabulary disagrees with the configuration. */
+            ladderMismatch: structure !== null && structure.kind !== resolution.system,
+            redundantOverride:
+              f.academicSystemOverride !== null &&
+              f.academicSystemOverride === f.university.defaultAcademicSystem,
+          };
+        }),
+      ),
+    };
   }
 
   async createFaculty(
@@ -663,13 +1156,34 @@ export class CatalogService {
    */
   async updateFaculty(
     id: string,
-    data: { name?: string; nameAr?: string; sortOrder?: number; isActive?: boolean },
+    data: {
+      name?: string;
+      nameAr?: string;
+      sortOrder?: number;
+      isActive?: boolean;
+      academicSystemOverride?: AcademicStructureKind | null;
+    },
     actor: { id: string; role: UserRole },
   ) {
     const before = await this.prisma.faculty.findFirst({ where: { id, ...notDeleted } });
     if (!before) throw AppException.notFound('Faculty', id);
 
-    const updated = await this.prisma.faculty.update({ where: { id }, data });
+    // Split out so the "omitted means leave alone, null means clear" distinction
+    // survives. Spreading `{ academicSystemOverride: undefined }` into Prisma
+    // would be treated as an explicit write by some clients and ignored by
+    // others, which is exactly the ambiguity this endpoint must not have.
+    const { academicSystemOverride, ...rest } = data;
+
+    const updated = await this.prisma.faculty.update({
+      where: { id },
+      data: {
+        ...(rest.name !== undefined ? { name: rest.name } : {}),
+        ...(rest.nameAr !== undefined ? { nameAr: rest.nameAr } : {}),
+        ...(rest.sortOrder !== undefined ? { sortOrder: rest.sortOrder } : {}),
+        ...(rest.isActive !== undefined ? { isActive: rest.isActive } : {}),
+        ...(academicSystemOverride !== undefined ? { academicSystemOverride } : {}),
+      },
+    });
     await this.bust();
     await this.audit.record({
       actorId: actor.id,

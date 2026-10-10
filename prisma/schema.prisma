@@ -674,6 +674,19 @@ model University {
   logoUrl   String?
   isActive  Boolean  @default(true)
   sortOrder Int      @default(0)
+
+  /// The academic progression system this university's colleges use unless a
+  /// college overrides it. YEAR is نظام الفرق ("First Year".."Fourth Year"),
+  /// LEVEL is نظام الليفلز ("Level 000".."Level 400").
+  ///
+  /// This is the ONLY place a university's system is recorded, and it is the
+  /// fallback every college inherits. It is deliberately independent of any
+  /// notion of government/private ownership: neither is allowed to decide it.
+  ///
+  /// Defaults to YEAR so a fresh row is a valid, inheritable configuration
+  /// rather than NULL, and so a university can never be left without an answer
+  /// for its own colleges.
+  defaultAcademicSystem AcademicStructureKind @default(YEAR)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   deletedAt DateTime?
@@ -699,21 +712,47 @@ model Faculty {
   updatedAt    DateTime @updatedAt
   deletedAt    DateTime?
 
+  /// Set when an Admin has pinned this faculty to a specific ladder, which
+  /// then wins over the one it would inherit from its university.
+  academicStructureOverride AcademicStructureFaculty?
+
+  /// The academic progression system for THIS COLLEGE ONLY.
+  ///
+  /// NULL means "inherit my university's default" — the overwhelmingly common
+  /// case, and the reason this column is nullable rather than defaulted. A
+  /// stored YEAR here and an inherited YEAR are different facts: the first is a
+  /// decision that survives a change of the university's default, the second is
+  /// a decision not to make one. Defaulting the column would collapse those two
+  /// facts together and make every college look explicitly configured.
+  ///
+  /// Copying the university's current value into this column is exactly the
+  /// mistake to avoid: it would silently freeze every existing college at its
+  /// university's present default, so the Admin could never make a
+  /// university-wide change afterwards.
+  academicSystemOverride AcademicStructureKind?
+
   university  University       @relation(fields: [universityId], references: [id], onDelete: Restrict)
   departments Department[]
   students    StudentProfile[]
   courses     Course[]
   libraryMaterials LibraryMaterial[]
   academicStructures AcademicStructure[]
-  /// Set when an Admin has pinned this faculty to a specific ladder, which
-  /// then wins over the one it would inherit from its university.
-  academicStructureOverride AcademicStructureFaculty?
 
   @@unique([universityId, name])
   @@index([universityId, isActive])
   @@map("faculties")
 }
 
+/// Whether a department is a general department or a programme branch.
+///
+/// DESCRIPTIVE ONLY. It labels the unit in the admin UI and in course
+/// targeting; it must never decide YEAR vs LEVEL. That was the original
+/// purpose of this column, and it is wrong: a college's progression system is
+/// its own configuration (Faculty.academicSystemOverride, falling back to
+/// University.defaultAcademicSystem), not a property of what a department is
+/// called. Deriving LEVEL from PROGRAMS meant a PROGRAMS department could never
+/// follow a YEAR university, which is precisely the configuration the product
+/// requires.
 enum StudyType {
   GENERAL
   PROGRAMS
