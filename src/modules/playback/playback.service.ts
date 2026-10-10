@@ -26,6 +26,7 @@ import { StorageService } from '../storage/storage.service';
 import { TokenService } from '../auth/token.service';
 
 import { ManifestService } from './manifest.service';
+import { GumletDrmService } from './gumlet-drm.service';
 
 /**
  * Prefix `LibraryDocumentsService.issueTicket` puts on `tid` for a document
@@ -103,6 +104,7 @@ export class PlaybackService {
     private readonly manifest: ManifestService,
     private readonly tokens: TokenService,
     private readonly security: SecurityEventService,
+    private readonly gumlet: GumletDrmService,
     config: ConfigService,
   ) {
     this.cfg = config.getOrThrow<PlaybackConfig>('playback');
@@ -117,6 +119,12 @@ export class PlaybackService {
     user: AuthenticatedUser;
     videoId: string;
     maxHeight?: number | null;
+    /**
+     * Client platform, used ONLY to pick the DRM key system. It never widens
+     * what the viewer may do - every entitlement, concurrency, device and
+     * capture control below runs identically regardless of this value.
+     */
+    platform?: 'ios' | 'android' | 'web';
     ip?: string | null;
     userAgent?: string | null;
     integritySuspect: boolean;
@@ -248,6 +256,7 @@ export class PlaybackService {
       video,
       deviceId,
       maxHeight: params.maxHeight ?? null,
+      platform: params.platform,
       ip: params.ip,
       userAgent: params.userAgent,
       rotatedFromId: null,
@@ -391,9 +400,15 @@ export class PlaybackService {
       renditions: { height: number }[];
       captions: { language: string; label: string; objectKey: string; isDefault: boolean }[];
       lesson: { id: string; title: string };
+      /** Which delivery path this video uses. Null = legacy R2/AES-128 HLS. */
+      drmProvider: string | null;
+      gumletAssetId: string | null;
+      gumletWorkspaceId: string | null;
     };
     deviceId: string | null;
     maxHeight: number | null;
+    /** Client platform, used only to choose the DRM key system. */
+    platform?: 'ios' | 'android' | 'web';
     ip?: string | null;
     userAgent?: string | null;
     rotatedFromId: string | null;
@@ -401,9 +416,6 @@ export class PlaybackService {
     playId: string | null;
   }): Promise<PlaybackTicketResponse> {
     const { user, video } = params;
-
-    const masterKey =
-      video.masterPlaylistKey ?? StorageService.keys.hlsMaster(video.id);
 
     const ttl = this.cfg.ticketTtl;
     const expiresAt = new Date(Date.now() + ttl * 1000);
@@ -444,9 +456,9 @@ export class PlaybackService {
 
     // The manifest is served by this API, not from storage, so every segment
     // URI inside it can be signed for THIS viewer and the AES key can be tied
-    // to this ticket. See ManifestService for the full rationale.
-    const manifestUrl = this.manifest.buildMasterUrl(ticket.id, expiresAt);
-    void masterKey; // packaged master playlist; retained for diagnostics
+    // to this ticket. Gumlet-backed videos are the only ones that consume the
+    // DRM path, and they carry their own manifest/DRM config.
+    const playback = await this.resolvePlaybackTarget(ticket.id, video, expiresAt, params.platform);
 
     const captions = await Promise.all(
       video.captions.map(async (c) => ({
@@ -480,9 +492,9 @@ export class PlaybackService {
 
     return {
       ticketId: ticket.id,
-      manifestUrl,
-      playbackHeaders: {},
-      drm: this.drmBlock(),
+      manifestUrl: playback.manifestUrl,
+      playbackHeaders: playback.playbackHeaders,
+      drm: playback.drm,
       watermark: {
         // Composed server-side. A patched client cannot substitute another
         // student's name, so the mark keeps its forensic value.
@@ -515,6 +527,99 @@ export class PlaybackService {
       licenseHeaders: this.videoCfg.drm.providerToken
         ? { Authorization: `Bearer ${this.videoCfg.drm.providerToken}` }
         : {},
+    };
+  }
+
+  /**
+   * Decide how THIS video is delivered, from the ticket's own video row.
+   *
+   * This is the single switch between the two playback paths:
+   *
+   *   drmProvider = null      -> legacy R2 + AES-128 HLS, manifest generated
+   *                             by this API (unchanged behaviour)
+   *   drmProvider = 'gumlet'  -> Gumlet DASH manifest + Gumlet DRM license URL
+   *
+   * There is no third option. A Gumlet-backed video with missing configuration
+   * or missing asset metadata FAILS rather than degrading to unprotected
+   * playback - the failure is visible to the student as an error, and the
+   * attempt is logged as a denied ticket.
+   */
+  private async resolvePlaybackTarget(
+    ticketId: string,
+    video: {
+      id: string;
+      drmProvider: string | null;
+      gumletAssetId: string | null;
+      gumletWorkspaceId: string | null;
+    },
+    expiresAt: Date,
+    platform?: 'ios' | 'android' | 'web',
+  ): Promise<{
+    manifestUrl: string;
+    playbackHeaders: Record<string, string>;
+    drm: PlaybackTicketResponse['drm'];
+  }> {
+    // ---- legacy path: byte-identical to the pre-integration behaviour ----
+    if (video.drmProvider !== 'gumlet') {
+      return {
+        manifestUrl: this.manifest.buildMasterUrl(ticketId, expiresAt),
+        playbackHeaders: {},
+        drm: this.drmBlock(),
+      };
+    }
+
+    // ---- Gumlet path ------------------------------------------------------
+    if (!this.videoCfg.drm.enabled) {
+      this.logger.error(
+        `Video ${video.id} is Gumlet-backed but DRM_ENABLED is false. Refusing to fall back to HLS.`,
+      );
+      throw new AppException(ErrorCode.PLAYBACK_DENIED, {
+        message: 'DRM is disabled on this platform but this lesson requires it',
+      });
+    }
+    if (this.videoCfg.drm.provider !== 'gumlet') {
+      throw new AppException(ErrorCode.PLAYBACK_DENIED, {
+        message: 'DRM provider is not configured as gumlet',
+      });
+    }
+
+    const assetId = video.gumletAssetId;
+    if (!assetId) {
+      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
+        message: 'This lesson has no Gumlet asset yet',
+      });
+    }
+
+    // signLicenseUrl fails closed on missing configuration; it never returns a
+    // half-valid URL.
+    const bundle = this.gumlet.signLicenseUrl({ assetId, hardwareSecure: true });
+
+    // Apple platforms cannot use Widevine at all. Handing an iOS/Safari
+    // client a Widevine URL would fail deep inside the CDM with an opaque
+    // message, so the FairPlay variant of the same signed token is selected
+    // here instead. `platform` is a presentation-layer hint only - every
+    // entitlement check above already ran identically.
+    const useFairPlay = platform === 'ios';
+    const licenseUrl = useFairPlay
+      ? this.gumlet.signFairPlayLicenseUrl({ assetId, hardwareSecure: true })
+      : bundle.licenseUrl;
+
+    return {
+      manifestUrl: this.gumlet.dashManifestUrl({
+        assetId,
+        workspaceId: video.gumletWorkspaceId,
+      }),
+      // The DASH manifest is served by Gumlet's CDN and needs no viewer-bound
+      // headers. Access is enforced at ticket issuance and by the licence
+      // token, not by a header here.
+      playbackHeaders: {},
+      drm: {
+        scheme: useFairPlay ? 'fairplay' : 'widevine',
+        licenseUrl,
+        // Only meaningful for FairPlay; Widevine clients ignore it.
+        certificateUrl: useFairPlay ? bundle.certificateUrl : null,
+        licenseHeaders: {},
+      },
     };
   }
 

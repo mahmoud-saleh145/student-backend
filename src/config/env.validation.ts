@@ -61,6 +61,16 @@ export class EnvironmentVariables {
   @MinLength(10)
   DATABASE_URL!: string;
 
+  /// Migrations only — see the `directUrl` note in prisma/schema.prisma.
+  ///
+  /// Optional here on purpose: the API process itself never dials it, so a
+  /// runtime-only deployment should not be forced to carry a credential it does
+  /// not use. Prisma's CLI still requires it wherever migrations run.
+  @IsOptional()
+  @IsString()
+  @MinLength(10)
+  DIRECT_URL?: string;
+
   @IsOptional()
   @IsString()
   DATABASE_REPLICA_URL?: string;
@@ -176,6 +186,23 @@ export class EnvironmentVariables {
   @IsOptional() @IsString() DRM_FAIRPLAY_LICENSE_URL?: string;
   @IsOptional() @IsString() DRM_FAIRPLAY_CERT_URL?: string;
   @IsOptional() @IsString() DRM_PROVIDER_TOKEN?: string;
+  @IsIn(['none', 'gumlet']) DRM_PROVIDER = 'none';
+
+  // --- Gumlet DRM -----------------------------------------------------------
+  // Required only when DRM_PROVIDER=gumlet. Names only here; values are supplied
+  // by the operator and are never printed or returned to any client.
+  @IsOptional() @IsString() GUMLET_API_KEY?: string;
+  @IsOptional() @IsString() GUMLET_WORKSPACE_ID?: string;
+  @IsOptional() @IsString() GUMLET_ORG_ID?: string;
+  @IsOptional() @IsString() GUMLET_SIGN_SECRET?: string;
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(30)
+  @Max(3600)
+  GUMLET_TOKEN_LIFETIME_SECONDS = 300;
+  /** Comma-separated renditions to request for ABR assets, e.g. 720p,1080p. */
+  @IsOptional() @IsString() GUMLET_RESOLUTIONS?: string;
 
   // --- payments -------------------------------------------------------------
   @IsString() PAYMENT_PROVIDER = 'none';

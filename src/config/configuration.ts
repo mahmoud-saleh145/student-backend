@@ -174,10 +174,22 @@ export const videoConfig = registerAs('video', () => ({
   keyRoot: process.env.HLS_KEY_ROOT!,
   drm: {
     enabled: bool(process.env.DRM_ENABLED),
+    provider: (process.env.DRM_PROVIDER ?? 'none') as 'none' | 'gumlet',
     widevineLicenseUrl: process.env.DRM_WIDEVINE_LICENSE_URL ?? null,
     fairplayLicenseUrl: process.env.DRM_FAIRPLAY_LICENSE_URL ?? null,
     fairplayCertUrl: process.env.DRM_FAIRPLAY_CERT_URL ?? null,
     providerToken: process.env.DRM_PROVIDER_TOKEN ?? null,
+    gumlet: {
+      apiKey: process.env.GUMLET_API_KEY ?? null,
+      workspaceId: process.env.GUMLET_WORKSPACE_ID ?? null,
+      orgId: process.env.GUMLET_ORG_ID ?? null,
+      signSecret: process.env.GUMLET_SIGN_SECRET ?? null,
+      tokenLifetimeSeconds: num(process.env.GUMLET_TOKEN_LIFETIME_SECONDS, 300),
+      resolutions: (process.env.GUMLET_RESOLUTIONS ?? '720p,1080p')
+        .split(',')
+        .map((r) => r.trim())
+        .filter(Boolean),
+    },
   },
 }));
 

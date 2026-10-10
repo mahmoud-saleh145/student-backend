@@ -1,4 +1,12 @@
-import { Body, Controller, Delete, Get, Param, Post } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  NotFoundException,
+  Param,
+  Post,
+} from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import {
@@ -18,6 +26,7 @@ import { StaffOnly } from '../../common/decorators/roles.decorator';
 import type { AuthenticatedUser } from '../../common/types/request-context';
 
 import { VideosService } from './videos.service';
+import { GumletIngestService } from './gumlet-ingest.service';
 
 class InitUploadDto {
   @IsString() @MaxLength(32) lessonId!: string;
@@ -51,7 +60,10 @@ class AddCaptionDto {
 @ApiBearerAuth('access-token')
 @Controller('videos')
 export class VideosController {
-  constructor(private readonly videos: VideosService) {}
+  constructor(
+    private readonly videos: VideosService,
+    private readonly gumletIngest: GumletIngestService,
+  ) {}
 
   @Post('uploads/init')
   @StaffOnly()
@@ -126,5 +138,57 @@ export class VideosController {
   })
   remove(@Param('videoId') videoId: string, @CurrentUser() actor: AuthenticatedUser) {
     return this.videos.remove(videoId, actor);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Gumlet-backed delivery (opt-in per video)
+  // ---------------------------------------------------------------------------
+
+  @Post(':videoId/gumlet/adopt')
+  @StaffOnly()
+  @ApiOperation({
+    summary: 'Hand this video to Gumlet for DRM packaging and delivery',
+    description: [
+      'Idempotent: re-calling refreshes an existing asset rather than creating',
+      'a duplicate. Sets the video to PROCESSING; it becomes PLAYABLE only once',
+      'Gumlet reports the asset ready AND the manifest is confirmed',
+      'CENC-encrypted.',
+    ].join('\n'),
+  })
+  async gumletAdopt(@Param('videoId') videoId: string, @CurrentUser() actor: AuthenticatedUser) {
+    await this.assertCanManageVideo(videoId, actor);
+    return this.gumletIngest.adopt(videoId);
+  }
+
+  @Post(':videoId/gumlet/sync')
+  @StaffOnly()
+  @ApiOperation({
+    summary: 'Re-check a Gumlet asset and mirror its state',
+    description:
+      'Polls Gumlet and updates status. Blocks playback if Gumlet reports ready but the manifest is not encrypted.',
+  })
+  async gumletSync(@Param('videoId') videoId: string, @CurrentUser() actor: AuthenticatedUser) {
+    await this.assertCanManageVideo(videoId, actor);
+    return this.gumletIngest.sync(videoId);
+  }
+
+  @Get(':videoId/gumlet/status')
+  @StaffOnly()
+  @ApiOperation({ summary: 'Gumlet provisioning state for a video' })
+  async gumletStatus(@Param('videoId') videoId: string, @CurrentUser() actor: AuthenticatedUser) {
+    await this.assertCanManageVideo(videoId, actor);
+    return this.gumletIngest.status(videoId);
+  }
+
+  /**
+   * Staff can reach these endpoints, but only for content they are allowed to
+   * manage. Without this, any staff account could ingest or inspect a video
+   * belonging to a course outside their scope - which is exactly the ownership
+   * check every other write on `videos` already performs.
+   */
+  private async assertCanManageVideo(videoId: string, actor: AuthenticatedUser): Promise<void> {
+    const video = await this.videos.getCourseForVideo(videoId);
+    if (!video) throw new NotFoundException('Video not found');
+    await this.videos.assertCanManageCourseContent(actor.id, actor.role, video.courseId);
   }
 }

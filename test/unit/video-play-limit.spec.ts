@@ -141,6 +141,13 @@ function build(options: Options = {}) {
     { buildMasterUrl: jest.fn(() => 'https://api.example/manifest') } as never,
     { mint: jest.fn(() => 'tok') } as never,
     { record: jest.fn(async () => undefined) } as never,
+    // gumlet: injected so per-video provider selection is exercised. These
+    // videos are legacy HLS (drmProvider null), so signing must never run.
+    {
+      signLicenseUrl: jest.fn(() => {
+        throw new Error('gumlet signing must not be reached for HLS videos');
+      }),
+    } as never,
     config as never,
   );
 

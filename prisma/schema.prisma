@@ -1442,6 +1442,20 @@ model Video {
   isEncrypted     Boolean @default(false)
   encryptionKeyId String?
 
+  /// Playback provider for THIS video only. Null = legacy R2/AES-128 HLS.
+  /// 'gumlet' means the media is ingested, packaged and DRM-encrypted by Gumlet
+  /// and is played back over DASH/EME. Existing rows stay null forever, so a
+  /// misconfiguration can never migrate the legacy library by itself.
+  drmProvider      String?
+
+  /// Gumlet asset identity and processing state. Only consulted when
+  /// drmProvider = 'gumlet'.
+  gumletAssetId    String?
+  gumletWorkspaceId String?
+  gumletStatus     String?
+  gumletError      String?
+  gumletUpdatedAt  DateTime?
+
   processingJobId String?
   processingError String?
   processingStartedAt DateTime?

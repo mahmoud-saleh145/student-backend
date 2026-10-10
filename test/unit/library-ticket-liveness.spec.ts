@@ -91,6 +91,13 @@ function build(options: Options = {}) {
     {} as never, // storage
     {} as never, // tokens
     {} as never, // manifest
+    // gumlet: injected so per-video provider selection is exercised; this suite
+    // targets legacy HLS tickets, where signing must never be reached.
+    {
+      signLicenseUrl: jest.fn(() => {
+        throw new Error('gumlet signing must not be reached for HLS videos');
+      }),
+    } as never,
     config as never,
   );
 

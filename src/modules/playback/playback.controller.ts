@@ -39,7 +39,7 @@ class ProtectionStateDto {
   @IsOptional() @IsBoolean() externalDisplay?: boolean;
 }
 
-class IssueTicketDto {
+export class IssueTicketDto {
   /** Server-enforced quality ceiling, mirrored into the signed URL. */
   @IsOptional()
   @Type(() => Number)
@@ -123,6 +123,9 @@ export class PlaybackController {
       user,
       videoId,
       maxHeight: dto.maxHeight ?? null,
+      // Drives the DRM key system. Undefined means "let the server decide",
+      // which keeps older clients working unchanged.
+      platform: dto.platform as 'ios' | 'android' | 'web' | undefined,
       ip: req.ip ?? null,
       userAgent: req.header('user-agent') ?? null,
       integritySuspect: req.deviceContext?.integritySuspect ?? false,

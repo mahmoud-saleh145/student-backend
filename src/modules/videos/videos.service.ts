@@ -102,7 +102,16 @@ export class VideosService {
       select: {
         id: true,
         courseId: true,
-        video: { select: { id: true, status: true, deletedAt: true, hlsPrefix: true } },
+        video: {
+          select: {
+            id: true,
+            status: true,
+            deletedAt: true,
+            hlsPrefix: true,
+            drmProvider: true,
+            gumletAssetId: true,
+          },
+        },
       },
     });
     if (!lesson) throw AppException.notFound('Lesson', params.lessonId);
@@ -135,6 +144,17 @@ export class VideosService {
             processedAt: null,
             deletedAt: null,
             uploadedById: actor.id,
+            // Replacing the file of a Gumlet-backed video makes the previous
+            // asset describe content that no longer exists. The provider is
+            // KEPT (the lesson is still meant to be DRM-delivered) but the
+            // asset identity is cleared, so the worker's adopt creates a fresh
+            // asset from the new source instead of re-syncing the old one -
+            // which would have marked the lesson READY while students kept
+            // watching the previous recording.
+            gumletAssetId: null,
+            gumletStatus: null,
+            gumletError: null,
+            gumletUpdatedAt: null,
           },
         })
       : await this.prisma.video.create({
@@ -378,6 +398,27 @@ export class VideosService {
   // Status
   // ---------------------------------------------------------------------------
 
+  /**
+   * Which course owns this video. The ownership gate the Gumlet ingest
+   * endpoints call before doing anything, so a staff member can only act on
+   * content inside their scope - the same check every other write here runs.
+   */
+  async getCourseForVideo(videoId: string): Promise<{ id: string; courseId: string } | null> {
+    return this.prisma.video.findFirst({
+      where: { id: videoId, ...notDeleted },
+      select: { id: true, courseId: true },
+    });
+  }
+
+  /**
+   * Content-scope ownership check, named for its intent rather than for the
+   * underlying access API, so callers read as "can this person manage this
+   * course's content".
+   */
+  async assertCanManageCourseContent(userId: string, role: UserRole, courseId: string): Promise<void> {
+    await this.access.assertCanManageCourse(userId, role, courseId, 'content');
+  }
+
   async status(videoId: string, actor: { id: string; role: UserRole }) {
     const video = await this.prisma.video.findFirst({
       where: { id: videoId },
@@ -396,6 +437,10 @@ export class VideosService {
       lessonId: video.lessonId,
       courseId: video.courseId,
       status: video.status,
+      drmProvider: video.drmProvider,
+      gumletAssetId: video.gumletAssetId,
+      gumletStatus: video.gumletStatus,
+      gumletError: video.gumletError,
       durationSeconds: video.durationSeconds,
       width: video.width,
       height: video.height,

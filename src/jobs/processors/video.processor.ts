@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import type { VideoConfig } from '../../config/configuration';
 import { HLS_CODECS, ManifestService } from '../../modules/playback/manifest.service';
 import { StorageService } from '../../modules/storage/storage.service';
+import { GumletIngestService } from '../../modules/videos/gumlet-ingest.service';
 import { VideosService } from '../../modules/videos/videos.service';
 import { QUEUE_NAMES, VIDEO_JOBS, type TranscodeJobData } from '../queue.constants';
 import { RESPONSIVE_WORKER } from '../queue.tuning';
@@ -68,6 +69,7 @@ export class VideoProcessor extends WorkerHost {
   constructor(
     private readonly storage: StorageService,
     private readonly videos: VideosService,
+    private readonly gumletIngest: GumletIngestService,
     config: ConfigService,
   ) {
     super();
@@ -87,6 +89,25 @@ export class VideoProcessor extends WorkerHost {
       if (!claimed) {
         this.logger.warn(`skipping stale transcode job ${job.id} for video ${videoId}`);
         return { videoId, skipped: true };
+      }
+
+      // --- provider branch -------------------------------------------------
+      // Exactly one place decides between the two delivery pipelines. It reads
+      // `drmProvider` from the database, NOT from the job payload, so a stale or
+      // replayed job can never reroute a legacy R2/HLS video onto the Gumlet
+      // path. Non-Gumlet videos return `handled: false` and fall through to the
+      // ffmpeg path below, byte-for-byte unchanged.
+      const gumlet = await this.gumletIngest.processFromJob(videoId, sourceKey);
+      if (gumlet.handled) {
+        this.logger.log(
+          `video ${videoId} handled by Gumlet ingest (status ${gumlet.status ?? 'n/a'}, playable ${gumlet.playable === true})`,
+        );
+        return {
+          videoId,
+          provider: 'gumlet',
+          status: gumlet.status ?? null,
+          playable: gumlet.playable === true,
+        };
       }
       await mkdir(workDir, { recursive: true });
 
