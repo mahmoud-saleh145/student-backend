@@ -514,18 +514,31 @@ export class PlaybackService {
   }
 
   private drmBlock(): PlaybackTicketResponse['drm'] {
-    if (!this.videoCfg.drm.enabled) {
+    const { widevineLicenseUrl, fairplayCertUrl, providerToken } = this.videoCfg.drm;
+
+    // A DRM scheme is only claimed when there is something to claim it WITH.
+    //
+    // `DRM_ENABLED` is a global switch that a Gumlet deployment turns on, but
+    // this method serves the LEGACY HLS path, which is AES-128 — not CENC — and
+    // cannot use an EME licence at all. Turning the flag on therefore used to
+    // hand every legacy video `scheme: 'widevine'` with a null licence URL.
+    //
+    // Today's clients happen to require a licence URL before routing to the DRM
+    // player, so this did not break playback. It is a trap rather than a
+    // symptom: any client that selects on `scheme !== 'none'` alone would send
+    // every HLS lesson into a DRM player with no licence to fetch. Reporting
+    // `none` when there is no licence server is both the truth and the safe
+    // default — it can never route a legacy video away from hls.js.
+    if (!this.videoCfg.drm.enabled || !widevineLicenseUrl) {
       return { scheme: 'none', licenseUrl: null, certificateUrl: null, licenseHeaders: {} };
     }
 
-    // The client sends its platform; Widevine is returned by default and the
-    // FairPlay variant is selected by the caller when the request is from iOS.
     return {
       scheme: 'widevine',
-      licenseUrl: this.videoCfg.drm.widevineLicenseUrl,
-      certificateUrl: this.videoCfg.drm.fairplayCertUrl,
-      licenseHeaders: this.videoCfg.drm.providerToken
-        ? { Authorization: `Bearer ${this.videoCfg.drm.providerToken}` }
+      licenseUrl: widevineLicenseUrl,
+      certificateUrl: fairplayCertUrl,
+      licenseHeaders: providerToken
+        ? { Authorization: `Bearer ${providerToken}` }
         : {},
     };
   }

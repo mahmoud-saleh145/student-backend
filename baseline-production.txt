@@ -1,0 +1,113 @@
+# BASELINE FINGERPRINT - production
+# generated: 2026-10-10T10:48:24.952Z
+
+server   : PostgreSQL 18.6 (c021049) on aarch64-unknown-linux-gnu
+database : neondb
+
+## ROW COUNTS (every table, exact)
+        15  _prisma_migrations
+         2  academic_structure_faculties
+         2  academic_structures
+        10  academic_years
+         0  access_code_redemptions
+       100  access_codes
+         0  announcement_dispatches
+         0  announcements
+         0  archive_records
+         2  attachments
+       175  audit_logs
+         0  caption_tracks
+         1  code_batches
+        28  course_departments
+         0  course_part_entitlements
+         0  course_part_purchases
+        18  course_parts
+         9  course_prices
+        18  course_sections
+         9  course_teachers
+         9  courses
+         1  daily_course_stats
+        15  departments
+         2  device_change_requests
+         7  devices
+         0  enrollment_section_grants
+         0  enrollments
+         2  faculties
+         0  idempotency_records
+         4  lessons
+         0  library_entitlements
+         0  library_materials
+         0  library_package_items
+         0  library_packages
+         0  library_parts
+         0  library_purchases
+        11  notification_preferences
+         0  notifications
+         0  payment_transactions
+         0  payments
+         0  platform_settings
+         0  playback_tickets
+         0  push_tokens
+         0  recharge_revenue
+       178  refresh_tokens
+         0  revenue_ledger
+       123  security_events
+        82  sessions
+         4  student_profiles
+         0  subjects
+         0  support_messages
+         0  support_tickets
+         6  teacher_profiles
+         5  universities
+        12  users
+         0  video_plays
+         7  video_renditions
+         4  videos
+         0  wallet_transactions
+         1  wallets
+         8  watch_events
+         0  watch_progress
+       870  -- TOTAL ROWS
+
+## KEY BUSINESS ROWS
+       4  videos_live
+       1  videos_ready
+       4  students
+      12  users_live
+       9  courses_live
+       5  universities
+       2  faculties_live
+       2  structures_active
+       2  faculty_pins
+       0  live_tickets
+
+## MIGRATION HISTORY (must be identical on the branch)
+  applied migrations: 15
+    OK 20260101000000_init  f82a9c7fa97c0916...
+    OK 20260907120000_dashboard_admin  0bc76d4c9c55abc9...
+    OK 20260918000000_wallet_credits  81710ad26582a367...
+    OK 20260918010000_course_parts_and_part_codes  eb3ac57b388ee0f0...
+    OK 20260918014216_library  93d714e4f1659e7a...
+    OK 20260918213457_announcement_audience_scheduling  b7cb7e07f25bbe16...
+    OK 20260924100000_course_departments  2b0e8c37ceee1f79...
+    OK 20260930000000_academic_structures_attachments_thumbnails_plays  961e5c0488061b75...
+    OK 20261004220000_playback_ticket_user_video_index  7506f8ddd3d40347...
+    OK 20261005010000_part_purchase_code_many_per_card  dd3a87f1665d4770...
+    OK 20261006090000_announcement_sweep_and_list_indexes  aaa812e2774a3e08...
+    OK 20261006120000_notification_dedupe_key  d2260d23f86a79dd...
+    OK 20261007120000_allow_multiple_platform_academic_structures  10b1f625be420567...
+    OK 20261008120000_academic_structure_faculty_overrides  b5dadb1eacf19a2a...
+    OK 20261008120000_engineering_study_types  831ab9c0f8695fcf...
+
+## CRITICAL STRUCTURE (the two migrations about to be applied)
+  new columns present: 0  (expected 0 before the release)
+
+  triggers on faculties: 0 (expected 0 before the release)
+
+## CHECKSUMS OF THE TWO PENDING MIGRATIONS (must match after apply)
+  20261009000000_academic_system_default_and_college_override
+    sha256(raw) = 287b639c4b4c7665596ec04978a191584e7b8c5eaa31708f2ab162958df5fc18
+    crlf count = 0  (must be 0)
+  20261009120000_gumlet_drm_per_video_provider
+    sha256(raw) = 2bc43079c5d8796dd70835c7e61cff3542fa4c5b55b785321416f1bc14f5f90d
+    crlf count = 0  (must be 0)

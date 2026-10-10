@@ -387,7 +387,31 @@ export class AuthService {
       throw new AppException(ErrorCode.SESSION_EXPIRED);
     }
 
-    if (stored.usedAt || stored.revokedAt) {
+    if (stored.revokedAt) {
+      // Explicitly revoked — by logout, an administrator, or a previous reuse
+      // detection. Never resurrectable, however recent.
+      throw new AppException(ErrorCode.SESSION_EXPIRED, {
+        message: 'Refresh token revoked',
+      });
+    }
+
+    if (stored.usedAt) {
+      // Already rotated. This is the single-use guarantee doing its job — but it
+      // cannot, on its own, distinguish a stolen token being replayed from one
+      // browser firing two requests at the same instant. Both present the same
+      // token twice within a second or two, and revoking the family for both
+      // turned ordinary navigation into a logout.
+      //
+      // So within a short grace window this is answered as an idempotent retry: a
+      // fresh pair is issued into the same family and the session survives.
+      // Beyond the window it is treated as what it usually is — replay — and the
+      // family is revoked exactly as before.
+      const ageSeconds = (Date.now() - stored.usedAt.getTime()) / 1000;
+
+      if (ageSeconds <= this.cfg.refreshReuseGraceSeconds) {
+        return this.reissueFromSuccessor(stored, meta);
+      }
+
       await this.security.record({
         type: SecurityEventType.TOKEN_REUSE,
         severity: SecuritySeverity.CRITICAL,
@@ -451,9 +475,26 @@ export class AuthService {
         data: { usedAt: new Date(), replacedById: next.id },
       });
 
+      // The session expiry slides with the refresh token.
+      //
+      // It was written once, at sign-in, and never moved: a fixed timestamp 30
+      // days out. The refresh token, by contrast, is re-issued with a fresh
+      // 30-day window on every rotation. So a student who stayed signed in for
+      // a month held a perfectly valid, endlessly-renewing refresh token and a
+      // session that expired anyway — `JwtAuthGuard` rejects on
+      // `session.expiresAt`, and the refresh that should have rescued it was
+      // already too late. The server-side session is the ceiling on the whole
+      // login, and it was the one part that did not renew.
+      //
+      // Sliding it keeps the two lifetimes compatible, which is the property
+      // that actually matters: the session now expires only after 30 days of
+      // genuine inactivity, not 30 days after first contact.
       await tx.session.update({
         where: { id: stored.sessionId },
-        data: { lastSeenAt: new Date() },
+        data: {
+          lastSeenAt: new Date(),
+          expiresAt: issued.refreshExpiresAt,
+        },
       });
     });
 
@@ -468,6 +509,121 @@ export class AuthService {
       refreshToken: issued.refreshToken,
       expiresIn: issued.expiresIn,
       device: deviceStatus,
+    };
+  }
+
+  /**
+   * Answers a refresh token that was already rotated inside the grace window.
+   *
+   * Refresh tokens are stored only as SHA-256 hashes, so the plaintext of the
+   * successor cannot be recovered here — only re-minted. That is fine: the
+   * point is that the session survives and the caller receives a current,
+   * usable pair rather than a 401. The successor stays valid alongside it, so
+   * whichever token the browser ends up holding is good.
+   *
+   * Every check that could make the session unrecoverable still runs — the
+   * session must be ACTIVE, the account usable, the credentials unchanged.
+   * Arriving early rescues a race; it never resurrects a revoked, disabled or
+   * expired session.
+   */
+  private async reissueFromSuccessor(
+    spent: {
+      userId: string;
+      sessionId: string;
+      familyId: string;
+      expiresAt: Date;
+      createdAt: Date;
+      user: {
+        id: string;
+        role: UserRole;
+        status: AccountStatus;
+        deletedAt: Date | null;
+        credentialsChangedAt: Date;
+      };
+      session: { id: string; status: SessionStatus; deviceId: string | null };
+    },
+    meta: RequestMeta,
+  ): Promise<AuthResult> {
+    const user = spent.user;
+
+    if (spent.expiresAt.getTime() <= Date.now()) {
+      throw new AppException(ErrorCode.SESSION_EXPIRED, {
+        message: 'Refresh token expired',
+      });
+    }
+
+    if (spent.session.status !== SessionStatus.ACTIVE) {
+      throw new AppException(ErrorCode.SESSION_EXPIRED, { message: 'Session revoked' });
+    }
+
+    if (
+      user.deletedAt ||
+      user.status === AccountStatus.DISABLED ||
+      user.status === AccountStatus.SUSPENDED
+    ) {
+      throw new AppException(ErrorCode.ACCOUNT_DISABLED);
+    }
+
+    // Same rule as the main path, and against the same field: `createdAt` is when
+    // this token was minted. Comparing `expiresAt` here would compare a token's
+    // *future* expiry against the credential change, which passes for any
+    // account whose password changed this month and rejects an unrelated one.
+    if (spent.createdAt.getTime() < user.credentialsChangedAt.getTime() - 1000) {
+      throw new AppException(ErrorCode.SESSION_EXPIRED, {
+        message: 'Credentials changed after this token was issued',
+      });
+    }
+
+    // Recorded, but deliberately not CRITICAL and not revoking: this is the
+    // signature of two concurrent requests — a client bug being absorbed — not
+    // evidence that a token was stolen. It stays visible for anyone reviewing
+    // how often it happens.
+    await this.security.record({
+      type: SecurityEventType.TOKEN_REUSE,
+      severity: SecuritySeverity.LOW,
+      userId: user.id,
+      sessionId: spent.sessionId,
+      ipAddress: meta.ip,
+      userAgent: meta.userAgent,
+      message: 'Rotated refresh token replayed within the reuse grace window — reissued',
+    });
+
+    const issued = await this.tokens.issue({
+      userId: user.id,
+      sessionId: spent.sessionId,
+      role: user.role,
+      familyId: spent.familyId,
+    });
+
+    // A real row, not a token minted into thin air: an unregistered token would
+    // be read as forgery on its next presentation and revoke the family — the
+    // exact failure this method exists to prevent.
+    await this.prisma.$transaction(async (tx) => {
+      await tx.refreshToken.create({
+        data: {
+          userId: user.id,
+          sessionId: spent.sessionId,
+          tokenHash: issued.refreshTokenHash,
+          familyId: spent.familyId,
+          expiresAt: issued.refreshExpiresAt,
+        },
+      });
+
+      await tx.session.update({
+        where: { id: spent.sessionId },
+        data: {
+          lastSeenAt: new Date(),
+          expiresAt: issued.refreshExpiresAt,
+        },
+      });
+    });
+
+    return {
+      user: await this.users.toPublicUser(user.id),
+      accessToken: issued.accessToken,
+      refreshToken: issued.refreshToken,
+      expiresIn: issued.expiresIn,
+      device: await this.currentDeviceStatus(user.id, meta.device.deviceKey),
     };
   }
 

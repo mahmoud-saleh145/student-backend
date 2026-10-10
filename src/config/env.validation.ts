@@ -96,7 +96,8 @@ export class EnvironmentVariables {
   JWT_PLAYBACK_SECRET!: string;
 
   @Type(() => Number) @IsInt() @Min(60) JWT_ACCESS_TTL = 900;
-  @Type(() => Number) @IsInt() @Min(3600) JWT_REFRESH_TTL = 2592000;
+  @Type(() => Number) @IsInt() @Min(2592000) JWT_REFRESH_TTL = 2592000;
+  @Type(() => Number) @IsInt() @Min(0) @Max(300) JWT_REFRESH_REUSE_GRACE_SECONDS = 30;
   @IsString() JWT_ISSUER = 'edu-platform';
   @IsString() JWT_AUDIENCE = 'edu-mobile';
 

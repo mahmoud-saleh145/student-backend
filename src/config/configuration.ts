@@ -35,6 +35,22 @@ export const authConfig = registerAs('auth', () => ({
   playbackSecret: process.env.JWT_PLAYBACK_SECRET!,
   accessTtl: num(process.env.JWT_ACCESS_TTL, 900),
   refreshTtl: num(process.env.JWT_REFRESH_TTL, 2592000),
+  /**
+   * How long after a rotation a spent refresh token is still accepted as an
+   * idempotent retry rather than treated as theft.
+   *
+   * The backend cannot tell "a second device replayed a stolen token" from "the
+   * same browser sent two requests at once". Both arrive as the same token
+   * presented twice within a second or two, and the previous answer to both was
+   * to revoke the whole family — which turned ordinary navigation into a logout
+   * and wrote a CRITICAL theft event against the account.
+   *
+   * Inside this window the second presentation is answered by re-issuing from
+   * the current head of the family, so a racing request recovers instead of
+   * dying. Outside it, reuse still revokes exactly as before: a real thief
+   * replaying later is still caught.
+   */
+  refreshReuseGraceSeconds: num(process.env.JWT_REFRESH_REUSE_GRACE_SECONDS, 30),
   issuer: process.env.JWT_ISSUER ?? 'edu-platform',
   audience: process.env.JWT_AUDIENCE ?? 'edu-mobile',
   argon: {
