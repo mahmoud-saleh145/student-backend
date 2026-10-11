@@ -35,6 +35,16 @@ import { GumletDrmService } from './gumlet-drm.service';
  */
 const LIBRARY_TICKET_PREFIX = 'lib_';
 
+/**
+ * Lecture/section/course document grants.
+ *
+ * `AttachmentsService.issueTicket` signs `att_<attachmentId>`. The Worker sends
+ * that id back here on every range request, and - exactly like the `lib_` case
+ * below - there is NO PlaybackTicket row for it, so it must never reach the
+ * `playbackTicket` lookup.
+ */
+const ATTACHMENT_TICKET_PREFIX = 'att_';
+
 /** Matches the mobile app's `PlaybackTicket` type exactly. */
 export interface PlaybackTicketResponse {
   ticketId: string;
@@ -1045,6 +1055,20 @@ export class PlaybackService {
       );
     }
 
+    // Same shape, same reason. `AttachmentsService.issueTicket` signs
+    // `att_<attachmentId>` and keeps no row either. Without this branch the id
+    // fell through to the `playbackTicket` lookup below, ALWAYS missed, and the
+    // edge read `live: false` - so every lecture PDF was refused with
+    // `ticket_revoked` while its signature, expiry and bucket were all valid.
+    // Library documents were already spared by the branch above; lecture
+    // documents were not, and that is the whole reason they failed.
+    if (ticketId.startsWith(ATTACHMENT_TICKET_PREFIX)) {
+      return this.attachmentTicketLiveness(
+        ticketId.slice(ATTACHMENT_TICKET_PREFIX.length),
+        uid,
+      );
+    }
+
     const ticket = await this.prisma.playbackTicket.findFirst({
       where: { id: ticketId, userId: uid },
       select: {
@@ -1146,6 +1170,117 @@ export class PlaybackService {
     // Previews are not device-bound when the URL is minted, so they are not
     // device-bound when it is re-checked either.
     if (!part.isPreview && activeDevices === 0) return { live: false };
+
+    return { live: true };
+  }
+
+  /**
+   * Is a lecture/section/course document grant still good?
+   *
+   * The video branch re-reads a PlaybackTicket row that pins one session and
+   * one device. A document grant has no row - `AttachmentsService.issueTicket`
+   * signs the URL and keeps no durable ticket of its own - so this re-runs the
+   * checks that issuing path made, mirroring it exactly:
+   *
+   *   - the attachment must still exist, not be deleted, and its lesson and
+   *     section must still be PUBLISHED. A lecture-scoped row carries a NULL
+   *     sectionId, so its section is reached through the lesson.
+   *   - a non-preview document needs live course entitlement, and a scoped one
+   *     needs that section too.
+   *   - a protected document is device-bound, exactly as it was at signing time.
+   *
+   * **One deliberate difference**, identical to the library branch: the probe
+   * carries only the ticket id and `uid`, not `sid`/`did`, so this asks whether
+   * the account still has ANY live session and any authorised device. Weaker than
+   * the video branch for a multi-device account, bounded by the attachment ticket
+   * TTL. The per-session/per-device binding is still enforced when the URL is
+   * signed, and again in the HMAC the Worker verifies.
+   */
+  private async attachmentTicketLiveness(
+    attachmentId: string,
+    userId: string,
+  ): Promise<{ live: boolean }> {
+    if (!attachmentId) return { live: false };
+
+    const attachment = await this.prisma.attachment.findFirst({
+      where: { id: attachmentId, ...notDeleted },
+      select: {
+        id: true,
+        courseId: true,
+        lessonId: true,
+        sectionId: true,
+        isPreview: true,
+        isProtected: true,
+      },
+    });
+
+    if (!attachment) return { live: false };
+
+    let lessonStatus: ContentStatus | null = null;
+    let sectionStatus: ContentStatus | null = null;
+
+    if (attachment.lessonId) {
+      const lesson = await this.prisma.lesson.findUnique({
+        where: { id: attachment.lessonId },
+        select: { status: true, section: { select: { status: true } } },
+      });
+      lessonStatus = lesson?.status ?? null;
+      sectionStatus = lesson?.section?.status ?? null;
+    }
+
+    if (attachment.sectionId) {
+      const section = await this.prisma.courseSection.findUnique({
+        where: { id: attachment.sectionId },
+        select: { status: true },
+      });
+      sectionStatus = section?.status ?? null;
+    }
+
+    const unpublished =
+      (lessonStatus !== null && lessonStatus !== ContentStatus.PUBLISHED) ||
+      (sectionStatus !== null && sectionStatus !== ContentStatus.PUBLISHED);
+    if (unpublished) return { live: false };
+
+    // Entitlement. A preview is openable by anyone, which is what makes it a
+    // preview; everything else needs the course, and a scoped document its
+    // section - resolved through the lesson for a lecture-scoped row.
+    if (!attachment.isPreview) {
+      const decision = await this.access.resolve({
+        userId,
+        role: UserRole.STUDENT,
+        courseId: attachment.courseId,
+      });
+      if (!decision.canAccessContent) return { live: false };
+
+      let scopedSectionId: string | null = attachment.sectionId;
+      if (!scopedSectionId && attachment.lessonId) {
+        const lesson = await this.prisma.lesson.findUnique({
+          where: { id: attachment.lessonId },
+          select: { sectionId: true },
+        });
+        scopedSectionId = lesson?.sectionId ?? null;
+      }
+
+      if (scopedSectionId) {
+        const allowed = await this.access.allowedSectionIds(userId, attachment.courseId);
+        // `null` is whole-course access, so there is nothing to narrow.
+        if (allowed !== null && !allowed.includes(scopedSectionId)) {
+          return { live: false };
+        }
+      }
+    }
+
+    const [activeSessions, activeDevices] = await this.prisma.$transaction([
+      this.prisma.session.count({ where: { userId, status: 'ACTIVE' } }),
+      this.prisma.device.count({ where: { userId, status: DeviceStatus.ACTIVE } }),
+    ]);
+
+    if (activeSessions === 0) return { live: false };
+
+    // Only device-bound material needs a device. `isProtected` is precisely what
+    // made `issueTicket` call `assertAuthorizedForProtectedContent`, so an
+    // unprotected syllabus is not device-bound here either.
+    if (attachment.isProtected && activeDevices === 0) return { live: false };
 
     return { live: true };
   }
