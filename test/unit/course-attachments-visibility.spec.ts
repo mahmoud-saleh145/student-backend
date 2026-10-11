@@ -86,15 +86,72 @@ function row(over: Record<string, unknown>) {
     isPreview: false,
     sortOrder: 0,
     deletedAt: null,
+    // Relations the publication filter walks. Prisma resolves them server-side;
+    // the double here models them so the student/staff difference is exercised.
+    lesson: null as unknown,
+    section: null as unknown,
     ...over,
   };
 }
 
+/** A published lesson in a published section is the baseline for visibility. */
+function published(row_: Record<string, unknown>, lessonId?: string, sectionId?: string) {
+  return row({
+    ...row_,
+    lessonId: lessonId ?? null,
+    sectionId: sectionId ?? null,
+    lesson: lessonId ? { status: 'PUBLISHED', section: { status: 'PUBLISHED' } } : null,
+    section: sectionId ? { status: 'PUBLISHED' } : null,
+  });
+}
+
 const ROWS = [
-  row({ id: 'att_lecture', lessonId: 'les_1', title: 'Lecture slides.pdf' }),
-  row({ id: 'att_section', sectionId: 'sec_1', title: 'Section handout.pdf' }),
-  row({ id: 'att_course', title: 'Syllabus.pdf' }),
+  published({ id: 'att_lecture', title: 'Lecture slides.pdf' }, 'les_1'),
+  published({ id: 'att_section', title: 'Section handout.pdf' }, undefined, 'sec_1'),
+  published({ id: 'att_course', title: 'Syllabus.pdf' }),
 ];
+
+/**
+ * Mirrors the part of the Prisma query the attachments list depends on:
+ * `courseId`, `deletedAt: null`, the optional `lessonId` filter and the nested
+ * publication rules, plus `orderBy`. Without this the tests would pass whether
+ * or not the query was right.
+ */
+function matches(r: Record<string, unknown>, where: Record<string, unknown>): boolean {
+  if (where.courseId && r.courseId !== where.courseId) return false;
+  if (where.deletedAt === null && r.deletedAt !== null) return false;
+  if ('lessonId' in where && where.lessonId !== undefined && r.lessonId !== where.lessonId) {
+    return false;
+  }
+  if ('sectionId' in where && where.sectionId !== undefined && r.sectionId !== where.sectionId) {
+    return false;
+  }
+
+  const and = (where.AND ?? []) as Array<Record<string, unknown>>;
+  for (const clause of and) {
+    const ors = (clause.OR ?? []) as Array<Record<string, unknown>>;
+    if (ors.length && !ors.some((o) => matches(r, o))) return false;
+  }
+  const or = (where.OR ?? []) as Array<Record<string, unknown>> | undefined;
+  if (or?.length && !or.some((o) => matches(r, o))) return false;
+
+  if (typeof where.lesson === 'object' && where.lesson !== null) {
+    const want = where.lesson as { status: string; section?: { status: string } };
+    const lesson = r.lesson as { status: string; section: { status: string } } | null;
+    if (!lesson || lesson.status !== want.status) return false;
+    // A lecture-scoped row carries a NULL sectionId, so its section is only
+    // reachable through the lesson. The query must check it there.
+    if (want.section && (!lesson.section || lesson.section.status !== want.section.status)) {
+      return false;
+    }
+  }
+  if (typeof where.section === 'object' && where.section !== null) {
+    const want = (where.section as { status: string }).status;
+    const section = r.section as { status: string } | null;
+    if (!section || section.status !== want) return false;
+  }
+  return true;
+}
 
 function build(rows: Record<string, unknown>[] = ROWS) {
   const attachmentQueries: Record<string, unknown>[] = [];
@@ -105,21 +162,12 @@ function build(rows: Record<string, unknown>[] = ROWS) {
     attachment: {
       findMany: jest.fn(async (args: Record<string, unknown>) => {
         attachmentQueries.push(args);
-        const where = (args.where ?? {}) as {
-          courseId?: string;
-          lessonId?: string | null;
-          deletedAt?: null;
-        };
+        const where = (args.where ?? {}) as Record<string, unknown>;
         const orderBy = (args.orderBy ?? {}) as
           | { sortOrder?: string }
           | Array<{ lessonId?: string; sortOrder?: string }>;
 
-        let out = rows.filter(
-          (r) =>
-            (!where.courseId || r.courseId === where.courseId) &&
-            (where.lessonId === undefined || r.lessonId === where.lessonId) &&
-            r.deletedAt === null,
-        );
+        let out = rows.filter((r) => matches(r, where));
 
         if (Array.isArray(orderBy)) {
           for (const clause of [...orderBy].reverse()) {
@@ -202,14 +250,14 @@ describe('the student Materials list', () => {
   });
 
   it('never returns another course\'s attachment', async () => {
-    const t = build([...ROWS, row({ id: 'att_other', courseId: 'crs_elsewhere' })]);
+    const t = build([...ROWS, published({ id: 'att_other', courseId: 'crs_elsewhere' }, 'les_1')]);
     const result = (await detail(t)) as { attachments: Array<{ id: string }> };
 
     expect(result.attachments.map((a) => a.id)).not.toContain('att_other');
   });
 
   it('never returns a soft-deleted attachment', async () => {
-    const t = build([...ROWS, row({ id: 'att_gone', deletedAt: new Date() })]);
+    const t = build([...ROWS, published({ id: 'att_gone', deletedAt: new Date() }, 'les_1')]);
     const result = (await detail(t)) as { attachments: Array<{ id: string }> };
 
     expect(result.attachments.map((a) => a.id)).not.toContain('att_gone');
@@ -220,6 +268,77 @@ describe('the student Materials list', () => {
     await detail(t);
 
     expect(t.attachmentQueries[0]?.where).toMatchObject({ courseId: 'crs_1', deletedAt: null });
+  });
+});
+
+/**
+ * Publishing, not entitlement.
+ *
+ * `loadSections({ includeUnpublished: false })` already hides a draft lecture
+ * from the outline, and `issueTicket` refuses its documents. Advertising the
+ * document here anyway would leak the title of a lecture the student may not
+ * open, then fail on click.
+ */
+describe('unpublished material stays off the student Materials list', () => {
+  function draftLecture() {
+    return {
+      ...row({ id: 'att_draft', title: 'Draft slides.pdf', lessonId: 'les_draft' }),
+      lesson: { status: 'DRAFT', section: { status: 'PUBLISHED' } },
+    };
+  }
+
+  function draftSection() {
+    return {
+      ...row({ id: 'att_draftsec', title: 'Draft handout.pdf', sectionId: 'sec_draft' }),
+      section: { status: 'DRAFT' },
+    };
+  }
+
+  it('omits a PDF on a draft lecture', async () => {
+    const t = build([...ROWS, draftLecture()]);
+    const result = (await detail(t)) as { attachments: Array<{ id: string }> };
+
+    expect(result.attachments.map((a) => a.id)).not.toContain('att_draft');
+  });
+
+  it('omits a handout on a draft section', async () => {
+    const t = build([...ROWS, draftSection()]);
+    const result = (await detail(t)) as { attachments: Array<{ id: string }> };
+
+    expect(result.attachments.map((a) => a.id)).not.toContain('att_draftsec');
+  });
+
+  it('omits a PDF whose lesson sits in a draft section', async () => {
+    const t = build([
+      ...ROWS,
+      {
+        ...row({ id: 'att_insecdraft', lessonId: 'les_2' }),
+        lesson: { status: 'PUBLISHED', section: { status: 'DRAFT' } },
+      },
+    ]);
+    const result = (await detail(t)) as { attachments: Array<{ id: string }> };
+
+    expect(result.attachments.map((a) => a.id)).not.toContain('att_insecdraft');
+  });
+
+  it('still shows course-wide documents, which belong to no lecture', async () => {
+    const t = build([...ROWS, draftLecture()]);
+    const result = (await detail(t)) as { attachments: Array<{ id: string }> };
+
+    expect(result.attachments.map((a) => a.id)).toContain('att_course');
+  });
+
+  it('keeps them for staff, who author them', async () => {
+    const t = build([...ROWS, draftLecture(), draftSection()]);
+    const result = (await t.service.detail({
+      courseId: 'crs_1',
+      userId: 'staff_1',
+      role: 'TEACHER' as never,
+    })) as { attachments: Array<{ id: string }> };
+
+    const ids = result.attachments.map((a) => a.id);
+    expect(ids).toContain('att_draft');
+    expect(ids).toContain('att_draftsec');
   });
 });
 
@@ -239,7 +358,9 @@ describe('access marking', () => {
   });
 
   it('leaves a preview document unlocked without course access', async () => {
-    const t = build([row({ id: 'att_preview', lessonId: 'les_1', isPreview: true })]);
+    const t = build([
+      published({ id: 'att_preview', isPreview: true }, 'les_1'),
+    ]);
     (t.service as unknown as { access: { resolve: unknown } }).access.resolve = jest.fn(
       async () => ({ canAccessContent: false, hasAccess: false }),
     );

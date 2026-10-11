@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import {
   type AttachmentKind,
   AuditAction,
+  ContentStatus,
   UserRole,
 } from '@prisma/client';
 import { createHash, randomBytes } from 'node:crypto';
@@ -87,6 +88,47 @@ export class AttachmentsService {
       allowPreview: true,
       isPreviewContent: attachment.isPreview,
     });
+
+    // Publication, for students, independent of entitlement.
+    //
+    // The lesson endpoint refuses a student a lecture whose lesson or section is
+    // not PUBLISHED - hiding a section must not merely drop it from the outline
+    // while leaving its lectures openable by id. A document ticket has to hold
+    // the same line, otherwise the attachment id alone is enough to read a draft
+    // lecture's material. Entitlement checks cannot catch this: an ENROLLED
+    // student passes every one of them for a course whose lesson is still a
+    // draft.
+    if (params.user.role === UserRole.STUDENT) {
+      let lessonStatus: ContentStatus | null = null;
+      let sectionStatus: ContentStatus | null = null;
+
+      if (attachment.lessonId) {
+        const lesson = await this.prisma.lesson.findUnique({
+          where: { id: attachment.lessonId },
+          select: { status: true, section: { select: { status: true } } },
+        });
+        lessonStatus = lesson?.status ?? null;
+        sectionStatus = lesson?.section?.status ?? null;
+      }
+
+      if (attachment.sectionId) {
+        const section = await this.prisma.courseSection.findUnique({
+          where: { id: attachment.sectionId },
+          select: { status: true },
+        });
+        sectionStatus = section?.status ?? null;
+      }
+
+      const unpublished =
+        (lessonStatus !== null && lessonStatus !== ContentStatus.PUBLISHED) ||
+        (sectionStatus !== null && sectionStatus !== ContentStatus.PUBLISHED);
+
+      if (unpublished) {
+        // NotFound, not Forbidden: a draft lecture's document must be
+        // indistinguishable from one that never existed.
+        throw AppException.notFound('Attachment', params.attachmentId);
+      }
+    }
 
     // Section scope, for both the shapes an attachment can have.
     //

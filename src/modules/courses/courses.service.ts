@@ -321,8 +321,45 @@ export class CoursesService {
     //
     // Ordering matches `attachments()` so both surfaces list documents the same
     // way; the per-lecture grouping is what `lessonId: 'asc'` buys us.
+    //
+    // Students additionally never see a document belonging to a lecture or
+    // section that is not published. The outline already hides unpublished
+    // lectures (`loadSections({ includeUnpublished })`), and `issueTicket`
+    // refuses their documents, so listing them here would advertise the title of
+    // a lecture the student is not allowed to open, then fail on click.
+    //
+    // A lecture-scoped row carries `lessonId` and a NULL `sectionId` - the two
+    // are mutually exclusive - so its section has to be checked THROUGH the
+    // lesson. Testing `sectionId: null` alone would wave every lecture document
+    // through regardless of the section it hangs off.
     const attachments = await this.prisma.attachment.findMany({
-      where: { courseId: course.id, ...notDeleted },
+      where: {
+        courseId: course.id,
+        ...notDeleted,
+        ...(isStaff
+          ? {}
+          : {
+              AND: [
+                {
+                  OR: [
+                    { lessonId: null },
+                    {
+                      lesson: {
+                        status: ContentStatus.PUBLISHED,
+                        section: { status: ContentStatus.PUBLISHED },
+                      },
+                    },
+                  ],
+                },
+                {
+                  OR: [
+                    { sectionId: null },
+                    { section: { status: ContentStatus.PUBLISHED } },
+                  ],
+                },
+              ],
+            }),
+      },
       orderBy: [{ lessonId: 'asc' }, { sortOrder: 'asc' }],
     });
 

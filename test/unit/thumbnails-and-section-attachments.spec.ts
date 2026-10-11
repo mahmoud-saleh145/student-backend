@@ -90,6 +90,13 @@ function buildAttachments(options: AttachOptions = {}) {
       findFirst: jest.fn(async (_args: { where: unknown; select: unknown }) =>
         options.section === undefined ? { id: 'sec_1', courseId: 'crs_1' } : options.section,
       ),
+      // `issueTicket` reads publication status, not just ownership. These tests
+      // are about ENTITLEMENT gating, so the section is published and the new
+      // publication check stays out of their way; the draft cases live in
+      // attachment-publication-access.spec.ts.
+      findUnique: jest.fn(async (_args: { where: unknown; select: unknown }) => ({
+        status: 'PUBLISHED',
+      })),
     },
     user: {
       findUniqueOrThrow: jest.fn(async (_args: { where: unknown; select: unknown }) => ({
