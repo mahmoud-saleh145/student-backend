@@ -270,7 +270,17 @@ export class StorageController {
     }
 
     return this.storage.presignUpload({
-      bucket: 'uploads',
+      // `media`, NOT `uploads`.
+      //
+      // Every reader resolves an attachment key through `bucketForKey`, which
+      // sends anything that is not `library/` to the media store: the Worker's
+      // `objectKey.startsWith('library/') ? LIBRARY : MEDIA` (cloudflare-worker.js)
+      // and MediaOriginController:161 both do the same. An attachment written to
+      // `uploads` was therefore looked up in `edu-media`, never found, and served
+      // as `404 x-deny-reason: not_found` while its signature and expiry were
+      // valid. Library documents worked because their key prefix DOES select the
+      // bucket they were written to.
+      bucket: 'media',
       objectKey: StorageService.keys.attachment(dto.courseId, dto.filename),
       contentType: dto.contentType,
       expiresIn: 3600,
@@ -518,7 +528,11 @@ export class StorageController {
     const objectKey = StorageService.keys.attachment(query.courseId, query.filename);
 
     await this.storage.putStream({
-      bucket: 'uploads',
+      // `media`, for the same reason as the presign above: this is the bucket
+      // every reader resolves `attachments/...` keys into. The dashboard streams
+      // bytes through this endpoint, so changing only one of the two write sites
+      // would have left the object in the wrong bucket again.
+      bucket: 'media',
       objectKey,
       body: req,
       contentLength: declared,

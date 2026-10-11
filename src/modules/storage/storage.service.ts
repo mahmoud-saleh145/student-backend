@@ -26,14 +26,22 @@ import { CloudinaryService } from './cloudinary.service';
 /**
  * The three object stores this platform uses.
  *
- *  - `media`    — HLS renditions, thumbnails, avatars, captions. Fronted by the
- *                 Cloudflare Worker and subject to the whole protected-video
- *                 delivery path.
+ *  - `media`    — HLS renditions, thumbnails, avatars, captions, AND course
+ *                 attachments. Fronted by the Cloudflare Worker and subject to
+ *                 the whole protected-media delivery path.
  *  - `uploads`  — raw source files a client hands us before processing (video
- *                 originals, course attachments). Never served directly.
+ *                 originals). Never served directly.
  *  - `library`  — Library documents. Separate so that paid PDFs do not consume
  *                 the capacity budgeted for protected video, and so the two can
  *                 be sized, priced and lifecycle-managed independently.
+ *
+ * Attachments belong in `media`, not `uploads`. Every reader resolves them
+ * through `bucketForKey`, which sends anything that is not `library/` to the
+ * media store — the Worker's key-prefix switch and MediaOriginController:161
+ * agree. An attachment written to `uploads` was looked up in `edu-media`, never
+ * found, and served as `404 x-deny-reason: not_found` behind a perfectly valid
+ * signature. This bullet used to list them under `uploads`, which is what let
+ * the write path drift away from every reader.
  */
 export type Bucket = 'media' | 'uploads' | 'library';
 
