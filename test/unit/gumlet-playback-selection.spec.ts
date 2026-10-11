@@ -360,3 +360,46 @@ describe('manifest selection follows the DRM system', () => {
     expect(serialised).not.toContain('api-key-for-tests');
   });
 });
+
+/**
+ * `hardware_secure=true` is signed into the licence URL, which is what gates SD
+ * and audio behind hardware decode. `gumlet-signing.spec.ts` proves the SIGNING
+ * honours the flag; these prove the PLAYBACK PATH actually asks for it, so a
+ * future refactor cannot quietly drop it and leave the library playable on
+ * software-only devices.
+ */
+describe('the issued licence URL always requests hardware security', () => {
+  it.each(['web', 'android'] as const)('for platform %s', async (platform) => {
+    const t = makeService({ drmEnabled: true, provider: 'gumlet' });
+
+    const result = await resolve(t.service, gumletVideo, platform);
+    const url = new URL((result.drm as { licenseUrl: string }).licenseUrl);
+
+    expect(url.searchParams.get('hardware_secure')).toBe('true');
+  });
+
+  it('for iOS as well, on the FairPlay host', async () => {
+    const t = makeService({ drmEnabled: true, provider: 'gumlet' });
+
+    const result = await resolve(t.service, gumletVideo, 'ios');
+    const url = new URL((result.drm as { licenseUrl: string }).licenseUrl);
+
+    expect(url.host).toContain('fairplay.gumlet.com');
+    expect(url.searchParams.get('hardware_secure')).toBe('true');
+  });
+
+  it('carries it in the signed string, not only in the query', async () => {
+    // If the flag were appended after signing, Gumlet would see a token that
+    // does not match its parameters and reject the request.
+    const t = makeService({ drmEnabled: true, provider: 'gumlet' });
+
+    const signed = t.gumlet.signLicenseUrl({ assetId: 'asset_1', hardwareSecure: true });
+    const withFlag = new URL(signed.licenseUrl).searchParams.get('token');
+    const without = new URL(
+      t.gumlet.signLicenseUrl({ assetId: 'asset_1', hardwareSecure: false }).licenseUrl,
+    ).searchParams.get('token');
+
+    expect(withFlag).toBeTruthy();
+    expect(withFlag).not.toBe(without);
+  });
+});

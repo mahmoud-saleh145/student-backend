@@ -308,9 +308,22 @@ export class CoursesService {
       : [];
     const progressByLesson = new Map(progressRows.map((p) => [p.lessonId, p]));
 
+    // Every document this course can hand a student - course-wide handouts,
+    // section handouts and lecture PDFs alike.
+    //
+    // This used to carry `lessonId: null`, which quietly narrowed the list to
+    // course-wide documents only and made `detail()` disagree with
+    // `attachments()` right below it, which has always returned everything.
+    // Student-web renders its Materials tab from THIS payload and never calls
+    // the `/courses/:id/attachments` endpoint, so the narrower definition was
+    // the one students got: a PDF attached to a lecture was saved, confirmed by
+    // the dashboard, and then simply absent from the course's materials.
+    //
+    // Ordering matches `attachments()` so both surfaces list documents the same
+    // way; the per-lecture grouping is what `lessonId: 'asc'` buys us.
     const attachments = await this.prisma.attachment.findMany({
-      where: { courseId: course.id, lessonId: null, ...notDeleted },
-      orderBy: { sortOrder: 'asc' },
+      where: { courseId: course.id, ...notDeleted },
+      orderBy: [{ lessonId: 'asc' }, { sortOrder: 'asc' }],
     });
 
     const summary = toCourseSummary({

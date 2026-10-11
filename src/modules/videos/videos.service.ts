@@ -77,6 +77,49 @@ export class VideosService {
   // Upload
   // ---------------------------------------------------------------------------
 
+  /**
+   * Delivery provider that any upload carrying NEW content must use.
+   *
+   * Uploads are routed to Gumlet automatically whenever the platform is
+   * configured for Gumlet DRM, so staff never opt a video in by hand and no
+   * upload can land on the legacy AES-128 path by omission.
+   *
+   * This matters more than it looks: `processFromJob` reads `drmProvider` from
+   * the database to choose the pipeline, so setting it here is both what turns
+   * the Gumlet branch on AND what guarantees the legacy ffmpeg path can never
+   * rescue a video whose Gumlet ingest or DRM packaging failed. The video stays
+   * unavailable instead.
+   *
+   * Applies to both a first upload and a REPLACEMENT. Replacing the file of a
+   * legacy lesson is a new recording, so it must not inherit the old row's
+   * legacy provider and slip new content onto the unprotected pipeline.
+   *
+   * FAILS CLOSED. If the platform declares Gumlet DRM but the credentials are
+   * incomplete, the upload is refused rather than quietly created (or replaced)
+   * as unprotected legacy HLS.
+   *
+   * Videos nobody touches keep whatever they already have, so the legacy
+   * library is never migrated as a side effect of uploading elsewhere.
+   */
+  private resolveNewVideoProvider(): string | null {
+    const drm = this.cfg.drm;
+    const gumletConfigured = Boolean(
+      drm.gumlet.apiKey && drm.gumlet.workspaceId && drm.gumlet.orgId && drm.gumlet.signSecret,
+    );
+
+    if (!drm.enabled || drm.provider !== 'gumlet') {
+      // The platform is explicitly not using Gumlet DRM. Legacy delivery stands.
+      return null;
+    }
+    if (!gumletConfigured) {
+      throw new AppException(ErrorCode.UPLOAD_FAILED, {
+        message:
+          'Gumlet DRM is enabled but not fully configured, so a new video cannot be delivered with DRM. Refusing to create an unprotected video.',
+      });
+    }
+    return 'gumlet';
+  }
+
   async initUpload(
     params: {
       lessonId: string;
@@ -133,6 +176,11 @@ export class VideosService {
     // before this, a re-upload after a delete kept the tombstone, and
     // `complete` then answered "Video not found" for the video it had just
     // created.
+    // Resolved BEFORE any write, so a misconfigured Gumlet deployment fails the
+    // upload closed and leaves the existing row untouched, instead of replacing
+    // a working lesson with an unprotected one.
+    const requestedProvider = this.resolveNewVideoProvider();
+
     const video = lesson.video
       ? await this.prisma.video.update({
           where: { id: lesson.video.id },
@@ -155,6 +203,15 @@ export class VideosService {
             gumletStatus: null,
             gumletError: null,
             gumletUpdatedAt: null,
+            // A LEGACY row carrying NEW content must not keep its old provider:
+            // that would send the new recording down the legacy ffmpeg/AES-128
+            // pipeline on a DRM platform. A row already on Gumlet keeps it, with
+            // only the stale asset identity cleared above. When the platform
+            // does not require Gumlet, `requestedProvider` is null and the row
+            // keeps whatever it had - the existing policy is preserved.
+            ...(requestedProvider !== null && lesson.video.drmProvider !== 'gumlet'
+              ? { drmProvider: requestedProvider }
+              : {}),
           },
         })
       : await this.prisma.video.create({
@@ -163,6 +220,9 @@ export class VideosService {
             courseId: lesson.courseId,
             status: VideoStatus.UPLOADING,
             uploadedById: actor.id,
+            // Set here, not by a later staff action, so every new upload enters
+            // the Gumlet workflow automatically. See resolveNewVideoProvider().
+            drmProvider: this.resolveNewVideoProvider(),
           },
         });
 

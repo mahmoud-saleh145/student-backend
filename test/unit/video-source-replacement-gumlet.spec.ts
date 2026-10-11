@@ -69,6 +69,25 @@ function build(existing: {
     getOrThrow: () => ({
       maxSourceBytes: 8 * 1024 ** 3,
       allowedVideoTypes: ['video/mp4'],
+      // `initUpload` reads `drm` to choose the delivery provider for a NEW
+      // video, so this mock must mirror the real VideoConfig shape. Gumlet is
+      // fully configured here, so a fresh upload routes to Gumlet.
+      drm: {
+        enabled: true,
+        provider: 'gumlet',
+        widevineLicenseUrl: null,
+        fairplayLicenseUrl: null,
+        fairplayCertUrl: null,
+        providerToken: null,
+        gumlet: {
+          apiKey: 'api-key-for-tests',
+          workspaceId: 'ws',
+          orgId: 'org_1',
+          signSecret: 'c2VjcmV0LWtleS1mb3ItdGVzdGluZw==',
+          tokenLifetimeSeconds: 300,
+          resolutions: ['720p', '1080p'],
+        },
+      },
     }),
   };
 
