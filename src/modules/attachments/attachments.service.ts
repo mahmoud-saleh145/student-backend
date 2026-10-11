@@ -19,6 +19,7 @@ import { DevicesService } from '../devices/devices.service';
 import { SecurityEventService } from '../security/security-event.service';
 import {
   assertObjectKeyInNamespace,
+  MAX_DOCUMENT_BYTES,
   StorageService,
 } from '../storage/storage.service';
 
@@ -297,6 +298,22 @@ export class AttachmentsService {
       'objectKey',
     );
 
+    // The object's real size, read back from storage.
+    //
+    // The upload itself ran through a presigned PUT, whose signature binds only
+    // `host` — and R2 ignores `x-amz-content-length-range`, so nothing stopped
+    // the bytes that actually landed from being larger than the `sizeBytes` this
+    // request declared. That declared value is the client's own claim and is
+    // capped at `@Min(0)`, so persisting it would let an oversized object be
+    // recorded as a small one. The `media` bucket is the WRITE site, which is
+    // what the delete path and `bucketForKey` both expect.
+    const sizeBytes = await this.storage.assertUploadWithinLimit({
+      bucket: 'media',
+      objectKey: input.objectKey,
+      maxBytes: MAX_DOCUMENT_BYTES,
+      field: 'sizeBytes',
+    });
+
     const attachment = await this.prisma.attachment.create({
       data: {
         courseId: input.courseId,
@@ -306,7 +323,7 @@ export class AttachmentsService {
         kind: input.kind,
         objectKey: input.objectKey,
         mimeType: input.mimeType,
-        sizeBytes: input.sizeBytes ? BigInt(input.sizeBytes) : null,
+        sizeBytes: BigInt(sizeBytes),
         pageCount: input.pageCount,
         isProtected,
         // A protected file is never downloadable — the two flags contradict

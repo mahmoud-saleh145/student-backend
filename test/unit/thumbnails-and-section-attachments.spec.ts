@@ -120,6 +120,11 @@ function buildAttachments(options: AttachOptions = {}) {
   const storage = {
     signMediaUrl: jest.fn(async (_args: unknown) => 'https://gate.example/x'),
     deleteObject: jest.fn(async (..._args: unknown[]) => undefined),
+    // Registration now measures the object instead of trusting the request's
+    // declared size, so the double answers that call. The sizing behaviour
+    // itself is covered in presigned-upload-size-verification.spec.ts; here it
+    // only has to let an ordinary create through.
+    assertUploadWithinLimit: jest.fn(async (_args: unknown) => 1024),
   };
   const audit = { record: jest.fn(async (_entry: Record<string, unknown>) => undefined) };
   const config = { getOrThrow: () => ({ ticketTtl: 300 }) };
