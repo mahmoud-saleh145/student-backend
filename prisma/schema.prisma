@@ -1394,7 +1394,16 @@ model Lesson {
   course  Course        @relation(fields: [courseId], references: [id], onDelete: Cascade)
   section CourseSection @relation(fields: [sectionId], references: [id], onDelete: Cascade)
 
+  /// The lesson that ORIGINATED this lecture's video (the upload target).
+  ///
+  /// This is the legacy one-video-per-lesson relation and it is deliberately
+  /// kept: the whole upload, ingest and worker pipeline is keyed off it, and
+  /// the row must never lose the lecture it came from. A video may ALSO be
+  /// attached to other lectures through `videoLinks`, which is what makes an
+  /// asset reusable without ever duplicating it.
   video       Video?
+  /// Every video attached to this lecture, including the one it owns.
+  videoLinks  LessonVideo[]
   attachments Attachment[]
 
   watchProgress WatchProgress[]
@@ -1416,7 +1425,20 @@ model Lesson {
 /// URL. A playable URL only ever comes from a PlaybackTicket.
 model Video {
   id       String      @id @default(cuid())
-  lessonId String      @unique
+  /// The lecture this video was UPLOADED to - i.e. where it was authored, and
+  /// the lecture that owns its ingest lifecycle. NULL only if that lecture was
+  /// hard-deleted while the asset was still reused elsewhere.
+  ///
+  /// This is deliberately NOT the only lecture the video belongs to: see
+  /// `lessonLinks` / `LessonVideo` for the full set of attached lectures. One
+  /// asset row holds one upload, one Gumlet asset ID and one DRM state, and can
+  /// be attached to any number of lectures without duplicating any of it.
+  ///
+  /// Still `@unique` so the legacy `Lesson.video` back-relation stays singular
+  /// and every existing `include: { video: … }` query keeps compiling and
+  /// meaning "the video this lecture owns". PostgreSQL permits many NULLs in a
+  /// unique index, so making the column nullable costs nothing here.
+  lessonId String?     @unique
   courseId String
   status   VideoStatus @default(UPLOADING)
 
@@ -1456,6 +1478,24 @@ model Video {
   gumletError      String?
   gumletUpdatedAt  DateTime?
 
+  /// Explicit DRM verification state, proven against the live asset.
+  ///
+  /// `drmProvider` alone is NOT proof that DRM works - it is a routing flag we
+  /// wrote ourselves. This field is set only after fetching the asset's DASH
+  /// manifest and confirming CENC encryption (`default_KID` + mp4protection), so
+  /// its presence means "someone actually looked".
+  ///
+  /// Playback requires this to be non-null AND fresher than the configured TTL.
+  /// It is cleared whenever a sync fails, so a video can never stay verified
+  /// after its asset stops being verifiable.
+  drmVerifiedAt   DateTime?
+  /// Why verification is not satisfied, for the admin UI. Never shown to students.
+  drmBlockedReason String?
+  /// True only while a Gumlet asset exists for this video and ingestion was
+  /// requested with DRM explicitly enabled. Set by our own ingest code, not by
+  /// anything a client can set.
+  drmRequested    Boolean  @default(false)
+
   processingJobId String?
   processingError String?
   processingStartedAt DateTime?
@@ -1466,7 +1506,10 @@ model Video {
   updatedAt DateTime  @updatedAt
   deletedAt DateTime?
 
-  lesson     Lesson           @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  lesson     Lesson?          @relation(fields: [lessonId], references: [id], onDelete: SetNull)
+  /// Every lecture this asset is attached to. Contains at least the owning
+  /// lecture for any live video, plus one row per reused attachment.
+  lessonLinks LessonVideo[]
   course     Course           @relation(fields: [courseId], references: [id], onDelete: Cascade)
   renditions VideoRendition[]
   captions   CaptionTrack[]
@@ -1477,6 +1520,43 @@ model Video {
   @@index([courseId, status])
   @@index([status, createdAt])
   @@map("videos")
+}
+
+/// Attaches one shared video asset to one lecture.
+///
+/// This is the whole point of the model: the video bytes, the Gumlet asset ID,
+/// the DRM state and the processing status live on exactly one `Video` row, and
+/// any number of lectures can reference that same row through this table. Reuse
+/// therefore costs one small row - it never re-uploads bytes, never creates a
+/// second Gumlet asset, and never forks the asset's metadata.
+///
+/// Referential integrity:
+///   * `onDelete: Cascade` on both sides. Deleting a LECTURE drops only the
+///     association row and leaves the shared asset intact for every other
+///     lecture still using it. Deleting a VIDEO removes the attachments, which
+///     is the correct inverse.
+///   * The composite primary key makes "this lecture has this video attached"
+///     unique, so a mapping can never be applied twice.
+model LessonVideo {
+  lessonId String
+  videoId  String
+
+  /// Position within the lecture's video list. 0 for the owned video and for a
+  /// simple single attachment; reserved for future multi-video lectures so the
+  /// table does not have to be reshaped to add ordering later.
+  sortOrder   Int       @default(0)
+  /// Staff member who performed the attach, for the audit trail.
+  createdById String?
+  createdAt   DateTime  @default(now())
+
+  lesson Lesson @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  video  Video  @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@id([lessonId, videoId])
+  /// Reverse lookup: "which lectures use this asset?" - the query that decides
+  /// whether detaching from one lecture may safely destroy the asset.
+  @@index([videoId])
+  @@map("lesson_videos")
 }
 
 model VideoRendition {

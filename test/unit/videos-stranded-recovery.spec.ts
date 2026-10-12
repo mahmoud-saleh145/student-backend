@@ -110,6 +110,7 @@ function build(rows: Row[]) {
     getOrThrow: () => ({ ladder: [360, 720], encryptionEnabled: true }),
   };
 
+  const lessonVideos = { countLiveAttachments: jest.fn().mockResolvedValue(1) };
   const service = new VideosService(
     prisma as never,
     {} as never, // storage
@@ -120,6 +121,7 @@ function build(rows: Row[]) {
     {} as never, // redis
     queue as never,
     config as never,
+    lessonVideos as never,
   );
 
   return { service, enqueued, failed };

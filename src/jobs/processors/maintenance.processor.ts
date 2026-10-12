@@ -9,6 +9,7 @@ import { EnrollmentsService } from '../../modules/enrollments/enrollments.servic
 import { AnnouncementsService } from '../../modules/notifications/announcements.service';
 import { NotificationsService } from '../../modules/notifications/notifications.service';
 import { PlaybackService } from '../../modules/playback/playback.service';
+import { DrmVerificationSweepService } from '../../modules/playback/drm-verification-sweep.service';
 import { VideosService } from '../../modules/videos/videos.service';
 import { MAINTENANCE_JOBS, QUEUE_NAMES, type MaintenanceJobData } from '../queue.constants';
 import { BACKGROUND_WORKER } from '../queue.tuning';
@@ -37,6 +38,7 @@ export class MaintenanceProcessor extends WorkerHost {
     private readonly notifications: NotificationsService,
     private readonly announcements: AnnouncementsService,
     private readonly videos: VideosService,
+    private readonly drmSweep: DrmVerificationSweepService,
   ) {
     super();
   }
@@ -72,6 +74,12 @@ export class MaintenanceProcessor extends WorkerHost {
 
       case MAINTENANCE_JOBS.recoverStrandedVideos:
         return this.videos.recoverStrandedVideos();
+
+      // Renews DRM proofs before they lapse. Without this, every lesson stops
+      // playing once the verification TTL expires. The sweep itself decides what
+      // is due and calls the real verifier, so this case only hands it over.
+      case MAINTENANCE_JOBS.refreshDrmVerification:
+        return this.drmSweep.sweep();
 
       default:
         this.logger.warn(`unknown maintenance job: ${job.name}`);

@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query } from '@nestjs/common';
 import {
   ApiBearerAuth,
   ApiOperation,
@@ -88,10 +88,16 @@ export class LessonsController {
   @ApiOperation({
     summary: 'Resolve a video id to its lesson',
     description:
-      'Convenience for the player route, which is entered with a video id but needs the lesson title, completion rule and next-lesson pointer.',
+      'Convenience for the player route, which is entered with a video id but needs the lesson title, completion rule and next-lesson pointer. ' +
+      'A video asset may be attached to several lectures, so clients should pass ?lessonId= to say which lecture they are actually watching. ' +
+      'Without it, an asset used by more than one lecture is refused rather than resolved to an arbitrary one.',
   })
-  byVideo(@Param('videoId') videoId: string, @CurrentUser() user: AuthenticatedUser) {
-    return this.lessons.byVideoId(videoId, user.id, user.role);
+  byVideo(
+    @Param('videoId') videoId: string,
+    @CurrentUser() user: AuthenticatedUser,
+    @Query('lessonId') lessonId?: string,
+  ) {
+    return this.lessons.byVideoId(videoId, user.id, user.role, lessonId);
   }
 
   @Post('lessons/:lessonId/complete')

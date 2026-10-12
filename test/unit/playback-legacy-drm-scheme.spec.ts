@@ -1,4 +1,5 @@
 import { PlaybackService } from 'src/modules/playback/playback.service';
+import { allowDrm } from './helpers/drm-doubles';
 
 /**
  * Mixed-provider playback: legacy HLS videos must never be told they are DRM.
@@ -63,6 +64,7 @@ function makeService(drm: {
     {} as never,
     {} as never,
     {} as never,
+    allowDrm() as never,
     configService as never,
   );
 

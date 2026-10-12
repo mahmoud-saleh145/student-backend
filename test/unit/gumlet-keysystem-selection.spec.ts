@@ -1,4 +1,5 @@
 import { GumletDrmService } from 'src/modules/playback/gumlet-drm.service';
+import { buildDrmVerification } from './helpers/drm-doubles';
 import { PlaybackService } from 'src/modules/playback/playback.service';
 
 /**
@@ -67,6 +68,23 @@ function makeService(drmEnabled = true) {
     {} as never,
     {} as never,
     gumlet as never,
+    buildDrmVerification({
+    // Mirror the video under test: a legacy row must be judged as legacy, not
+    // inherit the happy path.
+    row: (id) => {
+      const v = rowsById.get(id);
+      return v
+        ? {
+            drmProvider: v.drmProvider,
+            gumletAssetId: v.gumletAssetId,
+            gumletWorkspaceId: v.gumletWorkspaceId,
+            gumletStatus: 'ready',
+            drmRequested: v.drmProvider === 'gumlet',
+            drmVerifiedAt: v.drmProvider === 'gumlet' ? new Date() : null,
+          }
+        : {};
+    },
+  }) as never,
     configService as never,
   );
 
@@ -80,7 +98,10 @@ const gumletVideo: VideoRowLike = {
   gumletWorkspaceId: 'ws_1',
 };
 
+const rowsById = new Map<string, VideoRowLike>();
+
 function resolve(service: PlaybackService, video: VideoRowLike, platform: Platform) {
+  rowsById.set(video.id, video);
   return (
     service as unknown as {
       resolvePlaybackTarget: (
@@ -164,14 +185,15 @@ describe('a Gumlet video on non-iOS platforms', () => {
 });
 
 describe('key-system selection never bypasses access control', () => {
-  it('a legacy video is unaffected by the platform field', async () => {
+  it('a legacy video is refused on every platform, and never falls back to HLS', async () => {
+    // Previously this asserted a legacy video was served normally with a
+    // platform field it could not possibly use. Under strict DRM there is no
+    // legacy fallback at all, so the correct outcome is a refusal.
     const t = makeService();
     const legacy = { ...gumletVideo, id: 'v_legacy', drmProvider: null, gumletAssetId: null };
 
-    const result = await resolve(t.service, legacy, 'ios');
-
-    expect(result.manifestUrl).toBe('https://api.example/legacy/master.m3u8');
-    expect(t.manifest.buildMasterUrl).toHaveBeenCalled();
+    await expect(resolve(t.service, legacy, 'ios')).rejects.toThrow();
+    expect(t.manifest.buildMasterUrl).not.toHaveBeenCalled();
   });
 
   it('a Gumlet video with DRM disabled still fails closed on every platform', async () => {

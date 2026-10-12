@@ -26,7 +26,7 @@ const SECTION = {
   status: 'PUBLISHED',
 };
 
-function build(options: { teacherMayDeleteLectures: boolean; liveLessons: number }) {
+function build(options: { teacherMayDeleteLectures: boolean; liveLessons: number; sharedAcrossSections?: boolean }) {
   const assertTeacherCapability = jest.fn(async (role: UserRole, capability: string) => {
     if (role !== UserRole.TEACHER) return;
     if (capability === 'deleteLectures' && !options.teacherMayDeleteLectures) {
@@ -43,8 +43,18 @@ function build(options: { teacherMayDeleteLectures: boolean; liveLessons: number
 
   const tx = {
     courseSection: { update: sectionUpdate },
-    lesson: { updateMany: lessonUpdateMany },
-    video: { updateMany: videoUpdateMany },
+    lesson: { updateMany: lessonUpdateMany, findMany: jest.fn(async () => [{ id: 'l_1' }]) },
+    // A video may be attached to lectures in OTHER sections. Only one whose
+    // every attachment is inside the deleted section may be archived.
+    lessonVideo: { findMany: jest.fn(async () => [{ lessonId: 'l_1' }]) },
+    video: {
+      updateMany: videoUpdateMany,
+      findMany: jest.fn(async () => [
+        options.sharedAcrossSections === false
+          ? { id: 'v_own', lessonLinks: [{ lessonId: 'l_1' }] }
+          : { id: 'v_shared', lessonLinks: [{ lessonId: 'l_1' }, { lessonId: 'l_other' }] },
+      ]),
+    },
     playbackTicket: { updateMany: ticketUpdateMany },
     $executeRaw: jest.fn(async () => 0),
   };
@@ -128,11 +138,27 @@ describe('deleting a section stops its content being streamed', () => {
     const { service, videoUpdateMany, ticketUpdateMany } = build({
       teacherMayDeleteLectures: true,
       liveLessons: 2,
+      sharedAcrossSections: false,
     });
 
     await service.remove('sec_1', ADMIN);
 
     expect(videoUpdateMany).toHaveBeenCalled();
     expect(ticketUpdateMany).toHaveBeenCalled();
+  });
+
+  it('does NOT archive a video that another section is still using', async () => {
+    // One asset row can be attached to lectures in several sections and
+    // courses. Archiving it here would take every other section's playback
+    // down as a side effect of deleting an unrelated one.
+    const { service, videoUpdateMany } = build({
+      teacherMayDeleteLectures: true,
+      liveLessons: 1,
+      sharedAcrossSections: true,
+    });
+
+    await service.remove('sec_1', ADMIN);
+
+    expect(videoUpdateMany).not.toHaveBeenCalled();
   });
 });

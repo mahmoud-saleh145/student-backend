@@ -52,6 +52,14 @@ export class LessonsService {
             captions: true,
           },
         },
+        // A lecture can ATTACH a video it does not own (the same uploaded asset
+        // reused in another course). `video` above only resolves the owning
+        // lecture's row, so without this a destination lecture would report
+        // `video: null` and offer the student no way to play anything.
+        videoLinks: {
+          where: { video: notDeleted },
+          select: { video: { include: { renditions: { orderBy: { height: 'asc' } }, captions: true } } },
+        },
         attachments: { where: notDeleted, orderBy: { sortOrder: 'asc' } },
         course: {
           select: {
@@ -125,7 +133,14 @@ export class LessonsService {
     // A deleted video keeps its row (watch events reference it) and the
     // lesson↔video relation is one-to-one, so the relation still resolves to
     // the tombstone. It must read as "no video", not as a playable one.
-    const video = lesson.video && !lesson.video.deletedAt ? lesson.video : null;
+    const owned = lesson.video && !lesson.video.deletedAt ? lesson.video : null;
+    // Fall back to an ATTACHED asset when this lecture does not own one.
+    const reused = owned ? null : lesson.videoLinks[0]?.video ?? null;
+    const video = owned ?? reused;
+    // Whether this lecture OWNS the asset rather than borrowing it. Purely
+    // informational for the client; authorisation is decided at ticket time
+    // against the resolved lesson, never from this flag.
+    const videoReused = video !== null && owned === null;
 
     return {
       id: lesson.id,
@@ -154,6 +169,12 @@ export class LessonsService {
             hasCaptions: video.captions.length > 0,
             captionLanguages: video.captions.map((c) => c.language),
             status: video.status,
+            /**
+             * True when this lecture is showing a file uploaded elsewhere. The
+             * SAME asset, not a copy: the id above is the real video id, so the
+             * client must send this `lesson.id` when it asks for a ticket.
+             */
+            reused: videoReused,
           }
         : null,
 
@@ -191,28 +212,75 @@ export class LessonsService {
         section: { deletedAt: null, status: ContentStatus.PUBLISHED },
       },
       orderBy: [{ section: { sortOrder: 'asc' } }, { sortOrder: 'asc' }],
-      select: { id: true, video: { select: { id: true, deletedAt: true } } },
+      select: {
+        id: true,
+        video: { select: { id: true, deletedAt: true } },
+        // Reused assets count too. Without this, prev/next returned null for
+        // every lecture that borrows a video, so autoplay silently dead-ended
+        // at exactly the lectures that use sharing.
+        videoLinks: {
+          where: { video: notDeleted },
+          select: { video: { select: { id: true, deletedAt: true } } },
+          take: 1,
+        },
+      },
     });
-    return rows.map((r) => ({
-      id: r.id,
-      videoId: r.video && !r.video.deletedAt ? r.video.id : null,
-    }));
+    return rows.map((r) => {
+      const owned = r.video && !r.video.deletedAt ? r.video.id : null;
+      const attached = r.videoLinks[0]?.video;
+      const reused = owned ?? (attached && !attached.deletedAt ? attached.id : null);
+      return { id: r.id, videoId: reused };
+    });
   }
 
   /**
-   * Resolves a video id to its lesson.
+   * Resolves a video id to the lesson it should be played as.
    *
    * Exists because the mobile player route is entered with a video id but
-   * needs lesson metadata (title, completion rule, next lesson). Without it
-   * the client would have to guess the lesson id from the video id.
+   * needs lesson metadata (title, completion rule, next lesson).
+   *
+   * A video asset can be attached to several lectures, so a bare video id is no
+   * longer enough to identify one. When the caller says which lesson it is
+   * playing (`lessonId`) that is honoured - but only if the asset really is
+   * attached to it. When it is not supplied, a video with exactly one attachment
+   * resolves unambiguously; anything else is refused rather than guessed, because
+   * returning the wrong lesson would hand back another course's metadata and
+   * completion rules.
    */
-  async byVideoId(videoId: string, userId: string, role: UserRole) {
+  async byVideoId(videoId: string, userId: string, role: UserRole, lessonId?: string) {
     const video = await this.prisma.video.findFirst({
       where: { id: videoId, ...notDeleted },
-      select: { lessonId: true },
+      select: {
+        lessonId: true,
+        lessonLinks: {
+          where: { lesson: { ...notDeleted } },
+          select: { lessonId: true },
+        },
+      },
     });
     if (!video) throw AppException.notFound('Video', videoId);
-    return this.detail(video.lessonId, userId, role);
+
+    const attached = new Set(video.lessonLinks.map((link) => link.lessonId));
+
+    if (lessonId) {
+      if (!attached.has(lessonId)) {
+        throw new AppException(ErrorCode.PLAYBACK_DENIED, {
+          message: 'This video is not attached to the requested lesson',
+        });
+      }
+      return this.detail(lessonId, userId, role);
+    }
+
+    if (attached.size === 1) {
+      return this.detail([...attached][0], userId, role);
+    }
+
+    // More than one attachment and no hint from the caller: refuse rather than
+    // pick. Guessing would return whichever lecture happened to be first.
+    throw new AppException(ErrorCode.PLAYBACK_DENIED, {
+      message:
+        'This video is used by more than one lecture. Retry from the lesson you are trying to watch.',
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -521,10 +589,26 @@ export class LessonsService {
 
       // The video row is retained: watch events reference it, and the object
       // storage cleanup is a separate, auditable job.
-      await tx.video.updateMany({
+      //
+      // Reused assets are NOT archived. This lesson may be holding a file that
+      // other courses are still streaming, and archiving the shared row would
+      // take their playback down as a side effect of deleting an unrelated
+      // lecture. The lesson↔video links themselves cascade with the lesson.
+      const owned = await tx.video.findMany({
         where: { lessonId },
-        data: { status: VideoStatus.ARCHIVED },
+        select: { id: true, lessonLinks: { select: { lessonId: true } } },
       });
+
+      const orphaned = owned
+        .filter((v) => v.lessonLinks.every((link) => link.lessonId === lessonId))
+        .map((v) => v.id);
+
+      if (orphaned.length > 0) {
+        await tx.video.updateMany({
+          where: { id: { in: orphaned } },
+          data: { status: VideoStatus.ARCHIVED },
+        });
+      }
 
       await tx.playbackTicket.updateMany({
         where: { lessonId, status: 'ACTIVE' },

@@ -1,4 +1,5 @@
 import { GumletIngestService } from 'src/modules/videos/gumlet-ingest.service';
+import { buildDrmVerification } from './helpers/drm-doubles';
 
 /**
  * Fail-closed behaviour for the Gumlet-backed lifecycle.
@@ -61,6 +62,13 @@ function build(opts: {
         Object.assign(row, args.data);
         return row;
       }),
+      // `verify()` writes its success conditionally, so that a slower
+      // overlapping verification cannot overwrite a newer timestamp.
+      updateMany: jest.fn(async (args: { data: Record<string, unknown> }) => {
+        updates.push(args.data);
+        Object.assign(row, args.data);
+        return { count: 1 };
+      }),
     },
   };
 
@@ -70,10 +78,16 @@ function build(opts: {
     // never called for ingestion.
     signMediaUrl: jest.fn(async () => 'https://cdn.example/source?sig=SHOULD-NOT-BE-USED'),
     presignIngestionUrl: jest.fn(async () => 'https://r2.example/ingest?X-Amz-Signature=REDACTED'),
+    // `replaceFailedAsset()` checks the stored source really is there before it
+    // discards the dead asset id, so the double has to answer.
+    exists: jest.fn(async () => true),
+    isConfigured: true,
   };
 
   const gumlet = {
     isAssetApiConfigured: () => true,
+    // Checked by replaceFailedAsset before it is allowed to clear an asset id.
+    isSigningConfigured: () => true,
     isAssetPlayable: (s: string) => s === 'ready',
     assetHasDrm: (text: string) =>
       /urn:mpeg:dash:mp4protection:2011/.test(text) && /cenc:default_KID=/.test(text),
@@ -91,15 +105,31 @@ function build(opts: {
 
   const config = {
     getOrThrow: () => ({
-      drm: { gumlet: { workspaceId: 'ws', resolutions: ['720p', '1080p'] } },
+      drm: {
+        // replaceFailedAsset() now asserts the platform is actually on the Gumlet
+        // DRM path before it may discard an asset id, so the fixture must look
+        // like a configured platform or every replacement test would be refused
+        // for the wrong reason.
+        enabled: true,
+        provider: 'gumlet',
+        gumlet: { workspaceId: 'ws', resolutions: ['720p', '1080p'] },
+      },
     }),
   };
 
+  const lessonVideos = { propagateDurationToAttachedLessons: jest.fn().mockResolvedValue(0) };
   const service = new GumletIngestService(
     prisma as never,
     storage as never,
     gumlet as never,
+    buildDrmVerification({
+      // The REAL verifier over this harness's own Prisma stub, so a genuinely
+      // unencrypted manifest is actually detected rather than stubbed away.
+      prisma: prisma as never,
+    gumlet: gumlet as never,
+    }) as never,
     config as never,
+    lessonVideos as never,
   );
 
   return { service, updates, row, gumlet, storage };
@@ -161,7 +191,10 @@ describe('GumletIngestService.sync', () => {
   });
 
   it('marks READY only when ready AND the manifest is CENC-encrypted', async () => {
-    const t = build({ row: { ...baseRow(), gumletAssetId: 'a1' }, asset: { status: 'ready' } });
+    const t = build({
+      row: { ...baseRow(), drmProvider: 'gumlet', gumletAssetId: 'a1' },
+      asset: { status: 'ready' },
+    });
     jest.spyOn(global, 'fetch').mockResolvedValue({
       ok: true,
       text: async () => DRM_MANIFEST,
@@ -174,7 +207,10 @@ describe('GumletIngestService.sync', () => {
   });
 
   it('BLOCKS playback when Gumlet reports ready but the manifest is not encrypted', async () => {
-    const t = build({ row: { ...baseRow(), gumletAssetId: 'a1' }, asset: { status: 'ready' } });
+    const t = build({
+      row: { ...baseRow(), drmProvider: 'gumlet', gumletAssetId: 'a1' },
+      asset: { status: 'ready' },
+    });
     jest.spyOn(global, 'fetch').mockResolvedValue({
       ok: true,
       text: async () => PLAIN_MANIFEST,
@@ -189,7 +225,7 @@ describe('GumletIngestService.sync', () => {
 
   it('marks FAILED when Gumlet reports an errored asset', async () => {
     const t = build({
-      row: { ...baseRow(), gumletAssetId: 'a1' },
+      row: { ...baseRow(), drmProvider: 'gumlet', gumletAssetId: 'a1' },
       asset: { status: 'errored', error: 'source decode failed' },
     });
     const res = await t.service.sync('v1');
@@ -201,6 +237,136 @@ describe('GumletIngestService.sync', () => {
   it('refuses to sync a video that has no Gumlet asset', async () => {
     const t = build({ row: { ...baseRow(), gumletAssetId: null } });
     await expect(t.service.sync('v1')).rejects.toThrow(/not backed/i);
+  });
+});
+
+/**
+ * Replacing a permanently failed asset.
+ *
+ * `adopt()` is idempotent, so a video whose asset died at the provider can never
+ * be retried through the normal path. `replaceFailedAsset` is the one deliberate
+ * escape hatch, and each guard below exists to stop it being used where it would
+ * destroy something that works.
+ */
+describe('replaceFailedAsset', () => {
+  const deadOnLegacy = () =>
+    ({
+      ...baseRow(),
+      status: 'READY',
+      drmProvider: null,
+      gumletAssetId: 'dead_asset',
+      gumletStatus: 'errored',
+    }) as Row;
+
+  it('clears the dead asset id and creates a replacement', async () => {
+    const t = build({ row: deadOnLegacy() });
+    await t.service.replaceFailedAsset('v1');
+    expect(t.updates[0]).toMatchObject({ gumletAssetId: null, gumletStatus: null, gumletError: null });
+    expect(t.gumlet.createAsset).toHaveBeenCalledTimes(1);
+  });
+
+  it('reuses the SAME stored source object - no re-upload, nothing deleted', async () => {
+    const t = build({ row: deadOnLegacy() });
+    await t.service.replaceFailedAsset('v1');
+    const arg = (t.gumlet.createAsset as jest.Mock).mock.calls[0][0] as { sourceUrl: string };
+    expect(arg.sourceUrl).toContain('r2.example');
+    // The storage double only ever exposes presigning, a configuration flag, an
+    // existence probe, and the deliberately-decoy signer. There is no delete
+    // method on it at all, so a replacement physically cannot destroy the R2
+    // source object or any legacy HLS rendition.
+    expect(Object.keys(t.storage).sort()).toEqual([
+      'exists',
+      'isConfigured',
+      'presignIngestionUrl',
+      'signMediaUrl',
+    ]);
+  });
+
+  it('refuses when the video is already served by its Gumlet asset', async () => {
+    const t = build({ row: { ...deadOnLegacy(), drmProvider: 'gumlet' } as Row });
+    await expect(t.service.replaceFailedAsset('v1')).rejects.toThrow(/currently served/i);
+    expect(t.gumlet.createAsset).not.toHaveBeenCalled();
+  });
+
+  it('refuses when the asset is not terminally failed', async () => {
+    const t = build({ row: { ...deadOnLegacy(), gumletStatus: 'processing' } as Row });
+    await expect(t.service.replaceFailedAsset('v1')).rejects.toThrow(/terminal failure/i);
+    expect(t.gumlet.createAsset).not.toHaveBeenCalled();
+  });
+
+  it('refuses when the video is not currently playable', async () => {
+    const t = build({ row: { ...deadOnLegacy(), status: 'FAILED' } as Row });
+    await expect(t.service.replaceFailedAsset('v1')).rejects.toThrow(/not currently playing/i);
+    expect(t.gumlet.createAsset).not.toHaveBeenCalled();
+  });
+
+  it('refuses when there is no stored source to rebuild from', async () => {
+    const t = build({ row: { ...deadOnLegacy(), sourceKey: null } as Row });
+    await expect(t.service.replaceFailedAsset('v1')).rejects.toThrow(/no stored source/i);
+    expect(t.gumlet.createAsset).not.toHaveBeenCalled();
+  });
+
+  it('resumes cleanly when a previous replacement already cleared the id', async () => {
+    // The retry hazard: the id was cleared but asset creation failed. Without
+    // this, the video would be stranded forever with nothing to retry.
+    const t = build({ row: { ...deadOnLegacy(), gumletAssetId: null, gumletStatus: null } as Row });
+    await t.service.replaceFailedAsset('v1');
+    expect(t.gumlet.createAsset).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * Legacy preservation.
+ *
+ * A video can carry a `gumletAssetId` while still being delivered by the legacy
+ * R2/HLS path - that is exactly the state left behind when a migration attempt
+ * errored and the video was rolled back so students could keep watching.
+ *
+ * Re-syncing that asset must NOT re-break the lesson. `issueTicket` rejects
+ * FAILED before it reaches `resolvePlaybackTarget`, so writing FAILED onto a
+ * legacy video is not a "safe downgrade" - it is an outage.
+ */
+describe('sync() preserves a working legacy video', () => {
+  const legacyRow = () =>
+    ({ ...baseRow(), status: 'READY', drmProvider: null, gumletAssetId: 'stale' }) as Row;
+
+  it('does not mark an errored asset FAILED while the video is on legacy', async () => {
+    const t = build({
+      row: legacyRow(),
+      asset: { status: 'errored', error: 'exceeds the storage minutes quota' },
+    });
+
+    const res = await t.service.sync('v1');
+
+    // The row must not be demoted: legacy is still serving this lesson.
+    expect(t.updates.at(-1)?.status).toBeUndefined();
+    // But the provider-side reason is still recorded so it is diagnosable.
+    expect(String(t.updates.at(-1)?.gumletError)).toContain('storage minutes quota');
+    // And it must not claim the Gumlet asset is playable.
+    expect(res.playable).toBe(false);
+  });
+
+  it('does not mark FAILED when the asset is ready but not CENC-encrypted, on legacy', async () => {
+    const t = build({ row: legacyRow(), asset: { status: 'ready' } });
+    jest.spyOn(global, 'fetch').mockResolvedValue({ ok: true, text: async () => PLAIN_MANIFEST } as never);
+
+    const res = await t.service.sync('v1');
+
+    expect(t.updates.at(-1)?.status).toBeUndefined();
+    expect(String(t.updates.at(-1)?.gumletError)).toMatch(/not CENC-encrypted/i);
+    expect(res.playable).toBe(false);
+    (global.fetch as unknown as { mockRestore: () => void }).mockRestore();
+  });
+
+  it('still fails closed when the video IS on the Gumlet path', async () => {
+    const t = build({
+      row: { ...baseRow(), status: 'READY', drmProvider: 'gumlet', gumletAssetId: 'a1' },
+      asset: { status: 'errored', error: 'boom' },
+    });
+
+    await t.service.sync('v1');
+
+    expect(t.updates.at(-1)?.status).toBe('FAILED');
   });
 
   it('treats an unknown success-like status as NOT playable (fail-closed)', async () => {
@@ -216,6 +382,11 @@ function baseRow(): Row {
     id: 'v1',
     status: 'UPLOADING',
     drmProvider: null,
+    // Assets in this suite are created with enable_drm: true, so the row records
+    // that DRM was requested. Verification is a separate, later fact.
+    drmRequested: true,
+    drmVerifiedAt: null,
+    drmBlockedReason: null,
     gumletAssetId: null,
     gumletWorkspaceId: null,
     gumletStatus: null,

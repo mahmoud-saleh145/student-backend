@@ -96,6 +96,18 @@ export class MaintenanceScheduler implements OnModuleInit {
       '*/30 * * * *',
     );
 
+    // DRM re-verification.
+    //
+    // This schedule is the difference between "verified" being a fact with an
+    // expiry and being a fact that silently lapses. It runs every 30 minutes,
+    // comfortably inside the refresh margin the sweep derives from the TTL
+    // (a third of it, floor 60s), so a proof is renewed long before it is due
+    // to expire and the expiry is never actually observed by a student.
+    //
+    // It is a registered BullMQ repeatable, not a local interval: with several
+    // API replicas only one instance performs each occurrence.
+    await schedule(this.maintenance as never, MAINTENANCE_JOBS.refreshDrmVerification, '*/30 * * * *');
+
     // Hourly bookkeeping.
     await schedule(this.maintenance as never, MAINTENANCE_JOBS.expireEnrollments, '15 * * * *');
     await schedule(this.maintenance as never, MAINTENANCE_JOBS.expireCodes, '25 * * * *');

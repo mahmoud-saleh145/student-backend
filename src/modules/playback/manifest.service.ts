@@ -8,6 +8,7 @@ import { ErrorCode } from '../../common/errors/error-codes';
 import type { AppConfig, PlaybackConfig, VideoConfig } from '../../config/configuration';
 import { PrismaService } from '../../database/prisma.service';
 import { StorageService } from '../storage/storage.service';
+import { DrmVerificationService } from './drm-verification.service';
 
 /**
  * Dynamic HLS manifest generation.
@@ -46,15 +47,28 @@ export class ManifestService {
   private readonly app: AppConfig;
   private readonly cfg: PlaybackConfig;
   private readonly videoCfg: VideoConfig;
+  /**
+   * DRM-only mode. When true, the legacy HLS manifest/key/segment routes refuse
+   * any video that is not verifiably DRM-protected.
+   */
+  private readonly drmOnly: boolean;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly storage: StorageService,
+    private readonly drmVerification: DrmVerificationService,
     config: ConfigService,
   ) {
     this.app = config.getOrThrow<AppConfig>('app');
     this.cfg = config.getOrThrow<PlaybackConfig>('playback');
     this.videoCfg = config.getOrThrow<VideoConfig>('video');
+    // Defensive: a partially-populated config (a test harness, or a deployment
+    // missing the DRM block) must not throw during construction. Reading it as
+    // optional keeps boot resilient, and `drmOnly` simply stays false - which
+    // preserves the pre-existing legacy behaviour rather than inventing a new
+    // failure mode.
+    const drm = this.videoCfg?.drm;
+    this.drmOnly = Boolean(drm?.enabled && drm?.provider === 'gumlet');
   }
 
   // ---------------------------------------------------------------------------
@@ -154,6 +168,38 @@ export class ManifestService {
       throw new AppException(ErrorCode.DEVICE_NOT_AUTHORIZED, {
         message: 'Device was deauthorized during playback',
       });
+    }
+
+    // ---- STRICT DRM GATE --------------------------------------------------
+    //
+    // These endpoints serve AES-128 HLS from OUR OWN storage. On a DRM-only
+    // platform they must never produce a byte for a video that is not
+    // verifiably DRM-protected.
+    //
+    // Ticket liveness alone is not sufficient. A ticket minted before the DRM
+    // gate shipped - or before the video was migrated - stays ACTIVE for its
+    // full TTL and would happily stream the legacy ladder the whole time. This
+    // check runs on EVERY manifest, media-playlist and key request, so an
+    // already-issued ticket stops working at the next segment boundary instead
+    // of at expiry.
+    if (this.drmOnly) {
+      const verdict = await this.drmVerification.evaluate({
+        id: ticket.video.id,
+        drmProvider: ticket.video.drmProvider,
+        drmRequested: ticket.video.drmRequested,
+        drmVerifiedAt: ticket.video.drmVerifiedAt,
+        drmBlockedReason: ticket.video.drmBlockedReason,
+        gumletAssetId: ticket.video.gumletAssetId,
+        gumletStatus: ticket.video.gumletStatus,
+        gumletWorkspaceId: ticket.video.gumletWorkspaceId,
+        status: ticket.video.status,
+      });
+      if (!verdict.playable) {
+        throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
+          message: 'This video is not available',
+          details: { drmState: verdict.reason },
+        });
+      }
     }
 
     return ticket;

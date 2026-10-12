@@ -196,6 +196,12 @@ export class EnvironmentVariables {
   @IsOptional() @IsString() GUMLET_WORKSPACE_ID?: string;
   @IsOptional() @IsString() GUMLET_ORG_ID?: string;
   @IsOptional() @IsString() GUMLET_SIGN_SECRET?: string;
+  /**
+   * Shared secret for verifying Gumlet asset webhooks. Optional because the app
+   * must boot without it, but when blank the webhook endpoint refuses every
+   * event rather than trusting unsigned payloads.
+   */
+  @IsOptional() @IsString() GUMLET_WEBHOOK_SECRET?: string;
   @IsOptional()
   @Type(() => Number)
   @IsInt()
@@ -204,6 +210,20 @@ export class EnvironmentVariables {
   GUMLET_TOKEN_LIFETIME_SECONDS = 300;
   /** Comma-separated renditions to request for ABR assets, e.g. 720p,1080p. */
   @IsOptional() @IsString() GUMLET_RESOLUTIONS?: string;
+
+  /**
+   * How long a DRM verification stays trusted, in seconds.
+   *
+   * Bounded so it cannot be set to 0 (which would mean "never trust a
+   * verification" and break playback) or absurdly high (which would let a video
+   * stay playable long after DRM stopped working at the provider).
+   */
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(300)
+  @Max(604800)
+  DRM_VERIFICATION_TTL_SECONDS = 21600;
 
   // --- payments -------------------------------------------------------------
   @IsString() PAYMENT_PROVIDER = 'none';

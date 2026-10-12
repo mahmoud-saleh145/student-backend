@@ -49,6 +49,21 @@ export class IssueTicketDto {
   maxHeight?: number;
 
   @IsOptional() @IsIn(['ios', 'android', 'web']) platform?: string;
+
+  /**
+   * The lecture the viewer is playing FROM.
+   *
+   * A video asset can be attached to more than one lecture (the same uploaded
+   * file reused across courses), so a bare video id no longer identifies a single
+   * piece of content. Entitlement is evaluated against THIS lecture - the one the
+   * client actually navigated to - not against whichever lecture happened to
+   * upload the file.
+   *
+   * It is optional only for backwards compatibility with older clients. When it
+   * is absent the server resolves the lesson itself and refuses to guess if the
+   * answer would be ambiguous, so omitting it can never widen access.
+   */
+  @IsOptional() @IsString() @MaxLength(32) lessonId?: string;
 }
 
 class HeartbeatDto {
@@ -126,6 +141,9 @@ export class PlaybackController {
       // Drives the DRM key system. Undefined means "let the server decide",
       // which keeps older clients working unchanged.
       platform: dto.platform as 'ios' | 'android' | 'web' | undefined,
+      // The lecture the viewer is on. Entitlement is resolved against THIS, so a
+      // reused asset is authorised in the destination course's context.
+      lessonId: dto.lessonId,
       ip: req.ip ?? null,
       userAgent: req.header('user-agent') ?? null,
       integritySuspect: req.deviceContext?.integritySuspect ?? false,

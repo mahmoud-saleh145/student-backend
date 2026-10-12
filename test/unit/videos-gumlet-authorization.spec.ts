@@ -53,7 +53,13 @@ function build(opts: { course?: { courseId: string } | null; allowed?: boolean }
     })),
   };
 
-  const controller = new VideosController(videos as never, gumletIngest as never);
+  const lessonVideos = { attach: jest.fn(), detach: jest.fn() };
+  const controller = new VideosController(
+    videos as never,
+    gumletIngest as never,
+    { verify: jest.fn(async () => ({ playable: false, reason: 'NOT_VERIFIED', detail: 'x' })) } as never,
+    lessonVideos as never,
+  );
 
   return { controller, videos, gumletIngest };
 }

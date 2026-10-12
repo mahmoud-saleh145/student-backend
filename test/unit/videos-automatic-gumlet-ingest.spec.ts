@@ -57,6 +57,12 @@ function build(opts: { drm: DrmCfg; existing?: { drmProvider: string | null } | 
 
   const prisma = {
     lesson: { findFirst: jest.fn(async () => lesson) },
+    lessonVideo: {
+      upsert: jest.fn(async () => ({})),
+      findMany: jest.fn(async () => [{ lessonId: 'l_1' }]),
+      deleteMany: jest.fn(async () => ({ count: 1 })),
+      count: jest.fn(async () => 1),
+    },
     video: {
       create: jest.fn(async (args: { data: Record<string, unknown> }) => {
         creates.push(args.data);
@@ -94,6 +100,7 @@ function build(opts: { drm: DrmCfg; existing?: { drmProvider: string | null } | 
     }),
   };
 
+  const lessonVideos = { countLiveAttachments: jest.fn().mockResolvedValue(1) };
   const service = new VideosService(
     prisma as never,
     storage as never,
@@ -104,6 +111,7 @@ function build(opts: { drm: DrmCfg; existing?: { drmProvider: string | null } | 
     {} as never,
     {} as never,
     config as never,
+    lessonVideos as never,
   );
 
   return { service, creates, updates, storage };

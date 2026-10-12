@@ -56,6 +56,7 @@ function build(expiring: Enrollment[], insertCount?: number) {
     notifications as never, // NotificationsService
     {} as never, // AnnouncementsService
     {} as never, // VideosService
+    {} as never, // DrmVerificationSweepService
   );
 
   return { processor, findMany, createMany, notifications };

@@ -1,4 +1,5 @@
 import { ContentStatus, DeviceStatus, PlaybackTicketStatus } from '@prisma/client';
+import { allowDrm } from './helpers/drm-doubles';
 
 import { PlaybackService } from '../../src/modules/playback/playback.service';
 
@@ -98,6 +99,7 @@ function build(options: Options = {}) {
         throw new Error('gumlet signing must not be reached for HLS videos');
       }),
     } as never,
+    allowDrm() as never,
     config as never,
   );
 

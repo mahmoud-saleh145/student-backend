@@ -1,4 +1,5 @@
 import { DeviceStatus } from '@prisma/client';
+import { allowDrm } from './helpers/drm-doubles';
 import { PlaybackService } from 'src/modules/playback/playback.service';
 
 /**
@@ -110,6 +111,7 @@ function build(
     {} as never,
     {} as never,
     {} as never,
+    allowDrm() as never,
     { getOrThrow: () => ({}) } as never,
   );
 

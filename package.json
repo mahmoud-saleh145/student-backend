@@ -34,6 +34,8 @@
     "prisma:reset": "prisma migrate reset",
     "seed": "ts-node -r tsconfig-paths/register prisma/seed.ts",
     "bootstrap:master": "ts-node -r tsconfig-paths/register scripts/create-master.ts",
+    "gumlet:migrate:dry-run": "ts-node -r tsconfig-paths/register scripts/migrate-videos-to-gumlet.ts",
+    "gumlet:migrate:apply": "ts-node -r tsconfig-paths/register scripts/migrate-videos-to-gumlet.ts --apply",
     "db:setup": "npm run prisma:generate && npm run prisma:deploy && npm run seed",
     "infra:start": "./scripts/dev-infra.sh start",
     "infra:stop": "./scripts/dev-infra.sh stop",

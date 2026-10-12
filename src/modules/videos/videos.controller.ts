@@ -27,6 +27,8 @@ import type { AuthenticatedUser } from '../../common/types/request-context';
 
 import { VideosService } from './videos.service';
 import { GumletIngestService } from './gumlet-ingest.service';
+import { DrmVerificationService } from '../playback/drm-verification.service';
+import { LessonVideoService } from './lesson-video.service';
 
 class InitUploadDto {
   @IsString() @MaxLength(32) lessonId!: string;
@@ -41,6 +43,10 @@ class InitUploadDto {
   @IsString() @MaxLength(100) contentType!: string;
 
   @Type(() => Number) @IsInt() @Min(1) @Max(8 * 1024 * 1024 * 1024) sizeBytes!: number;
+}
+
+class AttachExistingVideoDto {
+  @IsString() @MaxLength(32) videoId!: string;
 }
 
 class AddCaptionDto {
@@ -63,6 +69,8 @@ export class VideosController {
   constructor(
     private readonly videos: VideosService,
     private readonly gumletIngest: GumletIngestService,
+    private readonly drmVerification: DrmVerificationService,
+    private readonly lessonVideos: LessonVideoService,
   ) {}
 
   @Post('uploads/init')
@@ -181,11 +189,94 @@ export class VideosController {
   }
 
   /**
+   * Re-verify DRM against the live provider.
+   *
+   * This is a VERIFICATION, not an override. It reads Gumlet and the manifest and
+   * records what it finds. There is deliberately no "mark as protected" path: an
+   * admin action must never be able to grant playback that the backend has not
+   * actually verified against the provider.
+   */
+  @Post(':videoId/gumlet/verify')
+  @StaffOnly()
+  @ApiOperation({
+    summary: 'Re-check that this video is verifiably DRM-protected',
+    description:
+      'Reads the asset state from Gumlet and confirms the DASH manifest is CENC-encrypted. ' +
+      'Only this endpoint can set drmVerifiedAt.',
+  })
+  async gumletVerify(@Param('videoId') videoId: string, @CurrentUser() actor: AuthenticatedUser) {
+    await this.assertCanManageVideo(videoId, actor);
+    return this.drmVerification.verify(videoId);
+  }
+
+  /**
    * Staff can reach these endpoints, but only for content they are allowed to
    * manage. Without this, any staff account could ingest or inspect a video
    * belonging to a course outside their scope - which is exactly the ownership
    * check every other write on `videos` already performs.
    */
+  /**
+   * Attach an ALREADY UPLOADED video to a lecture.
+   *
+   * This is the reuse endpoint. It never uploads bytes, never creates a Gumlet
+   * asset and never enqueues processing: it points the destination lecture at
+   * the existing asset, which keeps its duration, its DRM verification and its
+   * playback tickets exactly as they are.
+   *
+   * Authorisation is checked against the DESTINATION course, not the video's
+   * source course. Sharing an asset into a course must require permission on
+   * that course, otherwise any teacher could push material into a course they
+   * do not own by attaching a video they happen to manage.
+   *
+   * Note the deliberate absence of any playback URL here: attaching does not
+   * grant access. A student still needs entitlement to the destination lecture,
+   * which is enforced in PlaybackService when the ticket is minted.
+   */
+  @Post('reuse/:lessonId')
+  @StaffOnly()
+  @ApiOperation({
+    summary: 'Attach an existing uploaded video to a lecture',
+    description:
+      'References the existing video and Gumlet asset. No re-upload, no new asset, ' +
+      'no processing. Idempotent: re-applying the same mapping returns created=false.',
+  })
+  async attachExisting(
+    @Param('lessonId') lessonId: string,
+    @Body() dto: AttachExistingVideoDto,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    // Destination-course permission is the gate.
+    const lesson = await this.videos.getCourseForLesson(lessonId);
+    if (!lesson) throw new NotFoundException('Lesson not found');
+    await this.videos.assertCanManageCourseContent(actor.id, actor.role, lesson.courseId);
+
+    return this.lessonVideos.attach({ lessonId, videoId: dto.videoId, actorId: actor.id });
+  }
+
+  /**
+   * Remove one lecture's attachment.
+   *
+   * Detaching never destroys the shared asset while another lecture still uses
+   * it, and never revokes other courses' live playback grants. Removing the
+   * asset entirely remains an explicit, separately-authorised decision.
+   */
+  @Delete('reuse/:lessonId/:videoId')
+  @StaffOnly()
+  @ApiOperation({
+    summary: 'Detach a video from one lecture without destroying the asset',
+  })
+  async detachExisting(
+    @Param('lessonId') lessonId: string,
+    @Param('videoId') videoId: string,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    const lesson = await this.videos.getCourseForLesson(lessonId);
+    if (!lesson) throw new NotFoundException('Lesson not found');
+    await this.videos.assertCanManageCourseContent(actor.id, actor.role, lesson.courseId);
+
+    return this.lessonVideos.detach({ lessonId, videoId });
+  }
+
   private async assertCanManageVideo(videoId: string, actor: AuthenticatedUser): Promise<void> {
     const video = await this.videos.getCourseForVideo(videoId);
     if (!video) throw new NotFoundException('Video not found');

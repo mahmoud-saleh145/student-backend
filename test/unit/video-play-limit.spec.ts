@@ -1,4 +1,5 @@
 import { ContentStatus, UserRole, VideoStatus } from '@prisma/client';
+import { buildDrmVerification } from './helpers/drm-doubles';
 
 import { ErrorCode } from '../../src/common/errors/error-codes';
 import { PlaybackService } from '../../src/modules/playback/playback.service';
@@ -60,6 +61,16 @@ function build(options: Options = {}) {
     id: 'vid_1',
     courseId: 'crs_1',
     status: options.videoStatus ?? VideoStatus.READY,
+    // Playback is DRM-only now, so this fixture must be a verified Gumlet video
+    // for the play-limit assertions to be reachable at all. The suite is about
+    // attempt counting, not about the delivery path.
+    drmProvider: 'gumlet',
+    gumletAssetId: 'asset_1',
+    gumletWorkspaceId: 'ws_1',
+    gumletStatus: 'ready',
+    drmRequested: true,
+    drmVerifiedAt: new Date(),
+    drmBlockedReason: null,
     hlsPrefix: 'hls/vid_1/',
     masterPlaylistKey: 'hls/vid_1/master.m3u8',
     durationSeconds: 600,
@@ -74,6 +85,22 @@ function build(options: Options = {}) {
       sectionId: 'sec_1',
       section: { unlocksAt: null, status: ContentStatus.PUBLISHED },
     },
+    // Attachment rows are what authorise playback now, so the double must
+    // model them. One attachment to the owning lecture == unambiguous.
+    lessonLinks: [
+      {
+        lesson: {
+          id: 'les_1',
+          title: 'Lecture 1',
+          status: ContentStatus.PUBLISHED,
+          isPreview: options.isPreview ?? false,
+          courseId: 'crs_1',
+          sectionId: 'sec_1',
+          deletedAt: null,
+          section: { unlocksAt: null, status: ContentStatus.PUBLISHED },
+        },
+      },
+    ],
   };
 
   const prisma = {
@@ -122,7 +149,19 @@ function build(options: Options = {}) {
             playResumeWindow: 2700,
             minCountedPlaySeconds: 30,
           }
-        : { drm: { enabled: false } },
+        : {
+            // DRM must be ON for this suite to reach ticket issuance at all:
+            // playback is DRM-only, so a DRM-disabled platform refuses every
+            // video before any play limit is evaluated.
+            drm: {
+              enabled: true,
+              provider: 'gumlet',
+              gumlet: {
+                apiKey: 'k', workspaceId: 'ws_1', orgId: 'org_1',
+                signSecret: Buffer.from('s').toString('base64'),
+              },
+            },
+          },
   };
 
   // Order matches the real constructor: prisma, redis, access, devices,
@@ -141,13 +180,29 @@ function build(options: Options = {}) {
     { buildMasterUrl: jest.fn(() => 'https://api.example/manifest') } as never,
     { mint: jest.fn(() => 'tok') } as never,
     { record: jest.fn(async () => undefined) } as never,
-    // gumlet: injected so per-video provider selection is exercised. These
-    // videos are legacy HLS (drmProvider null), so signing must never run.
+    // gumlet: the fixture is now a verified Gumlet video (playback is DRM-only),
+    // so signing IS reached and must return a usable licence URL.
     {
-      signLicenseUrl: jest.fn(() => {
-        throw new Error('gumlet signing must not be reached for HLS videos');
-      }),
+      signLicenseUrl: jest.fn(() => ({
+        licenseUrl: 'https://widevine.gumlet.com/licence/org_1/a_1?token=T&expires=1&hardware_secure=true',
+        certificateUrl: 'https://fairplay.gumlet.com/certificate/org_1',
+        manifestUrl: null,
+        expires: 1,
+        expiresIso: new Date().toISOString(),
+        signedString: '/org_1/a_1?expires=1&hardware_secure=true',
+        hardwareSecure: true,
+        videoRobustness: ['HW_SECURE_ALL'],
+        audioRobustness: ['HW_SECURE_ALL'],
+      })),
+      signFairPlayLicenseUrl: jest.fn(() => 'https://fairplay.gumlet.com/licence/org_1/a_1?token=T'),
+      dashManifestUrl: jest.fn(() => 'https://video.gumlet.io/ws_1/a_1/main.mpd'),
+      hlsManifestUrl: jest.fn(() => 'https://video.gumlet.io/ws_1/a_1/main.m3u8'),
     } as never,
+    buildDrmVerification({
+      // The verifier looks the video up by id; mirror the fixture so it is
+      // judged as the verified Gumlet video this suite intends.
+      row: { id: 'vid_1' },
+    }) as never,
     config as never,
   );
 

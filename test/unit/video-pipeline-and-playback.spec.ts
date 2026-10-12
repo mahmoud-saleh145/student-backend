@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { allowDrm } from './helpers/drm-doubles';
 import { join } from 'node:path';
 
 import { ValidationPipe } from '@nestjs/common';
@@ -75,7 +76,7 @@ describe('master playlist', () => {
           video: { keyRoot: 'k'.repeat(40) },
         })[key],
     };
-    return new ManifestService(prisma as never, {} as never, config as never);
+    return new ManifestService(prisma as never, {} as never, allowDrm() as never, config as never);
   }
 
   it('advertises the codec the worker actually encodes (H.264 High 4.1)', async () => {
@@ -151,7 +152,13 @@ function videosService(overrides: { queue?: Record<string, jest.Mock>; heartbeat
       updateMany: jest.fn(async () => ({ count: 1 })),
     },
     playbackTicket: { updateMany: jest.fn() },
-    lesson: { update: jest.fn() },
+    lesson: { update: jest.fn(), updateMany: jest.fn(async () => ({ count: 1 })) },
+    // Attachment rows. A plain owned video has exactly one, pointing back at
+    // its own lesson.
+    lessonVideo: {
+      findMany: jest.fn(async () => [{ lessonId: 'l1' }]),
+      deleteMany: jest.fn(async () => ({ count: 1 })),
+    },
     $transaction: jest.fn(async (fn: (tx: unknown) => unknown): Promise<unknown> => fn(prisma)),
   };
   const queue = {
@@ -159,7 +166,11 @@ function videosService(overrides: { queue?: Record<string, jest.Mock>; heartbeat
     getJob: jest.fn(async () => null),
     ...overrides.queue,
   };
-  const storage = { objectSize: jest.fn(async () => 1234) };
+  const storage = {
+    objectSize: jest.fn(async () => 1234),
+    deletePrefix: jest.fn(async () => undefined),
+    deleteObject: jest.fn(async () => undefined),
+  };
   const access = {
     assertCanManageCourse: jest.fn(),
     assertTeacherCapability: jest.fn(),
@@ -170,6 +181,7 @@ function videosService(overrides: { queue?: Record<string, jest.Mock>; heartbeat
   const config = {
     getOrThrow: () => ({ ladder: [360, 720], encryptionEnabled: true }),
   };
+  const lessonVideos = { countLiveAttachments: jest.fn().mockResolvedValue(1) };
   const svc = new VideosService(
     prisma as never,
     storage as never,
@@ -180,8 +192,9 @@ function videosService(overrides: { queue?: Record<string, jest.Mock>; heartbeat
     redis as never,
     queue as never,
     config as never,
+    lessonVideos as never,
   );
-  return { svc, prisma, queue, updates, redis };
+  return { svc, prisma, queue, updates, redis, storage };
 }
 
 const ACTOR = { id: 'usr_admin', role: 'ADMIN' as never };
@@ -301,7 +314,39 @@ describe('VideosService.remove', () => {
     expect(prisma.playbackTicket.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({ where: { videoId: 'vid_1', status: 'ACTIVE' } }),
     );
-    expect(prisma.lesson.update).toHaveBeenCalledWith({ where: { id: 'l1' }, data: { durationSeconds: 0 } });
+    expect(prisma.lesson.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ['l1'] } },
+      data: { durationSeconds: 0 },
+    });
+  });
+
+  it('does NOT destroy the media when another lecture still uses the asset', async () => {
+    // The whole point of the reuse guard: removing a video from one lecture must
+    // not black out every other course streaming the same file.
+    const { svc, prisma, storage } = videosService();
+    prisma.video.findFirst.mockResolvedValue({
+      id: 'vid_1',
+      courseId: 'c1',
+      lessonId: 'l1',
+      hlsPrefix: 'hls/vid_1/',
+      sourceKey: 'uploads/vid_1.mp4',
+      processingJobId: 'job-1',
+    });
+    // Two live attachments: this lesson and one other course.
+    (svc as unknown as { lessonVideos: unknown }).lessonVideos = {
+      countLiveAttachments: jest.fn().mockResolvedValue(2),
+    };
+
+    const result = await svc.remove('vid_1', ACTOR);
+
+    expect(result).toMatchObject({ ok: true, detached: true });
+    // The asset row survives, so nobody else's playback breaks.
+    expect(prisma.video.update).not.toHaveBeenCalled();
+    // And the bytes are still there.
+    expect(storage.deletePrefix).not.toHaveBeenCalled();
+    expect(storage.deleteObject).not.toHaveBeenCalled();
+    // Nor are other courses' live playback grants revoked.
+    expect(prisma.playbackTicket.updateMany).not.toHaveBeenCalled();
   });
 
   it('refuses an already deleted video', async () => {

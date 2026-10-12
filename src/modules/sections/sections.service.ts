@@ -53,6 +53,8 @@ export class SectionsService {
           where: notDeleted,
           orderBy: { sortOrder: 'asc' },
           include: {
+            // The owning (upload-origin) video, which is what `video` means for
+            // a lecture that has one.
             video: {
               select: {
                 id: true,
@@ -61,6 +63,26 @@ export class SectionsService {
                 deletedAt: true,
                 processingError: true,
                 updatedAt: true,
+                lessonId: true,
+              },
+            },
+            // Attachment rows, so a reused asset can be reported as such instead
+            // of masquerading as a fresh upload to this lecture.
+            videoLinks: {
+              where: { video: { deletedAt: null } },
+              select: {
+                lessonId: true,
+                video: {
+                  select: {
+                    id: true,
+                    lessonId: true,
+                    courseId: true,
+                    status: true,
+                    durationSeconds: true,
+                    processingError: true,
+                    updatedAt: true,
+                  },
+                },
               },
             },
             _count: { select: { attachments: { where: { deletedAt: null } } } },
@@ -71,21 +93,41 @@ export class SectionsService {
 
     return sections.map(({ lessons, ...section }) => ({
       ...section,
-      lessons: lessons.map(({ video, _count, ...lesson }) => {
-        const live = video && !video.deletedAt ? video : null;
+      lessons: lessons.map(({ video, videoLinks, _count, ...lesson }) => {
+        const ownedLive = video && !video.deletedAt ? video : null;
+
+        // Prefer the lecture's OWN video; otherwise fall back to a reused
+        // attachment. `reused` is what tells the UI to say "reused video"
+        // rather than implying the file was uploaded here. Both cases are a
+        // real, attached video with its real metadata - the same row, the same
+        // duration, the same processing status.
+        const reused = !ownedLive
+          ? videoLinks.find((link) => link.lessonId !== lesson.id)?.video ?? null
+          : null;
+
+        const shown = ownedLive ?? reused;
+
         return {
           ...lesson,
           attachmentCount: _count.attachments,
-          // From the relation, not a stored counter: 0 or 1 today, because a
-          // lecture holds exactly one video row (Video.lessonId is unique).
-          videoCount: live ? 1 : 0,
-          video: live
+          // 0 or 1: a lecture has at most one attached video. Derived from the
+          // relations, never from a stored counter.
+          videoCount: shown ? 1 : 0,
+          /**
+           * True when this lecture is showing a file that was uploaded
+           * somewhere else. Purely informational - the UI uses it to avoid
+           * claiming a fresh upload happened.
+           */
+          videoReused: reused !== null,
+          videoSourceCourseId: reused ? reused.courseId : null,
+          video: shown
             ? {
-                id: live.id,
-                status: live.status,
-                durationSeconds: live.durationSeconds,
-                processingError: live.processingError,
-                updatedAt: live.updatedAt,
+                id: shown.id,
+                status: shown.status,
+                durationSeconds: shown.durationSeconds,
+                processingError: shown.processingError,
+                updatedAt: shown.updatedAt,
+                reused: reused !== null,
               }
             : null,
         };
@@ -302,10 +344,32 @@ export class SectionsService {
       // Mirrors `LessonsService.remove`. The video rows are retained because
       // watch events reference them and storage cleanup is a separate audited
       // job, but they must stop being streamable.
-      await tx.video.updateMany({
+      //
+      // EXCEPT a shared asset. One `Video` row can be attached to lectures in
+      // several sections and courses, and archiving it here would take every
+      // OTHER section's playback down as a side effect of deleting an unrelated
+      // one. Only an asset with no remaining live attachment may be archived.
+      const sectionVideos = await tx.video.findMany({
         where: { lesson: { sectionId } },
-        data: { status: VideoStatus.ARCHIVED },
+        select: { id: true, lessonLinks: { select: { lessonId: true } } },
       });
+
+      const sectionLessonIds = await tx.lesson.findMany({
+        where: { sectionId },
+        select: { id: true },
+      });
+      const lessonIdsInSection = new Set(sectionLessonIds.map((l) => l.id));
+
+      const orphans = sectionVideos
+        .filter((v) => v.lessonLinks.every((link) => lessonIdsInSection.has(link.lessonId)))
+        .map((v) => v.id);
+
+      if (orphans.length > 0) {
+        await tx.video.updateMany({
+          where: { id: { in: orphans } },
+          data: { status: VideoStatus.ARCHIVED },
+        });
+      }
 
       // A ticket already issued keeps playing until it lapses, which meant a
       // student could carry on watching a section that had just been removed.

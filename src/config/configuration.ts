@@ -200,6 +200,12 @@ export const videoConfig = registerAs('video', () => ({
       workspaceId: process.env.GUMLET_WORKSPACE_ID ?? null,
       orgId: process.env.GUMLET_ORG_ID ?? null,
       signSecret: process.env.GUMLET_SIGN_SECRET ?? null,
+      /**
+       * Shared secret used to sign Gumlet's asset-lifecycle webhooks. When
+       * blank, the webhook endpoint refuses EVERY event rather than accepting
+       * unsigned ones - a fail-open webhook would let anyone mark an asset ready.
+       */
+      webhookSecret: process.env.GUMLET_WEBHOOK_SECRET ?? null,
       tokenLifetimeSeconds: num(process.env.GUMLET_TOKEN_LIFETIME_SECONDS, 300),
       resolutions: (process.env.GUMLET_RESOLUTIONS ?? '720p,1080p')
         .split(',')

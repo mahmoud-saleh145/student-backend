@@ -5,6 +5,11 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
 import type { VideoConfig } from '../../config/configuration';
+import {
+  normalizeProviderDurationSeconds,
+  positiveIntOrNull,
+  positiveNumberOrNull,
+} from '../videos/provider-duration.util';
 
 /**
  * Gumlet DRM: license URL signing and asset lifecycle.
@@ -61,6 +66,21 @@ export interface GumletAssetStatus {
   playbackUrl: string | null;
   dashPlaybackUrl: string | null;
   error: string | null;
+
+  /// Source-asset metadata reported by the provider under `input`.
+  ///
+  /// These are NULL, not 0, when the provider has not reported them yet, because
+  /// "not measured yet" and "measured as zero" are different facts and only one
+  /// of them may be persisted as a duration.
+  ///
+  /// UNITS: `durationSeconds` is SECONDS. Gumlet reports `input.duration` as a
+  /// float number of seconds (e.g. 183.088), which matches `Video.durationSeconds`
+  /// 1:1 - so this is a round(), never a /1000. (The only millisecond fields in
+  /// the payload are `created_at` / `updated_at`.)
+  durationSeconds: number | null;
+  width: number | null;
+  height: number | null;
+  frameRate: number | null;
 }
 
 const WIDEVINE_LICENSE_BASE = 'https://widevine.gumlet.com/licence';
@@ -353,6 +373,7 @@ export class GumletDrmService {
       status?: string;
       progress?: number;
       output?: { playback_url?: string; dash_playback_url?: string };
+      input?: { duration?: number; width?: number; height?: number; fps?: number };
       error?: { message?: string };
     };
 
@@ -363,6 +384,10 @@ export class GumletDrmService {
       playbackUrl: a.output?.playback_url ?? null,
       dashPlaybackUrl: a.output?.dash_playback_url ?? null,
       error: a.error?.message ?? null,
+      durationSeconds: normalizeProviderDurationSeconds(a.input?.duration),
+      width: positiveIntOrNull(a.input?.width),
+      height: positiveIntOrNull(a.input?.height),
+      frameRate: positiveNumberOrNull(a.input?.fps),
     };
   }
 

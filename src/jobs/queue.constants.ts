@@ -24,7 +24,16 @@ export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
 export interface TranscodeJobData {
   videoId: string;
   sourceKey: string;
-  lessonId: string;
+  /**
+   * The lecture the file was UPLOADED to. Nullable because a reused asset can
+   * outlive that lecture, in which case the row's owner is gone and there is no
+   * single lecture the job "belongs" to.
+   *
+   * It is deliberately NOT an "attach to this lecture" instruction: the job is
+   * keyed by `videoId`, and processing must never create or move an attachment.
+   * Reuse enqueues nothing at all.
+   */
+  lessonId: string | null;
   courseId: string;
   /** Requested ladder; renditions above the source height are skipped. */
   ladder: number[];
@@ -73,6 +82,16 @@ export const MAINTENANCE_JOBS = {
   courseExpiryReminders: 'course-expiry-reminders',
   dispatchAnnouncements: 'dispatch-announcements',
   recoverStrandedVideos: 'recover-stranded-videos',
+  /**
+   * Re-checks DRM proof before the verification TTL can lapse.
+   *
+   * Without this, `DrmVerificationService.evaluate()` starts returning
+   * VERIFICATION_STALE exactly `DRM_VERIFICATION_TTL_SECONDS` after the last
+   * successful check and every lesson stops playing, with no operator action
+   * anywhere to explain it. The refresh must go through the real verifier, so
+   * this job re-verifies against the provider rather than extending a timestamp.
+   */
+  refreshDrmVerification: 'refresh-drm-verification',
 } as const;
 
 export interface MaintenanceJobData {

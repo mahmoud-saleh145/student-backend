@@ -45,6 +45,12 @@ function build(existing: {
     lesson: {
       findFirst: jest.fn(async () => lesson),
     },
+    lessonVideo: {
+      upsert: jest.fn(async () => ({})),
+      findMany: jest.fn(async () => [{ lessonId: 'l_1' }]),
+      deleteMany: jest.fn(async () => ({ count: 1 })),
+      count: jest.fn(async () => 1),
+    },
     video: {
       update: jest.fn(async (args: { data: Record<string, unknown> }) => {
         updates.push(args.data);
@@ -93,6 +99,7 @@ function build(existing: {
 
   // Constructor order: prisma, storage, access, courses, notifications, audit,
 // redis, queue, config. Only the first three and audit are on this path.
+  const lessonVideos = { countLiveAttachments: jest.fn().mockResolvedValue(1) };
   const service = new VideosService(
     prisma as never,
     storage as never,
@@ -103,6 +110,7 @@ function build(existing: {
     {} as never,
     {} as never,
     config as never,
+    lessonVideos as never,
   );
 
   return { service, updates, prisma, access, storage };

@@ -27,6 +27,7 @@ import { TokenService } from '../auth/token.service';
 
 import { ManifestService } from './manifest.service';
 import { GumletDrmService } from './gumlet-drm.service';
+import { DrmVerificationService } from './drm-verification.service';
 
 /**
  * Prefix `LibraryDocumentsService.issueTicket` puts on `tid` for a document
@@ -115,6 +116,7 @@ export class PlaybackService {
     private readonly tokens: TokenService,
     private readonly security: SecurityEventService,
     private readonly gumlet: GumletDrmService,
+    private readonly drmVerification: DrmVerificationService,
     config: ConfigService,
   ) {
     this.cfg = config.getOrThrow<PlaybackConfig>('playback');
@@ -135,6 +137,15 @@ export class PlaybackService {
      * capture control below runs identically regardless of this value.
      */
     platform?: 'ios' | 'android' | 'web';
+    /**
+     * The lecture the viewer is playing FROM, when the client supplies it.
+     *
+     * An uploaded video asset can be attached to several lectures, so a video id
+     * alone no longer identifies one piece of content. This is what lets access
+     * be evaluated against the DESTINATION lecture rather than against whichever
+     * lecture happened to upload the file.
+     */
+    lessonId?: string;
     ip?: string | null;
     userAgent?: string | null;
     integritySuspect: boolean;
@@ -144,7 +155,14 @@ export class PlaybackService {
     // --- 3. issuance rate limit ---------------------------------------------
     await this.enforceIssuanceRate(user.id, params.ip);
 
-    // --- 4. video ------------------------------------------------------------
+    // --- 4. video + the lecture it is being played AS ------------------------
+    //
+    // `lessonLinks` is the authoritative set of lectures this asset is attached
+    // to. The singular `lesson` is kept only as the "which lecture uploaded this
+    // file" fallback for assets that predate attachments; it is NOT used to
+    // decide access, because doing so would authorise a student in the source
+    // course even when they are watching the very same asset inside a
+    // destination course they do not own.
     const video = await this.prisma.video.findFirst({
       where: { id: videoId, ...notDeleted },
       include: {
@@ -159,6 +177,22 @@ export class PlaybackService {
             courseId: true,
             sectionId: true,
             section: { select: { unlocksAt: true, status: true } },
+          },
+        },
+        lessonLinks: {
+          select: {
+            lesson: {
+              select: {
+                id: true,
+                title: true,
+                status: true,
+                isPreview: true,
+                courseId: true,
+                sectionId: true,
+                deletedAt: true,
+                section: { select: { unlocksAt: true, status: true } },
+              },
+            },
           },
         },
       },
@@ -192,49 +226,94 @@ export class PlaybackService {
       });
     }
 
+    // --- 4b. WHICH lecture is this being played as? --------------------------
+    //
+    // This is the gate that keeps "reuse an asset" from becoming "share a
+    // course". A student may reach a shared asset only through a lecture they
+    // are actually entitled to, so the lecture is resolved FIRST and every
+    // check below - publication, course entitlement, section entitlement, drip
+    // release, watch progress - is evaluated against it.
+    //
+    // Resolution order:
+    //   1. The lesson the client said it is playing from, but only if this
+    //      asset really is attached to it. A client cannot invent a lesson to
+    //      borrow someone else's entitlement.
+    //   2. Otherwise the single attached lesson, if there is exactly one.
+    //   3. Otherwise DENIED. Never guessed: picking one arbitrarily would let a
+    //      student pick the most permissive of several attachments.
+    const attachments = video.lessonLinks
+      .map((link) => link.lesson)
+      .filter((lesson): lesson is NonNullable<typeof lesson> => lesson !== null && !lesson.deletedAt);
+
+    const requested = params.lessonId
+      ? attachments.find((lesson) => lesson.id === params.lessonId) ?? null
+      : null;
+
+    if (params.lessonId && !requested) {
+      // The caller named a lecture this asset is not attached to. That is
+      // either a stale client or an attempt to ride another lecture's access.
+      await this.denied(user, videoId, video.courseId, 'video is not attached to the requested lesson');
+      throw new AppException(ErrorCode.PLAYBACK_DENIED, {
+        message: 'This video is not attached to the requested lesson',
+      });
+    }
+
+    const lesson = requested ?? (attachments.length === 1 ? attachments[0] : null);
+
+    if (!lesson) {
+      await this.denied(user, videoId, video.courseId, 'ambiguous lesson context for a shared video');
+      throw new AppException(ErrorCode.PLAYBACK_DENIED, {
+        message:
+          'This video is used by more than one lesson. Retry from the lesson you are trying to watch.',
+      });
+    }
+
     if (
       user.role === UserRole.STUDENT &&
-      (video.lesson.status !== ContentStatus.PUBLISHED ||
-        video.lesson.section.status !== ContentStatus.PUBLISHED)
+      (lesson.status !== ContentStatus.PUBLISHED ||
+        lesson.section.status !== ContentStatus.PUBLISHED)
     ) {
-      await this.denied(user, videoId, video.courseId, 'lesson not published');
+      await this.denied(user, videoId, lesson.courseId, 'lesson not published');
       throw new AppException(ErrorCode.VIDEO_UNAVAILABLE);
     }
 
     // --- 5. course + lesson access ------------------------------------------
+    // NOTE the course is the LESSON's course, not `video.courseId`. For a reused
+    // asset these differ, and using the uploading course would entitle the
+    // viewer to content in the wrong course.
     await this.access.assertContentAccess({
       userId: user.id,
       role: user.role,
-      courseId: video.courseId,
+      courseId: lesson.courseId,
       allowPreview: true,
-      isPreviewContent: video.lesson.isPreview,
+      isPreviewContent: lesson.isPreview,
     });
 
     // Section-scoped entitlement, enforced at the point a playable URL would
     // be minted. This is the gate that matters: the lesson read above can be
     // skipped by a client, the ticket cannot.
-    if (user.role === UserRole.STUDENT && !video.lesson.isPreview) {
+    if (user.role === UserRole.STUDENT && !lesson.isPreview) {
       try {
         await this.access.assertSectionAccessible({
           userId: user.id,
-          courseId: video.courseId,
-          sectionId: video.lesson.sectionId,
+          courseId: lesson.courseId,
+          sectionId: lesson.sectionId,
         });
       } catch (error) {
-        await this.denied(user, videoId, video.courseId, 'section not covered by access');
+        await this.denied(user, videoId, lesson.courseId, 'section not covered by access');
         throw error;
       }
     }
 
     // Drip release is enforced here too, not only in the lesson read.
-    const unlocksAt = video.lesson.section.unlocksAt;
+    const unlocksAt = lesson.section.unlocksAt;
     if (
       unlocksAt &&
       unlocksAt.getTime() > Date.now() &&
-      !video.lesson.isPreview &&
+      !lesson.isPreview &&
       user.role === UserRole.STUDENT
     ) {
-      await this.denied(user, videoId, video.courseId, 'section not yet released');
+      await this.denied(user, videoId, lesson.courseId, 'section not yet released');
       throw new AppException(ErrorCode.PLAYBACK_DENIED, {
         message: 'This section has not been released yet',
       });
@@ -257,13 +336,14 @@ export class PlaybackService {
     // Counted only for protected lessons and only for students. A free
     // preview consumes nothing, and staff previewing their own material are
     // not spending a student's allowance.
-    const countPlays = user.role === UserRole.STUDENT && !video.lesson.isPreview;
+    const countPlays = user.role === UserRole.STUDENT && !lesson.isPreview;
     const play = countPlays ? await this.claimPlay(user, videoId, params.ip) : null;
 
     // --- 8. mint -------------------------------------------------------------
     return this.mintTicket({
       user,
       video,
+      lesson,
       deviceId,
       maxHeight: params.maxHeight ?? null,
       platform: params.platform,
@@ -409,12 +489,26 @@ export class PlaybackService {
       durationSeconds: number;
       renditions: { height: number }[];
       captions: { language: string; label: string; objectKey: string; isDefault: boolean }[];
-      lesson: { id: string; title: string };
+      /**
+       * The lecture the asset was UPLOADED to. Nullable because a reused asset
+       * can outlive the lecture it was authored in, and because it is
+       * deliberately NOT what authorises playback - see `lesson` below.
+       */
+      lesson: { id: string; title: string } | null;
       /** Which delivery path this video uses. Null = legacy R2/AES-128 HLS. */
       drmProvider: string | null;
       gumletAssetId: string | null;
       gumletWorkspaceId: string | null;
+      /** Provider-side asset status. Used to pick the student-facing message. */
+      gumletStatus: string | null;
     };
+    /**
+     * The lecture this playback has been AUTHORISED in. Always resolved from the
+     * asset's attachments by the caller, and always the destination lecture when
+     * the asset is reused. Entitlement, the ticket's lessonId and the watch event
+     * all use this, never `video.lesson`.
+     */
+    lesson: { id: string; title: string; courseId: string };
     deviceId: string | null;
     maxHeight: number | null;
     /** Client platform, used only to choose the DRM key system. */
@@ -425,7 +519,7 @@ export class PlaybackService {
     /** The counted play this grant belongs to; null for free/preview lessons. */
     playId: string | null;
   }): Promise<PlaybackTicketResponse> {
-    const { user, video } = params;
+    const { user, video, lesson } = params;
 
     const ttl = this.cfg.ticketTtl;
     const expiresAt = new Date(Date.now() + ttl * 1000);
@@ -439,7 +533,7 @@ export class PlaybackService {
         select: { fullName: true },
       }),
       this.prisma.watchProgress.findUnique({
-        where: { userId_lessonId: { userId: user.id, lessonId: video.lesson.id } },
+        where: { userId_lessonId: { userId: user.id, lessonId: lesson.id } },
         select: { positionSeconds: true, completed: true },
       }),
     ]);
@@ -448,8 +542,10 @@ export class PlaybackService {
       data: {
         userId: user.id,
         videoId: video.id,
-        lessonId: video.lesson.id,
-        courseId: video.courseId,
+        // The lecture this playback is authorised in. For a reused asset this is
+        // the destination lecture, not the uploading one.
+        lessonId: lesson.id,
+        courseId: lesson.courseId,
         sessionId: user.sessionId,
         deviceId: params.deviceId,
         watermarkTag,
@@ -468,7 +564,18 @@ export class PlaybackService {
     // URI inside it can be signed for THIS viewer and the AES key can be tied
     // to this ticket. Gumlet-backed videos are the only ones that consume the
     // DRM path, and they carry their own manifest/DRM config.
-    const playback = await this.resolvePlaybackTarget(ticket.id, video, expiresAt, params.platform);
+    const playback = await this.resolvePlaybackTarget(
+      ticket.id,
+      {
+        id: video.id,
+        drmProvider: video.drmProvider,
+        gumletAssetId: video.gumletAssetId,
+        gumletWorkspaceId: video.gumletWorkspaceId,
+        gumletStatus: video.gumletStatus,
+      },
+      expiresAt,
+      params.platform,
+    );
 
     const captions = await Promise.all(
       video.captions.map(async (c) => ({
@@ -490,8 +597,8 @@ export class PlaybackService {
       .create({
         data: {
           userId: user.id,
-          lessonId: video.lesson.id,
-          courseId: video.courseId,
+          lessonId: lesson.id,
+          courseId: lesson.courseId,
           videoId: video.id,
           ticketId: ticket.id,
           type: WatchEventType.STARTED,
@@ -574,6 +681,8 @@ export class PlaybackService {
       drmProvider: string | null;
       gumletAssetId: string | null;
       gumletWorkspaceId: string | null;
+      /** Used only to choose the student-facing message (processing vs unavailable). */
+      gumletStatus: string | null;
     },
     expiresAt: Date,
     platform?: 'ios' | 'android' | 'web',
@@ -582,36 +691,52 @@ export class PlaybackService {
     playbackHeaders: Record<string, string>;
     drm: PlaybackTicketResponse['drm'];
   }> {
-    // ---- legacy path: byte-identical to the pre-integration behaviour ----
-    if (video.drmProvider !== 'gumlet') {
-      return {
-        manifestUrl: this.manifest.buildMasterUrl(ticketId, expiresAt),
-        playbackHeaders: {},
-        drm: this.drmBlock(),
-      };
-    }
-
-    // ---- Gumlet path ------------------------------------------------------
+    // ---- STRICT DRM GATE --------------------------------------------------
+    //
+    // There is NO legacy fallback from here. A video that is not verifiably
+    // DRM-protected is not playable, full stop - not downgraded to HLS, not
+    // served from R2, not served as a direct MP4.
+    //
+    // This replaced a previous design where `drmProvider !== 'gumlet'` fell
+    // through to the legacy R2 + AES-128 HLS path. That path is the bypass this
+    // gate exists to close: any video whose provider was not exactly the string
+    // 'gumlet' - including one mid-migration, or one whose DB row was edited -
+    // was served unencrypted.
+    //
+    // `DrmVerificationService` is the authority. It refuses on: no asset, DRM not
+    // requested, asset not ready, asset failed, never verified, verification
+    // stale, DRM disabled platform-wide, or signing unconfigured.
     if (!this.videoCfg.drm.enabled) {
       this.logger.error(
-        `Video ${video.id} is Gumlet-backed but DRM_ENABLED is false. Refusing to fall back to HLS.`,
+        `Video ${video.id} needs DRM but DRM_ENABLED is false. Refusing to serve it unprotected.`,
       );
       throw new AppException(ErrorCode.PLAYBACK_DENIED, {
-        message: 'DRM is disabled on this platform but this lesson requires it',
-      });
-    }
-    if (this.videoCfg.drm.provider !== 'gumlet') {
-      throw new AppException(ErrorCode.PLAYBACK_DENIED, {
-        message: 'DRM provider is not configured as gumlet',
+        message: 'DRM is unavailable on this platform; this lesson cannot be played',
       });
     }
 
-    const assetId = video.gumletAssetId;
-    if (!assetId) {
+    const verdict = await this.drmVerification.evaluateVideo(video.id);
+    if (!verdict.playable) {
+      this.logger.warn(
+        `Denied DRM playback for video ${video.id}: ${verdict.reason} (${verdict.detail})`,
+      );
+      // A processing video gets the "try again shortly" status so the app can
+      // show the friendly message; everything else is unavailable.
+      const inFlight = video.gumletStatus === 'processing' || video.gumletStatus === 'queued'
+        || video.gumletStatus === 'pre-queued' || video.gumletStatus === 'upload-pending';
+      if (inFlight) {
+        throw new AppException(ErrorCode.VIDEO_NOT_READY, {
+          message: 'This video is still being prepared',
+          details: { drmState: verdict.reason },
+        });
+      }
       throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
-        message: 'This lesson has no Gumlet asset yet',
+        message: 'This video is not available',
+        details: { drmState: verdict.reason },
       });
     }
+
+    const assetId = video.gumletAssetId as string;
 
     // signLicenseUrl fails closed on missing configuration; it never returns a
     // half-valid URL.
@@ -947,6 +1072,14 @@ export class PlaybackService {
       const rotated = await this.mintTicket({
         user: params.user,
         video: ticket.video,
+        // Rotation stays inside the lesson the ORIGINAL ticket was issued for.
+        // The ticket is the authorisation, so a rotation must not re-resolve the
+        // attachment and silently move a reused video into a different lecture.
+        lesson: {
+          id: ticket.lessonId,
+          title: ticket.video.lesson?.title ?? '',
+          courseId: ticket.courseId,
+        },
         deviceId: ticket.deviceId,
         maxHeight: ticket.maxHeight,
         ip: params.ip,

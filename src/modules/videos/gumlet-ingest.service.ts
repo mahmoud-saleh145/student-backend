@@ -8,6 +8,8 @@ import type { VideoConfig } from '../../config/configuration';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { StorageService } from '../storage/storage.service';
 import { GumletDrmService } from '../playback/gumlet-drm.service';
+import { DrmVerificationService } from '../playback/drm-verification.service';
+import { LessonVideoService } from './lesson-video.service';
 
 /**
  * Gumlet-backed video lifecycle.
@@ -43,15 +45,19 @@ const GUMLET_POLL_INTERVAL_MS = 5000;
 export class GumletIngestService {
   private readonly logger = new Logger(GumletIngestService.name);
   private readonly cfg: VideoConfig['drm']['gumlet'];
+  private readonly drm: VideoConfig['drm'];
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly storage: StorageService,
     private readonly gumlet: GumletDrmService,
+    private readonly drmVerification: DrmVerificationService,
     config: ConfigService,
+    private readonly lessonVideos: LessonVideoService,
   ) {
     const videoCfg = config.getOrThrow<VideoConfig>('video');
     this.cfg = videoCfg.drm.gumlet;
+    this.drm = videoCfg.drm;
   }
 
   /**
@@ -120,6 +126,12 @@ export class GumletIngestService {
       where: { id: videoId },
       data: {
         drmProvider: 'gumlet',
+        // Records that WE asked for DRM. This is our intent, not proof - the
+        // proof is drmVerifiedAt, which only verify() may set.
+        drmRequested: true,
+        // A new asset has never been checked. Clearing this is what stops a
+        // previously-verified video from staying playable across a re-ingest.
+        drmVerifiedAt: null,
         gumletAssetId: created.assetId,
         gumletWorkspaceId: this.cfg.workspaceId,
         gumletStatus: created.status,
@@ -154,6 +166,178 @@ export class GumletIngestService {
   }
 
   /**
+   * Replace a PERMANENTLY FAILED Gumlet asset with a freshly created one.
+   *
+   * WHY THIS EXISTS
+   *
+   * `adopt()` is idempotent by design: once a row carries a `gumletAssetId` it
+   * re-syncs instead of creating anything. That is the right default and it is
+   * what stops a re-run producing duplicate, double-billed assets.
+   *
+   * But it also means a video whose asset died at the provider - `errored`, or
+   * `failed`, never `ready` and never going to be - can never be retried through
+   * the normal path. Every subsequent sync just re-reads the same terminal
+   * error. The only way forward is to discard the dead asset id and let
+   * `adopt()` build a new one.
+   *
+   * THE GUARDS, AND WHY EACH ONE IS REQUIRED
+   *
+   *   1. There must be an asset id, and its mirrored status must be a TERMINAL
+   *      failure. A `processing` or `ready` asset is refused: replacing one would
+   *      be destroying a live asset and burning quota.
+   *   2. The video must NOT be on the Gumlet path, UNLESS the caller explicitly
+   *      opted into `allowGumletProviderReplacement`. That escape hatch exists
+   *      for repairing a video whose asset failed while already routed to
+   *      Gumlet: such a video is unplayable either way, there is no live asset
+   *      to destroy, and refusing leaves no supported path back to a working
+   *      state. It is opt-in per call and still requires a terminal failure.
+   *   3. A stored source object must exist, because that is what the new asset
+   *      is created from.
+   *   4. The video must currently be playable, unless it is in the opt-in repair
+   *      case above, where `FAILED` is the expected state.
+   *
+   * ORDERING - this is the safety property, not a style choice.
+   *
+   *   Every check (configuration, terminal failure, source presence) completes
+   *   BEFORE the first write. An earlier version cleared `gumletAssetId` first
+   *   and only then called `adopt()`, so a missing R2 credential destroyed the
+   *   asset reference and then failed, leaving the row describing no asset at
+   *   all. Clearing is now the last thing that happens, and only once `adopt()`
+   *   is known to be reachable.
+   *
+   * Nothing is deleted. The failed asset is left at the provider (it is inert,
+   * and the operator can delete it once the replacement is proven), and the R2
+   * source object and any legacy HLS renditions are untouched - which is what
+   * keeps the legacy rollback available throughout.
+   */
+  async replaceFailedAsset(
+    videoId: string,
+    options: { allowGumletProviderReplacement?: boolean } = {},
+  ): Promise<{ assetId: string; status: string }> {
+    const video = await this.prisma.video.findFirst({
+      where: { id: videoId, ...notDeleted },
+      select: {
+        id: true,
+        status: true,
+        drmProvider: true,
+        gumletAssetId: true,
+        gumletStatus: true,
+        sourceKey: true,
+      },
+    });
+    if (!video) throw new NotFoundException('Video not found');
+
+    // ---- configuration, asserted before anything is written ------------------
+    // Same conditions preflight() enforces, checked again here so this method is
+    // safe when called directly (dashboard, admin endpoint) and not only via the
+    // CLI. This is the fix for the incident where an absent R2 credential was
+    // discovered by `adopt()`, after the asset id had already been discarded.
+    if (!this.storage.isConfigured) {
+      throw new AppException(ErrorCode.STORAGE_UNAVAILABLE, {
+        message: 'Object storage is not configured, so no replacement asset can be fetched',
+      });
+    }
+    if (!this.gumlet.isAssetApiConfigured()) {
+      throw new AppException(ErrorCode.VIDEO_PROCESSING_FAILED, {
+        message: 'Gumlet asset API is not configured (GUMLET_API_KEY / GUMLET_WORKSPACE_ID)',
+      });
+    }
+    if (!this.gumlet.isSigningConfigured()) {
+      throw new AppException(ErrorCode.PLAYBACK_DENIED, {
+        message: 'Gumlet signing is not configured, so a replacement could never be played',
+      });
+    }
+    if (!this.drm.enabled || this.drm.provider !== 'gumlet') {
+      throw new AppException(ErrorCode.PLAYBACK_DENIED, {
+        message: 'DRM is not enabled with the gumlet provider; refusing to replace an asset',
+      });
+    }
+
+    const repairingGumletVideo =
+      options.allowGumletProviderReplacement === true && video.drmProvider === 'gumlet';
+
+    if (!video.gumletAssetId) {
+      // A resumed replacement: a previous attempt already discarded the dead
+      // asset id but failed before, or while, creating the replacement. There is
+      // nothing left to clear, so go straight to adoption. Refusing here would
+      // strand the video permanently, because no other path would ever clear it.
+      const resumable =
+        Boolean(video.sourceKey) &&
+        (video.drmProvider !== 'gumlet'
+          ? video.status === VideoStatus.READY
+          : repairingGumletVideo && video.status === VideoStatus.FAILED);
+      if (resumable) {
+        this.logger.warn(
+          `video ${videoId}: no asset id stored, so an earlier replacement did not complete; adopting now`,
+        );
+        return this.adopt(videoId);
+      }
+      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
+        message: 'This video has no Gumlet asset to replace',
+      });
+    }
+    if (video.drmProvider === 'gumlet' && !repairingGumletVideo) {
+      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
+        message:
+          'This video is currently served by its Gumlet asset. Replacing it is not a migration ' +
+          'recovery and must be done deliberately.',
+      });
+    }
+    if (video.gumletStatus !== 'errored' && video.gumletStatus !== 'failed') {
+      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
+        message: `Refusing to replace a Gumlet asset whose status is "${video.gumletStatus ?? 'unknown'}". Only a terminal failure can be replaced.`,
+      });
+    }
+    if (!video.sourceKey) {
+      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
+        message: 'This video has no stored source object to create a replacement asset from',
+      });
+    }
+    if (!repairingGumletVideo && video.status !== VideoStatus.READY) {
+      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
+        message: `Refusing to replace the asset of a video whose status is "${video.status}". It is not currently playing, so this is a repair, not a migration recovery.`,
+      });
+    }
+
+    // The source object must actually exist. A non-null `sourceKey` only means
+    // it was recorded once; a missing object would otherwise produce a second
+    // dead asset and another silent failure.
+    const sourcePresent = await this.storage.exists('uploads', video.sourceKey);
+    if (!sourcePresent) {
+      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
+        message:
+          'The stored R2 source object for this video is missing, so no replacement can be created',
+      });
+    }
+
+    const failedAssetId = video.gumletAssetId;
+
+    // Drop only the dead asset identity, and only now that every precondition
+    // above has passed. On the legacy path `drmProvider` stays null and `status`
+    // stays READY, so legacy keeps serving this lesson while the replacement
+    // processes. On the repair path the video is already FAILED, so there is
+    // nothing to preserve.
+    await this.prisma.video.update({
+      where: { id: videoId },
+      data: {
+        gumletAssetId: null,
+        gumletStatus: null,
+        gumletError: null,
+        gumletUpdatedAt: new Date(),
+      },
+    });
+
+    this.logger.warn(
+      `video ${videoId}: discarded failed Gumlet asset ${failedAssetId} and requesting a replacement`,
+    );
+
+    // adopt() now sees no asset id and creates a fresh one from the same R2
+    // source object. It still sets PROCESSING, which is the one window in which
+    // this lesson is not playable - see the runbook.
+    return this.adopt(videoId);
+  }
+
+  /**
    * Poll Gumlet and mirror the result onto the video row.
    *
    * Sets READY only when BOTH conditions hold:
@@ -167,7 +351,22 @@ export class GumletIngestService {
   async sync(videoId: string): Promise<{ assetId: string; status: string; playable: boolean }> {
     const video = await this.prisma.video.findFirst({
       where: { id: videoId, ...notDeleted },
-      select: { id: true, gumletAssetId: true, gumletWorkspaceId: true, gumletStatus: true },
+      select: {
+        id: true,
+        lessonId: true,
+        courseId: true,
+        gumletAssetId: true,
+        gumletWorkspaceId: true,
+        gumletStatus: true,
+        // Needed for the legacy-preservation guard below.
+        drmProvider: true,
+        status: true,
+        // Needed so provider metadata only fills gaps, never overwrites a value
+        // we already measured locally.
+        width: true,
+        height: true,
+        frameRate: true,
+      },
     });
     if (!video) throw new NotFoundException('Video not found');
     if (!video.gumletAssetId) {
@@ -179,6 +378,25 @@ export class GumletIngestService {
     const asset = await this.gumlet.getAsset(video.gumletAssetId);
     const playable = this.gumlet.isAssetPlayable(asset.status);
 
+    // THE LEGACY-PRESERVATION GUARD.
+    //
+    // `drmProvider` decides whether this video is actually being delivered by
+    // Gumlet right now. If it is not, the video is still being served by the
+    // legacy R2 + AES-128 HLS path, and writing FAILED would take a working
+    // lesson offline: `issueTicket` rejects FAILED *before* it ever reaches
+    // `resolvePlaybackTarget`, so there is no legacy fallback to catch it.
+    //
+    // A video can be in exactly this state legitimately - a migration attempt
+    // recorded an asset id, the asset errored, and the video was rolled back to
+    // legacy so students could keep watching. Re-syncing that asset must not
+    // re-break the lesson.
+    //
+    // So: record the provider's verdict in `gumletError`, but only demote the
+    // row to FAILED when Gumlet is genuinely the delivery path. Fail-closed
+    // still holds where it matters - a video ON the Gumlet path that is not
+    // verified playable is refused, never silently downgraded.
+    const onGumletPath = video.drmProvider === 'gumlet';
+
     const update: Record<string, unknown> = {
       gumletStatus: asset.status,
       gumletUpdatedAt: new Date(),
@@ -188,47 +406,108 @@ export class GumletIngestService {
 
     if (playable) {
       // Confirm CENC before allowing playback. Never trust status alone.
-      const manifestUrl =
-        asset.dashPlaybackUrl ??
-        this.gumlet.dashManifestUrl({ assetId: asset.assetId, workspaceId: video.gumletWorkspaceId });
-      let drmConfirmed = false;
-      try {
-        const manifest = await fetch(manifestUrl);
-        drmConfirmed = manifest.ok && this.gumlet.assetHasDrm(await manifest.text());
-      } catch (e) {
-        this.logger.warn(`manifest check failed for asset ${asset.assetId}: ${(e as Error).message}`);
-      }
+      //
+      // DrmVerificationService owns this decision and is the only writer of
+      // `drmVerifiedAt`. Delegating keeps ONE definition of "DRM works", so the
+      // ingest path and the playback path can never disagree about it.
+      const verdict = await this.drmVerification.verify(videoId);
 
-      if (drmConfirmed) {
+      if (verdict.playable) {
         update.status = VideoStatus.READY;
         update.gumletError = null;
         update.processedAt = new Date();
-        // `durationSeconds` is intentionally NOT written here. For a legacy
-        // transcode the worker measures it locally with ffprobe; for a Gumlet
-        // asset the backend has no source and must not invent a value. Prisma
-        // treats `undefined` as "leave unchanged", so previously it was a
-        // silent no-op that read as if it cleared the field.
+
+        // PERSIST THE PROVIDER'S MEASURED METADATA.
+        //
+        // This block used to carry a comment saying durationSeconds was
+        // "intentionally NOT written here ... the backend has no source and must
+        // not invent a value". That premise was wrong: we are not inventing a
+        // value, we are copying one the provider already measured and reported
+        // in `input.duration` (float SECONDS).
+        //
+        // Because the legacy ffprobe path is the only other writer of
+        // `durationSeconds`, and the worker returns early for Gumlet videos
+        // (`if (gumlet.handled) return ...`) so `markReady()` is never reached,
+        // nothing on the Gumlet path ever wrote a duration at all. Every Gumlet
+        // lesson therefore kept the schema default of 0, which the dashboard
+        // rendered as a confident "0:00".
+        //
+        // `normalizeProviderDurationSeconds` returns null for a missing/zero
+        // value, so an asset the provider has not finished probing leaves any
+        // previously-stored duration untouched instead of clobbering it with 0.
+        const providerDuration = asset.durationSeconds;
+        if (providerDuration !== null) {
+          update.durationSeconds = providerDuration;
+        }
+
+        // Fill in the source geometry only where it is still unknown, so a
+        // locally-measured value (legacy path) always wins over the provider's.
+        if (video.width === null && asset.width !== null) update.width = asset.width;
+        if (video.height === null && asset.height !== null) update.height = asset.height;
+        if (video.frameRate === null && asset.frameRate !== null) update.frameRate = asset.frameRate;
       } else {
         // Fail-closed: Gumlet says ready but the media is not encrypted.
-        update.status = VideoStatus.FAILED;
         update.gumletError =
           'Gumlet reported the asset ready but the DASH manifest is not CENC-encrypted. ' +
           'This video was packaged without DRM and must be reprocessed before it can be played.';
-        this.logger.error(`asset ${asset.assetId} ready but NOT encrypted - refusing to mark playable`);
+        if (onGumletPath) {
+          update.status = VideoStatus.FAILED;
+          this.logger.error(`asset ${asset.assetId} ready but NOT encrypted - refusing to mark playable`);
+        } else {
+          // Legacy is still serving this lesson. Leave `status` alone so it keeps
+          // playing, and make the provider-side problem visible instead.
+          this.logger.warn(
+            `asset ${asset.assetId} ready but NOT encrypted; leaving legacy playback in place for video ${videoId}`,
+          );
+        }
       }
     } else if (asset.status === 'errored' || asset.status === 'failed') {
-      update.status = VideoStatus.FAILED;
       update.gumletError = asset.error ?? `Gumlet processing ended with status "${asset.status}"`;
+      if (onGumletPath) {
+        update.status = VideoStatus.FAILED;
+      } else {
+        // The asset failed, but this video is not being delivered by Gumlet.
+        // Marking it FAILED would black out a lesson that is currently playing
+        // on the legacy path, so record the reason and change nothing else.
+        this.logger.warn(
+          `asset ${asset.assetId} is "${asset.status}"; video ${videoId} stays on legacy playback`,
+        );
+      }
     }
 
     await this.prisma.video.update({ where: { id: videoId }, data: update });
+
+    // Keep every ATTACHED lecture's denormalised duration in step.
+    //
+    // On the legacy path this is `markReady()`'s job, but a Gumlet video returns
+    // from the worker before `markReady()` is ever reached, so nothing else does
+    // it. Without this, `Lesson.durationSeconds` stays 0 even after the video row
+    // is correct, and every consumer that reads the lesson - the dashboard
+    // lecture row, `Course.totalDurationSeconds`, lesson analytics - keeps
+    // reporting a zero-length lecture.
+    //
+    // It must fan out to EVERY attached lecture, not just `video.lessonId`: once
+    // an asset is reused across courses, the other courses' lectures have no
+    // other way to learn its length, and their own worker will never run again.
+    if (typeof update.durationSeconds === 'number' && update.durationSeconds > 0) {
+      await this.lessonVideos.propagateDurationToAttachedLessons(videoId, update.durationSeconds as number);
+    }
 
     const final = await this.prisma.video.findUniqueOrThrow({
       where: { id: videoId },
       select: { status: true },
     });
 
-    return { assetId: video.gumletAssetId, status: asset.status, playable: final.status === VideoStatus.READY };
+    // `playable` means "this video is verified playable ON THE GUMLET PATH".
+    // Gating on `onGumletPath` matters now that a legacy video can keep READY
+    // while its Gumlet asset is errored: without it, a rolled-back video would
+    // report `playable: true` on the strength of a stale asset, and a caller
+    // would treat that as a finished migration.
+    return {
+      assetId: video.gumletAssetId,
+      status: asset.status,
+      playable: onGumletPath && final.status === VideoStatus.READY,
+    };
   }
 
   /**
@@ -300,12 +579,27 @@ export class GumletIngestService {
     return { handled: true, status: last, playable: false };
   }
 
-  /** Staff-facing view of a Gumlet video's provisioning state. */  async status(videoId: string): Promise<{
+  /**
+   * Staff-facing view of a Gumlet video's provisioning state.
+   *
+   * `drmState` is derived from the SAME verifier the playback path uses, so the
+   * dashboard can never show "ready" for a video a student would be refused.
+   * It is a derived label, never a stored flag an admin can set.
+   */
+  async status(videoId: string): Promise<{
     assetId: string | null;
     gumletStatus: string | null;
     videoStatus: VideoStatus;
     error: string | null;
     playable: boolean;
+    drmVerified: boolean;
+    drmState:
+      | 'READY_DRM_VERIFIED'
+      | 'PENDING_SUBMISSION'
+      | 'PROCESSING'
+      | 'FAILED'
+      | 'DRM_NOT_VERIFIABLE';
+    drmDetail: string | null;
   }> {
     const video = await this.prisma.video.findFirst({
       where: { id: videoId, ...notDeleted },
@@ -313,19 +607,39 @@ export class GumletIngestService {
         id: true,
         status: true,
         drmProvider: true,
+        drmRequested: true,
+        drmVerifiedAt: true,
+        drmBlockedReason: true,
         gumletAssetId: true,
+        gumletWorkspaceId: true,
         gumletStatus: true,
         gumletError: true,
       },
     });
     if (!video) throw new NotFoundException('Video not found');
 
+    const verdict = this.drmVerification.evaluate(video);
+    const drmVerified = verdict.playable;
+
+    const drmState = ((): 'READY_DRM_VERIFIED' | 'PENDING_SUBMISSION' | 'PROCESSING' | 'FAILED' | 'DRM_NOT_VERIFIABLE' => {
+      if (drmVerified) return 'READY_DRM_VERIFIED';
+      if (!video.gumletAssetId) return 'PENDING_SUBMISSION';
+      if (video.gumletStatus === 'errored' || video.gumletStatus === 'failed') return 'FAILED';
+      if (video.gumletStatus) return 'PROCESSING';
+      return 'DRM_NOT_VERIFIABLE';
+    })();
+
     return {
       assetId: video.gumletAssetId,
       gumletStatus: video.gumletStatus,
       videoStatus: video.status,
       error: video.gumletError,
-      playable: video.status === VideoStatus.READY,
+      // Only ever true when the DRM verifier agrees - never merely because the
+      // row happens to say READY.
+      playable: drmVerified,
+      drmVerified,
+      drmState,
+      drmDetail: verdict.playable ? null : verdict.detail,
     };
   }
 }

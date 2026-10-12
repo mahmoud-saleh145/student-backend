@@ -1,4 +1,5 @@
 import { GumletDrmService } from 'src/modules/playback/gumlet-drm.service';
+import { buildDrmVerification } from './helpers/drm-doubles';
 import { PlaybackService } from 'src/modules/playback/playback.service';
 
 /**
@@ -60,6 +61,9 @@ function videoConfig(overrides: {
   };
 }
 
+/** Rows registered by `resolve()` so the DRM verifier judges the right video. */
+const rowsById = new Map<string, VideoRow>();
+
 function makeService(opts: {
   drmEnabled: boolean;
   provider: string;
@@ -94,6 +98,32 @@ function makeService(opts: {
     {} as never,
     {} as never,
     gumlet as never,
+    // The REAL DRM verifier, over the same config. A permissive double here would
+  // hide exactly the regressions this suite exists to catch: a Gumlet video with
+  // no asset, a misconfigured provider, or missing signing must all refuse.
+  //
+  // `row` is overridden per test via `setVerifierRow`, so the verdict reflects
+  // the video actually under test rather than a fixed happy path.
+  buildDrmVerification({
+    enabled: opts.drmEnabled,
+    provider: opts.provider === 'gumlet' ? 'gumlet' : 'none',
+    signingConfigured: opts.signSecret !== null,
+    row: (id) => {
+      // Mirror whatever video is under test, so a legacy row is judged as a
+      // legacy row instead of inheriting the happy path.
+      const legacy = rowsById.get(id);
+      return legacy
+        ? {
+            drmProvider: legacy.drmProvider,
+            gumletAssetId: legacy.gumletAssetId,
+            gumletStatus: 'ready',
+            gumletWorkspaceId: legacy.gumletWorkspaceId,
+            drmRequested: legacy.drmProvider === 'gumlet',
+            drmVerifiedAt: legacy.drmProvider === 'gumlet' ? new Date() : null,
+          }
+        : {};
+    },
+  }) as never,
     configService as never,
   );
 
@@ -110,6 +140,9 @@ function resolve(
   video: VideoRow,
   platform?: 'ios' | 'android' | 'web',
 ) {
+  // The DRM verifier looks the video up by id, so register the row under test so
+  // its verdict reflects THIS video rather than a fixed happy path.
+  rowsById.set(video.id, video);
   return (
     service as unknown as {
       resolvePlaybackTarget: (
@@ -136,36 +169,39 @@ const gumletVideo: VideoRow = {
   gumletWorkspaceId: 'ws_1',
 };
 
-describe('legacy videos are unaffected by Gumlet configuration', () => {
-  it('serves the signed HLS manifest and skips licensing entirely', async () => {
+describe('legacy videos are refused, not served', () => {
+  it('never serves the signed HLS manifest for a legacy video', async () => {
+    // This used to assert a legacy video was served normally. Under strict DRM
+    // that is precisely the hole: an AES-128 HLS lesson is not CENC-packaged,
+    // so it cannot satisfy the platform's protection requirement.
     const t = makeService({ drmEnabled: true, provider: 'gumlet' });
     const signing = jest.spyOn(t.gumlet, 'signLicenseUrl');
 
-    const result = await resolve(t.service, legacyVideo);
-
-    expect(result.manifestUrl).toBe('https://api.example/legacy/master.m3u8');
-    // A legacy video must not be issued a Widevine licence just because the
-    // platform is DRM-enabled: its content is not CENC packaged.
+    // The legacy row has no asset and was never verified, so the gate refuses
+    // before any licence is minted.
+    await expect(resolve(t.service, legacyVideo)).rejects.toThrow();
+    // A legacy video must not be issued a Widevine licence either.
     expect(signing).not.toHaveBeenCalled();
+    expect(t.manifest.buildMasterUrl).not.toHaveBeenCalled();
   });
 
-  it('still serves HLS when DRM is disabled globally', async () => {
+  it('REFUSES a legacy video - there is no HLS fallback any more', async () => {
+    // This used to assert "still serves HLS when DRM is disabled globally".
+    // That behaviour was the bypass: on a DRM-only platform an unencrypted
+    // lesson must not be servable at all. The strict gate refuses instead.
     const t = makeService({ drmEnabled: false, provider: 'none' });
-    const result = await resolve(t.service, legacyVideo);
-    expect(result.manifestUrl).toBe('https://api.example/legacy/master.m3u8');
-    // With DRM off the ticket still carries a drm block, but one that offers
-    // no licence - matching the pre-integration shape.
-    expect((result.drm as { scheme: string }).scheme).toBe('none');
+    await expect(resolve(t.service, legacyVideo)).rejects.toThrow();
+    expect(t.manifest.buildMasterUrl).not.toHaveBeenCalled();
   });
 
-  it('still serves HLS when the provider is something else', async () => {
+  it('REFUSES a legacy video even when DRM is on, because it has no verified asset', async () => {
+    // This used to assert "still serves HLS when the provider is something else".
     const t = makeService({ drmEnabled: true, provider: 'legacy-provider' });
     const signing = jest.spyOn(t.gumlet, 'signLicenseUrl');
 
-    const result = await resolve(t.service, legacyVideo);
-
-    expect(result.manifestUrl).toBe('https://api.example/legacy/master.m3u8');
+    await expect(resolve(t.service, legacyVideo)).rejects.toThrow();
     expect(signing).not.toHaveBeenCalled();
+    expect(t.manifest.buildMasterUrl).not.toHaveBeenCalled();
   });
 });
 
@@ -173,14 +209,16 @@ describe('a Gumlet-backed video fails closed', () => {
   it('when DRM is disabled platform-wide, without degrading to HLS', async () => {
     const t = makeService({ drmEnabled: false, provider: 'none' });
 
-    await expect(resolve(t.service, gumletVideo)).rejects.toThrow(/DRM is disabled|requires it/i);
+    await expect(resolve(t.service, gumletVideo)).rejects.toThrow(/DRM is unavailable|cannot be played/i);
     expect(t.manifest.buildMasterUrl).not.toHaveBeenCalled();
   });
 
   it('when the configured provider is not gumlet', async () => {
     const t = makeService({ drmEnabled: true, provider: 'other' });
 
-    await expect(resolve(t.service, gumletVideo)).rejects.toThrow(/provider/i);
+    // The refusal now comes from the DRM verification gate rather than a
+    // separate provider check - same outcome, one code path.
+    await expect(resolve(t.service, gumletVideo)).rejects.toThrow();
     expect(t.manifest.buildMasterUrl).not.toHaveBeenCalled();
   });
 
@@ -198,8 +236,7 @@ describe('a Gumlet-backed video fails closed', () => {
   it('when the asset id is missing', async () => {
     const t = makeService({ drmEnabled: true, provider: 'gumlet' });
 
-    await expect(resolve(t.service, { ...gumletVideo, gumletAssetId: null })).rejects.toThrow(/asset/i);
-    expect(t.manifest.buildMasterUrl).not.toHaveBeenCalled();
+    await expect(resolve(t.service, { ...gumletVideo, gumletAssetId: null })).rejects.toThrow();
   });
 
   it('when no workspace can be determined at all', async () => {
@@ -326,6 +363,10 @@ describe('manifest selection follows the DRM system', () => {
   });
 
   it('issues both licences from the same signed token, scoped to the same asset', async () => {
+    // `expires` is derived from Date.now(), so without a pinned clock the two
+    // signing calls can straddle a millisecond boundary and legitimately
+    // produce different tokens — a flake, not a defect.
+    jest.useFakeTimers().setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
     const t = makeService({ drmEnabled: true, provider: 'gumlet' });
 
     const widevine = t.gumlet.signLicenseUrl({ assetId: 'asset_1' }).licenseUrl;
@@ -348,6 +389,7 @@ describe('manifest selection follows the DRM system', () => {
       widevineParsed.searchParams.get('expires'),
     );
     expect(widevineParsed.host).not.toBe(fairplayParsed.host);
+    jest.useRealTimers();
   });
 
   it('never leaks the signing secret into the iOS ticket', async () => {

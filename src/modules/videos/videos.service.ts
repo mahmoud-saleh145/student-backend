@@ -26,6 +26,7 @@ import { CourseAccessService } from '../courses/course-access.service';
 import { CoursesService } from '../courses/courses.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { StorageService } from '../storage/storage.service';
+import { LessonVideoService } from './lesson-video.service';
 
 const ALLOWED_VIDEO_TYPES = new Set([
   'video/mp4',
@@ -69,6 +70,7 @@ export class VideosService {
     private readonly redis: RedisService,
     @InjectQueue(QUEUE_NAMES.video) private readonly queue: Queue<TranscodeJobData>,
     config: ConfigService,
+    private readonly lessonVideos: LessonVideoService,
   ) {
     this.cfg = config.getOrThrow<VideoConfig>('video');
   }
@@ -112,6 +114,11 @@ export class VideosService {
       return null;
     }
     if (!gumletConfigured) {
+      // On a DRM-only platform this is not a soft failure. Playback now refuses
+      // ANY video that is not verifiably DRM-protected, so accepting an upload
+      // that cannot be delivered with DRM would create a lesson that is broken
+      // the moment it is uploaded - worse than refusing it now, while the admin
+      // is still on the upload screen.
       throw new AppException(ErrorCode.UPLOAD_FAILED, {
         message:
           'Gumlet DRM is enabled but not fully configured, so a new video cannot be delivered with DRM. Refusing to create an unprotected video.',
@@ -226,6 +233,23 @@ export class VideosService {
           },
         });
 
+    // THE ATTACHMENT ROW IS NOT OPTIONAL.
+    //
+    // `lesson_videos` is what `PlaybackService.issueTicket` resolves the
+    // authorised lecture from. A video created without one has an empty
+    // attachment set, the resolver cannot determine which lecture the viewer is
+    // playing as, and it fails closed - so the lecture would be unplayable from
+    // the moment it was uploaded.
+    //
+    // Every video therefore gets its owner link at creation, which is also what
+    // keeps the "exactly one attachment" case unambiguous. Reuse then adds extra
+    // rows; nothing ever removes this one implicitly.
+    await this.prisma.lessonVideo.upsert({
+      where: { lessonId_videoId: { lessonId: lesson.id, videoId: video.id } },
+      update: {},
+      create: { lessonId: lesson.id, videoId: video.id, createdById: actor.id, sortOrder: 0 },
+    });
+
     const sourceKey = StorageService.keys.videoSource(video.id, params.filename);
 
     await this.prisma.video.update({
@@ -301,6 +325,25 @@ export class VideosService {
       },
     });
 
+    // -------------------------------------------------------------------------
+    // AUTOMATIC GUMLET INGESTION
+    //
+    // The upload is confirmed and the object is verifiably in R2, so the video is
+    // handed to Gumlet here without any staff action. That is the requirement:
+    // an admin must never have to upload the same video twice.
+    //
+    // Enqueueing the existing `transcode` job is what triggers it. The worker
+    // calls `GumletIngestService.processFromJob`, which reads `drmProvider` from
+    // the DATABASE (never from the job payload) and hands the video to Gumlet
+    // with `enable_drm: true`. Reusing that job rather than adding a second one
+    // keeps a single, already-idempotent path: a duplicate job re-syncs the
+    // existing asset instead of creating a second one.
+    //
+    // Asynchronous by construction - the admin's upload returns as soon as this
+    // enqueue succeeds, and any Gumlet slowness or failure is recorded on the row
+    // rather than blocking or rolling back the upload the student will later need.
+    // -------------------------------------------------------------------------
+
     const jobId = await this.enqueueTranscode(
       { id: videoId, sourceKey: video.sourceKey, lessonId: video.lessonId, courseId: video.courseId },
       actor.id,
@@ -321,7 +364,7 @@ export class VideosService {
    * reason, so the dashboard can offer the retry and the error is visible.
    */
   private async enqueueTranscode(
-    video: { id: string; sourceKey: string; lessonId: string; courseId: string },
+    video: { id: string; sourceKey: string; lessonId: string | null; courseId: string },
     requestedById?: string,
   ): Promise<string> {
     let jobId: string;
@@ -475,6 +518,16 @@ export class VideosService {
    * underlying access API, so callers read as "can this person manage this
    * course's content".
    */
+  /** Course that owns a lecture. Used to authorise reuse against the DESTINATION. */
+  async getCourseForLesson(
+    lessonId: string,
+  ): Promise<{ id: string; courseId: string; title: string } | null> {
+    return this.prisma.lesson.findFirst({
+      where: { id: lessonId, ...notDeleted },
+      select: { id: true, courseId: true, title: true },
+    });
+  }
+
   async assertCanManageCourseContent(userId: string, role: UserRole, courseId: string): Promise<void> {
     await this.access.assertCanManageCourse(userId, role, courseId, 'content');
   }
@@ -486,6 +539,13 @@ export class VideosService {
         renditions: { orderBy: { height: 'asc' } },
         captions: true,
         lesson: { select: { id: true, title: true, courseId: true } },
+        // How many lectures currently reference this asset. A count above 1 means
+        // the file is shared, which changes what "delete" and "replace" mean and
+        // must be visible in the UI rather than implied.
+        lessonLinks: {
+          where: { lesson: notDeleted },
+          select: { lessonId: true },
+        },
       },
     });
     if (!video) throw AppException.notFound('Video', videoId);
@@ -496,6 +556,17 @@ export class VideosService {
       id: video.id,
       lessonId: video.lessonId,
       courseId: video.courseId,
+      /**
+       * Live lectures attached to this asset, including the owning one.
+       * 1 = an ordinary single-course video. >1 = shared/reused.
+       */
+      attachmentCount: video.lessonLinks.length,
+      /**
+       * True when this asset is used by more than one lecture. Client-facing so
+       * the panel can say "shared" instead of offering a destructive
+       * "delete" action that would not do what the button says.
+       */
+      shared: video.lessonLinks.length > 1,
       status: video.status,
       drmProvider: video.drmProvider,
       gumletAssetId: video.gumletAssetId,
@@ -634,12 +705,23 @@ export class VideosService {
         include: { lesson: { select: { id: true, title: true, courseId: true } } },
       });
 
-      // The lesson's duration comes from the video, so cards and progress
-      // calculations stay accurate without a manual entry step.
-      await tx.lesson.update({
-        where: { id: updated.lessonId },
-        data: { durationSeconds: result.durationSeconds },
+      // The duration belongs to every LECTURE this asset is attached to, not just
+      // the one that uploaded it. A reused lecture has no worker of its own, so
+      // if it is not written here it would keep rendering a zero-length lecture
+      // for a video that plays perfectly.
+      const attachedLessonIds = await tx.lessonVideo.findMany({
+        where: { videoId },
+        select: { lessonId: true },
       });
+      const lessonIds = new Set(attachedLessonIds.map((link) => link.lessonId));
+      if (updated.lessonId) lessonIds.add(updated.lessonId);
+
+      if (lessonIds.size > 0) {
+        await tx.lesson.updateMany({
+          where: { id: { in: [...lessonIds] } },
+          data: { durationSeconds: result.durationSeconds },
+        });
+      }
 
       return updated;
     });
@@ -647,16 +729,22 @@ export class VideosService {
     await this.courses.recountCourse(video.courseId);
 
     // Tell enrolled students. This is the "new video" notification from §63.
-    await this.notifications
-      .notifyCourseStudents(video.courseId, {
-        kind: NotificationKind.NEW_VIDEO,
-        title: 'New video available',
-        titleAr: 'فيديو جديد متاح',
-        body: `${video.lesson.title} is ready to watch.`,
-        bodyAr: `${video.lesson.title} أصبح جاهزًا للمشاهدة.`,
-        route: `/lesson/${video.lessonId}`,
-      })
-      .catch((e) => this.logger.warn(`new-video notification failed: ${e.message}`));
+    //
+    // Skipped when the asset has no origin lecture (a reused asset whose author
+    // lesson was removed). There is no lesson to link to, and a notification
+    // pointing at the wrong lecture would be worse than none.
+    if (video.lesson && video.lessonId) {
+      await this.notifications
+        .notifyCourseStudents(video.courseId, {
+          kind: NotificationKind.NEW_VIDEO,
+          title: 'New video available',
+          titleAr: 'فيديو جديد متاح',
+          body: `${video.lesson.title} is ready to watch.`,
+          bodyAr: `${video.lesson.title} أصبح جاهزًا للمشاهدة.`,
+          route: `/lesson/${video.lessonId}`,
+        })
+        .catch((e) => this.logger.warn(`new-video notification failed: ${e.message}`));
+    }
 
     this.logger.log(`video ${videoId} is READY (${result.renditions.length} renditions)`);
   }
@@ -736,23 +824,68 @@ export class VideosService {
     await this.access.assertTeacherCapability(actor.role, 'deleteVideos');
 
     const now = new Date();
+
+    // How many OTHER lectures still reference this asset. This single number
+    // decides whether removing the video may destroy the media, and it is the
+    // whole reason reuse needs this method to be attachment-aware: deleting a
+    // reused video from one lecture used to purge the source object and the HLS
+    // output, blacking out every other course that was still streaming it.
+    const remainingAttachments = await this.lessonVideos.countLiveAttachments(videoId);
+
+    // The asset itself only disappears once nothing points at it any more. While
+    // other lectures are still attached we leave the row live so their playback
+    // keeps working; the lecture that asked for removal is detached instead.
+    const destroyAsset = remainingAttachments <= 1;
+
     await this.prisma.$transaction(async (tx) => {
-      await tx.video.update({
-        where: { id: videoId },
-        data: { status: VideoStatus.ARCHIVED, deletedAt: now },
-      });
+      if (destroyAsset) {
+        await tx.video.update({
+          where: { id: videoId },
+          data: { status: VideoStatus.ARCHIVED, deletedAt: now },
+        });
+      } else {
+        // Still in use elsewhere: detach from THIS lesson only.
+        if (video.lessonId) {
+          await tx.lessonVideo.deleteMany({
+            where: { lessonId: video.lessonId, videoId },
+          });
+        }
+      }
+
       // Anyone mid-stream loses the grant at the next playlist fetch rather
       // than watching a video that no longer exists until the ticket lapses.
-      await tx.playbackTicket.updateMany({
-        where: { videoId, status: 'ACTIVE' },
-        data: { status: 'REVOKED', revokedAt: now, revokedReason: 'Video deleted' },
+      // Only revoked when the asset is really going away - a detach must not
+      // interrupt students who are legitimately watching the same file in
+      // another course.
+      if (destroyAsset) {
+        await tx.playbackTicket.updateMany({
+          where: { videoId, status: 'ACTIVE' },
+          data: { status: 'REVOKED', revokedAt: now, revokedReason: 'Video deleted' },
+        });
+      }
+
+      // The lecture's duration came from this video (see markReady). Reset it on
+      // every lecture that no longer has a video.
+      const detachedLessonIds = await tx.lessonVideo.findMany({
+        where: { videoId: destroyAsset ? undefined : { not: video.lessonId ?? undefined } },
+        select: { lessonId: true },
       });
-      // The lecture's duration came from this video (see markReady).
-      await tx.lesson.update({ where: { id: video.lessonId }, data: { durationSeconds: 0 } });
+      const lessonIdsToClear = destroyAsset
+        ? detachedLessonIds.map((l) => l.lessonId)
+        : [video.lessonId].filter((id): id is string => Boolean(id));
+
+      if (lessonIdsToClear.length > 0) {
+        await tx.lesson.updateMany({
+          where: { id: { in: lessonIdsToClear } },
+          data: { durationSeconds: 0 },
+        });
+      }
     });
 
     // Drop any job still waiting so a deleted video is not transcoded later.
-    if (video.processingJobId) {
+    // Only when the asset is actually going away - an in-flight job for a shared
+    // asset still has a destination lecture that needs it.
+    if (destroyAsset && video.processingJobId) {
       await this.queue
         .getJob(video.processingJobId)
         .then((job) => job?.remove())
@@ -761,7 +894,9 @@ export class VideosService {
 
     await this.courses.recountCourse(video.courseId);
 
-    if (purgeObjects) {
+    // THE PURGE IS THE DANGEROUS PART, so it is gated on the same condition as
+    // the archive: bytes are only deleted once no lecture points at this asset.
+    if (purgeObjects && destroyAsset) {
       if (video.hlsPrefix) {
         await this.storage.deletePrefix('media', video.hlsPrefix).catch(() => undefined);
       }
@@ -776,9 +911,13 @@ export class VideosService {
       action: AuditAction.DELETE,
       entity: 'video',
       entityId: videoId,
-      note: purgeObjects ? 'Metadata archived, media objects purged' : 'Metadata archived',
+      note: destroyAsset
+        ? purgeObjects
+          ? 'Metadata archived, media objects purged'
+          : 'Metadata archived'
+        : `Detached from lesson; asset kept for ${remainingAttachments - 1} other attachment(s)`,
     });
 
-    return { ok: true };
+    return { ok: true, detached: !destroyAsset, remainingAttachments };
   }
 }
