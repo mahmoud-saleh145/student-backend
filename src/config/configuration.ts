@@ -201,6 +201,11 @@ export const videoConfig = registerAs('video', () => ({
       orgId: process.env.GUMLET_ORG_ID ?? null,
       signSecret: process.env.GUMLET_SIGN_SECRET ?? null,
       tokenLifetimeSeconds: num(process.env.GUMLET_TOKEN_LIFETIME_SECONDS, 300),
+      // TEMPORARY playback hotfix: when true, a ticket request that explicitly
+      // opts in with `delivery: 'embed'` (only the student web does) also gets
+      // a signed Gumlet embed-player URL (`embedUrl`). Off by default.
+      webEmbedEnabled: bool(process.env.GUMLET_WEB_EMBED_ENABLED),
+      embedTokenLifetimeSeconds: num(process.env.GUMLET_EMBED_TOKEN_LIFETIME_SECONDS, 3600),
       resolutions: (process.env.GUMLET_RESOLUTIONS ?? '720p,1080p')
         .split(',')
         .map((r) => r.trim())

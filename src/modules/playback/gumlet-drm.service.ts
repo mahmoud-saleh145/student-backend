@@ -66,6 +66,7 @@ export interface GumletAssetStatus {
 const WIDEVINE_LICENSE_BASE = 'https://widevine.gumlet.com/licence';
 const FAIRPLAY_LICENSE_BASE = 'https://fairplay.gumlet.com/licence';
 const FAIRPLAY_CERT_BASE = 'https://fairplay.gumlet.com/certificate';
+const GUMLET_EMBED_BASE = 'https://play.gumlet.io/embed';
 
 @Injectable()
 export class GumletDrmService {
@@ -206,6 +207,40 @@ export class GumletDrmService {
   signFairPlayLicenseUrl(params: { assetId: string; hardwareSecure?: boolean }): string {
     const bundle = this.signLicenseUrl(params);
     return bundle.licenseUrl.replace(WIDEVINE_LICENSE_BASE, FAIRPLAY_LICENSE_BASE);
+  }
+
+  /**
+   * TEMPORARY (playback hotfix): URL of Gumlet's own embed player for a DRM
+   * asset, so web clients can use Gumlet's player instead of our Shaka setup.
+   *
+   *   https://play.gumlet.io/embed/{assetId}?token=..&expires=..
+   *
+   * Gumlet's embed reference documents `token` ("DRM playback token") and
+   * `expires` (milliseconds since epoch) as required for DRM-encrypted videos
+   * and links both to the licence-server "generate token and expiry" section,
+   * so the token is produced by the exact same HMAC as `signLicenseUrl`.
+   * `hardware_secure` is NOT part of the embed's documented parameters, so it
+   * is left out of the signed string; the embed could not pass it on.
+   *
+   * Only ever called after every entitlement/device/concurrency check in
+   * `issueTicket` has passed. Fails closed exactly like `signLicenseUrl`.
+   */
+  signEmbedUrl(params: { assetId: string; tokenLifetimeSeconds?: number }): string {
+    const bundle = this.signLicenseUrl({
+      assetId: params.assetId,
+      hardwareSecure: false,
+      tokenLifetimeSeconds: params.tokenLifetimeSeconds,
+    });
+    const token = new URL(bundle.licenseUrl).searchParams.get('token');
+    if (!token) {
+      throw new AppException(ErrorCode.PLAYBACK_DENIED, {
+        message: 'Could not sign the Gumlet embed URL',
+      });
+    }
+    const query = new URLSearchParams();
+    query.set('token', token);
+    query.set('expires', String(bundle.expires));
+    return `${GUMLET_EMBED_BASE}/${encodeURIComponent(params.assetId)}?${query.toString()}`;
   }
 
   /**
