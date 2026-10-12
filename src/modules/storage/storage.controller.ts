@@ -14,10 +14,17 @@ import type { Request } from 'express';
 import { CourseAccessService } from '../courses/course-access.service';
 
 import { CloudinaryService } from './cloudinary.service';
-import { StorageService } from './storage.service';
+import { MAX_DOCUMENT_BYTES, StorageService } from './storage.service';
 
-/** Ceiling for a Library document, shared by both upload transports. */
-const MAX_LIBRARY_DOCUMENT_BYTES = 200 * 1024 * 1024;
+/**
+ * Ceiling for a Library document, shared by both upload transports.
+ *
+ * Aliased rather than re-spelled so this endpoint's gate, the equivalent gate
+ * for attachments below, and the registration-time measurement in
+ * `LibraryService`/`AttachmentsService` are all the same number. Same value as
+ * before — 200 MB — just no longer three independent literals.
+ */
+const MAX_LIBRARY_DOCUMENT_BYTES = MAX_DOCUMENT_BYTES;
 
 /**
  * Thumbnails are small and go through this API rather than browser→R2.
@@ -30,7 +37,7 @@ const MAX_LIBRARY_DOCUMENT_BYTES = 200 * 1024 * 1024;
  * held socket, not memory.
  */
 const MAX_THUMBNAIL_BYTES = 10 * 1024 * 1024;
-const MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES = MAX_DOCUMENT_BYTES;
 
 const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const DOC_TYPES = [
@@ -148,7 +155,7 @@ class PresignAttachmentDto {
   filename!: string;
 
   @IsIn([...DOC_TYPES, ...IMAGE_TYPES]) contentType!: string;
-  @Type(() => Number) @IsInt() @Min(1) @Max(200 * 1024 * 1024) sizeBytes!: number;
+  @Type(() => Number) @IsInt() @Min(1) @Max(MAX_ATTACHMENT_BYTES) sizeBytes!: number;
   @IsOptional() @IsString() @MaxLength(32) lessonId?: string;
 }
 
@@ -262,7 +269,28 @@ export class StorageController {
     description:
       'Returns an object key. Register it with POST /attachments to make it visible to students.',
   })
-  async attachment(@Body() dto: PresignAttachmentDto) {
+  async attachment(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Body() dto: PresignAttachmentDto,
+  ) {
+    // `courseId` becomes the key's namespace (`attachments/<courseId>/…`), so
+    // `@StaffOnly()` alone is not enough: it would let any teacher mint a
+    // signature against a course they do not teach. Checked here for the same
+    // reason `courseThumbnailContent` checks it — and checked BEFORE anything is
+    // signed, so an unauthorised caller is refused rather than handed a
+    // credential.
+    //
+    // Registration (`AttachmentsService.create`) already enforces this, so this
+    // is defence in depth rather than the only barrier: it stops the object
+    // being uploaded at all, instead of leaving an orphan in the bucket that
+    // registration later refuses to register.
+    await this.courseAccess.assertCourseExistsAndManageable(
+      actor.id,
+      actor.role,
+      dto.courseId,
+      'content',
+    );
+
     if (dto.filename.includes('..') || dto.filename.includes('/')) {
       throw new AppException(ErrorCode.VALIDATION_ERROR, {
         fields: { filename: ['must not contain path separators'] },

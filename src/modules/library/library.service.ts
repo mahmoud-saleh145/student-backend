@@ -7,6 +7,7 @@ import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import {
   assertObjectKeyInNamespace,
+  MAX_DOCUMENT_BYTES,
   StorageService,
 } from '../storage/storage.service';
 import { PlatformSettingsService } from '../settings/platform-settings.service';
@@ -660,6 +661,20 @@ export class LibraryService {
 
     this.assertLibraryPartKeys(input.objectKey, input.thumbnailKey, `thumbnails/library/${materialId}/`);
 
+    // The object's real size, read back from storage.
+    //
+    // The document was uploaded by a presigned PUT, and that signature binds
+    // only `host` — R2 does not honour `x-amz-content-length-range`, so nothing
+    // stopped the bytes that actually landed from exceeding the declared
+    // `sizeBytes`. `library` is the bucket the write site uses and the only one
+    // whose prefix selects it on read.
+    const sizeBytes = await this.storage.assertUploadWithinLimit({
+      bucket: 'library',
+      objectKey: input.objectKey,
+      maxBytes: MAX_DOCUMENT_BYTES,
+      field: 'sizeBytes',
+    });
+
     const part = await this.prisma.$transaction(async (tx) => {
       const last = await tx.libraryPart.findFirst({
         where: { materialId, ...notDeleted },
@@ -677,7 +692,7 @@ export class LibraryService {
           price: input.price,
           objectKey: input.objectKey,
           mimeType: input.mimeType ?? null,
-          sizeBytes: input.sizeBytes ?? null,
+          sizeBytes: BigInt(sizeBytes),
           pageCount: input.pageCount ?? null,
           isPreview: input.isPreview ?? false,
           // Null, not the library default. The default is resolved at read
@@ -726,11 +741,15 @@ export class LibraryService {
       thumbnailKey: string | null;
     }>,
     actor: { id: string; role: UserRole },
-  ) {
+  ): Promise<unknown> {
     const part = await this.prisma.libraryPart.findFirst({
       where: { id: partId, ...notDeleted },
     });
     if (!part) throw AppException.notFound('Library part', partId);
+
+    // Reassigned when a replacement document is verified, so the write below
+    // always persists the measured size rather than the declared one.
+    let patch = input;
 
     this.assertLibraryPartKeys(
       input.objectKey,
@@ -739,6 +758,20 @@ export class LibraryService {
     );
 
     if (input.objectKey && input.objectKey !== part.objectKey) {
+      // Replacing the document is a second way to register an object, so it
+      // carries the same verification `createPart` does. Without this, the
+      // create-time check would be bypassed by creating a valid part and then
+      // PATCHing an oversized object onto it.
+      const verifiedSize = await this.storage.assertUploadWithinLimit({
+        bucket: 'library',
+        objectKey: input.objectKey,
+        maxBytes: MAX_DOCUMENT_BYTES,
+        field: 'objectKey',
+      });
+
+      // The declared size loses to the measured one, for the same reason.
+      patch = { ...patch, sizeBytes: verifiedSize };
+
       const holders = await this.prisma.libraryEntitlement.count({
         where: { libraryPartId: partId, revokedAt: null },
       });
@@ -749,7 +782,7 @@ export class LibraryService {
       }
     }
 
-    await this.prisma.libraryPart.update({ where: { id: partId }, data: input });
+    await this.prisma.libraryPart.update({ where: { id: partId }, data: patch });
 
     await this.audit.record({
       actorId: actor.id,

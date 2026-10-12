@@ -45,6 +45,20 @@ import { CloudinaryService } from './cloudinary.service';
  */
 export type Bucket = 'media' | 'uploads' | 'library';
 
+/**
+ * The ceiling for a Library document and for a course material alike.
+ *
+ * Defined here rather than in the controller so the gate that SIZES an upload
+ * and the gate that ACCEPTS one cannot drift apart. `presignUpload` binds only
+ * `host` into its signature — no length, and R2 ignores
+ * `x-amz-content-length-range` — so a `sizeBytes` in a request body is a claim,
+ * not a measurement. The measurement happens here, at registration.
+ *
+ * Unchanged at 200 MB. This constant exists to make the existing limit shared,
+ * not to lower it.
+ */
+export const MAX_DOCUMENT_BYTES = 200 * 1024 * 1024;
+
 export interface SignedUpload {
   uploadUrl: string;
   objectKey: string;
@@ -466,6 +480,58 @@ export class StorageService {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * The object's ACTUAL size, refusing anything that is missing or too large.
+   *
+   * Exists because a presigned PUT cannot enforce a ceiling on its own.
+   * `presignUpload` signs `host` and nothing else; R2 does not honour
+   * `x-amz-content-length-range`; so a client may declare any `sizeBytes` it
+   * likes, upload whatever it actually has, and register the object. The
+   * registration DTOs cap `sizeBytes` at `@Min(0)` and cannot catch that,
+   * because the number they are checking is the attacker's own.
+   *
+   * So the size is read back from storage with a HEAD, which is the only value
+   * nobody supplied. That number is what callers must persist.
+   *
+   * Fails closed. `objectSize` returns `null` both for "no such object" and
+   * for "storage did not answer" — the two are indistinguishable from here —
+   * and treating an unverifiable upload as valid is the same failure as
+   * trusting the declared size. So `null` refuses rather than registers.
+   *
+   * @param bucket the bucket the object was WRITTEN to, not one inferred from
+   *   the key. Reading the wrong bucket reports a missing object and turns a
+   *   legitimate upload into a 5xx, so callers pass the write site's bucket.
+   */
+  async assertUploadWithinLimit(params: {
+    bucket: Bucket;
+    objectKey: string;
+    maxBytes: number;
+    /** The request field to blame, so the error lands where the client looks. */
+    field?: string;
+  }): Promise<number> {
+    const size = await this.objectSize(params.bucket, params.objectKey);
+
+    if (size === null) {
+      throw new AppException(ErrorCode.UPLOAD_FAILED, {
+        message:
+          'The uploaded file could not be found in storage. It may have failed to ' +
+          'upload, or storage could not be reached. Try the upload again.',
+        fields: params.field ? { [params.field]: ['not found in storage'] } : undefined,
+      });
+    }
+
+    if (size > params.maxBytes) {
+      throw new AppException(ErrorCode.VALIDATION_ERROR, {
+        message: `The uploaded file is larger than the ${params.maxBytes / 1024 / 1024} MB limit.`,
+        fields: params.field
+          ? { [params.field]: [`the uploaded file is ${size} bytes, over the ${params.maxBytes} byte limit`] }
+          : undefined,
+      });
+    }
+
+    return size;
   }
 
   // ---------------------------------------------------------------------------

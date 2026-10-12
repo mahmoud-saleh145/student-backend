@@ -424,8 +424,19 @@ export class LessonsService {
     await this.access.assertCanManageCourse(actor.id, actor.role, section.courseId, 'content');
 
     const lesson = await this.prisma.$transaction(async (tx) => {
+      // EVERY row in the section, soft-deleted included, because the
+      // `@@unique([sectionId, sortOrder])` index covers every row too. A lesson
+      // is soft-deleted by `remove()` with its `sortOrder` intact, so a deleted
+      // row still occupies its position in the index even though no reader sees
+      // it. Reading only live rows here computed a `target` that could land on
+      // exactly that position, and the insert failed with P2002 - surfaced as
+      // "A record with this sectionId already exists", because the handler
+      // reports the FIRST field of the compound key.
+      //
+      // Add a lecture, delete it, add another: with live-only reads the second
+      // add recomputed the same slot and was refused.
       const last = await tx.lesson.findFirst({
-        where: { sectionId, ...notDeleted },
+        where: { sectionId },
         orderBy: { sortOrder: 'desc' },
         select: { sortOrder: true },
       });
@@ -433,13 +444,35 @@ export class LessonsService {
       const target = input.sortOrder ?? (last?.sortOrder ?? 0) + 1;
 
       if (input.sortOrder !== undefined) {
+        // An explicit position cannot be silently moved onto an occupied slot.
+        // The shift below only relocates LIVE rows, so a deleted row holding
+        // this position would still collide on insert.
+        const occupied = await tx.lesson.findFirst({
+          where: { sectionId, sortOrder: target },
+          select: { id: true, deletedAt: true },
+        });
+        if (occupied) {
+          throw AppException.conflict(
+            'That position is already taken in this section. ' +
+              'Leave the position empty to add the lecture at the end.',
+            { sortOrder: target },
+          );
+        }
+
+        // Shift live rows at/after the target up by one. The rows are made
+        // negative first so the shift never transiently collides with itself
+        // under the unique index, then flipped back below.
         await tx.$executeRaw`
           UPDATE lessons SET "sortOrder" = -("sortOrder" + 1)
           WHERE "sectionId" = ${sectionId} AND "sortOrder" >= ${target} AND "deletedAt" IS NULL
         `;
+        // Restricted to live rows, which is exactly the set the statement above
+        // made negative. Flipping an unfiltered set would also reposition
+        // deleted rows that happened to hold a negative value, moving them into
+        // a live lecture's slot. Narrowing the set cannot create a collision.
         await tx.$executeRaw`
           UPDATE lessons SET "sortOrder" = -"sortOrder"
-          WHERE "sectionId" = ${sectionId} AND "sortOrder" < 0
+          WHERE "sectionId" = ${sectionId} AND "sortOrder" < 0 AND "deletedAt" IS NULL
         `;
       }
 

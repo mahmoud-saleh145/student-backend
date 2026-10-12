@@ -35,7 +35,10 @@ import { StorageService } from 'src/modules/storage/storage.service';
 
 /** The two endpoints under test, with their real arities. */
 type StorageControllerLike = {
-  attachment(dto: Record<string, unknown>): Promise<{ url: string; fields: Record<string, string> }>;
+  attachment(
+    actor: { id: string; role: 'ADMIN' },
+    dto: Record<string, unknown>,
+  ): Promise<{ url: string; fields: Record<string, string> }>;
   attachmentContent(
     query: Record<string, unknown>,
     req: unknown,
@@ -70,8 +73,13 @@ function build() {
   };
 
   const cloudinary = {};
+  // `assertCourseExistsAndManageable` is on the presign route now: `courseId`
+  // names the key's namespace, so it has to be a course this actor may manage
+  // before anything is signed.
+  const assertCourseExistsAndManageable = jest.fn(async () => undefined);
   const courseAccess = {
     assertCanManageCourse: jest.fn(async () => undefined),
+    assertCourseExistsAndManageable,
     assertTeacherCapability: jest.fn(async () => undefined),
   };
 
@@ -82,8 +90,11 @@ function build() {
     courseAccess as never,
   ) as unknown as StorageControllerLike;
 
-  return { controller, storage, presignUpload, putStream };
+  return { controller, storage, presignUpload, putStream, assertCourseExistsAndManageable };
 }
+
+/** The actor every `attachment()` call below is made as. */
+const ADMIN = { id: 'usr_1', role: 'ADMIN' } as const;
 
 /** Minimal request carrying a body length, which the endpoint requires. */
 function req(contentLength = 1024) {
@@ -115,7 +126,7 @@ describe('the bucket an attachment is written to', () => {
 describe('presigned attachment upload', () => {
   it('targets the bucket readers resolve attachments from', async () => {
     const t = build();
-    await t.controller.attachment({
+    await t.controller.attachment(ADMIN, {
       courseId: 'crs_1',
       filename: 'slides.pdf',
       contentType: 'application/pdf',
@@ -130,7 +141,7 @@ describe('presigned attachment upload', () => {
 
   it('signs an object key under the course attachment namespace', async () => {
     const t = build();
-    await t.controller.attachment({
+    await t.controller.attachment(ADMIN, {
       courseId: 'crs_1',
       filename: 'slides.pdf',
       contentType: 'application/pdf',
@@ -144,12 +155,73 @@ describe('presigned attachment upload', () => {
   it('still refuses a filename with path separators', async () => {
     const t = build();
     await expect(
-      t.controller.attachment({
+      t.controller.attachment(ADMIN, {
         courseId: 'crs_1',
         filename: '../../etc/passwd',
         contentType: 'application/pdf',
       }),
     ).rejects.toThrow();
+    expect(t.presignUpload).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The presign route became the dashboard's ONLY route to an attachment: the
+ * bytes now go browser -> storage over a signature this call returns, because
+ * proxying them through a Function failed above Vercel's 4.5 MB cap. That
+ * promoted this endpoint from "a key generator" to the whole authorisation
+ * step for the upload, so the checks it performs matter more than they did.
+ */
+describe('presigned attachment upload — course ownership', () => {
+  it('checks the course is manageable before signing anything', async () => {
+    const t = build();
+
+    await t.controller.attachment(ADMIN, {
+      courseId: 'crs_1',
+      filename: 'slides.pdf',
+      contentType: 'application/pdf',
+    });
+
+    expect(t.assertCourseExistsAndManageable).toHaveBeenCalledWith(
+      ADMIN.id,
+      ADMIN.role,
+      'crs_1',
+      'content',
+    );
+  });
+
+  it('signs nothing when the actor may not manage the course', async () => {
+    // Without this, `@StaffOnly()` alone would let any teacher mint a signature
+    // naming a course they do not teach — an object written into another
+    // teacher's namespace.
+    const t = build();
+    t.assertCourseExistsAndManageable.mockRejectedValueOnce(new Error('forbidden'));
+
+    await expect(
+      t.controller.attachment(ADMIN, {
+        courseId: 'crs_someone_elses',
+        filename: 'slides.pdf',
+        contentType: 'application/pdf',
+      }),
+    ).rejects.toThrow();
+
+    expect(t.presignUpload).not.toHaveBeenCalled();
+  });
+
+  it('checks ownership BEFORE validating the filename, so nothing is minted', async () => {
+    // Order is the point: an unauthorised caller learns nothing, and a
+    // traversal attempt cannot ride through on the back of the ownership check.
+    const t = build();
+    t.assertCourseExistsAndManageable.mockRejectedValueOnce(new Error('forbidden'));
+
+    await expect(
+      t.controller.attachment(ADMIN, {
+        courseId: 'crs_someone_elses',
+        filename: '../../etc/passwd',
+        contentType: 'application/pdf',
+      }),
+    ).rejects.toThrow('forbidden');
+
     expect(t.presignUpload).not.toHaveBeenCalled();
   });
 });
@@ -176,6 +248,7 @@ describe('streamed attachment upload (the path the dashboard uses)', () => {
     const t = build();
 
     await t.controller.attachment(
+      ADMIN,
       { courseId: 'crs_1', filename: 'slides.pdf', contentType: 'application/pdf' } as never,
     );
     await t.controller.attachmentContent(
