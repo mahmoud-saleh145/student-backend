@@ -269,7 +269,28 @@ export class StorageController {
     description:
       'Returns an object key. Register it with POST /attachments to make it visible to students.',
   })
-  async attachment(@Body() dto: PresignAttachmentDto) {
+  async attachment(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Body() dto: PresignAttachmentDto,
+  ) {
+    // `courseId` becomes the key's namespace (`attachments/<courseId>/…`), so
+    // `@StaffOnly()` alone is not enough: it would let any teacher mint a
+    // signature against a course they do not teach. Checked here for the same
+    // reason `courseThumbnailContent` checks it — and checked BEFORE anything is
+    // signed, so an unauthorised caller is refused rather than handed a
+    // credential.
+    //
+    // Registration (`AttachmentsService.create`) already enforces this, so this
+    // is defence in depth rather than the only barrier: it stops the object
+    // being uploaded at all, instead of leaving an orphan in the bucket that
+    // registration later refuses to register.
+    await this.courseAccess.assertCourseExistsAndManageable(
+      actor.id,
+      actor.role,
+      dto.courseId,
+      'content',
+    );
+
     if (dto.filename.includes('..') || dto.filename.includes('/')) {
       throw new AppException(ErrorCode.VALIDATION_ERROR, {
         fields: { filename: ['must not contain path separators'] },
