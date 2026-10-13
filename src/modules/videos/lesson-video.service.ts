@@ -51,9 +51,21 @@ const notDeleted = { deletedAt: null } as const;
  * `PlaybackService`, against the lecture the ticket was requested for. A student
  * enrolled in the destination course may play the shared asset there, and a
  * student who is not enrolled there gains nothing by knowing the video id or the
- * Gumlet asset id. Authorisation for the attach/detach itself is checked
- * against the DESTINATION course, so staff who can manage the source course but
- * not the destination cannot spread assets into it.
+ * Gumlet asset id.
+ *
+ * ## Authorisation is the CALLER's job, and it is two checks
+ *
+ * Nothing in this class checks a permission, so it must never be reached from a
+ * route that has not. `VideosController.attachExisting` checks BOTH courses
+ * before calling `attach()`: the DESTINATION lecture's course (so staff cannot
+ * write into a course they do not manage) and the SOURCE video's course (so
+ * staff cannot copy another course's paid media into a course whose enrolment
+ * and pricing they control). Either check alone would be a hole.
+ *
+ * Detach is deliberately not routed through this class: `VideosController`
+ * calls `VideosService.detach`, which is authorised and additionally revokes
+ * that lecture's live tickets, releases the origin pointer, resets the duration
+ * and recounts the course. `detach()` below is unused by production code.
  */
 @Injectable()
 export class LessonVideoService {

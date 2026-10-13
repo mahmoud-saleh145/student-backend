@@ -290,8 +290,11 @@ drift message go away.
 
 ### The audited pending set
 
-The second condition is a human check against a list, not a wildcard. For the
-2026-10-10 database release it is exactly these two, and nothing else:
+The second condition is a human check against a list, not a wildcard. Each
+release has its own entry, and the pending set must be **exactly** that
+release's list — no more, no fewer.
+
+**2026-10-10 database release** — exactly these two:
 
 ```
 20261009000000_academic_system_default_and_college_override
@@ -305,10 +308,45 @@ The academic migration's backfill was dry-run against production on 2026-10-10 a
 writes exactly one `faculties.academicSystemOverride` cell; the diagnostic in
 `inspect-academic-systems.sql` returns 0 rows for sections 5 and 6.
 
-**A third pending migration means stop and report.** It is not covered by the
-audit above, and it is the thing this check exists to catch. When a release
-legitimately changes the pending set, amend this list in the same commit as the
-migration it authorises — never by relaxing the rule.
+**2026-10-13 shared-video + DRM recovery release** — exactly these three:
+
+```
+20261012090000_strict_drm_playback
+20261012120000_shared_video_assets
+20261013120000_drm_check_epoch
+```
+
+All three are additive, and together they are **not** rollback-safe as a group:
+
+- `strict_drm_playback` adds three columns to `videos` and two indexes. No
+  backfill, no rewrite. It **fails every existing row closed**: each reads
+  `drmVerifiedAt = NULL`, so no pre-existing Gumlet video plays until a real
+  verification records a proof. `drmRequested` defaults to `false`, so assets
+  adopted before that column existed are re-evaluated against the provider's own
+  record rather than being banned permanently.
+- `shared_video_assets` creates `lesson_videos`, backfills one row per video with
+  a non-null `lessonId`, makes `videos.lessonId` nullable, and changes
+  `videos_lessonId_fkey` from `ON DELETE CASCADE` to `ON DELETE SET NULL`. It has
+  **no down-migration**: its own header documents guard-first checks and a Neon
+  branch restore. Read that header before attempting to reverse it.
+- `drm_check_epoch` adds one nullable column. Nothing reads it for playability,
+  so applying it ahead of the code changes no behaviour.
+
+Consequences to state in the release note before rolling:
+
+- Applying the code without these fails at runtime, not at boot —
+  `The table public.lesson_videos does not exist` on the first request that
+  touches the model (see the note on the Pre-Deploy Command below).
+- The 2026-10-10 pair may still be pending. If it is, **the total pending set is
+  five, not three**: both entries together are the audited set for this release,
+  and any migration outside their union is a stop and report. Confirm against
+  `prisma migrate status` rather than assuming.
+
+**Any pending migration outside the current release's audited list means stop and
+report.** It is not covered by the audit above, and it is the thing this check
+exists to catch. When a release legitimately changes the pending set, amend this
+list in the same commit as the migration it authorises — never by relaxing the
+rule.
 
 > **The release gate reports; `migrate status` decides.** `npm run db:gate` /
 > `db:gate:prod` parses both forms Prisma emits — the plain pending list that a
