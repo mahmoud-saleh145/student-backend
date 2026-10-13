@@ -52,16 +52,20 @@ function build(opts: { drm: DrmCfg; existing?: { drmProvider: string | null } | 
           drmProvider: opts.existing.drmProvider,
           gumletAssetId: null,
         },
+        // The owned video's own attachment: unshared, so nothing else plays it.
+        videoLinks: [{ videoId: 'v_1', video: { deletedAt: null } }],
       }
-    : { id: 'lesson_1', courseId: 'course_1', video: null };
+    : { id: 'lesson_1', courseId: 'course_1', video: null, videoLinks: [] };
 
   const prisma = {
+    $transaction: jest.fn(async (fn: (tx: unknown) => unknown): Promise<unknown> => fn(prisma)),
     lesson: { findFirst: jest.fn(async () => lesson) },
     lessonVideo: {
       upsert: jest.fn(async () => ({})),
       findMany: jest.fn(async () => [{ lessonId: 'l_1' }]),
       deleteMany: jest.fn(async () => ({ count: 1 })),
-      count: jest.fn(async () => 1),
+      // "How many OTHER lectures use this video": none, it is unshared.
+      count: jest.fn(async () => 0),
     },
     video: {
       create: jest.fn(async (args: { data: Record<string, unknown> }) => {
