@@ -1,12 +1,21 @@
 import { Injectable, Logger } from '@nestjs/common';
 
 import { PrismaService, notDeleted } from '../../database/prisma.service';
+import { RedisService } from '../../redis/redis.service';
 import { DrmVerificationService } from './drm-verification.service';
 
 /** Videos re-verified per sweep run when no batch size is given. */
 export const SWEEP_DEFAULT_BATCH_SIZE = 25;
 /** Tries per provider request during a sweep (transient failures only). */
 export const SWEEP_VERIFY_ATTEMPTS = 2;
+/**
+ * How many candidate rows (id + proof time only) one sweep loads to choose its
+ * batch from. Rotation (below) is fair across everything inside this window;
+ * a library with more Gumlet videos due at once than this would need a cursor.
+ */
+export const SWEEP_CANDIDATE_WINDOW = 1000;
+/** Redis sorted set: due video id -> when a sweep last attempted it (ms). */
+export const SWEEP_ATTEMPTS_KEY_PARTS = ['drm', 'sweep-attempts'] as const;
 
 /**
  * Recurring DRM re-verification.
@@ -66,6 +75,7 @@ export class DrmVerificationSweepService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly drmVerification: DrmVerificationService,
+    private readonly redis: RedisService,
   ) {
     this.marginSeconds = DrmVerificationSweepService.defaultMarginSeconds(
       this.drmVerification.ttl,
@@ -131,10 +141,11 @@ export class DrmVerificationSweepService {
         status: 'READY',
       },
       select: { id: true, drmVerifiedAt: true },
-      // Bounded: the sweep must never load the whole library into memory, and a
-      // hard cap keeps one run from monopolising the provider.
-      take: batchSize * 4,
-      orderBy: { drmVerifiedAt: { sort: 'asc', nulls: 'first' } },
+      // Bounded: the sweep must never load the whole library into memory. Only
+      // `batchSize` of these are verified per run, which is what keeps one run
+      // from monopolising the provider.
+      take: SWEEP_CANDIDATE_WINDOW,
+      orderBy: [{ drmVerifiedAt: { sort: 'asc', nulls: 'first' } }, { id: 'asc' }],
     });
 
     const ids = DrmVerificationSweepService.selectCandidates(
@@ -145,7 +156,7 @@ export class DrmVerificationSweepService {
     );
     result.skippedFresh = candidates.length - ids.length;
 
-    for (const id of ids.slice(0, batchSize)) {
+    for (const id of await this.chooseBatch(ids, batchSize)) {
       result.checked += 1;
       try {
         const verdict = await this.drmVerification.verify(id, { attempts: SWEEP_VERIFY_ATTEMPTS });
@@ -176,6 +187,55 @@ export class DrmVerificationSweepService {
       `DRM re-verification: ${result.refreshed} refreshed, ${result.failed} failed, ${result.errored} errored, ${result.skippedFresh} still fresh`,
     );
     return result;
+  }
+
+  /**
+   * Which due videos this run verifies: the least recently ATTEMPTED first.
+   *
+   * Ordering by `drmVerifiedAt` alone starved the queue. Every blocked or
+   * never-verified video has no proof, so all of them sort first - and in a
+   * fixed order - and a failing check leaves them exactly there. With 25 or
+   * more of them, every run re-checked the same 25 and nothing behind them
+   * (other blocked videos, proofs about to lapse) was ever reached. Blocked
+   * videos depend on this sweep to recover (the playback path does not
+   * re-check a recorded failure), so that was a permanent outage for them.
+   *
+   * Attempt times live in Redis - not in the video row, which has no column
+   * with that meaning - and are recorded BEFORE the batch is verified, so a run
+   * that dies part-way still moves the rotation on. Videos never attempted
+   * (including a proof that has just become due again: ids that are no longer
+   * due are pruned) go first, in database order. Every due video inside the
+   * candidate window is therefore attempted within ceil(due / batchSize) runs.
+   * If Redis is unavailable the database order is used, as before.
+   */
+  private async chooseBatch(due: string[], batchSize: number): Promise<string[]> {
+    if (due.length <= batchSize) return due;
+    const key = this.redis.key(...SWEEP_ATTEMPTS_KEY_PARTS);
+    try {
+      const flat = await this.redis.client.zrange(key, 0, -1, 'WITHSCORES');
+      const lastAttempt = new Map<string, number>();
+      for (let i = 0; i + 1 < flat.length; i += 2) lastAttempt.set(flat[i], Number(flat[i + 1]));
+
+      // Array.prototype.sort is stable: ties keep the database order.
+      const chosen = [...due]
+        .sort((a, b) => (lastAttempt.get(a) ?? -1) - (lastAttempt.get(b) ?? -1))
+        .slice(0, batchSize);
+
+      const dueSet = new Set(due);
+      const stale = [...lastAttempt.keys()].filter((id) => !dueSet.has(id));
+      const now = Date.now();
+      const tx = this.redis.client.multi();
+      if (stale.length > 0) tx.zrem(key, ...stale);
+      tx.zadd(key, ...chosen.flatMap((id) => [now, id]));
+      tx.expire(key, 7 * 24 * 3600);
+      await tx.exec();
+      return chosen;
+    } catch (error) {
+      this.logger.warn(
+        `DRM re-verification rotation unavailable (${(error as Error).message}); using database order this run`,
+      );
+      return due.slice(0, batchSize);
+    }
   }
 
   /** Exposed so the scheduler can compute the interval from the same TTL. */

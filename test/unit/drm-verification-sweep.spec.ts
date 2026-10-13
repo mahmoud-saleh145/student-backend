@@ -1,3 +1,4 @@
+import { fakeSweepRedis } from './helpers/drm-doubles';
 import {
   DrmVerificationSweepService,
   SWEEP_VERIFY_ATTEMPTS,
@@ -73,7 +74,7 @@ describe('DrmVerificationSweepService.sweep', () => {
       isPlatformUsable: jest.fn(() => opts.platformUsable ?? true),
       verify: jest.fn(verify),
     };
-    const service = new DrmVerificationSweepService(prisma as never, drmVerification as never);
+    const service = new DrmVerificationSweepService(prisma as never, drmVerification as never, fakeSweepRedis() as never);
     return { service, prisma, drmVerification, findMany };
   }
 

@@ -179,3 +179,51 @@ export const verifiedVideo = (over: Partial<VideoForVerdict> = {}): VideoForVerd
   status: 'READY',
   ...over,
 });
+/**
+ * RedisService as the DRM sweep uses it: one sorted set, read with
+ * ZRANGE ... WITHSCORES and written through MULTI (ZREM / ZADD / EXPIRE), with
+ * ioredis's reply shapes. `down: true` makes every command fail, as an
+ * unreachable Redis does.
+ */
+export function fakeSweepRedis(opts: { down?: boolean } = {}) {
+  const sets = new Map<string, Map<string, number>>();
+  const set = (key: string) => {
+    let s = sets.get(key);
+    if (!s) sets.set(key, (s = new Map()));
+    return s;
+  };
+  const fail = () => Promise.reject(new Error('connect ECONNREFUSED'));
+  const client = {
+    zrange: jest.fn(async (key: string, _start: number, _stop: number, _withScores: 'WITHSCORES') => {
+      if (opts.down) return fail();
+      return [...set(key).entries()]
+        .sort((a, b) => a[1] - b[1] || (a[0] < b[0] ? -1 : 1))
+        .flatMap(([member, score]) => [member, String(score)]);
+    }),
+    multi: jest.fn(() => {
+      const ops: (() => void)[] = [];
+      const chain = {
+        zrem: (key: string, ...members: string[]) => (ops.push(() => members.forEach((m) => set(key).delete(m))), chain),
+        zadd: (key: string, ...scoreMembers: (string | number)[]) => {
+          ops.push(() => {
+            for (let i = 0; i + 1 < scoreMembers.length; i += 2) set(key).set(String(scoreMembers[i + 1]), Number(scoreMembers[i]));
+          });
+          return chain;
+        },
+        expire: (_key: string, _seconds: number) => chain,
+        exec: async () => {
+          if (opts.down) return fail();
+          ops.forEach((op) => op());
+          return [];
+        },
+      };
+      return chain;
+    }),
+  };
+  return {
+    key: (...parts: (string | number)[]) => ['test', ...parts].join(':'),
+    client,
+    /** Members of a sorted set by its key parts, for assertions. */
+    members: (...parts: string[]) => [...set(['test', ...parts].join(':')).keys()],
+  };
+}

@@ -20,6 +20,19 @@ export interface ProgressInput {
 }
 
 /**
+ * The video a lecture plays: the one it OWNS (the legacy `Lesson.video`
+ * relation, unchanged for every lecture that has one), otherwise the one it
+ * ATTACHES through `videoLinks` - a shared asset reused from another lecture.
+ * Without the fallback a destination lecture had no video here, so no watch
+ * time was ever credited and it could never complete. Same rule as
+ * LessonsService.detail, i.e. the video the student was actually shown (a
+ * lecture holds at most one attached video; attaching a second is refused).
+ */
+function playedVideo<V>(lesson: { video: V | null; videoLinks: { video: V }[] }): V | null {
+  return lesson.video ?? lesson.videoLinks[0]?.video ?? null;
+}
+
+/**
  * Watch progress.
  *
  * The rules that make this trustworthy rather than decorative:
@@ -92,10 +105,16 @@ export class ProgressService {
           },
         },
         video: { select: { id: true, durationSeconds: true } },
+        videoLinks: {
+          where: { video: notDeleted },
+          take: 1,
+          select: { video: { select: { id: true, durationSeconds: true } } },
+        },
       },
     });
 
     if (!lesson) throw AppException.notFound('Lesson', params.input.lessonId);
+    const video = playedVideo(lesson);
 
     // Progress is content access: an expired student cannot keep writing
     // progress, which would otherwise let watch time accrue after access ends.
@@ -107,7 +126,7 @@ export class ProgressService {
       isPreviewContent: lesson.isPreview,
     });
 
-    const duration = lesson.durationSeconds || lesson.video?.durationSeconds || 0;
+    const duration = lesson.durationSeconds || video?.durationSeconds || 0;
 
     const existing = await this.prisma.watchProgress.findUnique({
       where: { userId_lessonId: { userId: params.userId, lessonId: lesson.id } },
@@ -134,7 +153,7 @@ export class ProgressService {
     // heartbeat for its own progress to be saved, so a genuine student on a
     // flaky connection can always move their resume marker. What they cannot do
     // is move it *far*, or bank watch time with no playback behind it at all.
-    const observed = await this.observePlayback(params.userId, lesson.video?.id ?? null);
+    const observed = await this.observePlayback(params.userId, video?.id ?? null, lesson.id);
 
     // Only the portion of observed watch time not already banked can be claimed,
     // so replaying the same heartbeat window cannot be counted twice.
@@ -223,7 +242,7 @@ export class ProgressService {
             userId: params.userId,
             lessonId: lesson.id,
             courseId: lesson.courseId,
-            videoId: lesson.video?.id,
+            videoId: video?.id,
             type: WatchEventType.COMPLETED,
             positionSeconds: position,
           },
@@ -288,7 +307,10 @@ export class ProgressService {
   // ---------------------------------------------------------------------------
 
   /**
-   * What the server has itself recorded of real viewing for this video.
+   * What the server has itself recorded of real viewing for this video, IN
+   * THIS LECTURE. A shared asset is played through several lectures (in
+   * different courses); every ticket records the lecture it was authorised
+   * for, so watching it in one course must not credit another course's lecture.
    *
    * Summing across tickets rather than reading the latest is deliberate: a long
    * lesson rotates its ticket (`rotatedFromId` chains the grants), so the most
@@ -303,6 +325,7 @@ export class ProgressService {
   private async observePlayback(
     userId: string,
     videoId: string | null,
+    lessonId: string,
   ): Promise<{ watchedSeconds: number; positionSeconds: number }> {
     // A lesson with no video cannot have been watched, so there is nothing to
     // vouch for. Returning zeroes makes that lesson's progress inert rather
@@ -311,7 +334,7 @@ export class ProgressService {
     if (!videoId) return { watchedSeconds: 0, positionSeconds: 0 };
 
     const rows = await this.prisma.playbackTicket.findMany({
-      where: { userId, videoId },
+      where: { userId, videoId, lessonId },
       select: { watchedSeconds: true, lastPositionSeconds: true },
     });
 
@@ -375,6 +398,11 @@ export class ProgressService {
         lesson: {
           include: {
             video: { select: { id: true, status: true, durationSeconds: true } },
+            videoLinks: {
+              where: { video: notDeleted },
+              take: 1,
+              select: { video: { select: { id: true, status: true, durationSeconds: true } } },
+            },
             _count: { select: { attachments: { where: { deletedAt: null } } } },
           },
         },
@@ -430,7 +458,7 @@ export class ProgressService {
           title: row.lesson.title,
           kind: row.lesson.kind,
           order: row.lesson.sortOrder,
-          durationSeconds: row.lesson.durationSeconds || row.lesson.video?.durationSeconds || 0,
+          durationSeconds: row.lesson.durationSeconds || playedVideo(row.lesson)?.durationSeconds || 0,
           isPreview: row.lesson.isPreview,
           locked: false,
           attachmentCount: row.lesson._count.attachments,

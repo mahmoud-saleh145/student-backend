@@ -274,10 +274,15 @@ export class DrmVerificationService {
    * VERIFICATION_UNAVAILABLE after `attempts` tries. It proves nothing about
    * the asset either way, so it must not erase a proof that was valid.
    *
-   * Idempotent, and safe to call concurrently: the write is a single update, so
-   * two overlapping calls converge on the same outcome.
+   * Safe to call concurrently. Every write is a single conditional update that
+   * applies only while the row still holds the asset THIS check looked at, so
+   * a result for a replaced asset never touches its replacement; a failure
+   * additionally applies only if no proof newer than this check's start has
+   * been recorded, so a slow failing check cannot erase a newer success. A
+   * result that no longer applies is reported as the stored state instead.
    */
   async verify(videoId: string, options: { attempts?: number } = {}): Promise<DrmVerdict> {
+    const startedAt = new Date();
     const video = await this.prisma.video.findFirst({
       where: { id: videoId, ...notDeleted },
       select: DrmVerificationService.select(),
@@ -285,16 +290,39 @@ export class DrmVerificationService {
     if (!video) {
       return { playable: false, reason: 'NO_GUMLET_ASSET', detail: 'Video not found.' };
     }
+    // The asset this check is about. adopt() can replace it while the check runs.
+    const checkedAssetId = video.gumletAssetId;
 
-    const fail = async (verdict: Exclude<DrmVerdict, { playable: true }>) => {
-      // Never leave a stale success behind a fresh failure.
-      await this.prisma.video.update({
-        where: { id: videoId },
+    const fail = async (
+      verdict: Exclude<DrmVerdict, { playable: true }>,
+      observed: { gumletStatus: string; gumletError: string | null } | null = null,
+    ): Promise<DrmVerdict> => {
+      // Never leave a stale success behind a fresh failure - but only a success
+      // recorded BEFORE this check started is stale. One recorded after it (a
+      // newer, overlapping check that succeeded) is newer information than
+      // this one, and erasing it would refuse a working video until something
+      // re-verifies it (the playback path does not, once a failure is on
+      // record). Conditional in the database, so concurrent processes agree.
+      const written = await this.prisma.video.updateMany({
+        where: {
+          id: videoId,
+          gumletAssetId: checkedAssetId,
+          OR: [{ drmVerifiedAt: null }, { drmVerifiedAt: { lt: startedAt } }],
+        },
         data: {
           drmVerifiedAt: null,
           drmBlockedReason: verdict.detail,
+          ...(observed
+            ? { gumletStatus: observed.gumletStatus, gumletError: observed.gumletError, gumletUpdatedAt: new Date() }
+            : {}),
         },
       });
+      if (written.count === 0) {
+        this.logger.log(
+          `DRM verification of video ${videoId} failed, but a newer result or a replacement asset is already recorded; keeping it`,
+        );
+        return this.storedVerdict(videoId);
+      }
       this.logger.warn(`DRM verification failed for video ${videoId}: ${verdict.detail}`);
       return verdict;
     };
@@ -351,16 +379,17 @@ export class DrmVerificationService {
     }
 
     if (!this.gumlet.isAssetPlayable(asset.status)) {
-      await this.prisma.video.update({
-        where: { id: videoId },
-        data: { gumletStatus: asset.status, gumletUpdatedAt: new Date(), gumletError: asset.error },
-      });
-      return fail({
-        playable: false,
-        reason:
-          asset.status === 'errored' || asset.status === 'failed' ? 'ASSET_FAILED' : 'ASSET_NOT_READY',
-        detail: asset.error ?? `Gumlet reports the asset as "${asset.status}".`,
-      });
+      // The provider's status is recorded in the same conditional write as the
+      // failure, so an old asset's status never lands on its replacement.
+      return fail(
+        {
+          playable: false,
+          reason:
+            asset.status === 'errored' || asset.status === 'failed' ? 'ASSET_FAILED' : 'ASSET_NOT_READY',
+          detail: asset.error ?? `Gumlet reports the asset as "${asset.status}".`,
+        },
+        { gumletStatus: asset.status, gumletError: asset.error ?? null },
+      );
     }
 
     // The decisive check: is the packaged media actually encrypted?
@@ -438,11 +467,13 @@ export class DrmVerificationService {
     // worse, letting a stale success outlive a failure observed in between.
     //
     // The write is therefore conditional on the stored timestamp still being
-    // absent or older than the one being written. A newer verification wins and
-    // the loser reports success without having moved anything.
+    // absent or older than the one being written, and on the row still holding
+    // the asset that was checked: a proof for a replaced asset says nothing
+    // about its replacement.
     const written = await this.prisma.video.updateMany({
       where: {
         id: videoId,
+        gumletAssetId: checkedAssetId,
         OR: [{ drmVerifiedAt: null }, { drmVerifiedAt: { lt: verifiedAt } }],
       },
       data: {
@@ -457,16 +488,19 @@ export class DrmVerificationService {
       },
     });
     if (written.count === 0) {
+      // A newer proof, or a replacement asset, is recorded. Report what is
+      // stored rather than this check's success: for a replaced asset that is
+      // "not verified", so no caller (e.g. sync() marking the video READY) acts
+      // on a proof of the old asset.
       this.logger.log(
-        `DRM verification for video ${videoId} finished after a newer one had already been recorded; keeping the newer result`,
+        `DRM verification for video ${videoId} finished after a newer result or a replacement asset was recorded; keeping it`,
       );
-    } else {
-      this.logger.log(`DRM verified for video ${videoId} (asset ${asset.assetId})`);
+      return this.storedVerdict(videoId);
     }
+    this.logger.log(`DRM verified for video ${videoId} (asset ${asset.assetId})`);
 
     // Report exactly what the playback path will now decide for the row as
     // written, instead of a hard-coded success that could disagree with it.
-    // (count === 0 means a NEWER success is stored; the same verdict holds.)
     return this.evaluate({
       ...video,
       drmRequested: true,
@@ -474,6 +508,17 @@ export class DrmVerificationService {
       drmBlockedReason: null,
       gumletStatus: asset.status,
     });
+  }
+
+  /** The verdict for the row as currently stored (no provider call). */
+  private async storedVerdict(videoId: string): Promise<DrmVerdict> {
+    const current = await this.prisma.video.findFirst({
+      where: { id: videoId, ...notDeleted },
+      select: DrmVerificationService.select(),
+    });
+    return current
+      ? this.evaluate(current)
+      : { playable: false, reason: 'NO_GUMLET_ASSET', detail: 'Video not found.' };
   }
 
   /**

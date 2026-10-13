@@ -32,6 +32,9 @@ const LESSON = {
     completionRequireContiguous: false,
   },
   video: { id: 'vid_1', durationSeconds: 600 },
+  // As the real include returns it: this lecture's attached videos (an owning
+  // lecture's own link; see shared-video-progress.spec.ts for destinations).
+  videoLinks: [{ video: { id: 'vid_1', durationSeconds: 600 } }],
 };
 
 interface StoredProgress {
@@ -447,6 +450,7 @@ describe('ProgressService.upsert', () => {
       prisma.lesson.findFirst.mockImplementation(async () => ({
         ...LESSON,
         video: null,
+        videoLinks: [],
         durationSeconds: 0,
       }));
 
@@ -459,9 +463,10 @@ describe('ProgressService.upsert', () => {
       expect(upsert.mock.calls[0]![0].create.watchedSeconds).toBe(0);
     });
 
-    it('scopes the observation to the requesting user and this video', async () => {
-      // Otherwise a student could claim another student's viewing, and the
-      // lesson's own video would be the wrong pool entirely.
+    it('scopes the observation to the requesting user, this video and THIS lecture', async () => {
+      // Otherwise a student could claim another student's viewing, the
+      // lesson's own video would be the wrong pool entirely, and a shared
+      // video watched in another course's lecture would be credited here.
       const { service, upsert, prisma } = buildService(null, {
         watchedSeconds: 60,
         positionSeconds: 60,
@@ -473,7 +478,7 @@ describe('ProgressService.upsert', () => {
       });
 
       expect(prisma.playbackTicket.findMany).toHaveBeenCalledWith({
-        where: { userId: 'usr_1', videoId: 'vid_1' },
+        where: { userId: 'usr_1', videoId: 'vid_1', lessonId: 'les_1' },
         select: { watchedSeconds: true, lastPositionSeconds: true },
       });
       expect(upsert.mock.calls[0]![0].create.watchedSeconds).toBe(60);

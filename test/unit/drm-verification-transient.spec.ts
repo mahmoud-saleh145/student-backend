@@ -11,6 +11,7 @@
 import { DrmVerificationSweepService } from '../../src/modules/playback/drm-verification-sweep.service';
 import { DrmVerificationService } from '../../src/modules/playback/drm-verification.service';
 import { GumletDrmService, GumletRequestError } from '../../src/modules/playback/gumlet-drm.service';
+import { fakeSweepRedis } from './helpers/drm-doubles';
 
 const CENC =
   '<MPD><AdaptationSet><ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" cenc:default_KID="k"/></AdaptationSet></MPD>';
@@ -207,7 +208,7 @@ describe('the sweep under provider failure', () => {
   it('counts an unreachable provider as errored (retry next run), not failed, and keeps the proof', async () => {
     const proof = hoursAgo(5); // due for refresh (age > TTL - margin = 4 h)
     const t = setup({ asset: ['network'], row: { drmVerifiedAt: proof } });
-    const sweep = new DrmVerificationSweepService(t.prisma as never, t.verification);
+    const sweep = new DrmVerificationSweepService(t.prisma as never, t.verification, fakeSweepRedis() as never);
     const result = await sweep.sweep();
     expect(result).toMatchObject({ checked: 1, refreshed: 0, failed: 0, errored: 1 });
     expect(t.row.drmVerifiedAt).toBe(proof);
@@ -242,7 +243,7 @@ describe('C2: after a DEFINITIVE failure, playback requests do not re-check Guml
     await t.verification.ensurePlayable('v_1'); // definitive failure recorded
     expect(t.row.drmVerifiedAt).toBeNull();
 
-    const sweep = new DrmVerificationSweepService(t.prisma as never, t.verification);
+    const sweep = new DrmVerificationSweepService(t.prisma as never, t.verification, fakeSweepRedis() as never);
     await expect(sweep.sweep()).resolves.toMatchObject({ checked: 1, refreshed: 1 });
     expect(t.row).toMatchObject({ drmVerifiedAt: expect.any(Date), drmBlockedReason: null });
 

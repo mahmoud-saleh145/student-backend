@@ -26,17 +26,7 @@ function build(updateManyResult: { count: number }) {
   } as never);
   const updateMany = jest.fn(async (_args: WriteArgs) => updateManyResult);
   const update = jest.fn(async (_args: WriteArgs) => ({}));
-  const findFirst = jest.fn(async (_args?: { where?: { id?: string } }) => ({
-    id: 'v_1',
-    drmProvider: 'gumlet',
-    drmRequested: true,
-    drmVerifiedAt: null,
-    drmBlockedReason: null,
-    gumletAssetId: 'a_1',
-    gumletStatus: 'ready',
-    gumletWorkspaceId: 'ws_1',
-    status: 'READY',
-  }));
+  const findFirst = jest.fn(async (_args?: { where?: { id?: string } }): Promise<typeof ROW> => ROW);
 
   const gumlet = {
     isSigningConfigured: jest.fn(() => true),
@@ -59,8 +49,20 @@ function build(updateManyResult: { count: number }) {
     gumlet as never,
     { getOrThrow: () => ({ drm: { enabled: true, provider: 'gumlet', gumlet: {} } }) } as never,
   );
-  return { service, updateMany, update };
+  return { service, updateMany, update, findFirst };
 }
+
+const ROW = {
+  id: 'v_1',
+  drmProvider: 'gumlet',
+  drmRequested: true,
+  drmVerifiedAt: null as Date | null,
+  drmBlockedReason: null,
+  gumletAssetId: 'a_1',
+  gumletStatus: 'ready',
+  gumletWorkspaceId: 'ws_1',
+  status: 'READY',
+};
 
 describe('DrmVerificationService.verify - concurrent writes', () => {
   it('writes the proof when nothing newer exists', async () => {
@@ -77,23 +79,30 @@ describe('DrmVerificationService.verify - concurrent writes', () => {
     // The guard: absent, or strictly older than the timestamp being written.
     expect(where).toMatchObject({
       id: 'v_1',
+      // ...and on the row still holding the asset that was checked.
+      gumletAssetId: 'a_1',
       OR: [{ drmVerifiedAt: null }, { drmVerifiedAt: { lt: expect.any(Date) } }],
     });
   });
 
   it('does NOT regress the timestamp when a newer verification already won', async () => {
     // `count: 0` is what the conditional write returns when another verification
-    // landed first. The loser must report success without moving anything, so a
-    // slow check cannot shorten a TTL that a fresh one just established.
-    const { service, updateMany } = build({ count: 0 });
+    // landed first. The loser must not move anything, so a slow check cannot
+    // shorten a TTL that a fresh one just established - and it reports the
+    // STORED state, which here is the winner's fresh proof.
+    const { service, updateMany, findFirst } = build({ count: 0 });
+    findFirst
+      .mockResolvedValueOnce(ROW)
+      .mockResolvedValueOnce({ ...ROW, drmVerifiedAt: new Date() });
     const v = await service.verify('v_1');
     expect(v.playable).toBe(true);
+    expect(findFirst).toHaveBeenCalledTimes(2);
     expect(updateMany).toHaveBeenCalledTimes(1);
     // No unconditional write that would clobber the winner.
     expect(updateMany.mock.calls[0][0].where).toBeDefined();
   });
 
-  it('uses the fail path (a plain update clearing the proof) on a real failure', async () => {
+  it('a real failure clears a proof recorded BEFORE the check started (conditional write)', async () => {
     const gumletHasDrm = false;
     jest.spyOn(global, 'fetch').mockResolvedValue({
       ok: true,
@@ -105,7 +114,8 @@ describe('DrmVerificationService.verify - concurrent writes', () => {
       id: 'v_1',
       drmProvider: 'gumlet',
       drmRequested: true,
-      drmVerifiedAt: new Date(),
+      // Recorded by an earlier check, i.e. before this one started.
+      drmVerifiedAt: new Date(Date.now() - 60_000),
       drmBlockedReason: null,
       gumletAssetId: 'a_1',
       gumletStatus: 'ready',
@@ -134,9 +144,18 @@ describe('DrmVerificationService.verify - concurrent writes', () => {
 
     const v = await service.verify('v_1');
     expect(v.playable).toBe(false);
-    // A failure must clear the proof unconditionally, or a stale success would
-    // outlive the evidence that invalidated it.
-    expect(updateMany).not.toHaveBeenCalled();
-    expect(update.mock.calls[0][0].data).toMatchObject({ drmVerifiedAt: null });
+    // The failure clears the proof - but conditionally: only while the row
+    // holds the checked asset and no proof NEWER than this check's start is
+    // stored (drm-verification-races.spec.ts runs the race end to end).
+    expect(update).not.toHaveBeenCalled();
+    expect(updateMany).toHaveBeenCalledTimes(1);
+    expect(updateMany.mock.calls[0][0]).toMatchObject({
+      where: {
+        id: 'v_1',
+        gumletAssetId: 'a_1',
+        OR: [{ drmVerifiedAt: null }, { drmVerifiedAt: { lt: expect.any(Date) } }],
+      },
+      data: { drmVerifiedAt: null, drmBlockedReason: expect.stringContaining('not CENC-encrypted') },
+    });
   });
 });
