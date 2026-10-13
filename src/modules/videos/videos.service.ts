@@ -163,11 +163,41 @@ export class VideosService {
             gumletAssetId: true,
           },
         },
+        // Every video attached to this lecture, owned or reused.
+        videoLinks: { select: { videoId: true, video: { select: { deletedAt: true } } } },
       },
     });
     if (!lesson) throw AppException.notFound('Lesson', params.lessonId);
 
     await this.access.assertCanManageCourse(actor.id, actor.role, lesson.courseId, 'content');
+
+    // A lecture that plays a REUSED asset is not the place to upload: a new
+    // owned video would give it two attachments and lesson detail and the
+    // ticket resolver would disagree about which file it plays.
+    const reusedHere = lesson.videoLinks.find(
+      (link) => link.videoId !== lesson.video?.id && !link.video.deletedAt,
+    );
+    if (reusedHere) {
+      throw new AppException(ErrorCode.CONFLICT, {
+        message: 'This lecture plays a shared video. Remove it from this lecture before uploading a new one.',
+        details: { lessonId: lesson.id, attachedVideoId: reusedHere.videoId },
+      });
+    }
+
+    // Replacing the file REWRITES the shared row and clears its Gumlet asset,
+    // so every other lecture that reuses it would silently start playing the
+    // new recording (and stop playing until it is re-ingested). Refuse instead.
+    if (lesson.video && !lesson.video.deletedAt) {
+      const sharedWith = await this.prisma.lessonVideo.count({
+        where: { videoId: lesson.video.id, lessonId: { not: lesson.id }, lesson: { ...notDeleted } },
+      });
+      if (sharedWith > 0) {
+        throw new AppException(ErrorCode.CONFLICT, {
+          message: `This video is also used by ${sharedWith} other lecture(s). Replacing it here would change them too.`,
+          details: { videoId: lesson.video.id, otherLectures: sharedWith },
+        });
+      }
+    }
 
     // Uploading over a LIVE video replaces the source a student streams. That
     // is the operation the "edit video URLs" switch governs; a first upload
@@ -189,66 +219,75 @@ export class VideosService {
     // a working lesson with an unprotected one.
     const requestedProvider = this.resolveNewVideoProvider();
 
-    const video = lesson.video
-      ? await this.prisma.video.update({
-          where: { id: lesson.video.id },
-          data: {
-            status: VideoStatus.UPLOADING,
-            processingError: null,
-            processingJobId: null,
-            processingStartedAt: null,
-            processedAt: null,
-            deletedAt: null,
-            uploadedById: actor.id,
-            // Replacing the file of a Gumlet-backed video makes the previous
-            // asset describe content that no longer exists. The provider is
-            // KEPT (the lesson is still meant to be DRM-delivered) but the
-            // asset identity is cleared, so the worker's adopt creates a fresh
-            // asset from the new source instead of re-syncing the old one -
-            // which would have marked the lesson READY while students kept
-            // watching the previous recording.
-            gumletAssetId: null,
-            gumletStatus: null,
-            gumletError: null,
-            gumletUpdatedAt: null,
-            // A LEGACY row carrying NEW content must not keep its old provider:
-            // that would send the new recording down the legacy ffmpeg/AES-128
-            // pipeline on a DRM platform. A row already on Gumlet keeps it, with
-            // only the stale asset identity cleared above. When the platform
-            // does not require Gumlet, `requestedProvider` is null and the row
-            // keeps whatever it had - the existing policy is preserved.
-            ...(requestedProvider !== null && lesson.video.drmProvider !== 'gumlet'
-              ? { drmProvider: requestedProvider }
-              : {}),
-          },
-        })
-      : await this.prisma.video.create({
-          data: {
-            lessonId: lesson.id,
-            courseId: lesson.courseId,
-            status: VideoStatus.UPLOADING,
-            uploadedById: actor.id,
-            // Set here, not by a later staff action, so every new upload enters
-            // the Gumlet workflow automatically. See resolveNewVideoProvider().
-            drmProvider: this.resolveNewVideoProvider(),
-          },
-        });
+    // The video row and its owner attachment are written in ONE transaction:
+    // a video committed without its lesson_videos row is unplayable (the ticket
+    // resolver fails closed on an empty attachment set).
+    const video = await this.prisma.$transaction(async (tx) => {
+      const written = lesson.video
+        ? await tx.video.update({
+            where: { id: lesson.video.id },
+            data: {
+              status: VideoStatus.UPLOADING,
+              processingError: null,
+              processingJobId: null,
+              processingStartedAt: null,
+              processedAt: null,
+              deletedAt: null,
+              uploadedById: actor.id,
+              // Replacing the file of a Gumlet-backed video makes the previous
+              // asset describe content that no longer exists. The provider is
+              // KEPT (the lesson is still meant to be DRM-delivered) but the
+              // asset identity is cleared, so the worker's adopt creates a fresh
+              // asset from the new source instead of re-syncing the old one -
+              // which would have marked the lesson READY while students kept
+              // watching the previous recording.
+              gumletAssetId: null,
+              gumletStatus: null,
+              gumletError: null,
+              gumletUpdatedAt: null,
+              // A LEGACY row carrying NEW content must not keep its old provider:
+              // that would send the new recording down the legacy ffmpeg/AES-128
+              // pipeline on a DRM platform. A row already on Gumlet keeps it, with
+              // only the stale asset identity cleared above. When the platform
+              // does not require Gumlet, `requestedProvider` is null and the row
+              // keeps whatever it had - the existing policy is preserved.
+              ...(requestedProvider !== null && lesson.video.drmProvider !== 'gumlet'
+                ? { drmProvider: requestedProvider }
+                : {}),
+            },
+          })
+        : await tx.video.create({
+            data: {
+              lessonId: lesson.id,
+              courseId: lesson.courseId,
+              status: VideoStatus.UPLOADING,
+              uploadedById: actor.id,
+              // Set here, not by a later staff action, so every new upload enters
+              // the Gumlet workflow automatically. See resolveNewVideoProvider().
+              drmProvider: requestedProvider,
+            },
+          });
 
-    // THE ATTACHMENT ROW IS NOT OPTIONAL.
-    //
-    // `lesson_videos` is what `PlaybackService.issueTicket` resolves the
-    // authorised lecture from. A video created without one has an empty
-    // attachment set, the resolver cannot determine which lecture the viewer is
-    // playing as, and it fails closed - so the lecture would be unplayable from
-    // the moment it was uploaded.
-    //
-    // Every video therefore gets its owner link at creation, which is also what
-    // keeps the "exactly one attachment" case unambiguous. Reuse then adds extra
-    // rows; nothing ever removes this one implicitly.
-    await this.prisma.lessonVideo.upsert({
-      where: { lessonId_videoId: { lessonId: lesson.id, videoId: video.id } },
-      update: {},
-      create: { lessonId: lesson.id, videoId: video.id, createdById: actor.id, sortOrder: 0 },
+      // THE ATTACHMENT ROW IS NOT OPTIONAL.
+      //
+      // `lesson_videos` is what `PlaybackService.issueTicket` resolves the
+      // authorised lecture from. A video created without one has an empty
+      // attachment set, the resolver cannot determine which lecture the viewer is
+      // playing as, and it fails closed - so the lecture would be unplayable from
+      // the moment it was uploaded.
+      //
+      // Every video therefore gets its owner link at creation, which is also what
+      // keeps the "exactly one attachment" case unambiguous. Reuse then adds extra
+      // rows; nothing ever removes this one implicitly. The upsert also HEALS a
+      // row an older build created without its attachment, the next time that
+      // lecture's video is replaced.
+      await tx.lessonVideo.upsert({
+        where: { lessonId_videoId: { lessonId: lesson.id, videoId: written.id } },
+        update: {},
+        create: { lessonId: lesson.id, videoId: written.id, createdById: actor.id, sortOrder: 0 },
+      });
+
+      return written;
     });
 
     const sourceKey = StorageService.keys.videoSource(video.id, params.filename);

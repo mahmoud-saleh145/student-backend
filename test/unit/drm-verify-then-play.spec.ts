@@ -280,6 +280,19 @@ describe('verification never weakens entitlement', () => {
     expect(w.tickets).toHaveLength(0);
   });
 
+  it('Fix 3: a verified video with NO lesson attachment is refused, even naming its video.lessonId', async () => {
+    const w = world({ attachments: [] });
+    await w.drmVerification.verify('vid_1');
+    for (const lessonId of [undefined, 'les_src']) {
+      await expect(w.issue(lessonId)).rejects.toMatchObject({
+        code: 'VIDEO_UNAVAILABLE',
+        details: { reason: 'NO_LESSON_ATTACHMENT' },
+      });
+    }
+    expect(w.access.assertContentAccess).not.toHaveBeenCalled();
+    expect(w.tickets).toHaveLength(0);
+  });
+
   it('a shared asset with no lecture named is refused rather than guessed', async () => {
     const w = world({ attachments: shared });
     await w.drmVerification.verify('vid_1');

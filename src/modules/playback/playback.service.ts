@@ -253,6 +253,19 @@ export class PlaybackService {
       .map((link) => link.lesson)
       .filter((lesson): lesson is NonNullable<typeof lesson> => lesson !== null && !lesson.deletedAt);
 
+    // No live attachment at all: a row an older build created without its
+    // lesson_videos link, or one whose only lecture was deleted. Still DENIED -
+    // `video.lessonId` is not trusted as a substitute, because it can point at a
+    // lecture the asset was deliberately detached from - but reported as its own
+    // reason so it is diagnosable and repairable instead of looking "ambiguous".
+    if (attachments.length === 0) {
+      await this.denied(user, videoId, video.courseId, 'video has no live lesson attachment');
+      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
+        message: 'This video is not attached to any lesson',
+        details: { reason: 'NO_LESSON_ATTACHMENT' },
+      });
+    }
+
     const requested = params.lessonId
       ? attachments.find((lesson) => lesson.id === params.lessonId) ?? null
       : null;

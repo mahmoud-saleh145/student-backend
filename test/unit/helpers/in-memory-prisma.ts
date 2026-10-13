@@ -190,7 +190,8 @@ export function createInMemoryPrisma(seed: Seed) {
       },
       create: async (args: Row) => {
         record('create', args);
-        const row = { ...(args.data as Row) };
+        // Prisma models here default `id` to cuid(); join rows have no id.
+        const row = { ...(name === 'lessonVideo' ? {} : { id: `${name}_new_${tables[name].length + 1}` }), ...(args.data as Row) };
         tables[name].push(row);
         return project(name, row, args);
       },
