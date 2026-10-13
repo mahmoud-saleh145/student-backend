@@ -18,7 +18,7 @@
 type Row = Record<string, unknown>;
 type Where = Record<string, unknown>;
 
-type ModelName = 'lesson' | 'video' | 'lessonVideo' | 'playbackTicket' | 'course';
+type ModelName = 'lesson' | 'video' | 'lessonVideo' | 'playbackTicket' | 'course' | 'videoRendition';
 
 type Relation =
   | { kind: 'one'; model: ModelName; local: string; foreign: string }
@@ -40,6 +40,7 @@ const RELATIONS: Record<ModelName, Record<string, Relation>> = {
   },
   playbackTicket: {},
   course: {},
+  videoRendition: {},
 };
 
 const COMPOSITE_KEYS: Partial<Record<ModelName, Record<string, string[]>>> = {
@@ -59,6 +60,7 @@ export function createInMemoryPrisma(seed: Seed) {
     lessonVideo: [],
     playbackTicket: [],
     course: [],
+    videoRendition: [],
   };
   for (const [name, rows] of Object.entries(seed) as [ModelName, Row[]][]) {
     tables[name] = rows.map((r) => ({ ...r }));
@@ -235,6 +237,7 @@ export function createInMemoryPrisma(seed: Seed) {
     lessonVideo: model('lessonVideo'),
     playbackTicket: model('playbackTicket'),
     course: model('course'),
+    videoRendition: model('videoRendition'),
     $transaction: async (fn: (tx: unknown) => unknown) => fn(prisma),
   };
 

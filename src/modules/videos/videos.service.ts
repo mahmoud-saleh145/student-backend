@@ -712,6 +712,9 @@ export class VideosService {
       }[];
     },
   ): Promise<void> {
+    // Every course whose lecture just received this duration; recounted below.
+    const touchedCourseIds = new Set<string>();
+
     const video = await this.prisma.$transaction(async (tx) => {
       await tx.videoRendition.deleteMany({ where: { videoId } });
 
@@ -751,10 +754,14 @@ export class VideosService {
       // for a video that plays perfectly.
       const attachedLessonIds = await tx.lessonVideo.findMany({
         where: { videoId },
-        select: { lessonId: true },
+        select: { lessonId: true, lesson: { select: { courseId: true } } },
       });
       const lessonIds = new Set(attachedLessonIds.map((link) => link.lessonId));
       if (updated.lessonId) lessonIds.add(updated.lessonId);
+
+      touchedCourseIds.add(updated.courseId);
+      for (const link of attachedLessonIds) touchedCourseIds.add(link.lesson.courseId);
+      if (updated.lesson?.courseId) touchedCourseIds.add(updated.lesson.courseId);
 
       if (lessonIds.size > 0) {
         await tx.lesson.updateMany({
@@ -766,7 +773,11 @@ export class VideosService {
       return updated;
     });
 
-    await this.courses.recountCourse(video.courseId);
+    // Course totals are SUM(lesson durations): every course that just received
+    // the duration is stale, destinations included - not only the uploader's.
+    for (const courseId of touchedCourseIds) {
+      await this.courses.recountCourse(courseId);
+    }
 
     // Tell enrolled students. This is the "new video" notification from §63.
     //
