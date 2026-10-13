@@ -46,6 +46,18 @@ const LIBRARY_TICKET_PREFIX = 'lib_';
  */
 const ATTACHMENT_TICKET_PREFIX = 'att_';
 
+/** An attached, non-deleted lecture as loaded for ticket authorisation. */
+type PlayableLesson = {
+  id: string;
+  title: string;
+  status: ContentStatus;
+  isPreview: boolean;
+  courseId: string;
+  sectionId: string;
+  deletedAt: Date | null;
+  section: { unlocksAt: Date | null; status: ContentStatus };
+};
+
 /** Matches the mobile app's `PlaybackTicket` type exactly. */
 export interface PlaybackTicketResponse {
   ticketId: string;
@@ -188,6 +200,9 @@ export class PlaybackService {
           },
         },
         lessonLinks: {
+          // Deterministic order (oldest attachment first) for resolving a
+          // shared asset when the client names no lecture - see below.
+          orderBy: { createdAt: 'asc' },
           select: {
             lesson: {
               select: {
@@ -245,10 +260,16 @@ export class PlaybackService {
     // Resolution order:
     //   1. The lesson the client said it is playing from, but only if this
     //      asset really is attached to it. A client cannot invent a lesson to
-    //      borrow someone else's entitlement.
+    //      borrow someone else's entitlement. Strict: never falls back.
     //   2. Otherwise the single attached lesson, if there is exactly one.
-    //   3. Otherwise DENIED. Never guessed: picking one arbitrarily would let a
-    //      student pick the most permissive of several attachments.
+    //   3. Otherwise (shared asset, no lesson named - the native app and older
+    //      web builds never send one): the FIRST attached lecture, in a fixed
+    //      order (the uploading lecture, then oldest attachment), that passes
+    //      the FULL lesson authorisation below for this user. Each candidate is
+    //      checked exactly as if the client had named it, so this grants nothing
+    //      the user could not already obtain by naming that lecture - it never
+    //      picks "the most permissive" one. If none passes, DENIED with the
+    //      first candidate's reason.
     const attachments = video.lessonLinks
       .map((link) => link.lesson)
       .filter((lesson): lesson is NonNullable<typeof lesson> => lesson !== null && !lesson.deletedAt);
@@ -279,65 +300,34 @@ export class PlaybackService {
       });
     }
 
-    const lesson = requested ?? (attachments.length === 1 ? attachments[0] : null);
-
-    if (!lesson) {
-      await this.denied(user, videoId, video.courseId, 'ambiguous lesson context for a shared video');
-      throw new AppException(ErrorCode.PLAYBACK_DENIED, {
-        message:
-          'This video is used by more than one lesson. Retry from the lesson you are trying to watch.',
-      });
-    }
-
-    if (
-      user.role === UserRole.STUDENT &&
-      (lesson.status !== ContentStatus.PUBLISHED ||
-        lesson.section.status !== ContentStatus.PUBLISHED)
-    ) {
-      await this.denied(user, videoId, lesson.courseId, 'lesson not published');
-      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE);
-    }
-
-    // --- 5. course + lesson access ------------------------------------------
-    // NOTE the course is the LESSON's course, not `video.courseId`. For a reused
-    // asset these differ, and using the uploading course would entitle the
-    // viewer to content in the wrong course.
-    await this.access.assertContentAccess({
-      userId: user.id,
-      role: user.role,
-      courseId: lesson.courseId,
-      allowPreview: true,
-      isPreviewContent: lesson.isPreview,
-    });
-
-    // Section-scoped entitlement, enforced at the point a playable URL would
-    // be minted. This is the gate that matters: the lesson read above can be
-    // skipped by a client, the ticket cannot.
-    if (user.role === UserRole.STUDENT && !lesson.isPreview) {
-      try {
-        await this.access.assertSectionAccessible({
-          userId: user.id,
-          courseId: lesson.courseId,
-          sectionId: lesson.sectionId,
-        });
-      } catch (error) {
-        await this.denied(user, videoId, lesson.courseId, 'section not covered by access');
-        throw error;
+    let lesson: PlayableLesson;
+    if (requested || attachments.length === 1) {
+      lesson = requested ?? attachments[0];
+      await this.authorizeLessonForPlayback(user, videoId, lesson, { record: true });
+    } else {
+      // Shared asset, no lecture named: first entitled lecture in fixed order.
+      const ordered = [
+        ...attachments.filter((l) => l.id === video.lessonId),
+        ...attachments.filter((l) => l.id !== video.lessonId),
+      ];
+      let chosen: PlayableLesson | null = null;
+      for (const candidate of ordered) {
+        try {
+          await this.authorizeLessonForPlayback(user, videoId, candidate, { record: false });
+          chosen = candidate;
+          break;
+        } catch {
+          // Not entitled through this lecture; try the next one.
+        }
       }
-    }
-
-    // Drip release is enforced here too, not only in the lesson read.
-    const unlocksAt = lesson.section.unlocksAt;
-    if (
-      unlocksAt &&
-      unlocksAt.getTime() > Date.now() &&
-      !lesson.isPreview &&
-      user.role === UserRole.STUDENT
-    ) {
-      await this.denied(user, videoId, lesson.courseId, 'section not yet released');
-      throw new AppException(ErrorCode.PLAYBACK_DENIED, {
-        message: 'This section has not been released yet',
-      });
+      if (!chosen) {
+        // Re-run the first candidate with recording on, so the refusal is
+        // logged and thrown with that lecture's real reason. (If access was
+        // granted in the meantime it passes, and that lecture is used.)
+        await this.authorizeLessonForPlayback(user, videoId, ordered[0], { record: true });
+        chosen = ordered[0];
+      }
+      lesson = chosen;
     }
 
     // --- 6. device -----------------------------------------------------------
@@ -687,6 +677,70 @@ export class PlaybackService {
         ? { Authorization: `Bearer ${providerToken}` }
         : {},
     };
+  }
+
+  /**
+   * Every LESSON-scoped check for playing a video as `lesson`: publication,
+   * course entitlement (the lesson's own course, never the uploader's),
+   * section entitlement and drip release. Throws on the first failure.
+   *
+   * `record: false` only suppresses the denied-attempt security record; the
+   * checks themselves are identical. It is used while trying candidate
+   * lectures of a shared asset, where a miss on one lecture is not an attempt.
+   */
+  private async authorizeLessonForPlayback(
+    user: AuthenticatedUser,
+    videoId: string,
+    lesson: PlayableLesson,
+    options: { record: boolean },
+  ): Promise<void> {
+    const deny = (reason: string) =>
+      options.record ? this.denied(user, videoId, lesson.courseId, reason) : Promise.resolve();
+
+    if (
+      user.role === UserRole.STUDENT &&
+      (lesson.status !== ContentStatus.PUBLISHED || lesson.section.status !== ContentStatus.PUBLISHED)
+    ) {
+      await deny('lesson not published');
+      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE);
+    }
+
+    // --- 5. course + lesson access ------------------------------------------
+    // NOTE the course is the LESSON's course, not `video.courseId`. For a reused
+    // asset these differ, and using the uploading course would entitle the
+    // viewer to content in the wrong course.
+    await this.access.assertContentAccess({
+      userId: user.id,
+      role: user.role,
+      courseId: lesson.courseId,
+      allowPreview: true,
+      isPreviewContent: lesson.isPreview,
+    });
+
+    // Section-scoped entitlement, enforced at the point a playable URL would
+    // be minted. This is the gate that matters: the lesson read above can be
+    // skipped by a client, the ticket cannot.
+    if (user.role === UserRole.STUDENT && !lesson.isPreview) {
+      try {
+        await this.access.assertSectionAccessible({
+          userId: user.id,
+          courseId: lesson.courseId,
+          sectionId: lesson.sectionId,
+        });
+      } catch (error) {
+        await deny('section not covered by access');
+        throw error;
+      }
+    }
+
+    // Drip release is enforced here too, not only in the lesson read.
+    const unlocksAt = lesson.section.unlocksAt;
+    if (unlocksAt && unlocksAt.getTime() > Date.now() && !lesson.isPreview && user.role === UserRole.STUDENT) {
+      await deny('section not yet released');
+      throw new AppException(ErrorCode.PLAYBACK_DENIED, {
+        message: 'This section has not been released yet',
+      });
+    }
   }
 
   /**

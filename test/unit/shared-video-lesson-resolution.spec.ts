@@ -86,13 +86,50 @@ describe('byVideoId disambiguation', () => {
     await expect(callByVideo(service, 'vid_shared', 'les_not_attached')).rejects.toBeDefined();
   });
 
-  it('REFUSES rather than guessing when several lectures share the asset', async () => {
-    const { service } = harness({
-      attachments: [SRC, { id: 'les_dst', courseId: 'crs_dst', deletedAt: null }],
-      lesson: { id: 'les_dst', courseId: 'crs_dst', videoLinks: [], video: null },
+  // Policy (recovery): with no lesson named (native app, older web), a shared
+  // asset resolves to the FIRST lecture - uploading lecture first, then oldest
+  // attachment - that detail() lets this user open. detail() runs the full
+  // publication / course / section / drip checks, so it is stubbed per lecture
+  // here to express "entitled through X"; its own checks are tested elsewhere.
+  function withEntitlement(entitled: string[]) {
+    const h = harness({
+      attachments: [{ id: 'les_dst', courseId: 'crs_dst', deletedAt: null }, SRC],
+      lesson: SRC,
     });
+    const detail = jest
+      .spyOn(h.service, 'detail')
+      .mockImplementation(async (id: string) => {
+        if (!entitled.includes(id)) throw Object.assign(new Error(`not entitled via ${id}`), { code: 'NOT_ENROLLED' });
+        return { id } as never;
+      });
+    return { ...h, detail };
+  }
 
-    await expect(callByVideo(service, 'vid_shared')).rejects.toThrow(/more than one lecture/i);
+  it('no lesson named: returns the lecture the user is entitled to, trying the uploading lecture first', async () => {
+    const { service, detail } = withEntitlement(['les_dst']);
+    await expect(callByVideo(service, 'vid_shared')).resolves.toEqual({ id: 'les_dst' });
+    expect(detail.mock.calls.map((c) => c[0])).toEqual(['les_src', 'les_dst']);
+  });
+
+  it('no lesson named and entitled through both: the uploading lecture wins', async () => {
+    const { service } = withEntitlement(['les_src', 'les_dst']);
+    await expect(callByVideo(service, 'vid_shared')).resolves.toEqual({ id: 'les_src' });
+  });
+
+  it('no lesson named and entitled through none: REFUSED with the first lecture\'s reason', async () => {
+    const { service } = withEntitlement([]);
+    await expect(callByVideo(service, 'vid_shared')).rejects.toThrow('not entitled via les_src');
+  });
+
+  it('a NAMED lesson never falls back to another lecture', async () => {
+    const { service, detail } = withEntitlement(['les_src']);
+    await expect(callByVideo(service, 'vid_shared', 'les_dst')).rejects.toThrow('not entitled via les_dst');
+    expect(detail.mock.calls.map((c) => c[0])).toEqual(['les_dst']);
+  });
+
+  it('a video with no live attachment is refused', async () => {
+    const { service } = harness({ attachments: [], lesson: SRC });
+    await expect(callByVideo(service, 'vid_shared')).rejects.toThrow(/not attached to any lesson/i);
   });
 
   it('resolves when there is exactly one attachment', async () => {

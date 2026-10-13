@@ -44,7 +44,7 @@ function lesson(id: string, courseId: string, overrides: Partial<LessonRow> = {}
   };
 }
 
-function harness(opts: { attachments: LessonRow[] }) {
+function harness(opts: { attachments: LessonRow[]; entitledCourses?: string[]; originLessonId?: string | null }) {
   const calls = {
     contentAccess: [] as Record<string, unknown>[],
     sectionAccess: [] as Record<string, unknown>[],
@@ -68,6 +68,7 @@ function harness(opts: { attachments: LessonRow[] }) {
         renditions: [],
         captions: [],
         lesson: null,
+        lessonId: opts.originLessonId ?? null,
         lessonLinks: opts.attachments.map((l) => ({ lesson: l })),
       })),
     },
@@ -93,6 +94,9 @@ function harness(opts: { attachments: LessonRow[] }) {
   const access = {
     assertContentAccess: jest.fn(async (args: Record<string, unknown>) => {
       calls.contentAccess.push(args);
+      if (opts.entitledCourses && !opts.entitledCourses.includes(args.courseId as string)) {
+        throw Object.assign(new Error('NOT_ENROLLED'), { code: 'NOT_ENROLLED' });
+      }
     }),
     assertSectionAccessible: jest.fn(async (args: Record<string, unknown>) => {
       calls.sectionAccess.push(args);
@@ -210,23 +214,72 @@ describe('shared video entitlement', () => {
     expect(calls.tickets).toHaveLength(0);
   });
 
-  it('REFUSES rather than guessing when several lectures share the asset and none is named', async () => {
-    // Picking one arbitrarily would let a caller choose the most permissive
-    // attachment - for example a free-preview lecture.
+  // Policy (recovery): the native app and older web builds never name a lecture.
+  // For a shared asset the server tries each attached lecture in a FIXED order
+  // (uploading lecture, then oldest attachment) with the FULL lesson checks,
+  // and uses the first the student passes - never "the most permissive".
+  const unnamed = (service: PlaybackService) =>
+    service
+      .issueTicket({ user: ACTOR_STUDENT, videoId: 'vid_shared', integritySuspect: false, manifest: REJECTED } as never)
+      .catch((e: unknown) => e);
+
+  it('no lecture named: resolves to the lecture the student is entitled to, checked against ITS course', async () => {
     const { service, calls } = harness({
-      attachments: [lesson('les_a', 'crs_a'), lesson('les_b', 'crs_b')],
+      attachments: [lesson('les_src', 'crs_src'), lesson('les_dst', 'crs_dst')],
+      originLessonId: 'les_src',
+      entitledCourses: ['crs_dst'],
     });
+    await unnamed(service);
+    expect(calls.contentAccess.map((c) => c.courseId)).toEqual(['crs_src', 'crs_dst']);
+    expect(calls.sectionAccess[0]).toMatchObject({ courseId: 'crs_dst', sectionId: 'sec_les_dst' });
+    expect(calls.tickets[0]).toMatchObject({ lessonId: 'les_dst', courseId: 'crs_dst' });
+  });
 
-    await expect(
-      service.issueTicket({
-        user: ACTOR_STUDENT,
-        videoId: 'vid_shared',
-        integritySuspect: false,
-        manifest: REJECTED,
-      } as never),
-    ).rejects.toBeDefined();
+  it('no lecture named and entitled through several: the uploading lecture wins (deterministic)', async () => {
+    const { service, calls } = harness({
+      attachments: [lesson('les_dst', 'crs_dst'), lesson('les_src', 'crs_src')],
+      originLessonId: 'les_src',
+      entitledCourses: ['crs_src', 'crs_dst'],
+    });
+    await unnamed(service);
+    expect(calls.tickets[0]).toMatchObject({ lessonId: 'les_src', courseId: 'crs_src' });
+  });
 
-    expect(calls.contentAccess).toHaveLength(0);
+  it('no lecture named and entitled through none: REFUSED with the first lecture reason, no ticket', async () => {
+    const { service, calls } = harness({
+      attachments: [lesson('les_src', 'crs_src'), lesson('les_dst', 'crs_dst')],
+      originLessonId: 'les_src',
+      entitledCourses: [],
+    });
+    expect(await unnamed(service)).toMatchObject({ code: 'NOT_ENROLLED' });
+    expect(calls.tickets).toHaveLength(0);
+  });
+
+  it('no lecture named: an unpublished or undripped lecture is skipped exactly as if it were named', async () => {
+    const { service, calls } = harness({
+      attachments: [
+        lesson('les_src', 'crs_src', { status: 'DRAFT' }),
+        // A real Date: the code under test calls getTime(), and a string would be
+        // skipped by a TypeError rather than by the drip rule.
+        lesson('les_drip', 'crs_drip', { section: { unlocksAt: new Date(Date.now() + 86_400_000) as never, status: 'PUBLISHED' } }),
+        lesson('les_ok', 'crs_ok'),
+      ],
+      originLessonId: 'les_src',
+    });
+    await unnamed(service);
+    expect(calls.tickets[0]).toMatchObject({ lessonId: 'les_ok' });
+  });
+
+  it('a NAMED lecture never falls back to another one, even if the student is entitled elsewhere', async () => {
+    const { service, calls } = harness({
+      attachments: [lesson('les_src', 'crs_src'), lesson('les_dst', 'crs_dst')],
+      originLessonId: 'les_src',
+      entitledCourses: ['crs_src'],
+    });
+    const err = await service
+      .issueTicket({ user: ACTOR_STUDENT, videoId: 'vid_shared', lessonId: 'les_dst', integritySuspect: false } as never)
+      .catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: 'NOT_ENROLLED' });
     expect(calls.tickets).toHaveLength(0);
   });
 

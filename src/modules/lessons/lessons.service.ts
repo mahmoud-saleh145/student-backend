@@ -254,6 +254,8 @@ export class LessonsService {
         lessonId: true,
         lessonLinks: {
           where: { lesson: { ...notDeleted } },
+          // Deterministic order for the no-hint case below.
+          orderBy: { createdAt: 'asc' },
           select: { lessonId: true },
         },
       },
@@ -271,16 +273,36 @@ export class LessonsService {
       return this.detail(lessonId, userId, role);
     }
 
+    if (attached.size === 0) {
+      throw new AppException(ErrorCode.PLAYBACK_DENIED, {
+        message: 'This video is not attached to any lesson',
+      });
+    }
+
     if (attached.size === 1) {
       return this.detail([...attached][0], userId, role);
     }
 
-    // More than one attachment and no hint from the caller: refuse rather than
-    // pick. Guessing would return whichever lecture happened to be first.
-    throw new AppException(ErrorCode.PLAYBACK_DENIED, {
-      message:
-        'This video is used by more than one lecture. Retry from the lesson you are trying to watch.',
-    });
+    // Shared asset and no hint (the native app and older web builds never send
+    // one): the FIRST lecture, in a fixed order - the uploading lecture, then
+    // oldest attachment - that `detail()` lets this user open. `detail()` runs
+    // the full publication / course / section / drip checks and writes
+    // nothing, so this returns only a lecture the user could open by id anyway.
+    // Mirrors PlaybackService.issueTicket, so the lecture shown and the lecture
+    // the ticket is issued for agree.
+    const ordered = [
+      ...[...attached].filter((id) => id === video.lessonId),
+      ...[...attached].filter((id) => id !== video.lessonId),
+    ];
+    let firstError: unknown = null;
+    for (const candidate of ordered) {
+      try {
+        return await this.detail(candidate, userId, role);
+      } catch (error) {
+        firstError ??= error;
+      }
+    }
+    throw firstError;
   }
 
   // ---------------------------------------------------------------------------

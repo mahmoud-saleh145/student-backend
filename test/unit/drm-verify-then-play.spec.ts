@@ -370,10 +370,26 @@ describe('verification never weakens entitlement', () => {
     expect(w.tickets).toHaveLength(0);
   });
 
-  it('a shared asset with no lecture named is refused rather than guessed', async () => {
-    const w = world({ attachments: shared });
-    await w.drmVerification.verify('vid_1');
-    await expect(w.issue()).rejects.toMatchObject({ code: 'PLAYBACK_DENIED' });
+  // The six shared-video lectures and clients that send no lessonId (native
+  // app, older web builds): resolved to the first lecture the student passes
+  // the full checks for - never one they could not open by naming it.
+  it('old client, shared asset, entitled only via the DESTINATION: plays as the destination lecture', async () => {
+    const w = world({ attachments: shared, entitledCourses: ['crs_dst'] });
+    await expect(w.issue()).resolves.toMatchObject({ drm: { scheme: 'widevine' } });
+    expect(w.tickets[0]).toMatchObject({ lessonId: 'les_dst', courseId: 'crs_dst' });
+  });
+
+  it('old client, shared asset, entitled via the SOURCE: plays as the source lecture (as it does today)', async () => {
+    const w = world({ attachments: shared, entitledCourses: ['crs_src'] });
+    await expect(w.issue()).resolves.toMatchObject({ drm: { scheme: 'widevine' } });
+    expect(w.tickets[0]).toMatchObject({ lessonId: 'les_src', courseId: 'crs_src' });
+  });
+
+  it('old client, shared asset, entitled via neither: refused, no ticket, no licence signed', async () => {
+    const w = world({ attachments: shared, entitledCourses: [] });
+    await expect(w.issue()).rejects.toMatchObject({ code: 'NOT_ENROLLED' });
+    expect(w.tickets).toHaveLength(0);
+    expect(w.signLicence).not.toHaveBeenCalled();
   });
 });
 
