@@ -1,0 +1,45 @@
+-- DRM verification concurrency epoch.
+--
+-- PREPARED ONLY. NOT APPLIED to Production. Apply only after review.
+--
+-- WHY A MIGRATION IS ESSENTIAL
+--
+-- Two verification checks can overlap (the in-process sweep timer and a
+-- webhook, or two processes), and each may only write its result while the
+-- check it read is still the current one. Ordering those writes needs a value
+-- that changes on EVERY check, including the ones that record no playability
+-- result at all.
+--
+-- The existing columns cannot carry that. A failure is stored as
+-- `drmVerifiedAt = NULL`, which is exactly the same value a video that was
+-- never verified has. So "no proof on record" cannot be told apart from "a
+-- newer check just recorded a definitive failure", and a slower check that
+-- started FIRST therefore cannot be prevented from clearing that newer
+-- failure when it finishes last. `drmBlockedReason` does not help either: two
+-- checks of the same broken asset produce the identical reason string, so
+-- comparing it detects no change.
+--
+-- `drmCheckedAt` is the missing value. Every check stamps it on entry and may
+-- only write its outcome while the stamp is still its own, which makes the
+-- comparison a strict "last check to start wins" with no ambiguity left.
+--
+-- ADDITIVE AND BACKWARDS COMPATIBLE:
+--   * one nullable column with no default; no table rewrite, no index, no
+--     backfill, and no existing row is modified
+--   * NULL means "no check is in flight", the normal resting state
+--   * nothing reads it for playability - `drmVerifiedAt` alone still decides -
+--     so applying this while the previous build is live changes no behaviour,
+--     and the previous build is unaffected by the column existing
+ALTER TABLE "videos" ADD COLUMN IF NOT EXISTS "drmCheckedAt" TIMESTAMP(3);
+
+-- ---------------------------------------------------------------------------
+-- ROLLBACK
+-- ---------------------------------------------------------------------------
+-- ALTER TABLE "videos" DROP COLUMN "drmCheckedAt";
+--
+-- Safe at any time, with one caveat worth stating: if the new build is still
+-- running, dropping the column breaks it, because it both reads and writes
+-- this value. Roll the code back first, then drop the column. Nothing this
+-- column stores is durable state - it is a per-check scratch value that the
+-- next check overwrites - so dropping it cannot lose verification results and
+-- cannot alter what is playable.

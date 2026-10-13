@@ -1496,6 +1496,22 @@ model Video {
   /// anything a client can set.
   drmRequested    Boolean  @default(false)
 
+  /// When the verification attempt currently in charge of this asset STARTED.
+  ///
+  /// This is the concurrency epoch for DRM verification. Every `verify()` claims
+  /// the row before it makes any provider call, and may only write its outcome
+  /// while the claim is still its own. Two checks can overlap (the sweep timer
+  /// and a webhook, or two processes), and without an epoch a slow check that
+  /// started FIRST can finish LAST and overwrite a newer result - in either
+  /// direction. Timestamps alone cannot express this, because a failure is
+  /// recorded as `drmVerifiedAt = null`, which is indistinguishable from "never
+  /// verified": an older success would read that as an invitation to clear a
+  /// newer, definitive failure.
+  ///
+  /// NULL simply means no check is in flight (the normal state). It is never
+  /// consulted for playability - `drmVerifiedAt` alone decides that.
+  drmCheckedAt    DateTime?
+
   processingJobId String?
   processingError String?
   processingStartedAt DateTime?

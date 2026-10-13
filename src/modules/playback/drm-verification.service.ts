@@ -274,12 +274,19 @@ export class DrmVerificationService {
    * VERIFICATION_UNAVAILABLE after `attempts` tries. It proves nothing about
    * the asset either way, so it must not erase a proof that was valid.
    *
-   * Safe to call concurrently. Every write is a single conditional update that
-   * applies only while the row still holds the asset THIS check looked at, so
-   * a result for a replaced asset never touches its replacement; a failure
-   * additionally applies only if no proof newer than this check's start has
-   * been recorded, so a slow failing check cannot erase a newer success. A
-   * result that no longer applies is reported as the stored state instead.
+   * Safe to call concurrently. Every check claims the row (`drmCheckedAt`) before
+   * it makes any provider call, and every write is a single conditional update
+   * that applies only while that claim is still its own and the row still holds
+   * the asset this check read. Two consequences:
+   *   * the newest check wins in both directions, so a slow check can neither
+   *     erase a newer success nor clear a newer definitive failure;
+   *   * a result for a replaced asset never touches its replacement.
+   * A result that no longer applies is reported as the stored state instead.
+   *
+   * Two checks starting in the same millisecond share a claim, so the newest-wins
+   * rule can lapse for that sub-millisecond overlap. That is accepted: it reverts
+   * to exactly the unguarded behaviour of two simultaneous writes, which is the
+   * pre-existing case, and closing it would need a sequence column per row.
    */
   async verify(videoId: string, options: { attempts?: number } = {}): Promise<DrmVerdict> {
     const startedAt = new Date();
@@ -293,22 +300,46 @@ export class DrmVerificationService {
     // The asset this check is about. adopt() can replace it while the check runs.
     const checkedAssetId = video.gumletAssetId;
 
+    // Claim the check BEFORE the first provider call.
+    //
+    // This is the whole of the concurrency control. A check may only write its
+    // outcome while this claim is still its own, so of two overlapping checks
+    // the one that started LAST is the only one whose result can land, and a
+    // slow check that started first is discarded rather than allowed to
+    // overwrite newer information.
+    //
+    // It has to be a stored value, not a comparison of `drmVerifiedAt`. A
+    // failure is recorded as `drmVerifiedAt = null`, identical to a video that
+    // was never verified, so on that column alone a slow success cannot be told
+    // apart from a stale one and will happily clear a newer definitive failure.
+    // `drmBlockedReason` cannot disambiguate either: two checks of one broken
+    // asset produce the identical string, so the row looks untouched.
+    //
+    // Conditional on the asset so that a check which lost the row to adopt()
+    // never claims the replacement.
+    await this.prisma.video.updateMany({
+      where: { id: videoId, gumletAssetId: checkedAssetId },
+      data: { drmCheckedAt: startedAt },
+    });
+
+    // The guard every terminal write shares: this row, still holding the asset
+    // this check read, still claimed by this check.
+    const ownedBy = {
+      id: videoId,
+      gumletAssetId: checkedAssetId,
+      drmCheckedAt: startedAt,
+    } as const;
+
     const fail = async (
       verdict: Exclude<DrmVerdict, { playable: true }>,
       observed: { gumletStatus: string; gumletError: string | null } | null = null,
     ): Promise<DrmVerdict> => {
-      // Never leave a stale success behind a fresh failure - but only a success
-      // recorded BEFORE this check started is stale. One recorded after it (a
-      // newer, overlapping check that succeeded) is newer information than
-      // this one, and erasing it would refuse a working video until something
-      // re-verifies it (the playback path does not, once a failure is on
-      // record). Conditional in the database, so concurrent processes agree.
+      // Never leave a stale result behind a fresh one. `ownedBy` is the whole
+      // rule: a check that has been superseded - by a later check, or by adopt()
+      // replacing the asset - writes nothing and reports the stored state
+      // instead. Conditional in the database, so concurrent processes agree.
       const written = await this.prisma.video.updateMany({
-        where: {
-          id: videoId,
-          gumletAssetId: checkedAssetId,
-          OR: [{ drmVerifiedAt: null }, { drmVerifiedAt: { lt: startedAt } }],
-        },
+        where: ownedBy,
         data: {
           drmVerifiedAt: null,
           drmBlockedReason: verdict.detail,
@@ -461,21 +492,20 @@ export class DrmVerificationService {
     // Concurrency guard.
     //
     // Two verifications can overlap: the recurring sweep and a webhook, or two
-    // workers if the sweep is ever scaled. Whichever finishes LAST writes last,
-    // and without this guard a slow check that started earlier would overwrite a
-    // newer timestamp with an older one - pushing the TTL expiry backwards and,
-    // worse, letting a stale success outlive a failure observed in between.
+    // workers if the sweep is ever scaled. Without a guard, a slow check that
+    // started earlier would finish later and overwrite the newer result. That
+    // is wrong in BOTH directions and both are dangerous:
+    //   * an older failure erasing a newer success refuses a working video,
+    //     and a recorded failure stops the playback path re-checking it;
+    //   * an older success erasing a newer DEFINITIVE failure is worse - it
+    //     marks an asset playable on evidence the newer check already
+    //     contradicted.
     //
-    // The write is therefore conditional on the stored timestamp still being
-    // absent or older than the one being written, and on the row still holding
-    // the asset that was checked: a proof for a replaced asset says nothing
-    // about its replacement.
+    // The guard is `ownedBy`: the row must still hold the asset this check read
+    // and still carry this check's own claim. A superseded check writes nothing
+    // and reports the stored state instead, so the newest check always decides.
     const written = await this.prisma.video.updateMany({
-      where: {
-        id: videoId,
-        gumletAssetId: checkedAssetId,
-        OR: [{ drmVerifiedAt: null }, { drmVerifiedAt: { lt: verifiedAt } }],
-      },
+      where: ownedBy,
       data: {
         drmVerifiedAt: verifiedAt,
         // Established above from our own or the provider's record of the

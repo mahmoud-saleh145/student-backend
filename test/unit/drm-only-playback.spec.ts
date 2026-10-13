@@ -147,13 +147,15 @@ describe('DrmVerificationService.verify - what actually counts as proof', () => 
   it('does not grant when the provider cannot be reached - and does not erase an earlier proof either', async () => {
     // Contract changed deliberately (recovery): an unreachable provider proves
     // nothing about the asset, so verify() refuses to conclude
-    // (VERIFICATION_UNAVAILABLE) and writes NOTHING. Clearing the proof here
-    // turned every Gumlet blip into an immediate outage. The playback path adds
-    // a bounded grace on top (drm-verification-transient.spec.ts).
+    // (VERIFICATION_UNAVAILABLE) and changes no verification state. Clearing the
+    // proof here turned every Gumlet blip into an immediate outage. The playback
+    // path adds a bounded grace on top (drm-verification-transient.spec.ts).
     const t = buildVerifier({ getAssetThrows: true });
     const verdict = await t.service.verify('v_1');
     expect(verdict).toMatchObject({ playable: false, reason: 'VERIFICATION_UNAVAILABLE' });
-    expect(t.updates).toEqual([]);
+    // The only write is the concurrency claim, which records when the check
+    // began and decides nothing about playability.
+    expect(t.updates).toEqual([{ drmCheckedAt: expect.any(Date) }]);
   });
 
   it('fails closed when the manifest cannot be fetched', async () => {

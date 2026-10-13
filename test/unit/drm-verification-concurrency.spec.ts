@@ -69,19 +69,23 @@ describe('DrmVerificationService.verify - concurrent writes', () => {
     const { service, updateMany } = build({ count: 1 });
     const v = await service.verify('v_1');
     expect(v.playable).toBe(true);
-    expect(updateMany).toHaveBeenCalledTimes(1);
+    // Two writes: the concurrency claim taken before the provider call, then the
+    // proof itself, conditional on that claim still being ours.
+    expect(updateMany).toHaveBeenCalledTimes(2);
+    expect(updateMany.mock.calls[0][0].data).toEqual({ drmCheckedAt: expect.any(Date) });
+    expect(updateMany.mock.calls[1][0].data).toMatchObject({ drmVerifiedAt: expect.any(Date) });
   });
 
-  it('makes the write conditional on no newer verification existing', async () => {
+  it('makes the write conditional on this check still owning the row', async () => {
     const { service, updateMany } = build({ count: 1 });
     await service.verify('v_1');
-    const where = updateMany.mock.calls[0][0].where;
-    // The guard: absent, or strictly older than the timestamp being written.
+    const where = updateMany.mock.calls[1][0].where;
+    // The guard: the row must still carry the claim this check took on entry,
+    // and still hold the asset this check read.
     expect(where).toMatchObject({
       id: 'v_1',
-      // ...and on the row still holding the asset that was checked.
       gumletAssetId: 'a_1',
-      OR: [{ drmVerifiedAt: null }, { drmVerifiedAt: { lt: expect.any(Date) } }],
+      drmCheckedAt: expect.any(Date),
     });
   });
 
@@ -97,9 +101,10 @@ describe('DrmVerificationService.verify - concurrent writes', () => {
     const v = await service.verify('v_1');
     expect(v.playable).toBe(true);
     expect(findFirst).toHaveBeenCalledTimes(2);
-    expect(updateMany).toHaveBeenCalledTimes(1);
+    // The claim plus the (rejected) proof write.
+    expect(updateMany).toHaveBeenCalledTimes(2);
     // No unconditional write that would clobber the winner.
-    expect(updateMany.mock.calls[0][0].where).toBeDefined();
+    expect(updateMany.mock.calls[1][0].where).toBeDefined();
   });
 
   it('a real failure clears a proof recorded BEFORE the check started (conditional write)', async () => {
@@ -148,12 +153,12 @@ describe('DrmVerificationService.verify - concurrent writes', () => {
     // holds the checked asset and no proof NEWER than this check's start is
     // stored (drm-verification-races.spec.ts runs the race end to end).
     expect(update).not.toHaveBeenCalled();
-    expect(updateMany).toHaveBeenCalledTimes(1);
-    expect(updateMany.mock.calls[0][0]).toMatchObject({
+    expect(updateMany).toHaveBeenCalledTimes(2);
+    expect(updateMany.mock.calls[1][0]).toMatchObject({
       where: {
         id: 'v_1',
         gumletAssetId: 'a_1',
-        OR: [{ drmVerifiedAt: null }, { drmVerifiedAt: { lt: expect.any(Date) } }],
+        drmCheckedAt: expect.any(Date),
       },
       data: { drmVerifiedAt: null, drmBlockedReason: expect.stringContaining('not CENC-encrypted') },
     });

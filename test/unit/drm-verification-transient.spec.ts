@@ -141,7 +141,10 @@ describe('verify(): transient failures write nothing; definitive failures clear'
     const proof = hoursAgo(1);
     const t = setup({ ...o, row: { drmVerifiedAt: proof } });
     await expect(t.verification.verify('v_1')).resolves.toMatchObject({ reason: 'VERIFICATION_UNAVAILABLE' });
-    expect(t.writes).toEqual([]);
+    // The only write is the concurrency claim, which says when this check began
+    // and decides nothing about playability. No verification state is touched:
+    // an unreachable provider must not conclude anything about the asset.
+    expect(t.writes).toEqual([{ drmCheckedAt: expect.any(Date) }]);
     expect(t.row.drmVerifiedAt).toBe(proof);
   });
 
@@ -225,8 +228,11 @@ describe('C2: after a DEFINITIVE failure, playback requests do not re-check Guml
     }
 
     expect(t.calls).toEqual({ asset: 1, manifest: 1 });
-    expect(t.writes).toHaveLength(1);
-    expect(t.writes[0]).toMatchObject({ drmVerifiedAt: null, drmBlockedReason: expect.stringMatching(/HTTP 403/) });
+    // The claim, then the one write that changes verification state. Five
+    // ensurePlayable calls, one verification.
+    expect(t.writes).toHaveLength(2);
+    expect(t.writes[0]).toEqual({ drmCheckedAt: expect.any(Date) });
+    expect(t.writes[1]).toMatchObject({ drmVerifiedAt: null, drmBlockedReason: expect.stringMatching(/HTTP 403/) });
   });
 
   it('a concurrent burst after the failure makes no provider calls at all', async () => {

@@ -12,6 +12,16 @@ export const SWEEP_VERIFY_ATTEMPTS = 2;
  * How many candidate rows (id + proof time only) one sweep loads to choose its
  * batch from. Rotation (below) is fair across everything inside this window;
  * a library with more Gumlet videos due at once than this would need a cursor.
+ *
+ * KNOWN LIMITATION, deliberately not papered over: while more than this many are
+ * eligible, `take` cuts the list at a fixed point in a deterministic order, so
+ * everything past the cut is starved permanently - rotation can only reorder the
+ * rows it is handed. `sweep()` warns when the window saturates, so the condition
+ * is visible rather than inferred from videos that never recover. A cursor or
+ * keyset paging is the fix, and is deliberately not attempted here: it is a
+ * change to the queue's selection semantics on a security-relevant path, and the
+ * backlog it addresses (a platform-wide provider outage, or a first migration
+ * over a large library) is better answered by fixing the provider.
  */
 export const SWEEP_CANDIDATE_WINDOW = 1000;
 /** Redis sorted set: due video id -> when a sweep last attempted it (ms). */
@@ -155,6 +165,21 @@ export class DrmVerificationSweepService {
       candidates,
     );
     result.skippedFresh = candidates.length - ids.length;
+
+    // Saturation is the one thing that defeats the rotation below, so it is
+    // reported rather than left to be discovered as "some videos never recover".
+    // `take` cuts the list at a fixed point in a deterministic order, so while
+    // more than a window's worth is due, everything past the cut is invisible to
+    // this run AND to the Redis rotation, which can only reorder what it is
+    // given. Rotation still guarantees fairness within the window.
+    if (candidates.length >= SWEEP_CANDIDATE_WINDOW) {
+      this.logger.warn(
+        `DRM re-verification candidate window is saturated (${candidates.length} Gumlet videos eligible): ` +
+          'rotation can only order the first window\'s worth, so eligible videos beyond it are not ' +
+          're-verified until the backlog falls below the window. This is expected during a provider ' +
+          'outage or a large first migration; it is a defect only if it persists afterwards.',
+      );
+    }
 
     for (const id of await this.chooseBatch(ids, batchSize)) {
       result.checked += 1;

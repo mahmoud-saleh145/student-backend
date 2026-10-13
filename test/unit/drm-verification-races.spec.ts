@@ -26,7 +26,13 @@ function matches(row: Row, where: Row): boolean {
   return Object.entries(where).every(([key, cond]) => {
     if (key === 'OR') return (cond as Row[]).some((c) => matches(row, c));
     if (cond === null) return row[key] === null || row[key] === undefined;
-    if (cond instanceof Date || typeof cond !== 'object') return row[key] === cond;
+    // Postgres compares timestamps by value, never by object identity. The
+    // concurrency claim is a millisecond timestamp, so identity would be the
+    // wrong thing to assert on.
+    if (cond instanceof Date) {
+      return row[key] instanceof Date && (row[key] as Date).getTime() === cond.getTime();
+    }
+    if (typeof cond !== 'object') return row[key] === cond;
     const op = cond as { lt?: Date };
     if (op.lt) return row[key] instanceof Date && (row[key] as Date) < op.lt;
     throw new Error(`unsupported where operator for ${key}: ${JSON.stringify(cond)}`);
@@ -155,6 +161,73 @@ describe('an older failing check that finishes AFTER a newer successful one', ()
   });
 });
 
+describe('an older SUCCESS that finishes AFTER a newer definitive FAILURE', () => {
+  // The direction the timestamp comparison alone could not express. A failure is
+  // recorded as `drmVerifiedAt = null`, which is also what a never-verified
+  // video reads, so a guard of "absent or older" invited the slow success to
+  // clear the newer failure - marking an asset playable on evidence a later
+  // check had already contradicted.
+  it('does not clear the newer failure', async () => {
+    const slow = deferred();
+    const w = world({}, {
+      asset_1: [
+        { manifest: { status: 200, body: CENC }, gate: slow.promise }, // older: succeeds, slowly
+        { manifest: { status: 404 } },                              // newer: definitively broken
+      ],
+    });
+
+    const older = w.drm.verify('vid_1', { attempts: 1 });
+    await tick();
+    const newer = await w.drm.verify('vid_1', { attempts: 1 });
+    expect(newer).toMatchObject({ playable: false, reason: 'NOT_VERIFIED' });
+
+    slow.release();
+    const olderVerdict = await older;
+
+    // The newer failure stands: still unverified, still blocked.
+    expect(w.video).toMatchObject({
+      drmVerifiedAt: null,
+      drmBlockedReason: expect.stringContaining('HTTP 404'),
+    });
+    expect(w.updates.at(-1)).toMatchObject({ applied: false });
+    // The superseded check reports the stored failure, not its own stale success.
+    expect(olderVerdict.playable).toBe(false);
+  });
+
+  it('does not clear it even when the newer failure repeats the reason already on record', async () => {
+    // The narrow case a "did the reason change?" check would miss: both failures
+    // carry the identical detail, so the row looks untouched and only a real
+    // per-check epoch can tell the newer one apart from the older.
+    const reason = 'The DASH manifest returned HTTP 404; this asset cannot be played.';
+    const slow = deferred();
+    const w = world({ drmVerifiedAt: null, drmBlockedReason: reason }, {
+      asset_1: [
+        { manifest: { status: 200, body: CENC }, gate: slow.promise },
+        { manifest: { status: 404 } },
+      ],
+    });
+
+    const older = w.drm.verify('vid_1', { attempts: 1 });
+    await tick();
+    await w.drm.verify('vid_1', { attempts: 1 });
+    slow.release();
+    await older;
+
+    expect(w.video).toMatchObject({ drmVerifiedAt: null, drmBlockedReason: reason });
+  });
+
+  it('a later check that owns the row still recovers a blocked video', async () => {
+    // The guard must not become permanent: once the newest check completes, it
+    // writes, and a fixed asset is playable again.
+    const w = world(
+      { drmVerifiedAt: null, drmBlockedReason: 'The DASH manifest returned HTTP 404; this asset cannot be played.' },
+      { asset_1: [{ manifest: { status: 200, body: CENC } }] },
+    );
+    await expect(w.drm.verify('vid_1', { attempts: 1 })).resolves.toMatchObject({ playable: true });
+    expect(w.video).toMatchObject({ drmVerifiedAt: expect.any(Date), drmBlockedReason: null });
+  });
+});
+
 describe('a result for a REPLACED asset cannot change the replacement', () => {
   /** What adopt() writes when it swaps in a new asset (gumlet-ingest.service.ts). */
   const adoptNewAsset = (video: Row) =>
@@ -174,7 +247,9 @@ describe('a result for a REPLACED asset cannot change the replacement', () => {
     const verdict = await check;
 
     expect(w.video).toMatchObject({ gumletAssetId: 'asset_2', drmVerifiedAt: null, drmBlockedReason: null, gumletStatus: 'queued' });
-    expect(w.updates).toEqual([expect.objectContaining({ applied: false })]);
+    // The claim landed, but the RESULT write was rejected: adopt() replaced the
+    // asset while this check was still reading the old one.
+    expect(w.updates.at(-1)).toMatchObject({ applied: false });
     // Not playable: a caller such as sync() must not mark the video READY on it.
     expect(verdict.playable).toBe(false);
   });
@@ -208,7 +283,9 @@ describe('a result for a REPLACED asset cannot change the replacement', () => {
   it('without a replacement, the provider status and the failure are recorded together', async () => {
     const w = world({}, { asset_1: [{ status: 'errored' }] });
     await expect(w.drm.verify('vid_1', { attempts: 1 })).resolves.toMatchObject({ reason: 'ASSET_FAILED' });
-    expect(w.updates).toHaveLength(1);
+    // The claim, then the single write that records the failure.
+    expect(w.updates).toHaveLength(2);
+    expect(w.updates[1]).toMatchObject({ applied: true });
     expect(w.video).toMatchObject({ gumletStatus: 'errored', drmVerifiedAt: null, drmBlockedReason: expect.any(String) });
   });
 });
