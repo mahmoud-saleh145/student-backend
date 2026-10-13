@@ -43,6 +43,12 @@ RUN npx prisma generate && npm run build && npm prune --omit=dev
 # -----------------------------------------------------------------------------
 FROM base AS production
 ENV NODE_ENV=production
+# The commit this image was built from, reported in the worker heartbeat and
+# /meta/health/deep so a release can confirm API and worker match:
+#   docker build --build-arg BUILD_COMMIT=$(git rev-parse HEAD) ...
+# Render sets RENDER_GIT_COMMIT itself; this covers the PC-hosted worker.
+ARG BUILD_COMMIT=
+ENV BUILD_COMMIT=${BUILD_COMMIT}
 RUN groupadd -r app && useradd -r -g app -m app
 
 COPY --from=build --chown=app:app /app/node_modules ./node_modules

@@ -6,6 +6,7 @@ import { Public } from '../../common/decorators/public.decorator';
 import type { AppConfig, StorageConfig } from '../../config/configuration';
 import {
   readWorkerHeartbeat,
+  runningBuild,
   WORKER_HEARTBEAT_TTL_SECONDS,
 } from '../../jobs/worker-heartbeat';
 import { PrismaService } from '../../database/prisma.service';
@@ -92,12 +93,25 @@ export class HealthController {
             ? undefined
             : 'A worker is running but cannot execute ffmpeg/ffprobe — every transcode will fail'
           : `No queue worker has checked in within ${WORKER_HEARTBEAT_TTL_SECONDS}s — uploaded videos stay QUEUED and scheduled jobs do not run`,
+        drmSweep:
+          worker && !(worker.capabilities ?? []).includes('drm-verification-sweep')
+            ? 'The running worker predates the DRM verification sweep: it will silently drop that job and verified videos will go stale'
+            : undefined,
       },
       // Where the video pipeline stands, so "why is it still QUEUED?" has an
-      // answer without opening the database.
+      // answer without opening the database. `build` lets a release confirm the
+      // API and the worker run the same commit before relying on the worker.
       videoPipeline: {
+        apiBuild: runningBuild(),
         worker: worker
-          ? { lastSeenAt: worker.at, host: worker.host, ffmpeg: worker.ffmpeg, ffprobe: worker.ffprobe }
+          ? {
+              lastSeenAt: worker.at,
+              host: worker.host,
+              ffmpeg: worker.ffmpeg,
+              ffprobe: worker.ffprobe,
+              build: worker.build ?? null,
+              capabilities: worker.capabilities ?? [],
+            }
           : null,
         videosByStatus: videoCounts,
         publicApiUrl: this.app.publicUrl,

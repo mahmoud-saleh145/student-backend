@@ -300,6 +300,15 @@ export class EnvironmentVariables {
   RUN_WORKERS = 'false';
 
   /**
+   * Build identity, reported (validated and shortened) in the worker heartbeat
+   * and /meta/health/deep so a release can confirm API and worker run the same
+   * commit. BUILD_COMMIT is baked into the Docker image; RENDER_GIT_COMMIT is
+   * set by Render. Both optional: a missing value is reported as unknown.
+   */
+  @IsOptional() @IsString() BUILD_COMMIT?: string;
+  @IsOptional() @IsString() RENDER_GIT_COMMIT?: string;
+
+  /**
    * Swagger is off in production unless this is exactly 'true'. Left as a
    * string comparison in main.ts so the opt-in cannot be widened by a truthy
    * value like `1`.

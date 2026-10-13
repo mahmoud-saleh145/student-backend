@@ -36,6 +36,27 @@ export const WORKER_HEARTBEAT_KEY = 'worker:heartbeat';
 export const WORKER_HEARTBEAT_TTL_SECONDS = 180;
 const INTERVAL_MS = 60_000;
 
+/**
+ * Jobs this build's worker can actually execute, beyond the original set.
+ *
+ * Needed because an OLDER worker consuming a job name it does not know logs a
+ * warning and completes it: the API schedules the DRM re-verification sweep,
+ * an old worker swallows it, and verified videos silently go stale (and stop
+ * playing) one TTL later while the worker still looks healthy. A heartbeat
+ * without these capabilities - every pre-recovery build - is that old worker.
+ */
+export const WORKER_CAPABILITIES = ['drm-verification-sweep'] as const;
+
+/**
+ * The commit this process was built from: BUILD_COMMIT (passed into the
+ * Docker image) or RENDER_GIT_COMMIT (set by Render). Null when unknown.
+ * Shortened: enough to compare API and worker, nothing more.
+ */
+export function runningBuild(): string | null {
+  const raw = (process.env.BUILD_COMMIT ?? process.env.RENDER_GIT_COMMIT ?? '').trim();
+  return /^[0-9a-f]{7,40}$/i.test(raw) ? raw.slice(0, 12).toLowerCase() : null;
+}
+
 export interface WorkerHeartbeatPayload {
   pid: number;
   host: string;
@@ -44,6 +65,9 @@ export interface WorkerHeartbeatPayload {
   /** Whether ffmpeg/ffprobe could be executed — transcoding is impossible without them. */
   ffmpeg: boolean;
   ffprobe: boolean;
+  /** Absent on workers built before these fields existed. */
+  build?: string | null;
+  capabilities?: string[];
 }
 
 export async function readWorkerHeartbeat(
@@ -113,6 +137,8 @@ export class WorkerHeartbeat implements OnModuleInit, OnModuleDestroy {
       startedAt: this.startedAt,
       at: new Date().toISOString(),
       ...this.tools,
+      build: runningBuild(),
+      capabilities: [...WORKER_CAPABILITIES],
     };
     await this.redis
       .setJson(WORKER_HEARTBEAT_KEY, payload, WORKER_HEARTBEAT_TTL_SECONDS)
