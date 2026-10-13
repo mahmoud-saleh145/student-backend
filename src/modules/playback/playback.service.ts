@@ -545,6 +545,9 @@ export class PlaybackService {
   }): Promise<PlaybackTicketResponse> {
     const { user, video, lesson } = params;
 
+    // Gate first: nothing is written for a video the strict DRM gate refuses.
+    await this.assertStrictDrmGate(video);
+
     const ttl = this.cfg.ticketTtl;
     const expiresAt = new Date(Date.now() + ttl * 1000);
 
@@ -687,6 +690,42 @@ export class PlaybackService {
   }
 
   /**
+   * The strict DRM gate: throws unless the video is verifiably DRM-protected
+   * right now. Run BEFORE a ticket row is written, so a refused video never
+   * leaves an ACTIVE grant behind (and a refused rotation never releases the
+   * live ticket first).
+   */
+  private async assertStrictDrmGate(video: { id: string; gumletStatus: string | null }): Promise<void> {
+    if (!this.videoCfg.drm.enabled) {
+      this.logger.error(
+        `Video ${video.id} needs DRM but DRM_ENABLED is false. Refusing to serve it unprotected.`,
+      );
+      throw new AppException(ErrorCode.PLAYBACK_DENIED, {
+        message: 'DRM is unavailable on this platform; this lesson cannot be played',
+      });
+    }
+
+    const verdict = await this.drmVerification.evaluateVideo(video.id);
+    if (verdict.playable) return;
+
+    this.logger.warn(`Denied DRM playback for video ${video.id}: ${verdict.reason} (${verdict.detail})`);
+    // A processing video gets the "try again shortly" status so the app can
+    // show the friendly message; everything else is unavailable.
+    const inFlight = video.gumletStatus === 'processing' || video.gumletStatus === 'queued'
+      || video.gumletStatus === 'pre-queued' || video.gumletStatus === 'upload-pending';
+    if (inFlight) {
+      throw new AppException(ErrorCode.VIDEO_NOT_READY, {
+        message: 'This video is still being prepared',
+        details: { drmState: verdict.reason },
+      });
+    }
+    throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
+      message: 'This video is not available',
+      details: { drmState: verdict.reason },
+    });
+  }
+
+  /**
    * Decide how THIS video is delivered, from the ticket's own video row.
    *
    * This is the single switch between the two playback paths:
@@ -734,35 +773,10 @@ export class PlaybackService {
     // `DrmVerificationService` is the authority. It refuses on: no asset, DRM not
     // requested, asset not ready, asset failed, never verified, verification
     // stale, DRM disabled platform-wide, or signing unconfigured.
-    if (!this.videoCfg.drm.enabled) {
-      this.logger.error(
-        `Video ${video.id} needs DRM but DRM_ENABLED is false. Refusing to serve it unprotected.`,
-      );
-      throw new AppException(ErrorCode.PLAYBACK_DENIED, {
-        message: 'DRM is unavailable on this platform; this lesson cannot be played',
-      });
-    }
-
-    const verdict = await this.drmVerification.evaluateVideo(video.id);
-    if (!verdict.playable) {
-      this.logger.warn(
-        `Denied DRM playback for video ${video.id}: ${verdict.reason} (${verdict.detail})`,
-      );
-      // A processing video gets the "try again shortly" status so the app can
-      // show the friendly message; everything else is unavailable.
-      const inFlight = video.gumletStatus === 'processing' || video.gumletStatus === 'queued'
-        || video.gumletStatus === 'pre-queued' || video.gumletStatus === 'upload-pending';
-      if (inFlight) {
-        throw new AppException(ErrorCode.VIDEO_NOT_READY, {
-          message: 'This video is still being prepared',
-          details: { drmState: verdict.reason },
-        });
-      }
-      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
-        message: 'This video is not available',
-        details: { drmState: verdict.reason },
-      });
-    }
+    //
+    // mintTicket() already ran this before writing the ticket row; it is
+    // repeated here so no caller can reach the signing below without it.
+    await this.assertStrictDrmGate(video);
 
     const assetId = video.gumletAssetId as string;
 
@@ -1108,6 +1122,10 @@ export class PlaybackService {
     const shouldRotate = remainingMs < this.cfg.heartbeatInterval * 2 * 1000;
 
     if (shouldRotate) {
+      // Refused before the live ticket is released: a video that stopped
+      // verifying ends playback with the current grant, not with a half-rotation.
+      await this.assertStrictDrmGate(ticket.video);
+
       await this.prisma.playbackTicket.update({
         where: { id: ticket.id },
         data: { status: PlaybackTicketStatus.RELEASED, releasedAt: new Date() },

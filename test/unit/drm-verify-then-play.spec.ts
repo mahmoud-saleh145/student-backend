@@ -72,6 +72,8 @@ function world(opts: {
   const attachments = opts.attachments ?? [lesson('les_src', 'crs_src')];
   const entitled = new Set(opts.entitledCourses ?? ['crs_src', 'crs_dst']);
   const tickets: Row[] = [];
+  let existingTicket: Row | null = null;
+  const ticketUpdates: { where: Row; data: Row }[] = [];
 
   global.fetch = jest.fn(async (input: unknown) => {
     const url = String(input);
@@ -103,9 +105,16 @@ function world(opts: {
         return { id: `tid_${tickets.length}` };
       }),
       updateMany: jest.fn(async () => ({ count: 0 })),
+      update: jest.fn(async (a: { where: Row; data: Row }) => {
+        ticketUpdates.push(a);
+        return {};
+      }),
+      // For heartbeat tests: the most recently issued ticket, as stored.
+      findFirst: jest.fn(async () => (existingTicket ? { ...existingTicket, video: { ...video } } : null)),
     },
     watchEvent: { create: jest.fn(async () => ({})) },
     videoPlay: {
+      update: jest.fn(async () => ({})),
       aggregate: jest.fn(async () => ({ _max: { attemptNumber: null } })),
       findFirst: jest.fn(async () => null),
       create: jest.fn(async () => ({ id: 'play_1' })),
@@ -138,6 +147,12 @@ function world(opts: {
       if (!entitled.has(a.courseId)) throw Object.assign(new Error('NOT_ENROLLED'), { code: 'NOT_ENROLLED' });
     }),
     assertSectionAccessible: jest.fn(async () => undefined),
+    // Heartbeat re-authorisation.
+    resolve: jest.fn(async (a: { courseId: string }) =>
+      entitled.has(a.courseId)
+        ? { canAccessContent: true, state: 'ACTIVE' }
+        : { canAccessContent: false, state: 'NOT_ENROLLED', denialCode: 'NOT_ENROLLED' },
+    ),
   };
 
   const playback = new PlaybackService(
@@ -166,7 +181,23 @@ function world(opts: {
   const issue = (lessonId?: string) =>
     playback.issueTicket({ user: STUDENT, videoId: 'vid_1', lessonId, platform: 'web', integritySuspect: false });
 
-  return { video, tickets, drmVerification, signLicence, issue, access };
+  /** Heartbeat on a stored ticket; `expiresInMs` small enough forces rotation. */
+  const heartbeat = (ticket: Row, expiresInMs: number) => {
+    existingTicket = {
+      id: 'tid_live',
+      userId: 'usr_1',
+      videoId: 'vid_1',
+      status: 'ACTIVE',
+      deviceId: 'dev_1',
+      maxHeight: null,
+      playId: 'play_1',
+      expiresAt: new Date(Date.now() + expiresInMs),
+      ...ticket,
+    };
+    return playback.heartbeat({ user: STUDENT, ticketId: 'tid_live', positionSeconds: 120, watchedDeltaSeconds: 30 });
+  };
+
+  return { video, tickets, drmVerification, signLicence, issue, heartbeat, access, ticketUpdates: () => ticketUpdates };
 }
 
 describe('existing eligible Gumlet asset with drmRequested=false', () => {
@@ -175,6 +206,8 @@ describe('existing eligible Gumlet asset with drmRequested=false', () => {
 
     await expect(w.issue()).rejects.toMatchObject({ code: 'VIDEO_UNAVAILABLE' });
     expect(w.signLicence).not.toHaveBeenCalled();
+    // A refused video leaves no ACTIVE grant behind.
+    expect(w.tickets).toHaveLength(0);
 
     const verdict = await w.drmVerification.verify('vid_1');
     expect(verdict).toEqual({ playable: true, reason: null });
@@ -297,5 +330,54 @@ describe('verification never weakens entitlement', () => {
     const w = world({ attachments: shared });
     await w.drmVerification.verify('vid_1');
     await expect(w.issue()).rejects.toMatchObject({ code: 'PLAYBACK_DENIED' });
+  });
+});
+
+describe('Fix 6: heartbeat and rotation keep the destination lesson', () => {
+  const shared = [lesson('les_src', 'crs_src'), lesson('les_dst', 'crs_dst')];
+  const onDestination = { lessonId: 'les_dst', courseId: 'crs_dst' };
+
+  it('re-authorises every beat against the DESTINATION course', async () => {
+    const w = world({ attachments: shared, row: { drmRequested: true, drmVerifiedAt: new Date() } });
+    const res = await w.heartbeat(onDestination, 10 * 60 * 1000);
+    expect(res).toEqual({ ok: true, terminate: null });
+    expect(w.access.resolve).toHaveBeenCalledWith(expect.objectContaining({ courseId: 'crs_dst' }));
+  });
+
+  it('rotates INSIDE the destination lecture rather than re-resolving the shared asset', async () => {
+    const w = world({ attachments: shared, row: { drmRequested: true, drmVerifiedAt: new Date() } });
+    const res = await w.heartbeat(onDestination, 5 * 1000);
+    expect(res).toMatchObject({ ok: true, ticket: { drm: { scheme: 'widevine' } } });
+    expect(w.tickets).toHaveLength(1);
+    expect(w.tickets[0]).toMatchObject({ lessonId: 'les_dst', courseId: 'crs_dst', rotatedFromId: 'tid_live' });
+  });
+
+  it('rotation still passes the strict DRM gate: a stale verification ends playback', async () => {
+    const w = world({
+      attachments: shared,
+      row: { drmRequested: true, drmVerifiedAt: new Date(Date.now() - 7 * 3600 * 1000) },
+    });
+    await expect(w.heartbeat(onDestination, 5 * 1000)).rejects.toMatchObject({
+      details: { drmState: 'VERIFICATION_STALE' },
+    });
+    // No replacement grant, and the live ticket was not released first.
+    expect(w.tickets).toHaveLength(0);
+    expect(w.ticketUpdates().filter((u) => u.data.status === 'RELEASED')).toEqual([]);
+  });
+
+  it('losing the destination enrolment terminates playback even though the source course is still owned', async () => {
+    const w = world({
+      attachments: shared,
+      entitledCourses: ['crs_src'],
+      row: { drmRequested: true, drmVerifiedAt: new Date() },
+    });
+    const res = await w.heartbeat(onDestination, 10 * 60 * 1000);
+    expect(res).toEqual({ ok: false, terminate: { reason: 'NOT_ENROLLED' } });
+  });
+
+  it('a ticket revoked by detaching its lecture is terminated at the next beat', async () => {
+    const w = world({ attachments: shared, row: { drmRequested: true, drmVerifiedAt: new Date() } });
+    const res = await w.heartbeat({ ...onDestination, status: 'REVOKED', revokedReason: 'Video removed from this lecture' }, 10 * 60 * 1000);
+    expect(res).toEqual({ ok: false, terminate: { reason: 'Video removed from this lecture' } });
   });
 });
