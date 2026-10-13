@@ -1,8 +1,15 @@
 import { Injectable, Logger, type OnApplicationBootstrap, type OnModuleDestroy } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { hostname } from 'node:os';
 
+import type { VideoConfig } from '../../config/configuration';
 import { RedisService } from '../../redis/redis.service';
-import { type DrmSweepResult, DrmVerificationSweepService } from './drm-verification-sweep.service';
+import {
+  type DrmSweepResult,
+  DrmVerificationSweepService,
+  SWEEP_DEFAULT_BATCH_SIZE,
+  SWEEP_VERIFY_ATTEMPTS,
+} from './drm-verification-sweep.service';
 
 /** Where the last completed sweep is recorded, for /meta/health/deep. */
 export const DRM_LAST_SWEEP_KEY = 'drm:verification:last-sweep';
@@ -10,6 +17,48 @@ export const DRM_LAST_SWEEP_KEY = 'drm:verification:last-sweep';
 export interface DrmLastSweepRecord extends DrmSweepResult {
   at: string;
   host: string;
+}
+
+/**
+ * Where the last sweep that THREW (DB down, unexpected error) is recorded, so
+ * health can say "the last attempt failed" instead of only "overdue" two
+ * intervals later. Time and host only: /meta/health/deep is public, and an
+ * error message can carry connection details. The message goes to the log.
+ */
+export const DRM_LAST_SWEEP_FAILURE_KEY = 'drm:verification:last-sweep-failure';
+
+export interface DrmLastSweepFailureRecord {
+  at: string;
+  host: string;
+}
+
+/**
+ * DRM_SWEEP_INTERVAL_SECONDS as the scheduler applies it: unset means 900,
+ * 0 / negative / non-numeric disables the sweep, anything else is floored to a
+ * whole number of seconds and never below 60. /meta/health/deep uses the same
+ * function, so "overdue" is always judged against the interval actually running.
+ */
+export function normalizeSweepIntervalSeconds(raw: string | undefined): number {
+  const value = Number(raw ?? 900);
+  return Number.isFinite(value) && value > 0 ? Math.max(60, Math.floor(value)) : 0;
+}
+
+/** Slack on top of the computed worst case, for DB reads/writes around the provider calls. */
+const LOCK_MARGIN_SECONDS = 60;
+
+/**
+ * Upper bound on one sweep's wall time: every video in the batch makes two
+ * provider requests (asset, manifest), each tried SWEEP_VERIFY_ATTEMPTS times
+ * at the full HTTP timeout, with withRetry's linear backoff (250 ms x attempt)
+ * between tries.
+ */
+export function worstCaseSweepSeconds(httpTimeoutMs: number): number {
+  const backoffMs = Array.from({ length: SWEEP_VERIFY_ATTEMPTS - 1 }, (_v, i) => 250 * (i + 1)).reduce(
+    (a, b) => a + b,
+    0,
+  );
+  const perRequestMs = SWEEP_VERIFY_ATTEMPTS * httpTimeoutMs + backoffMs;
+  return Math.ceil((SWEEP_DEFAULT_BATCH_SIZE * 2 * perRequestMs) / 1000);
 }
 
 /**
@@ -36,25 +85,25 @@ export interface DrmLastSweepRecord extends DrmSweepResult {
 export class DrmVerificationScheduler implements OnApplicationBootstrap, OnModuleDestroy {
   private readonly logger = new Logger(DrmVerificationScheduler.name);
   readonly intervalSeconds: number;
+  /**
+   * Longer than the worst-case sweep at the CONFIGURED Gumlet timeout (up to
+   * 30 s: ~3000 s for a full batch), so a slow run is never overlapped. The
+   * old fixed 900 s only covered the 5 s default. If a lock ever does lapse
+   * mid-run, a second sweep is harmless: verification writes are conditional
+   * and idempotent.
+   */
+  readonly lockSeconds: number;
   private timer?: NodeJS.Timeout;
   private first?: NodeJS.Timeout;
 
   constructor(
     private readonly sweeper: DrmVerificationSweepService,
     private readonly redis: RedisService,
+    config: ConfigService,
   ) {
-    const raw = Number(process.env.DRM_SWEEP_INTERVAL_SECONDS ?? 900);
-    this.intervalSeconds = Number.isFinite(raw) && raw > 0 ? Math.max(60, Math.floor(raw)) : 0;
-  }
-
-  /**
-   * Longer than the worst-case sweep (25 videos x 2 attempts x 2 requests x
-   * the HTTP timeout), so a slow run is never overlapped. If a lock ever does
-   * lapse mid-run, a second sweep is harmless: verification writes are
-   * conditional and idempotent.
-   */
-  get lockSeconds(): number {
-    return Math.max(this.intervalSeconds, 900);
+    this.intervalSeconds = normalizeSweepIntervalSeconds(process.env.DRM_SWEEP_INTERVAL_SECONDS);
+    const timeoutMs = config.get<VideoConfig>('video')?.drm.gumlet.httpTimeoutMs ?? 5000;
+    this.lockSeconds = Math.max(this.intervalSeconds, worstCaseSweepSeconds(timeoutMs) + LOCK_MARGIN_SECONDS);
   }
 
   onApplicationBootstrap(): void {
@@ -84,6 +133,8 @@ export class DrmVerificationScheduler implements OnApplicationBootstrap, OnModul
       return result;
     } catch (error) {
       this.logger.error(`DRM verification sweep failed: ${(error as Error).message}`);
+      const failure: DrmLastSweepFailureRecord = { at: new Date().toISOString(), host: hostname() };
+      await this.redis.setJson(DRM_LAST_SWEEP_FAILURE_KEY, failure, 7 * 24 * 3600).catch(() => undefined);
       return null;
     } finally {
       await release();

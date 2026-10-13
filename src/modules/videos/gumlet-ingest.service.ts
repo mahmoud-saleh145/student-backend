@@ -132,6 +132,10 @@ export class GumletIngestService {
         // A new asset has never been checked. Clearing this is what stops a
         // previously-verified video from staying playable across a re-ingest.
         drmVerifiedAt: null,
+        // ...and a definitive failure recorded against the PREVIOUS asset says
+        // nothing about this one. Left set, the playback path would treat the
+        // new asset as definitively failed and never verify it on demand.
+        drmBlockedReason: null,
         gumletAssetId: created.assetId,
         gumletWorkspaceId: this.cfg.workspaceId,
         gumletStatus: created.status,

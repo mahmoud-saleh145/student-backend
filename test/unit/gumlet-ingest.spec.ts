@@ -182,6 +182,15 @@ describe('GumletIngestService.adopt', () => {
     // The presigned URL is used to fetch, but must not be persisted.
     expect(arg.sourceUrl).toContain('r2.example');
   });
+
+  it('a NEW asset starts with no proof and no definitive failure carried over from the old one', async () => {
+    // The playback path skips on-demand verification while a definitive failure
+    // is recorded (drmBlockedReason). A reason left over from the PREVIOUS asset
+    // would therefore stop the new asset from ever being verified on demand.
+    const t = build({ row: { ...baseRow(), drmBlockedReason: 'old asset: manifest not CENC' } as Row });
+    await t.service.adopt('v1');
+    expect(t.updates[0]).toMatchObject({ drmVerifiedAt: null, drmBlockedReason: null, drmRequested: true });
+  });
 });
 
 describe('GumletIngestService.sync', () => {

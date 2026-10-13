@@ -24,6 +24,7 @@ import { DevicesService } from '../devices/devices.service';
 import { SecurityEventService } from '../security/security-event.service';
 import { StorageService } from '../storage/storage.service';
 import { TokenService } from '../auth/token.service';
+import { orderSharedLectureCandidates } from '../videos/shared-lecture-order';
 
 import { ManifestService } from './manifest.service';
 import { GumletDrmService } from './gumlet-drm.service';
@@ -45,6 +46,30 @@ const LIBRARY_TICKET_PREFIX = 'lib_';
  * `playbackTicket` lookup.
  */
 const ATTACHMENT_TICKET_PREFIX = 'att_';
+
+/**
+ * How long a passed strict DRM gate may be reused by the SAME request before
+ * the gate runs again. It only spans the few DB writes between the gate and
+ * signing; anything slower than this re-verifies against the current state.
+ */
+const DRM_GATE_PASS_MAX_AGE_MS = 10_000;
+
+/**
+ * Proof that `assertStrictDrmGate` passed for one video, a moment ago, in this
+ * request. Not exported, and nominal (the private field), so nothing outside
+ * this file can construct one: the only way to skip a gate is to have run it.
+ * Never cached across requests - every ticket issue and every rotation gates
+ * once against the current verification state.
+ */
+class DrmGatePass {
+  private readonly issuedBy = 'assertStrictDrmGate';
+  readonly at = Date.now();
+  constructor(readonly videoId: string) {}
+
+  covers(videoId: string): boolean {
+    return this.videoId === videoId && Date.now() - this.at <= DRM_GATE_PASS_MAX_AGE_MS;
+  }
+}
 
 /** An attached, non-deleted lecture as loaded for ticket authorisation. */
 type PlayableLesson = {
@@ -263,13 +288,14 @@ export class PlaybackService {
     //      borrow someone else's entitlement. Strict: never falls back.
     //   2. Otherwise the single attached lesson, if there is exactly one.
     //   3. Otherwise (shared asset, no lesson named - the native app and older
-    //      web builds never send one): the FIRST attached lecture, in a fixed
-    //      order (the uploading lecture, then oldest attachment), that passes
-    //      the FULL lesson authorisation below for this user. Each candidate is
-    //      checked exactly as if the client had named it, so this grants nothing
-    //      the user could not already obtain by naming that lecture - it never
-    //      picks "the most permissive" one. If none passes, DENIED with the
-    //      first candidate's reason.
+    //      web builds never send one): the FIRST attached lecture that passes
+    //      the FULL lesson authorisation below, in the order defined by
+    //      orderSharedLectureCandidates - lectures in the user's OWN courses
+    //      (enrolment / staff) first, preview-only lectures in other courses
+    //      last, the uploading lecture then oldest attachment within each tier.
+    //      Each candidate is checked exactly as if the client had named it, so
+    //      this grants nothing the user could not already obtain by naming that
+    //      lecture. If none passes, DENIED with the first candidate's reason.
     const attachments = video.lessonLinks
       .map((link) => link.lesson)
       .filter((lesson): lesson is NonNullable<typeof lesson> => lesson !== null && !lesson.deletedAt);
@@ -305,11 +331,13 @@ export class PlaybackService {
       lesson = requested ?? attachments[0];
       await this.authorizeLessonForPlayback(user, videoId, lesson, { record: true });
     } else {
-      // Shared asset, no lecture named: first entitled lecture in fixed order.
-      const ordered = [
-        ...attachments.filter((l) => l.id === video.lessonId),
-        ...attachments.filter((l) => l.id !== video.lessonId),
-      ];
+      // Shared asset, no lecture named: the user's own courses first, then
+      // preview-only lectures elsewhere (see orderSharedLectureCandidates).
+      // `attachments` is already oldest-first (lessonLinks orderBy createdAt).
+      const ordered = await orderSharedLectureCandidates(attachments, video.lessonId, async (courseId) => {
+        const decision = await this.access.resolve({ userId: user.id, role: user.role, courseId });
+        return decision.canAccessContent;
+      });
       let chosen: PlayableLesson | null = null;
       for (const candidate of ordered) {
         try {
@@ -532,11 +560,17 @@ export class PlaybackService {
     rotatedFromId: string | null;
     /** The counted play this grant belongs to; null for free/preview lessons. */
     playId: string | null;
+    /**
+     * The gate this request already passed (a rotation gates before releasing
+     * the live ticket). Reused only if it covers this video and is fresh;
+     * otherwise the gate runs here.
+     */
+    drmGate?: DrmGatePass;
   }): Promise<PlaybackTicketResponse> {
     const { user, video, lesson } = params;
 
     // Gate first: nothing is written for a video the strict DRM gate refuses.
-    await this.assertStrictDrmGate(video);
+    const drmGate = params.drmGate?.covers(video.id) ? params.drmGate : await this.assertStrictDrmGate(video);
 
     const ttl = this.cfg.ticketTtl;
     const expiresAt = new Date(Date.now() + ttl * 1000);
@@ -593,6 +627,7 @@ export class PlaybackService {
       expiresAt,
       params.platform,
       params.delivery,
+      drmGate,
     );
 
     const captions = await Promise.all(
@@ -749,7 +784,7 @@ export class PlaybackService {
    * leaves an ACTIVE grant behind (and a refused rotation never releases the
    * live ticket first).
    */
-  private async assertStrictDrmGate(video: { id: string; gumletStatus: string | null }): Promise<void> {
+  private async assertStrictDrmGate(video: { id: string; gumletStatus: string | null }): Promise<DrmGatePass> {
     if (!this.videoCfg.drm.enabled) {
       this.logger.error(
         `Video ${video.id} needs DRM but DRM_ENABLED is false. Refusing to serve it unprotected.`,
@@ -763,7 +798,7 @@ export class PlaybackService {
     // is issuing the ticket, so playback never depends on a background worker
     // having run recently (see DrmVerificationService.ensurePlayable).
     const verdict = await this.drmVerification.ensurePlayable(video.id);
-    if (verdict.playable) return;
+    if (verdict.playable) return new DrmGatePass(video.id);
 
     this.logger.warn(`Denied DRM playback for video ${video.id}: ${verdict.reason} (${verdict.detail})`);
     // A processing video gets the "try again shortly" status so the app can
@@ -809,6 +844,8 @@ export class PlaybackService {
     expiresAt: Date,
     platform?: 'ios' | 'android' | 'web',
     delivery?: 'embed',
+    /** The gate mintTicket just passed for this video; absent = gate here. */
+    drmGate?: DrmGatePass,
   ): Promise<{
     manifestUrl: string;
     playbackHeaders: Record<string, string>;
@@ -831,9 +868,11 @@ export class PlaybackService {
     // requested, asset not ready, asset failed, never verified, verification
     // stale, DRM disabled platform-wide, or signing unconfigured.
     //
-    // mintTicket() already ran this before writing the ticket row; it is
-    // repeated here so no caller can reach the signing below without it.
-    await this.assertStrictDrmGate(video);
+    // mintTicket() runs this before writing the ticket row and hands its pass
+    // down, so a ticket costs ONE verification. Any other caller - or a pass
+    // for a different video, or one older than DRM_GATE_PASS_MAX_AGE_MS -
+    // gates here, so nothing reaches the signing below without a current pass.
+    if (!drmGate?.covers(video.id)) await this.assertStrictDrmGate(video);
 
     const assetId = video.gumletAssetId as string;
 
@@ -1181,7 +1220,8 @@ export class PlaybackService {
     if (shouldRotate) {
       // Refused before the live ticket is released: a video that stopped
       // verifying ends playback with the current grant, not with a half-rotation.
-      await this.assertStrictDrmGate(ticket.video);
+      // The pass is handed to mintTicket so the rotation verifies once, not three times.
+      const drmGate = await this.assertStrictDrmGate(ticket.video);
 
       await this.prisma.playbackTicket.update({
         where: { id: ticket.id },
@@ -1207,6 +1247,7 @@ export class PlaybackService {
         // one — carrying the id forward is what stops a long lesson spending
         // the student's whole allowance on a single sitting.
         playId: ticket.playId,
+        drmGate,
       });
 
       return { ok: true, ticket: rotated };

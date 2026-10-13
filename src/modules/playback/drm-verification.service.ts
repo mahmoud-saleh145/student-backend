@@ -504,6 +504,15 @@ export class DrmVerificationService {
     const current = this.evaluate(video);
     if (current.playable || !REFRESHABLE_REASONS.has(current.reason)) return current;
 
+    // A DEFINITIVE failure is on record. Only fail() writes drmBlockedReason
+    // (always together with drmVerifiedAt = null) and only a successful verify()
+    // clears it. Re-asking Gumlet on every ticket request cannot change that
+    // answer - it multiplied provider calls and writes per student request - so
+    // the playback path refuses from the stored state. Recovery stays with the
+    // paths built for it: the sweep (a row with no proof is always a candidate)
+    // and the staff "verify" endpoint, both of which call verify() directly.
+    if (video.drmBlockedReason) return current;
+
     const recentlyUnavailable = (this.unavailableAt.get(videoId) ?? 0) > Date.now() - UNAVAILABLE_BACKOFF_MS;
     const refreshed: DrmVerdict = recentlyUnavailable
       ? { playable: false, reason: 'VERIFICATION_UNAVAILABLE', detail: 'Provider recently unreachable.' }

@@ -3,6 +3,11 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { DrmVerificationService } from './drm-verification.service';
 
+/** Videos re-verified per sweep run when no batch size is given. */
+export const SWEEP_DEFAULT_BATCH_SIZE = 25;
+/** Tries per provider request during a sweep (transient failures only). */
+export const SWEEP_VERIFY_ATTEMPTS = 2;
+
 /**
  * Recurring DRM re-verification.
  *
@@ -90,7 +95,7 @@ export class DrmVerificationSweepService {
   }
 
   async sweep(options: { batchSize?: number } = {}): Promise<DrmSweepResult> {
-    const batchSize = Math.max(1, Math.min(options.batchSize ?? 25, 100));
+    const batchSize = Math.max(1, Math.min(options.batchSize ?? SWEEP_DEFAULT_BATCH_SIZE, 100));
 
     const ttlSeconds = this.drmVerification.ttl;
     const margin = this.marginSeconds;
@@ -143,7 +148,7 @@ export class DrmVerificationSweepService {
     for (const id of ids.slice(0, batchSize)) {
       result.checked += 1;
       try {
-        const verdict = await this.drmVerification.verify(id);
+        const verdict = await this.drmVerification.verify(id, { attempts: SWEEP_VERIFY_ATTEMPTS });
         if (verdict.playable) result.refreshed += 1;
         // The provider could not be asked: nothing was concluded or written,
         // so this is a retry-next-run, not a failed verification.

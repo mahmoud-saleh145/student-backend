@@ -10,7 +10,13 @@ import {
   WORKER_HEARTBEAT_TTL_SECONDS,
 } from '../../jobs/worker-heartbeat';
 import { PrismaService } from '../../database/prisma.service';
-import { DRM_LAST_SWEEP_KEY, type DrmLastSweepRecord } from '../playback/drm-verification-scheduler.service';
+import {
+  DRM_LAST_SWEEP_FAILURE_KEY,
+  DRM_LAST_SWEEP_KEY,
+  type DrmLastSweepFailureRecord,
+  type DrmLastSweepRecord,
+  normalizeSweepIntervalSeconds,
+} from '../playback/drm-verification-scheduler.service';
 import { RedisService } from '../../redis/redis.service';
 import { StorageService } from '../storage/storage.service';
 
@@ -69,7 +75,7 @@ export class HealthController {
   @Public()
   @ApiOperation({ summary: 'Full dependency report' })
   async deep() {
-    const [database, redis, storage, worker, videoCounts, lastSweep] = await Promise.all([
+    const [database, redis, storage, worker, videoCounts, lastSweep, lastSweepFailure] = await Promise.all([
       this.prisma.ping(),
       this.redis.ping(),
       this.storage.health(),
@@ -79,16 +85,16 @@ export class HealthController {
         .then((rows) => Object.fromEntries(rows.map((r) => [r.status, r._count._all])))
         .catch(() => null),
       this.redis.getJson<DrmLastSweepRecord>(DRM_LAST_SWEEP_KEY).catch(() => null),
+      this.redis.getJson<DrmLastSweepFailureRecord>(DRM_LAST_SWEEP_FAILURE_KEY).catch(() => null),
     ]);
 
     // The sweep runs in-process (DrmVerificationScheduler). Playback does not
     // depend on it - the ticket path refreshes lapsed proofs - but a sweep that
     // has not completed for two intervals means proofs are only being renewed
-    // on demand, which is worth knowing.
-    const sweepIntervalSeconds = Number(process.env.DRM_SWEEP_INTERVAL_SECONDS ?? 900);
-    const sweepAgeSeconds = lastSweep ? (Date.now() - new Date(lastSweep.at).getTime()) / 1000 : null;
-    const sweepOverdue =
-      sweepIntervalSeconds > 0 && (sweepAgeSeconds === null || sweepAgeSeconds > 2 * sweepIntervalSeconds);
+    // on demand, which is worth knowing. Same normalisation as the scheduler,
+    // so "overdue" is judged against the interval actually running.
+    const sweepIntervalSeconds = normalizeSweepIntervalSeconds(process.env.DRM_SWEEP_INTERVAL_SECONDS);
+    const drmSweepNote = HealthController.drmSweepNote(sweepIntervalSeconds, lastSweep, lastSweepFailure);
 
     const checks = { database, redis, storage, worker: Boolean(worker) };
     const critical = database;
@@ -104,9 +110,7 @@ export class HealthController {
             ? undefined
             : 'A worker is running but cannot execute ffmpeg/ffprobe — every transcode will fail'
           : `No queue worker has checked in within ${WORKER_HEARTBEAT_TTL_SECONDS}s — uploaded videos stay QUEUED and scheduled jobs do not run`,
-        drmSweep: sweepOverdue
-          ? 'No DRM verification sweep has completed in the last two intervals; proofs are only being renewed on demand at ticket time'
-          : undefined,
+        drmSweep: drmSweepNote,
       },
       drmVerification: {
         sweepIntervalSeconds,
@@ -122,6 +126,7 @@ export class HealthController {
               skippedPlatform: lastSweep.skippedPlatform,
             }
           : null,
+        lastFailedAttemptAt: lastSweepFailure?.at ?? null,
       },
       // Where the video pipeline stands, so "why is it still QUEUED?" has an
       // answer without opening the database. `build` lets a release confirm the
@@ -153,5 +158,36 @@ export class HealthController {
       env: this.app.env,
       timestamp: new Date().toISOString(),
     };
+  }
+
+  /**
+   * What, if anything, is wrong with the DRM sweep - most serious first. A
+   * sweep that RAN is not automatically a healthy one: a run skipped because
+   * the platform is unconfigured renews nothing, and per-video failures or
+   * provider errors are exactly the state an operator needs to see.
+   */
+  static drmSweepNote(
+    intervalSeconds: number,
+    lastSweep: DrmLastSweepRecord | null,
+    lastFailure: DrmLastSweepFailureRecord | null,
+    now = Date.now(),
+  ): string | undefined {
+    if (intervalSeconds === 0) return undefined;
+    const lastAt = lastSweep ? new Date(lastSweep.at).getTime() : null;
+    if (lastFailure && (lastAt === null || new Date(lastFailure.at).getTime() > lastAt)) {
+      return `The last DRM verification sweep attempt (${lastFailure.at}) failed before completing - see the API logs; proofs are only being renewed on demand at ticket time`;
+    }
+    if (lastAt === null || (now - lastAt) / 1000 > 2 * intervalSeconds) {
+      return 'No DRM verification sweep has completed in the last two intervals; proofs are only being renewed on demand at ticket time';
+    }
+    if ((lastSweep?.skippedPlatform ?? 0) > 0) {
+      return 'The last DRM verification sweep was skipped: the platform is not configured for Gumlet DRM, so no proofs were renewed';
+    }
+    const failed = lastSweep?.failed ?? 0;
+    const errored = lastSweep?.errored ?? 0;
+    if (failed > 0 || errored > 0) {
+      return `The last DRM verification sweep had problems: ${failed} video(s) failed verification and are blocked until re-verified; ${errored} could not be checked (provider unavailable) and will be retried`;
+    }
+    return undefined;
   }
 }

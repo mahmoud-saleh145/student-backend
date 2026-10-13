@@ -1,4 +1,7 @@
-import { DrmVerificationSweepService } from '../../src/modules/playback/drm-verification-sweep.service';
+import {
+  DrmVerificationSweepService,
+  SWEEP_VERIFY_ATTEMPTS,
+} from '../../src/modules/playback/drm-verification-sweep.service';
 
 /**
  * The six-hour TTL is only safe because something renews the proof. These tests
@@ -99,7 +102,8 @@ describe('DrmVerificationSweepService.sweep', () => {
       rows: [{ id: 'v_1', drmVerifiedAt: null }],
     });
     const r = await service.sweep();
-    expect(drmVerification.verify).toHaveBeenCalledWith('v_1');
+    // Same as verify()'s own default (2); now explicit so the scheduler can size its lock from it.
+    expect(drmVerification.verify).toHaveBeenCalledWith('v_1', { attempts: SWEEP_VERIFY_ATTEMPTS });
     expect(r.checked).toBe(1);
     expect(r.refreshed).toBe(1);
   });

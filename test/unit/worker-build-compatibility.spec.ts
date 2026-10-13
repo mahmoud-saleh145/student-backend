@@ -13,7 +13,10 @@
  * health report flags a worker that cannot run the sweep.
  */
 import { HealthController } from '../../src/modules/health/health.controller';
-import { DRM_LAST_SWEEP_KEY } from '../../src/modules/playback/drm-verification-scheduler.service';
+import {
+  DRM_LAST_SWEEP_FAILURE_KEY,
+  DRM_LAST_SWEEP_KEY,
+} from '../../src/modules/playback/drm-verification-scheduler.service';
 import {
   WORKER_CAPABILITIES,
   WorkerHeartbeat,
@@ -67,7 +70,11 @@ describe('the worker heartbeat', () => {
 });
 
 describe('/meta/health/deep', () => {
-  function deepWith(worker: Partial<WorkerHeartbeatPayload> | null, lastSweep: Record<string, unknown> | null = null) {
+  function deepWith(
+    worker: Partial<WorkerHeartbeatPayload> | null,
+    lastSweep: Record<string, unknown> | null = null,
+    lastFailure: Record<string, unknown> | null = null,
+  ) {
     const controller = new HealthController(
       {
         ping: jest.fn(async () => true),
@@ -75,7 +82,9 @@ describe('/meta/health/deep', () => {
       } as never,
       {
         ping: jest.fn(async () => true),
-        getJson: jest.fn(async (key: string) => (key === DRM_LAST_SWEEP_KEY ? lastSweep : worker)),
+        getJson: jest.fn(async (key: string) =>
+          key === DRM_LAST_SWEEP_KEY ? lastSweep : key === DRM_LAST_SWEEP_FAILURE_KEY ? lastFailure : worker,
+        ),
       } as never,
       { health: jest.fn(async () => true) } as never,
       {
@@ -99,7 +108,7 @@ describe('/meta/health/deep', () => {
     const res = await deepWith(base, null);
     expect(res.checks.worker).toBe(true);
     expect(res.notes.drmSweep).toMatch(/No DRM verification sweep has completed/);
-    expect(res.drmVerification).toEqual({ sweepIntervalSeconds: 900, lastSweep: null });
+    expect(res.drmVerification).toEqual({ sweepIntervalSeconds: 900, lastSweep: null, lastFailedAttemptAt: null });
     expect(res.videoPipeline.worker).toMatchObject({ build: null, capabilities: [] });
   });
 
@@ -117,6 +126,75 @@ describe('/meta/health/deep', () => {
   it('flags a sweep older than two intervals', async () => {
     const res = await deepWith(null, sweep(31));
     expect(res.notes.drmSweep).toMatch(/No DRM verification sweep has completed/);
+  });
+
+  describe('C3: a sweep that ran is not automatically a healthy one', () => {
+    const minutesAgo = (m: number) => new Date(Date.now() - m * 60_000).toISOString();
+
+    it('reports a sweep skipped because the platform is not configured', async () => {
+      const res = await deepWith(null, { ...sweep(5), checked: 0, refreshed: 0, skippedFresh: 0, skippedPlatform: 1 });
+      expect(res.notes.drmSweep).toMatch(/skipped: the platform is not configured/);
+    });
+
+    it('reports per-video definitive failures and provider errors with their counts', async () => {
+      const res = await deepWith(null, { ...sweep(5), refreshed: 8, failed: 2, errored: 1 });
+      expect(res.notes.drmSweep).toMatch(/2 video\(s\) failed verification/);
+      expect(res.notes.drmSweep).toMatch(/1 could not be checked/);
+    });
+
+    it('reports provider errors alone (nothing failed definitively)', async () => {
+      const res = await deepWith(null, { ...sweep(5), refreshed: 0, errored: 11 });
+      expect(res.notes.drmSweep).toMatch(/0 video\(s\) failed verification.*; 11 could not be checked/);
+    });
+
+    it('reports an attempt that threw AFTER the last completed sweep, without any error text', async () => {
+      const res = await deepWith(null, sweep(10), { at: minutesAgo(2), host: 'srv-api' });
+      expect(res.notes.drmSweep).toMatch(/attempt .* failed before completing/);
+      expect(res.drmVerification.lastFailedAttemptAt).toEqual(expect.any(String));
+    });
+
+    it('a failed attempt with no completed sweep at all is still reported as a failed attempt', async () => {
+      const res = await deepWith(null, null, { at: minutesAgo(2), host: 'srv-api' });
+      expect(res.notes.drmSweep).toMatch(/failed before completing/);
+    });
+
+    it('an older failed attempt superseded by a clean sweep is not reported', async () => {
+      const res = await deepWith(null, sweep(2), { at: minutesAgo(10), host: 'srv-api' });
+      expect(res.notes.drmSweep).toBeUndefined();
+    });
+
+    it('a clean recent sweep stays quiet', async () => {
+      const res = await deepWith(null, sweep(2));
+      expect(res.notes.drmSweep).toBeUndefined();
+    });
+  });
+
+  describe('C5: health judges "overdue" against the interval the scheduler actually runs', () => {
+    const saved = process.env.DRM_SWEEP_INTERVAL_SECONDS;
+    afterEach(() => {
+      if (saved === undefined) delete process.env.DRM_SWEEP_INTERVAL_SECONDS;
+      else process.env.DRM_SWEEP_INTERVAL_SECONDS = saved;
+    });
+
+    it('DRM_SWEEP_INTERVAL_SECONDS=5 runs every 60 s, so a 3-minute-old sweep is overdue', async () => {
+      process.env.DRM_SWEEP_INTERVAL_SECONDS = '5';
+      const res = await deepWith(null, sweep(3));
+      expect(res.drmVerification.sweepIntervalSeconds).toBe(60);
+      expect(res.notes.drmSweep).toMatch(/No DRM verification sweep has completed/);
+    });
+
+    it('a non-numeric value disables the sweep in both places (no false "overdue")', async () => {
+      process.env.DRM_SWEEP_INTERVAL_SECONDS = 'abc';
+      const res = await deepWith(null, null);
+      expect(res.drmVerification.sweepIntervalSeconds).toBe(0);
+      expect(res.notes.drmSweep).toBeUndefined();
+    });
+
+    it('a fractional value is floored the same way as the scheduler', async () => {
+      process.env.DRM_SWEEP_INTERVAL_SECONDS = '1234.7';
+      const res = await deepWith(null, sweep(1));
+      expect(res.drmVerification.sweepIntervalSeconds).toBe(1234);
+    });
   });
 
   it('with no worker at all, keeps the existing "no worker" note', async () => {

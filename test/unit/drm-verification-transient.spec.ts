@@ -213,3 +213,60 @@ describe('the sweep under provider failure', () => {
     expect(t.row.drmVerifiedAt).toBe(proof);
   });
 });
+
+describe('C2: after a DEFINITIVE failure, playback requests do not re-check Gumlet', () => {
+  it('sequential requests: one provider check and one write in total, all refused', async () => {
+    // Manifest 403 (how Gumlet answers for a deleted asset) on the first check.
+    const t = setup({ manifest: [403, 'ok'], row: { drmVerifiedAt: hoursAgo(7) } });
+
+    for (let i = 0; i < 5; i += 1) {
+      await expect(t.verification.ensurePlayable('v_1')).resolves.toMatchObject({ playable: false, reason: 'NOT_VERIFIED' });
+    }
+
+    expect(t.calls).toEqual({ asset: 1, manifest: 1 });
+    expect(t.writes).toHaveLength(1);
+    expect(t.writes[0]).toMatchObject({ drmVerifiedAt: null, drmBlockedReason: expect.stringMatching(/HTTP 403/) });
+  });
+
+  it('a concurrent burst after the failure makes no provider calls at all', async () => {
+    const t = setup({ manifest: [403, 'ok'], row: { drmVerifiedAt: hoursAgo(7) } });
+    await t.verification.ensurePlayable('v_1');
+    const before = { ...t.calls };
+    const verdicts = await Promise.all([1, 2, 3, 4, 5, 6].map(() => t.verification.ensurePlayable('v_1')));
+    expect(verdicts.every((v) => !v.playable)).toBe(true);
+    expect(t.calls).toEqual(before);
+  });
+
+  it('the SWEEP still recovers it once Gumlet is valid again, and playback then needs no further check', async () => {
+    const t = setup({ manifest: [403, 'ok'], row: { drmVerifiedAt: hoursAgo(7) } });
+    await t.verification.ensurePlayable('v_1'); // definitive failure recorded
+    expect(t.row.drmVerifiedAt).toBeNull();
+
+    const sweep = new DrmVerificationSweepService(t.prisma as never, t.verification);
+    await expect(sweep.sweep()).resolves.toMatchObject({ checked: 1, refreshed: 1 });
+    expect(t.row).toMatchObject({ drmVerifiedAt: expect.any(Date), drmBlockedReason: null });
+
+    const calls = { ...t.calls };
+    await expect(t.verification.ensurePlayable('v_1')).resolves.toEqual({ playable: true, reason: null });
+    expect(t.calls).toEqual(calls);
+  });
+
+  it('the staff verify path (verify()) still recovers it directly', async () => {
+    const t = setup({ manifest: [403, 'ok'], row: { drmVerifiedAt: hoursAgo(7) } });
+    await t.verification.ensurePlayable('v_1');
+    await expect(t.verification.verify('v_1')).resolves.toEqual({ playable: true, reason: null });
+    await expect(t.verification.ensurePlayable('v_1')).resolves.toEqual({ playable: true, reason: null });
+  });
+
+  it('a recorded definitive failure is not overridden by the grace while Gumlet is down', async () => {
+    const t = setup({ asset: ['network'], row: { drmVerifiedAt: null, drmBlockedReason: 'manifest not CENC' } });
+    await expect(t.verification.ensurePlayable('v_1')).resolves.toMatchObject({ playable: false });
+    expect(t.calls).toEqual({ asset: 0, manifest: 0 });
+  });
+
+  it('a never-verified row WITHOUT a recorded failure is still verified on demand', async () => {
+    const t = setup({ row: { drmVerifiedAt: null, drmBlockedReason: null } });
+    await expect(t.verification.ensurePlayable('v_1')).resolves.toEqual({ playable: true, reason: null });
+    expect(t.calls).toEqual({ asset: 1, manifest: 1 });
+  });
+});

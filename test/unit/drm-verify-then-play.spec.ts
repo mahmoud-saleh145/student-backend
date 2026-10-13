@@ -203,7 +203,7 @@ function world(opts: {
   };
 
   return {
-    video, tickets, drmVerification, signLicence, issue, heartbeat, access,
+    video, tickets, drmVerification, signLicence, issue, heartbeat, access, prisma,
     ticketUpdates: () => ticketUpdates,
     providerCalls: () => [...providerCalls],
   };
@@ -450,5 +450,95 @@ describe('Fix 6: heartbeat and rotation keep the destination lesson', () => {
     const w = world({ attachments: shared, row: { drmRequested: true, drmVerifiedAt: new Date() } });
     const res = await w.heartbeat({ ...onDestination, status: 'REVOKED', revokedReason: 'Video removed from this lecture' }, 10 * 60 * 1000);
     expect(res).toEqual({ ok: false, terminate: { reason: 'Video removed from this lecture' } });
+  });
+});
+
+describe('T2: one DRM verification per ticket, and none reused across requests', () => {
+  const shared = [lesson('les_src', 'crs_src'), lesson('les_dst', 'crs_dst')];
+  const onDestination = { lessonId: 'les_dst', courseId: 'crs_dst' };
+  const realNow = Date.now.bind(Date);
+  let skewMs = 0;
+  beforeEach(() => {
+    skewMs = 0;
+    jest.spyOn(Date, 'now').mockImplementation(() => realNow() + skewMs);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('issuing a ticket runs the gate ONCE (previously twice)', async () => {
+    const w = world({ row: { drmRequested: true, drmVerifiedAt: new Date() } });
+    const gate = jest.spyOn(w.drmVerification, 'ensurePlayable');
+    await expect(w.issue('les_src')).resolves.toMatchObject({ drm: { scheme: 'widevine' } });
+    expect(gate).toHaveBeenCalledTimes(1);
+    expect(w.signLicence).toHaveBeenCalledTimes(1);
+  });
+
+  it('a lapsed proof is renewed with ONE provider round trip per ticket (1 asset + 1 manifest read)', async () => {
+    const w = world({ row: { drmRequested: true, drmVerifiedAt: new Date(Date.now() - 7 * 3600 * 1000) } });
+    const gate = jest.spyOn(w.drmVerification, 'ensurePlayable');
+    await expect(w.issue('les_src')).resolves.toMatchObject({ drm: { scheme: 'widevine' } });
+    expect(gate).toHaveBeenCalledTimes(1);
+    expect(w.providerCalls()).toEqual(['asset-api', 'manifest']);
+  });
+
+  it('a rotation runs the gate ONCE (previously three times), before releasing the live ticket', async () => {
+    const w = world({ attachments: shared, row: { drmRequested: true, drmVerifiedAt: new Date() } });
+    const order: string[] = [];
+    const gate = jest.spyOn(w.drmVerification, 'ensurePlayable').mockImplementation(async function (this: unknown, id: string) {
+      order.push('gate');
+      return DrmVerificationService.prototype.ensurePlayable.call(w.drmVerification, id);
+    });
+    w.prisma.playbackTicket.update.mockImplementation(async (a: { data: Row }) => {
+      if (a.data.status === 'RELEASED') order.push('release');
+      return {};
+    });
+    const res = await w.heartbeat(onDestination, 5 * 1000);
+    expect(res).toMatchObject({ ok: true, ticket: { drm: { scheme: 'widevine' } } });
+    expect(gate).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(['gate', 'release']);
+    expect(w.tickets).toEqual([expect.objectContaining({ lessonId: 'les_dst', rotatedFromId: 'tid_live' })]);
+  });
+
+  it('state changing BETWEEN requests is always seen: no pass outlives its request', async () => {
+    const w = world({ attachments: shared, row: { drmRequested: true, drmVerifiedAt: new Date() } });
+    await expect(w.issue('les_dst')).resolves.toBeTruthy();
+    // Gumlet / staff mark the asset unservable after the first ticket.
+    Object.assign(w.video, { drmVerifiedAt: null, drmBlockedReason: 'NOT_VERIFIED: manifest 404' });
+    await expect(w.issue('les_dst')).rejects.toMatchObject({ details: { drmState: 'NOT_VERIFIED' } });
+    // ...and the next rotation ends playback instead of minting a new grant.
+    await expect(w.heartbeat(onDestination, 5 * 1000)).rejects.toMatchObject({ details: { drmState: 'NOT_VERIFIED' } });
+    expect(w.tickets).toHaveLength(1);
+    expect(w.ticketUpdates().filter((u) => u.data.status === 'RELEASED')).toEqual([]);
+  });
+
+  it('a pass gone stale inside one slow request is not trusted: the gate runs again and sees the change', async () => {
+    const w = world({ attachments: shared, row: { drmRequested: true, drmVerifiedAt: new Date() } });
+    const gate = jest.spyOn(w.drmVerification, 'ensurePlayable');
+    // The release write is slow (11 s > the 10 s pass lifetime) and, meanwhile,
+    // the asset stops verifying.
+    w.prisma.playbackTicket.update.mockImplementation(async (a: { data: Row }) => {
+      // Only the release of the live ticket (the beat's own position write is
+      // also an update, and comes before the gate).
+      if (a.data.status === 'RELEASED') {
+        skewMs += 11_000;
+        Object.assign(w.video, { drmVerifiedAt: null, drmBlockedReason: 'NOT_VERIFIED: manifest 404' });
+      }
+      return {};
+    });
+    await expect(w.heartbeat(onDestination, 5 * 1000)).rejects.toMatchObject({ details: { drmState: 'NOT_VERIFIED' } });
+    expect(gate).toHaveBeenCalledTimes(2);
+    expect(w.tickets).toHaveLength(0);
+    expect(w.signLicence).not.toHaveBeenCalled();
+  });
+
+  it('a slow ticket write likewise re-gates before signing', async () => {
+    const w = world({ row: { drmRequested: true, drmVerifiedAt: new Date() } });
+    const gate = jest.spyOn(w.drmVerification, 'ensurePlayable');
+    const create = w.prisma.playbackTicket.create.getMockImplementation()!;
+    w.prisma.playbackTicket.create.mockImplementation(async (a: { data: Row }) => {
+      skewMs += 11_000;
+      return create(a);
+    });
+    await expect(w.issue('les_src')).resolves.toMatchObject({ drm: { scheme: 'widevine' } });
+    expect(gate).toHaveBeenCalledTimes(2);
   });
 });

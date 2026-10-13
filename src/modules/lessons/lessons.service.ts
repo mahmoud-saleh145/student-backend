@@ -13,6 +13,7 @@ import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { CourseAccessService } from '../courses/course-access.service';
 import { CoursesService } from '../courses/courses.service';
+import { orderSharedLectureCandidates } from '../videos/shared-lecture-order';
 import {
   toAttachment,
   toCompletionRule,
@@ -256,7 +257,7 @@ export class LessonsService {
           where: { lesson: { ...notDeleted } },
           // Deterministic order for the no-hint case below.
           orderBy: { createdAt: 'asc' },
-          select: { lessonId: true },
+          select: { lessonId: true, lesson: { select: { courseId: true } } },
         },
       },
     });
@@ -284,18 +285,22 @@ export class LessonsService {
     }
 
     // Shared asset and no hint (the native app and older web builds never send
-    // one): the FIRST lecture, in a fixed order - the uploading lecture, then
-    // oldest attachment - that `detail()` lets this user open. `detail()` runs
-    // the full publication / course / section / drip checks and writes
-    // nothing, so this returns only a lecture the user could open by id anyway.
-    // Mirrors PlaybackService.issueTicket, so the lecture shown and the lecture
-    // the ticket is issued for agree.
-    const ordered = [
-      ...[...attached].filter((id) => id === video.lessonId),
-      ...[...attached].filter((id) => id !== video.lessonId),
-    ];
+    // one): the FIRST lecture that `detail()` lets this user open, in the order
+    // of orderSharedLectureCandidates - the user's OWN courses (enrolment /
+    // staff) first, preview-only lectures elsewhere last, the uploading lecture
+    // then oldest attachment within each tier. `detail()` runs the full
+    // publication / course / section / drip checks and writes nothing, so this
+    // returns only a lecture the user could open by id anyway. The SAME order
+    // and the same checks are used by PlaybackService.issueTicket, so the
+    // lecture shown (whose id the client then reports progress and completion
+    // against) and the lecture the ticket is issued for agree.
+    const ordered = await orderSharedLectureCandidates(
+      video.lessonLinks.map((link) => ({ id: link.lessonId, courseId: link.lesson.courseId })),
+      video.lessonId,
+      async (courseId) => (await this.access.resolve({ userId, role, courseId })).canAccessContent,
+    );
     let firstError: unknown = null;
-    for (const candidate of ordered) {
+    for (const { id: candidate } of ordered) {
       try {
         return await this.detail(candidate, userId, role);
       } catch (error) {

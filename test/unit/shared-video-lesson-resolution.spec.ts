@@ -27,7 +27,10 @@ function harness(opts: {
         lessonId: 'les_src',
         courseId: 'crs_src',
         deletedAt: null,
-        lessonLinks: opts.attachments.map((l) => ({ lessonId: l.id as string })),
+        lessonLinks: opts.attachments.map((l) => ({
+          lessonId: l.id as string,
+          lesson: { courseId: l.courseId as string },
+        })),
       })),
     },
     lesson: {
@@ -44,6 +47,12 @@ function harness(opts: {
     assertContentAccess: jest.fn(async () => undefined),
     assertSectionAccessible: jest.fn(async () => undefined),
     staffMayViewCourse: jest.fn(async () => true),
+    // No full-course access anywhere: every lecture sits in the same (preview)
+    // tier, so these cases pin the order WITHIN a tier - uploading lecture
+    // first, then oldest attachment. Ordering ACROSS tiers (a lecture in a
+    // course the student has full access to comes first) is covered with the
+    // real access rules in shared-lecture-context.spec.ts.
+    resolve: jest.fn(async () => ({ state: 'NOT_ENROLLED', canAccessContent: false })),
   };
 
   const service = new LessonsService(
