@@ -64,6 +64,14 @@ export class IssueTicketDto {
    * answer would be ambiguous, so omitting it can never widen access.
    */
   @IsOptional() @IsString() @MaxLength(32) lessonId?: string;
+
+  /**
+   * TEMPORARY playback hotfix. Explicit opt-in to Gumlet's embed player,
+   * sent only by the student web player. Optional, so every existing client
+   * (including the native apps, which never send it) is unaffected. Honoured
+   * only when GUMLET_WEB_EMBED_ENABLED is true.
+   */
+  @IsOptional() @IsIn(['embed']) delivery?: string;
 }
 
 class HeartbeatDto {
@@ -144,6 +152,7 @@ export class PlaybackController {
       // The lecture the viewer is on. Entitlement is resolved against THIS, so a
       // reused asset is authorised in the destination course's context.
       lessonId: dto.lessonId,
+      delivery: dto.delivery === 'embed' ? 'embed' : undefined,
       ip: req.ip ?? null,
       userAgent: req.header('user-agent') ?? null,
       integritySuspect: req.deviceContext?.integritySuspect ?? false,

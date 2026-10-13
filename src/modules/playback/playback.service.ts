@@ -57,6 +57,12 @@ export interface PlaybackTicketResponse {
     certificateUrl: string | null;
     licenseHeaders: Record<string, string>;
   };
+  /**
+   * TEMPORARY playback hotfix: signed URL of Gumlet's own embed player. Set
+   * only for Gumlet videos, only when the request sent `delivery: 'embed'`,
+   * and only while GUMLET_WEB_EMBED_ENABLED is true; null otherwise.
+   */
+  embedUrl?: string | null;
   watermark: {
     primary: string;
     secondary: string;
@@ -146,6 +152,8 @@ export class PlaybackService {
      * lecture happened to upload the file.
      */
     lessonId?: string;
+    /** TEMPORARY hotfix: explicit web opt-in to Gumlet's embed player. */
+    delivery?: 'embed';
     ip?: string | null;
     userAgent?: string | null;
     integritySuspect: boolean;
@@ -347,6 +355,7 @@ export class PlaybackService {
       deviceId,
       maxHeight: params.maxHeight ?? null,
       platform: params.platform,
+      delivery: params.delivery,
       ip: params.ip,
       userAgent: params.userAgent,
       rotatedFromId: null,
@@ -513,6 +522,8 @@ export class PlaybackService {
     maxHeight: number | null;
     /** Client platform, used only to choose the DRM key system. */
     platform?: 'ios' | 'android' | 'web';
+    /** TEMPORARY hotfix: explicit web opt-in to Gumlet's embed player. */
+    delivery?: 'embed';
     ip?: string | null;
     userAgent?: string | null;
     rotatedFromId: string | null;
@@ -575,6 +586,7 @@ export class PlaybackService {
       },
       expiresAt,
       params.platform,
+      params.delivery,
     );
 
     const captions = await Promise.all(
@@ -612,6 +624,7 @@ export class PlaybackService {
       manifestUrl: playback.manifestUrl,
       playbackHeaders: playback.playbackHeaders,
       drm: playback.drm,
+      embedUrl: playback.embedUrl ?? null,
       watermark: {
         // Composed server-side. A patched client cannot substitute another
         // student's name, so the mark keeps its forensic value.
@@ -686,10 +699,12 @@ export class PlaybackService {
     },
     expiresAt: Date,
     platform?: 'ios' | 'android' | 'web',
+    delivery?: 'embed',
   ): Promise<{
     manifestUrl: string;
     playbackHeaders: Record<string, string>;
     drm: PlaybackTicketResponse['drm'];
+    embedUrl?: string | null;
   }> {
     // ---- STRICT DRM GATE --------------------------------------------------
     //
@@ -752,7 +767,23 @@ export class PlaybackService {
       ? this.gumlet.signFairPlayLicenseUrl({ assetId, hardwareSecure: true })
       : bundle.licenseUrl;
 
+    // TEMPORARY playback hotfix: Gumlet's own embed player, ONLY for a request
+    // that explicitly opted in with `delivery: 'embed'` (the student web; the
+    // native apps never send it, and `platform` alone cannot tell iPhone
+    // Safari from the native iOS app) AND only while GUMLET_WEB_EMBED_ENABLED
+    // is true. Minted here, i.e. only after every entitlement, publication,
+    // drip, device, concurrency and play-limit check in issueTicket passed.
+    // The manifest/drm fields below are returned unchanged either way.
+    const embedUrl =
+      delivery === 'embed' && this.videoCfg.drm.gumlet.webEmbedEnabled === true
+      ? this.gumlet.signEmbedUrl({
+          assetId,
+          tokenLifetimeSeconds: this.videoCfg.drm.gumlet.embedTokenLifetimeSeconds,
+        })
+      : null;
+
     return {
+      embedUrl,
       // Manifest choice follows the DRM system. Gumlet offers FairPlay for HLS
       // only - their DASH manifests carry a Widevine PSSH and no FairPlay
       // signalling - so an Apple client must be handed the HLS playlist. Every

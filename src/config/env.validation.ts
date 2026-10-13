@@ -208,6 +208,14 @@ export class EnvironmentVariables {
   @Min(30)
   @Max(3600)
   GUMLET_TOKEN_LIFETIME_SECONDS = 300;
+  /** TEMPORARY: serve a signed Gumlet embed URL to ticket requests that send `delivery: 'embed'`. */
+  @toBool() @IsBoolean() GUMLET_WEB_EMBED_ENABLED = false;
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(60)
+  @Max(14400)
+  GUMLET_EMBED_TOKEN_LIFETIME_SECONDS = 3600;
   /** Comma-separated renditions to request for ABR assets, e.g. 720p,1080p. */
   @IsOptional() @IsString() GUMLET_RESOLUTIONS?: string;
 
