@@ -1,4 +1,5 @@
 import { DrmVerificationService } from '../../src/modules/playback/drm-verification.service';
+import { fetchManifestViaGlobalFetch } from './helpers/drm-doubles';
 
 /**
  * Three videos were migrated onto Gumlet BEFORE the migration that added the
@@ -62,6 +63,7 @@ function build(opts: {
   const gumlet = {
     isSigningConfigured: jest.fn(() => true),
     dashManifestUrl: jest.fn(() => 'https://video.gumlet.io/ws_1/a_legacy/main.mpd'),
+    fetchManifest: fetchManifestViaGlobalFetch,
     assetHasDrm: (t: string) =>
       /schemeIdUri="urn:mpeg:dash:mp4protection:2011"/.test(t) && /cenc:default_KID="/.test(t),
     getAsset: jest.fn(async () => ({
@@ -137,6 +139,7 @@ describe('DrmVerificationService.verify - pre-migration videos', () => {
       {
         isSigningConfigured: jest.fn(() => true),
         dashManifestUrl: jest.fn(() => 'https://video.gumlet.io/ws_1/a_legacy/main.mpd'),
+        fetchManifest: fetchManifestViaGlobalFetch,
         assetHasDrm: () => true,
         getAsset: jest.fn(),
         isAssetPlayable: () => true,
@@ -170,6 +173,7 @@ describe('DrmVerificationService.verify - pre-migration videos', () => {
         isSigningConfigured: jest.fn(() => false),
         dashManifestUrl: jest.fn(() => 'https://video.gumlet.io/ws_1/a_legacy/main.mpd',
         ),
+        fetchManifest: fetchManifestViaGlobalFetch,
         assetHasDrm: () => true,
         getAsset: jest.fn(),
         isAssetPlayable: () => true,

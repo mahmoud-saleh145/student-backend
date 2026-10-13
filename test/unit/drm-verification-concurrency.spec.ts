@@ -1,4 +1,5 @@
 import { DrmVerificationService } from '../../src/modules/playback/drm-verification.service';
+import { fetchManifestViaGlobalFetch } from './helpers/drm-doubles';
 
 /**
  * Two verifications of the same video can overlap: the recurring sweep and a
@@ -40,6 +41,7 @@ function build(updateManyResult: { count: number }) {
   const gumlet = {
     isSigningConfigured: jest.fn(() => true),
     dashManifestUrl: jest.fn(() => 'https://video.gumlet.io/ws_1/a_1/main.mpd'),
+    fetchManifest: fetchManifestViaGlobalFetch,
     assetHasDrm: jest.fn(() => true),
     getAsset: jest.fn(async () => ({
       assetId: 'a_1',
@@ -115,6 +117,7 @@ describe('DrmVerificationService.verify - concurrent writes', () => {
       {
         isSigningConfigured: jest.fn(() => true),
         dashManifestUrl: jest.fn(() => 'https://video.gumlet.io/ws_1/a_1/main.mpd'),
+        fetchManifest: fetchManifestViaGlobalFetch,
         assetHasDrm: jest.fn(() => gumletHasDrm),
         getAsset: jest.fn(async () => ({
           assetId: 'a_1',

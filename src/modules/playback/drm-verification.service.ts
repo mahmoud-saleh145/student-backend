@@ -3,7 +3,27 @@ import { ConfigService } from '@nestjs/config';
 
 import type { VideoConfig } from '../../config/configuration';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
-import { GumletDrmService } from '../playback/gumlet-drm.service';
+import { GumletDrmService, GumletRequestError } from '../playback/gumlet-drm.service';
+
+/**
+ * Reasons a fresh provider check can resolve. Everything else is either a
+ * platform/configuration gate or a definitive stored failure, and asking the
+ * provider again on the playback path would not change the answer.
+ */
+const REFRESHABLE_REASONS = new Set(['NOT_VERIFIED', 'VERIFICATION_STALE', 'DRM_NOT_REQUESTED', 'ASSET_NOT_READY']);
+
+/** After the provider could not be reached for a video, don't ask again for this long. */
+const UNAVAILABLE_BACKOFF_MS = 60_000;
+
+/** Transient = the provider could not be asked. Unknown errors count as transient. */
+export function isTransientProviderError(error: unknown): boolean {
+  return !(error instanceof GumletRequestError) || error.transient;
+}
+
+/** Manifest statuses that describe the CDN, not the asset. 403/404/410 are definitive. */
+export function isTransientManifestStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
 
 /**
  * The ONLY authority on whether a video may be played with DRM.
@@ -53,6 +73,8 @@ export type DrmVerdict =
         | 'ASSET_FAILED'
         | 'NOT_VERIFIED'
         | 'VERIFICATION_STALE'
+        /** The provider could not be asked; nothing was concluded or written. */
+        | 'VERIFICATION_UNAVAILABLE'
         | 'DRM_DISABLED_ON_PLATFORM'
         | 'SIGNING_UNAVAILABLE';
       /** Admin-facing detail. Never contains a secret, token or signed URL. */
@@ -108,7 +130,20 @@ export class DrmVerificationService {
     const videoCfg = config.getOrThrow<VideoConfig>('video');
     this.drm = videoCfg.drm;
     this.ttlSeconds = Number(process.env.DRM_VERIFICATION_TTL_SECONDS ?? 21600); // 6h
+    this.graceSeconds = Number(process.env.DRM_VERIFICATION_GRACE_SECONDS ?? 86400); // 24h
   }
+
+  /**
+   * How long past the TTL an earlier successful proof is still honoured on the
+   * playback path WHILE the provider cannot be reached. Never applies after a
+   * definitive failure (which clears the proof) or to a video never verified.
+   */
+  private readonly graceSeconds: number;
+
+  /** Per-process single flight: concurrent tickets for one video share one check. */
+  private readonly inFlight = new Map<string, Promise<DrmVerdict>>();
+  /** Per-process negative cache: videoId -> when the provider was last unreachable. */
+  private readonly unavailableAt = new Map<string, number>();
 
   /** The same projection, for use in a Prisma `select`. */
   private static select() {
@@ -231,13 +266,18 @@ export class DrmVerificationService {
    *   3. fetches the DASH manifest and requires real CENC encryption,
    *   4. writes the timestamp on success, or CLEARS it with a reason on failure.
    *
-   * Clearing on failure is essential: a stale `drmVerifiedAt` from a previous
-   * success is exactly what would let a broken asset keep playing.
+   * Clearing on a DEFINITIVE failure is essential: a stale `drmVerifiedAt` from
+   * a previous success is exactly what would let a broken asset keep playing.
+   *
+   * A TRANSIENT failure - the provider could not be asked (timeout, network,
+   * 5xx, 429, rejected API credentials) - writes nothing and returns
+   * VERIFICATION_UNAVAILABLE after `attempts` tries. It proves nothing about
+   * the asset either way, so it must not erase a proof that was valid.
    *
    * Idempotent, and safe to call concurrently: the write is a single update, so
    * two overlapping calls converge on the same outcome.
    */
-  async verify(videoId: string): Promise<DrmVerdict> {
+  async verify(videoId: string, options: { attempts?: number } = {}): Promise<DrmVerdict> {
     const video = await this.prisma.video.findFirst({
       where: { id: videoId, ...notDeleted },
       select: DrmVerificationService.select(),
@@ -288,15 +328,25 @@ export class DrmVerificationService {
       } : precheck);
     }
 
+    const attempts = Math.max(1, Math.min(options.attempts ?? 2, 3));
+    const assetId = video.gumletAssetId;
+
     let asset;
     try {
-      asset = await this.gumlet.getAsset(video.gumletAssetId);
+      asset = await this.withRetry(attempts, () => this.gumlet.getAsset(assetId));
     } catch (error) {
-      // Provider unreachable. Fail closed - never assume the asset is fine.
+      // Could not ASK the provider. That says nothing about the asset, so an
+      // earlier proof is left exactly as it is (the caller decides whether a
+      // bounded grace applies) - erasing it here turned every provider blip
+      // into an immediate playback outage for the videos being re-verified.
+      if (isTransientProviderError(error)) {
+        return this.unavailable(videoId, `Could not read the Gumlet asset: ${(error as Error).message}`);
+      }
+      // Gumlet answered definitively (404/410 or an error body): no such asset.
       return fail({
         playable: false,
-        reason: 'NOT_VERIFIED',
-        detail: `Could not read the Gumlet asset: ${(error as Error).message}`,
+        reason: 'NO_GUMLET_ASSET',
+        detail: `Gumlet has no usable asset for this video: ${(error as Error).message}`,
       });
     }
 
@@ -318,18 +368,33 @@ export class DrmVerificationService {
       asset.dashPlaybackUrl ??
       this.gumlet.dashManifestUrl({ assetId: asset.assetId, workspaceId: video.gumletWorkspaceId });
 
-    let encrypted = false;
+    let manifest: { status: number; ok: boolean; text: string };
     try {
-      const response = await fetch(manifestUrl);
-      encrypted = response.ok && this.gumlet.assetHasDrm(await response.text());
+      manifest = await this.withRetry(attempts, async () => {
+        const m = await this.gumlet.fetchManifest(manifestUrl);
+        if (!m.ok && isTransientManifestStatus(m.status)) {
+          throw new GumletRequestError(`Manifest read failed with HTTP ${m.status}`, true, m.status);
+        }
+        return m;
+      });
     } catch (error) {
+      if (isTransientProviderError(error)) {
+        return this.unavailable(videoId, `Could not read the DASH manifest: ${(error as Error).message}`);
+      }
+      throw error;
+    }
+
+    if (!manifest.ok) {
+      // 403/404/410 from the CDN: the packaged media is not servable (this is
+      // exactly how Gumlet answers for a deleted asset). Definitive.
       return fail({
         playable: false,
         reason: 'NOT_VERIFIED',
-        detail: `Could not read the DASH manifest: ${(error as Error).message}`,
+        detail: `The DASH manifest returned HTTP ${manifest.status}; this asset cannot be played.`,
       });
     }
 
+    const encrypted = this.gumlet.assetHasDrm(manifest.text);
     if (!encrypted) {
       this.logger.error(
         `asset ${asset.assetId} reported ready but the manifest is not CENC-encrypted - refusing to verify`,
@@ -409,5 +474,93 @@ export class DrmVerificationService {
       drmBlockedReason: null,
       gumletStatus: asset.status,
     });
+  }
+
+  /**
+   * The playback-path gate: is this video playable RIGHT NOW, refreshing the
+   * proof on demand if it has lapsed.
+   *
+   * This is what removes the dependency on any background process for
+   * playback. Whatever process issues the ticket re-verifies a lapsed proof
+   * itself (one provider check per video, shared by concurrent requests), so
+   * playback works with no worker running at all.
+   *
+   *   * fresh proof                     -> playable, no provider call
+   *   * lapsed/missing, check succeeds  -> playable (proof renewed)
+   *   * lapsed, check fails definitively-> refused (proof cleared by verify)
+   *   * lapsed, provider unreachable    -> playable ONLY if an earlier real
+   *                                        proof is within TTL + grace and no
+   *                                        definitive failure was recorded;
+   *                                        otherwise refused
+   *   * platform/config gates           -> refused, no provider call
+   */
+  async ensurePlayable(videoId: string): Promise<DrmVerdict> {
+    const video = await this.prisma.video.findFirst({
+      where: { id: videoId, ...notDeleted },
+      select: DrmVerificationService.select(),
+    });
+    if (!video) return { playable: false, reason: 'NO_GUMLET_ASSET', detail: 'Video not found.' };
+
+    const current = this.evaluate(video);
+    if (current.playable || !REFRESHABLE_REASONS.has(current.reason)) return current;
+
+    const recentlyUnavailable = (this.unavailableAt.get(videoId) ?? 0) > Date.now() - UNAVAILABLE_BACKOFF_MS;
+    const refreshed: DrmVerdict = recentlyUnavailable
+      ? { playable: false, reason: 'VERIFICATION_UNAVAILABLE', detail: 'Provider recently unreachable.' }
+      : await this.singleFlight(videoId);
+
+    if (refreshed.playable || refreshed.reason !== 'VERIFICATION_UNAVAILABLE') return refreshed;
+
+    if (this.withinGrace(video)) {
+      this.logger.warn(
+        `Provider unreachable; honouring the earlier DRM proof of video ${videoId} within the grace window`,
+      );
+      return { playable: true, reason: null };
+    }
+    return current;
+  }
+
+  /** One provider check per video at a time in this process; one attempt on the playback path. */
+  private singleFlight(videoId: string): Promise<DrmVerdict> {
+    const existing = this.inFlight.get(videoId);
+    if (existing) return existing;
+    const run = this.verify(videoId, { attempts: 1 })
+      .then((verdict) => {
+        if (verdict.reason === 'VERIFICATION_UNAVAILABLE') this.unavailableAt.set(videoId, Date.now());
+        else this.unavailableAt.delete(videoId);
+        return verdict;
+      })
+      .finally(() => this.inFlight.delete(videoId));
+    this.inFlight.set(videoId, run);
+    return run;
+  }
+
+  /**
+   * An earlier REAL proof, no recorded definitive failure, every structural
+   * gate still satisfied, and not older than TTL + grace.
+   */
+  private withinGrace(video: VideoForVerdict): boolean {
+    if (!video.drmVerifiedAt || !video.drmRequested || video.drmBlockedReason) return false;
+    // Re-run every non-time gate (platform, signing, provider, asset, status).
+    if (!this.evaluate({ ...video, drmVerifiedAt: new Date() }).playable) return false;
+    const ageSeconds = (Date.now() - video.drmVerifiedAt.getTime()) / 1000;
+    return ageSeconds <= this.ttlSeconds + this.graceSeconds;
+  }
+
+  private unavailable(videoId: string, detail: string): DrmVerdict {
+    this.logger.warn(`DRM verification for video ${videoId} could not reach the provider: ${detail}`);
+    return { playable: false, reason: 'VERIFICATION_UNAVAILABLE', detail };
+  }
+
+  /** Retries TRANSIENT provider failures with a short linear backoff; definitive ones are thrown at once. */
+  private async withRetry<T>(attempts: number, fn: () => Promise<T>): Promise<T> {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await fn();
+      } catch (error) {
+        if (attempt >= attempts || !isTransientProviderError(error)) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+      }
+    }
   }
 }

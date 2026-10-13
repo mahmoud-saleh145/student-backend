@@ -1,6 +1,7 @@
 import { DrmVerificationService, VideoForVerdict } from 'src/modules/playback/drm-verification.service';
 import { PlaybackService } from 'src/modules/playback/playback.service';
 import { allowDrm, denyDrm, verifiedVideo } from './helpers/drm-doubles';
+import { fetchManifestViaGlobalFetch } from './helpers/drm-doubles';
 
 /**
  * THE SECURITY TESTS.
@@ -69,6 +70,7 @@ function buildVerifier(opts?: {
   const gumlet = {
     isSigningConfigured: jest.fn(() => opts?.signing ?? true),
     dashManifestUrl: jest.fn(() => 'https://video.gumlet.io/ws_1/a_1/main.mpd'),
+    fetchManifest: fetchManifestViaGlobalFetch,
     assetHasDrm: jest.fn((t: string) =>
       /schemeIdUri="urn:mpeg:dash:mp4protection:2011"/.test(t) && /cenc:default_KID="/.test(t),
     ),
@@ -142,11 +144,16 @@ describe('DrmVerificationService.verify - what actually counts as proof', () => 
     expect(t.updates.at(-1)?.drmVerifiedAt).toBeNull();
   });
 
-  it('fails closed when the provider cannot be reached', async () => {
+  it('does not grant when the provider cannot be reached - and does not erase an earlier proof either', async () => {
+    // Contract changed deliberately (recovery): an unreachable provider proves
+    // nothing about the asset, so verify() refuses to conclude
+    // (VERIFICATION_UNAVAILABLE) and writes NOTHING. Clearing the proof here
+    // turned every Gumlet blip into an immediate outage. The playback path adds
+    // a bounded grace on top (drm-verification-transient.spec.ts).
     const t = buildVerifier({ getAssetThrows: true });
     const verdict = await t.service.verify('v_1');
-    expect(verdict.playable).toBe(false);
-    expect(t.updates.at(-1)?.drmVerifiedAt).toBeNull();
+    expect(verdict).toMatchObject({ playable: false, reason: 'VERIFICATION_UNAVAILABLE' });
+    expect(t.updates).toEqual([]);
   });
 
   it('fails closed when the manifest cannot be fetched', async () => {

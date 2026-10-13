@@ -233,6 +233,34 @@ export class EnvironmentVariables {
   @Max(604800)
   DRM_VERIFICATION_TTL_SECONDS = 21600;
 
+  /**
+   * How long past the TTL an earlier successful DRM proof is still honoured on
+   * the playback path while Gumlet cannot be reached. Never applies after a
+   * definitive failure or to a never-verified video. 0 disables the grace.
+   */
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(604800)
+  DRM_VERIFICATION_GRACE_SECONDS = 86400;
+
+  /** In-process DRM re-verification sweep interval (Redis-locked). 0 disables the timer. */
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(86400)
+  DRM_SWEEP_INTERVAL_SECONDS = 900;
+
+  /** Per-request timeout for Gumlet's asset API and manifest reads, in milliseconds. */
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(500)
+  @Max(30000)
+  GUMLET_HTTP_TIMEOUT_MS = 5000;
+
   // --- payments -------------------------------------------------------------
   @IsString() PAYMENT_PROVIDER = 'none';
   @IsString() PAYMENT_CURRENCY = 'EGP';

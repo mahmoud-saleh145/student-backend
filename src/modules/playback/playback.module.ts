@@ -4,6 +4,7 @@ import { DevicesModule } from '../devices/devices.module';
 import { GumletDrmService } from './gumlet-drm.service';
 import { DrmVerificationService } from './drm-verification.service';
 import { DrmVerificationSweepService } from './drm-verification-sweep.service';
+import { DrmVerificationScheduler } from './drm-verification-scheduler.service';
 import { ManifestController } from './manifest.controller';
 import { ManifestService } from './manifest.service';
 import { MediaOriginController } from './media-origin.controller';
@@ -25,6 +26,8 @@ import { PlaybackService } from './playback.service';
     // the sweep. It is the counterpart to DrmVerificationService: that service
     // decides whether a video is playable, this one decides when to re-ask.
     DrmVerificationSweepService,
+    // Runs the sweep in-process under a Redis lock (no queue, no worker).
+    DrmVerificationScheduler,
   ],
   exports: [
     PlaybackService,

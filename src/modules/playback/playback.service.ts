@@ -705,7 +705,10 @@ export class PlaybackService {
       });
     }
 
-    const verdict = await this.drmVerification.evaluateVideo(video.id);
+    // Refresh-on-read: a lapsed proof is re-verified here, by whichever process
+    // is issuing the ticket, so playback never depends on a background worker
+    // having run recently (see DrmVerificationService.ensurePlayable).
+    const verdict = await this.drmVerification.ensurePlayable(video.id);
     if (verdict.playable) return;
 
     this.logger.warn(`Denied DRM playback for video ${video.id}: ${verdict.reason} (${verdict.detail})`);

@@ -10,6 +10,7 @@ import {
   WORKER_HEARTBEAT_TTL_SECONDS,
 } from '../../jobs/worker-heartbeat';
 import { PrismaService } from '../../database/prisma.service';
+import { DRM_LAST_SWEEP_KEY, type DrmLastSweepRecord } from '../playback/drm-verification-scheduler.service';
 import { RedisService } from '../../redis/redis.service';
 import { StorageService } from '../storage/storage.service';
 
@@ -68,7 +69,7 @@ export class HealthController {
   @Public()
   @ApiOperation({ summary: 'Full dependency report' })
   async deep() {
-    const [database, redis, storage, worker, videoCounts] = await Promise.all([
+    const [database, redis, storage, worker, videoCounts, lastSweep] = await Promise.all([
       this.prisma.ping(),
       this.redis.ping(),
       this.storage.health(),
@@ -77,7 +78,17 @@ export class HealthController {
         .groupBy({ by: ['status'], where: { deletedAt: null }, _count: { _all: true } })
         .then((rows) => Object.fromEntries(rows.map((r) => [r.status, r._count._all])))
         .catch(() => null),
+      this.redis.getJson<DrmLastSweepRecord>(DRM_LAST_SWEEP_KEY).catch(() => null),
     ]);
+
+    // The sweep runs in-process (DrmVerificationScheduler). Playback does not
+    // depend on it - the ticket path refreshes lapsed proofs - but a sweep that
+    // has not completed for two intervals means proofs are only being renewed
+    // on demand, which is worth knowing.
+    const sweepIntervalSeconds = Number(process.env.DRM_SWEEP_INTERVAL_SECONDS ?? 900);
+    const sweepAgeSeconds = lastSweep ? (Date.now() - new Date(lastSweep.at).getTime()) / 1000 : null;
+    const sweepOverdue =
+      sweepIntervalSeconds > 0 && (sweepAgeSeconds === null || sweepAgeSeconds > 2 * sweepIntervalSeconds);
 
     const checks = { database, redis, storage, worker: Boolean(worker) };
     const critical = database;
@@ -93,10 +104,24 @@ export class HealthController {
             ? undefined
             : 'A worker is running but cannot execute ffmpeg/ffprobe — every transcode will fail'
           : `No queue worker has checked in within ${WORKER_HEARTBEAT_TTL_SECONDS}s — uploaded videos stay QUEUED and scheduled jobs do not run`,
-        drmSweep:
-          worker && !(worker.capabilities ?? []).includes('drm-verification-sweep')
-            ? 'The running worker predates the DRM verification sweep: it will silently drop that job and verified videos will go stale'
-            : undefined,
+        drmSweep: sweepOverdue
+          ? 'No DRM verification sweep has completed in the last two intervals; proofs are only being renewed on demand at ticket time'
+          : undefined,
+      },
+      drmVerification: {
+        sweepIntervalSeconds,
+        lastSweep: lastSweep
+          ? {
+              at: lastSweep.at,
+              host: lastSweep.host,
+              checked: lastSweep.checked,
+              refreshed: lastSweep.refreshed,
+              failed: lastSweep.failed,
+              errored: lastSweep.errored,
+              skippedFresh: lastSweep.skippedFresh,
+              skippedPlatform: lastSweep.skippedPlatform,
+            }
+          : null,
       },
       // Where the video pipeline stands, so "why is it still QUEUED?" has an
       // answer without opening the database. `build` lets a release confirm the

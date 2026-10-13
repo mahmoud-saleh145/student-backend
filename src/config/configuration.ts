@@ -207,6 +207,12 @@ export const videoConfig = registerAs('video', () => ({
        */
       webhookSecret: process.env.GUMLET_WEBHOOK_SECRET ?? null,
       tokenLifetimeSeconds: num(process.env.GUMLET_TOKEN_LIFETIME_SECONDS, 300),
+      /**
+       * Per-request timeout for Gumlet's asset API and manifest reads. Without
+       * it a hung connection stalls verification (and, when verification runs
+       * on the ticket path, the student) indefinitely.
+       */
+      httpTimeoutMs: num(process.env.GUMLET_HTTP_TIMEOUT_MS, 5000),
       // TEMPORARY playback hotfix: when true, a ticket request that explicitly
       // opts in with `delivery: 'embed'` (only the student web does) also gets
       // a signed Gumlet embed-player URL (`embedUrl`). Off by default.

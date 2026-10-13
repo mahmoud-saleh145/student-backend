@@ -12,11 +12,31 @@
  * masked by a permissive double.
  */
 import { DrmVerificationService, VideoForVerdict } from 'src/modules/playback/drm-verification.service';
+import { GumletRequestError } from 'src/modules/playback/gumlet-drm.service';
+
+/**
+ * `GumletDrmService.fetchManifest` for doubles: reads through the global
+ * `fetch` mock the suites already install. A mocked response without a status
+ * keeps the historical meaning of "not ok" (an answer: 404, definitive); a
+ * rejected fetch is what the real method reports for timeouts and network
+ * failures (transient).
+ */
+export async function fetchManifestViaGlobalFetch(url: string): Promise<{ status: number; ok: boolean; text: string }> {
+  let response: { ok: boolean; status?: number; text: () => Promise<string> };
+  try {
+    response = (await fetch(url)) as never;
+  } catch {
+    throw new GumletRequestError('Manifest read failed: network error', true, null);
+  }
+  const status = response.status ?? (response.ok ? 200 : 404);
+  return { status, ok: response.ok, text: response.ok ? await response.text() : '' };
+}
 
 type GumletDouble = {
   isSigningConfigured?: () => boolean;
   dashManifestUrl?: (p: { assetId: string; workspaceId?: string | null }) => string;
   assetHasDrm?: (manifestText: string) => boolean;
+  fetchManifest?: (url: string) => Promise<{ status: number; ok: boolean; text: string }>;
   getAsset?: (assetId: string) => Promise<{
     assetId: string;
     status: string;
@@ -106,6 +126,7 @@ export function buildDrmVerification(opts?: {
     {
       isSigningConfigured: jest.fn(() => opts?.signingConfigured ?? true),
       dashManifestUrl: jest.fn(() => 'https://video.gumlet.io/ws_1/a_1/main.mpd'),
+      fetchManifest: fetchManifestViaGlobalFetch,
       assetHasDrm: jest.fn(() => true),
       getAsset: jest.fn(async () => ({
         assetId: 'a_1',
@@ -127,6 +148,7 @@ export function allowDrm(): DrmVerificationService {
   return {
     evaluate: () => ({ playable: true, reason: null }),
     evaluateVideo: async () => ({ playable: true, reason: null }),
+    ensurePlayable: async () => ({ playable: true, reason: null }),
     verify: async () => ({ playable: true, reason: null }),
   } as unknown as DrmVerificationService;
 }
@@ -139,6 +161,7 @@ export function denyDrm(
   return {
     evaluate: () => ({ playable: false, reason, detail }),
     evaluateVideo: async () => ({ playable: false, reason, detail }),
+    ensurePlayable: async () => ({ playable: false, reason, detail }),
     verify: async () => ({ playable: false, reason, detail }),
   } as unknown as DrmVerificationService;
 }

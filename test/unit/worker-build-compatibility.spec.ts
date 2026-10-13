@@ -13,6 +13,7 @@
  * health report flags a worker that cannot run the sweep.
  */
 import { HealthController } from '../../src/modules/health/health.controller';
+import { DRM_LAST_SWEEP_KEY } from '../../src/modules/playback/drm-verification-scheduler.service';
 import {
   WORKER_CAPABILITIES,
   WorkerHeartbeat,
@@ -66,13 +67,16 @@ describe('the worker heartbeat', () => {
 });
 
 describe('/meta/health/deep', () => {
-  function deepWith(worker: Partial<WorkerHeartbeatPayload> | null) {
+  function deepWith(worker: Partial<WorkerHeartbeatPayload> | null, lastSweep: Record<string, unknown> | null = null) {
     const controller = new HealthController(
       {
         ping: jest.fn(async () => true),
         video: { groupBy: jest.fn(async () => []) },
       } as never,
-      { ping: jest.fn(async () => true), getJson: jest.fn(async () => worker) } as never,
+      {
+        ping: jest.fn(async () => true),
+        getJson: jest.fn(async (key: string) => (key === DRM_LAST_SWEEP_KEY ? lastSweep : worker)),
+      } as never,
       { health: jest.fn(async () => true) } as never,
       {
         getOrThrow: (k: string) =>
@@ -83,22 +87,36 @@ describe('/meta/health/deep', () => {
   }
 
   const base = { pid: 1, host: 'edu-worker-pc', startedAt: 'x', at: 'y', ffmpeg: true, ffprobe: true };
+  const sweep = (minutesAgo: number) => ({
+    at: new Date(Date.now() - minutesAgo * 60_000).toISOString(),
+    host: 'srv-api',
+    checked: 11, refreshed: 11, failed: 0, errored: 0, skippedFresh: 1, skippedPlatform: 0,
+  });
 
-  it('flags a worker that predates the DRM sweep (today\'s 99c0bb1 container)', async () => {
-    const res = await deepWith(base);
+  it('flags a sweep that has not completed recently - independent of which worker is running', async () => {
+    // Today's 99c0bb1 container with no sweep record: exactly the state that
+    // let proofs age to 35-38 h. Still reported, but now from the real signal.
+    const res = await deepWith(base, null);
     expect(res.checks.worker).toBe(true);
-    expect(res.notes.drmSweep).toMatch(/predates the DRM verification sweep/);
+    expect(res.notes.drmSweep).toMatch(/No DRM verification sweep has completed/);
+    expect(res.drmVerification).toEqual({ sweepIntervalSeconds: 900, lastSweep: null });
     expect(res.videoPipeline.worker).toMatchObject({ build: null, capabilities: [] });
   });
 
-  it('is quiet for a worker built with the sweep, and reports both builds', async () => {
+  it('is quiet when a sweep completed within two intervals, and reports it', async () => {
     process.env.RENDER_GIT_COMMIT = 'c0f4883bbbbbbbbb';
-    const res = await deepWith({ ...base, build: 'c0f4883bbbbb', capabilities: ['drm-verification-sweep'] });
+    const res = await deepWith({ ...base, build: 'c0f4883bbbbb', capabilities: ['drm-verification-sweep'] }, sweep(5));
     expect(res.notes.drmSweep).toBeUndefined();
+    expect(res.drmVerification.lastSweep).toMatchObject({ host: 'srv-api', refreshed: 11 });
     expect(res.videoPipeline).toMatchObject({
       apiBuild: 'c0f4883bbbbb',
       worker: { build: 'c0f4883bbbbb', capabilities: ['drm-verification-sweep'] },
     });
+  });
+
+  it('flags a sweep older than two intervals', async () => {
+    const res = await deepWith(null, sweep(31));
+    expect(res.notes.drmSweep).toMatch(/No DRM verification sweep has completed/);
   });
 
   it('with no worker at all, keeps the existing "no worker" note', async () => {

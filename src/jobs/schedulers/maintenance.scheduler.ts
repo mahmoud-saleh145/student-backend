@@ -96,17 +96,14 @@ export class MaintenanceScheduler implements OnModuleInit {
       '*/30 * * * *',
     );
 
-    // DRM re-verification.
+    // DRM re-verification is deliberately NOT a BullMQ repeatable any more.
     //
-    // This schedule is the difference between "verified" being a fact with an
-    // expiry and being a fact that silently lapses. It runs every 30 minutes,
-    // comfortably inside the refresh margin the sweep derives from the TTL
-    // (a third of it, floor 60s), so a proof is renewed long before it is due
-    // to expire and the expiry is never actually observed by a student.
-    //
-    // It is a registered BullMQ repeatable, not a local interval: with several
-    // API replicas only one instance performs each occurrence.
-    await schedule(this.maintenance as never, MAINTENANCE_JOBS.refreshDrmVerification, '*/30 * * * *');
+    // A queued job only runs where RUN_WORKERS=true, and an older worker build
+    // completes job names it does not know - it silently swallowed this one.
+    // The sweep now runs in-process under a Redis lock (DrmVerificationScheduler,
+    // PlaybackModule), so the always-on API keeps proofs fresh with no worker,
+    // and the ticket path refreshes a lapsed proof itself. The processor still
+    // handles MAINTENANCE_JOBS.refreshDrmVerification if one is enqueued by hand.
 
     // Hourly bookkeeping.
     await schedule(this.maintenance as never, MAINTENANCE_JOBS.expireEnrollments, '15 * * * *');

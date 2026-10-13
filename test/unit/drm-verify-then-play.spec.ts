@@ -46,6 +46,8 @@ function world(opts: {
   drmType?: string | null;
   attachments?: Row[];
   entitledCourses?: string[];
+  /** Gumlet unreachable: every provider request fails at the network level. */
+  gumletDown?: boolean;
 } = {}) {
   const video: Row = {
     id: 'vid_1',
@@ -75,8 +77,11 @@ function world(opts: {
   let existingTicket: Row | null = null;
   const ticketUpdates: { where: Row; data: Row }[] = [];
 
+  const providerCalls: string[] = [];
   global.fetch = jest.fn(async (input: unknown) => {
     const url = String(input);
+    providerCalls.push(url.startsWith('https://api.gumlet.com/') ? 'asset-api' : 'manifest');
+    if (opts.gumletDown) throw new TypeError('fetch failed');
     if (url.startsWith('https://api.gumlet.com/v1/video/assets/')) {
       const transformations = opts.drmType === null ? {} : { drm: { type: opts.drmType ?? 'widevine,fairplay' } };
       return {
@@ -197,30 +202,42 @@ function world(opts: {
     return playback.heartbeat({ user: STUDENT, ticketId: 'tid_live', positionSeconds: 120, watchedDeltaSeconds: 30 });
   };
 
-  return { video, tickets, drmVerification, signLicence, issue, heartbeat, access, ticketUpdates: () => ticketUpdates };
+  return {
+    video, tickets, drmVerification, signLicence, issue, heartbeat, access,
+    ticketUpdates: () => ticketUpdates,
+    providerCalls: () => [...providerCalls],
+  };
 }
 
 describe('existing eligible Gumlet asset with drmRequested=false', () => {
-  it('is refused before verification, verified once, then issues a playable Widevine ticket', async () => {
+  it('a separate verify() establishes the proof, and the hot path agrees with it', async () => {
     const w = world();
-
-    await expect(w.issue()).rejects.toMatchObject({ code: 'VIDEO_UNAVAILABLE' });
-    expect(w.signLicence).not.toHaveBeenCalled();
-    // A refused video leaves no ACTIVE grant behind.
-    expect(w.tickets).toHaveLength(0);
-
     const verdict = await w.drmVerification.verify('vid_1');
     expect(verdict).toEqual({ playable: true, reason: null });
     expect(w.video.drmRequested).toBe(true);
     expect(w.video.drmVerifiedAt).toBeInstanceOf(Date);
-
-    // The hot path agrees with verify() - this is the regression.
+    // The hot path agrees with verify() - this is the Fix 2 regression.
     await expect(w.drmVerification.evaluateVideo('vid_1')).resolves.toEqual({ playable: true, reason: null });
+  });
+
+  it('with NO worker and NO prior sweep, the first ticket request verifies on demand and plays', async () => {
+    const w = world();
 
     const ticket = await w.issue();
+
     expect(ticket.drm).toMatchObject({ scheme: 'widevine' });
     expect(ticket.drm?.licenseUrl).toMatch(/^https:\/\/widevine\.gumlet\.com\/licence\/org_1\/asset_1\?/);
     expect(w.tickets[0]).toMatchObject({ lessonId: 'les_src', courseId: 'crs_src' });
+    expect(w.video).toMatchObject({ drmRequested: true, drmVerifiedAt: expect.any(Date) });
+    expect(w.providerCalls()).toEqual(['asset-api', 'manifest']);
+  });
+
+  it('a fresh proof is served without asking the provider again', async () => {
+    const w = world();
+    await w.issue();
+    const calls = w.providerCalls().length;
+    await w.issue();
+    expect(w.providerCalls()).toHaveLength(calls);
   });
 });
 
@@ -242,15 +259,42 @@ describe('verification failure', () => {
   });
 });
 
-describe('expired verification', () => {
-  it('a verification older than the TTL is refused as VERIFICATION_STALE until re-verified', async () => {
-    const sevenHoursAgo = new Date(Date.now() - 7 * 3600 * 1000);
-    const w = world({ row: { drmRequested: true, drmVerifiedAt: sevenHoursAgo } });
+describe('expired verification (no worker needed)', () => {
+  const hoursAgo = (h: number) => new Date(Date.now() - h * 3600 * 1000);
 
-    await expect(w.issue()).rejects.toMatchObject({ details: { drmState: 'VERIFICATION_STALE' } });
-
-    await w.drmVerification.verify('vid_1');
+  it('a proof older than the TTL is renewed on demand by the ticket request', async () => {
+    const w = world({ row: { drmRequested: true, drmVerifiedAt: hoursAgo(7) } });
     await expect(w.issue()).resolves.toMatchObject({ drm: { scheme: 'widevine' } });
+    expect((w.video.drmVerifiedAt as Date).getTime()).toBeGreaterThan(Date.now() - 60_000);
+  });
+
+  it('Gumlet unreachable: an earlier proof inside TTL + grace still plays, and is NOT erased', async () => {
+    const proof = hoursAgo(7); // TTL 6 h, default grace 24 h
+    const w = world({ gumletDown: true, row: { drmRequested: true, drmVerifiedAt: proof } });
+    await expect(w.issue()).resolves.toMatchObject({ drm: { scheme: 'widevine' } });
+    expect(w.video.drmVerifiedAt).toEqual(proof);
+  });
+
+  it('Gumlet unreachable: a proof older than TTL + grace is refused (and still not erased)', async () => {
+    const proof = hoursAgo(31);
+    const w = world({ gumletDown: true, row: { drmRequested: true, drmVerifiedAt: proof } });
+    await expect(w.issue()).rejects.toMatchObject({ details: { drmState: 'VERIFICATION_STALE' } });
+    expect(w.video.drmVerifiedAt).toEqual(proof);
+    expect(w.tickets).toHaveLength(0);
+  });
+
+  it('Gumlet unreachable: a video that was NEVER verified is refused - grace needs a real earlier proof', async () => {
+    const w = world({ gumletDown: true });
+    await expect(w.issue()).rejects.toBeDefined();
+    expect(w.tickets).toHaveLength(0);
+    expect(w.signLicence).not.toHaveBeenCalled();
+  });
+
+  it('a lapsed proof that now fails DEFINITIVELY (manifest unencrypted) is cleared and refused', async () => {
+    const w = world({ manifest: UNENCRYPTED, row: { drmRequested: true, drmVerifiedAt: hoursAgo(7) } });
+    await expect(w.issue()).rejects.toBeDefined();
+    expect(w.video.drmVerifiedAt).toBeNull();
+    expect(w.tickets).toHaveLength(0);
   });
 });
 
@@ -352,13 +396,24 @@ describe('Fix 6: heartbeat and rotation keep the destination lesson', () => {
     expect(w.tickets[0]).toMatchObject({ lessonId: 'les_dst', courseId: 'crs_dst', rotatedFromId: 'tid_live' });
   });
 
-  it('rotation still passes the strict DRM gate: a stale verification ends playback', async () => {
+  it('rotation renews a lapsed proof on demand and keeps playing (no worker needed)', async () => {
     const w = world({
       attachments: shared,
       row: { drmRequested: true, drmVerifiedAt: new Date(Date.now() - 7 * 3600 * 1000) },
     });
+    const res = await w.heartbeat(onDestination, 5 * 1000);
+    expect(res).toMatchObject({ ok: true, ticket: { drm: { scheme: 'widevine' } } });
+    expect(w.tickets[0]).toMatchObject({ lessonId: 'les_dst', courseId: 'crs_dst' });
+  });
+
+  it('rotation still passes the strict DRM gate: a lapsed proof that fails definitively ends playback', async () => {
+    const w = world({
+      attachments: shared,
+      manifest: UNENCRYPTED,
+      row: { drmRequested: true, drmVerifiedAt: new Date(Date.now() - 7 * 3600 * 1000) },
+    });
     await expect(w.heartbeat(onDestination, 5 * 1000)).rejects.toMatchObject({
-      details: { drmState: 'VERIFICATION_STALE' },
+      details: { drmState: 'NOT_VERIFIED' },
     });
     // No replacement grant, and the live ticket was not released first.
     expect(w.tickets).toHaveLength(0);

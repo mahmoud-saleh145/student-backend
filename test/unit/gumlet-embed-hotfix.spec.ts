@@ -102,7 +102,8 @@ function makeService(
   const gumlet = new GumletDrmService(configService as never);
   const rows = new Map<string, VideoRow>([gumletVideo, legacyVideo].map((v) => [v.id, v]));
   const drmVerification = {
-    evaluateVideo: jest.fn(async (videoId: string) => verdictFor(rows.get(videoId) ?? legacyVideo)),
+    // The strict gate's entry point (refresh-on-read, see DrmVerificationService).
+    ensurePlayable: jest.fn(async (videoId: string) => verdictFor(rows.get(videoId) ?? legacyVideo)),
   };
   const service = new PlaybackService(
     {} as never,
@@ -221,7 +222,7 @@ describe('Gumlet embed hotfix: inherits the strict DRM gate (recovery merge)', (
       const signEmbed = jest.spyOn(gumlet, 'signEmbedUrl');
       const signLicence = jest.spyOn(gumlet, 'signLicenseUrl');
       await expect(resolve(service, gumletVideo, 'ios', 'embed')).rejects.toBeDefined();
-      expect(drmVerification.evaluateVideo).toHaveBeenCalledWith('v_gumlet');
+      expect(drmVerification.ensurePlayable).toHaveBeenCalledWith('v_gumlet');
       expect(signEmbed).not.toHaveBeenCalled();
       expect(signLicence).not.toHaveBeenCalled();
     },
@@ -230,7 +231,7 @@ describe('Gumlet embed hotfix: inherits the strict DRM gate (recovery merge)', (
   it('a verified asset still gets the embed URL, signed only after the gate ran', async () => {
     const order: string[] = [];
     const { service, gumlet, drmVerification } = makeService(true);
-    drmVerification.evaluateVideo.mockImplementation(async () => {
+    drmVerification.ensurePlayable.mockImplementation(async () => {
       order.push('gate');
       return { playable: true, reason: null };
     });

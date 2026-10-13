@@ -134,6 +134,7 @@ function harness(opts: { attachments: LessonRow[] }) {
       // The strict gate now runs before the ticket row is written, so the
       // double must answer the method the gate actually calls.
       evaluateVideo: jest.fn(async () => ({ playable: true, reason: null })),
+      ensurePlayable: jest.fn(async () => ({ playable: true, reason: null })),
       verify: jest.fn(async () => ({ playable: true, reason: null })),
     } as never, // drmVerification
     cfg as never,

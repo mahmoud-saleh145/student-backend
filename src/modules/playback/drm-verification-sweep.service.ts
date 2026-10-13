@@ -145,6 +145,9 @@ export class DrmVerificationSweepService {
       try {
         const verdict = await this.drmVerification.verify(id);
         if (verdict.playable) result.refreshed += 1;
+        // The provider could not be asked: nothing was concluded or written,
+        // so this is a retry-next-run, not a failed verification.
+        else if (verdict.reason === 'VERIFICATION_UNAVAILABLE') result.errored += 1;
         else result.failed += 1;
       } catch (error) {
         // An unexpected throw is not the same as a failed verification. Leaving

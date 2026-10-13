@@ -92,6 +92,30 @@ export interface GumletAssetStatus {
   drmSystems: string[] | null;
 }
 
+/**
+ * A failed call to Gumlet, classified.
+ *
+ * `transient` is true when the failure says nothing about the asset itself -
+ * a timeout, a dropped connection, a 5xx, a 429, or credentials rejected by
+ * the API (401/403, an operator problem). Verification must NOT erase an
+ * earlier proof because of one of these. It is false when Gumlet answered
+ * definitively that the asset does not exist (404/410).
+ */
+export class GumletRequestError extends AppException {
+  constructor(
+    message: string,
+    readonly transient: boolean,
+    readonly httpStatus: number | null,
+  ) {
+    super(ErrorCode.VIDEO_UNAVAILABLE, { message });
+  }
+}
+
+/** True for HTTP statuses that describe the provider, not the asset. */
+export function isTransientHttpStatus(status: number): boolean {
+  return status === 401 || status === 403 || status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
 /** Parses Gumlet's `input.transformations.drm` into lower-case system names. */
 export function parseGumletDrmSystems(drm: unknown): string[] | null {
   if (drm === undefined || drm === null) return null;
@@ -404,25 +428,29 @@ export class GumletDrmService {
       });
     }
 
-    const res = await fetch(`https://api.gumlet.com/v1/video/assets/${encodeURIComponent(assetId)}`, {
+    const res = await this.timedFetch(`https://api.gumlet.com/v1/video/assets/${encodeURIComponent(assetId)}`, {
       headers: { authorization: `Bearer ${this.cfg.apiKey}` },
-    });
+    }, 'Gumlet asset lookup');
 
     const json = (await res.json().catch(() => null)) as
       | { status?: string; progress?: number; output?: { playback_url?: string; dash_playback_url?: string }; error?: { message?: string } }
       | { error?: { message?: string } }
       | null;
 
-    if (!res.ok || !json) {
-      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
-        message: `Gumlet asset lookup failed with HTTP ${res.status}`,
-      });
+    if (!res.ok) {
+      throw new GumletRequestError(
+        `Gumlet asset lookup failed with HTTP ${res.status}`,
+        isTransientHttpStatus(res.status),
+        res.status,
+      );
+    }
+    if (!json) {
+      // A 2xx with an unreadable body is the provider misbehaving, not an answer.
+      throw new GumletRequestError('Gumlet asset lookup returned an unreadable body', true, res.status);
     }
 
     if ('error' in json && json.error && Object.keys(json).length === 1) {
-      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
-        message: json.error.message ?? 'Gumlet asset lookup failed',
-      });
+      throw new GumletRequestError(json.error.message ?? 'Gumlet asset lookup failed', false, res.status);
     }
 
     const a = json as {
@@ -454,6 +482,34 @@ export class GumletDrmService {
         ? parseGumletDrmSystems(a.input.transformations.drm)
         : null,
     };
+  }
+
+  /**
+   * Reads a (public, unsigned) Gumlet manifest for verification.
+   *
+   * Returns the status and body for any HTTP answer; throws a transient
+   * GumletRequestError only when no answer arrived (timeout, network). The
+   * caller decides which statuses are definitive.
+   */
+  async fetchManifest(url: string): Promise<{ status: number; ok: boolean; text: string }> {
+    const res = await this.timedFetch(url, {}, 'Manifest read');
+    const text = res.ok ? await res.text() : '';
+    return { status: res.status, ok: res.ok, text };
+  }
+
+  /**
+   * fetch() with the configured timeout. A timeout or network failure becomes
+   * a TRANSIENT GumletRequestError, never an unbounded wait.
+   */
+  private async timedFetch(url: string, init: RequestInit, what: string): Promise<Response> {
+    const timeoutMs = this.cfg.httpTimeoutMs ?? 5000;
+    try {
+      return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    } catch (error) {
+      const name = (error as Error)?.name;
+      const reason = name === 'TimeoutError' || name === 'AbortError' ? `timed out after ${timeoutMs} ms` : 'network error';
+      throw new GumletRequestError(`${what} failed: ${reason}`, true, null);
+    }
   }
 
   /** A non-forgeable placeholder used by tests and by dry-run validation. */

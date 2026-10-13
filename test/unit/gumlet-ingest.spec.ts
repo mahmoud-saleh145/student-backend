@@ -1,5 +1,6 @@
 import { GumletIngestService } from 'src/modules/videos/gumlet-ingest.service';
 import { buildDrmVerification } from './helpers/drm-doubles';
+import { fetchManifestViaGlobalFetch } from './helpers/drm-doubles';
 
 /**
  * Fail-closed behaviour for the Gumlet-backed lifecycle.
@@ -89,6 +90,7 @@ function build(opts: {
     // Checked by replaceFailedAsset before it is allowed to clear an asset id.
     isSigningConfigured: () => true,
     isAssetPlayable: (s: string) => s === 'ready',
+    fetchManifest: fetchManifestViaGlobalFetch,
     assetHasDrm: (text: string) =>
       /urn:mpeg:dash:mp4protection:2011/.test(text) && /cenc:default_KID=/.test(text),
     createAsset: jest.fn(async () => ({ assetId: 'asset_1', status: 'pre-queued', playbackUrl: null })),

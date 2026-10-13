@@ -1,5 +1,6 @@
 import { GumletIngestService } from 'src/modules/videos/gumlet-ingest.service';
 import { VideosService } from 'src/modules/videos/videos.service';
+import { fetchManifestViaGlobalFetch } from './helpers/drm-doubles';
 
 /**
  * Automatic Gumlet ingestion.
@@ -55,6 +56,7 @@ function ingestHarness(rowOverrides: Record<string, unknown> = {}) {
   const gumlet = {
     isAssetApiConfigured: jest.fn(() => true),
     isAssetPlayable: jest.fn((s: string) => s === 'ready'),
+    fetchManifest: fetchManifestViaGlobalFetch,
     assetHasDrm: jest.fn(() => true),
     dashManifestUrl: jest.fn(() => 'https://video.gumlet.io/ws_1/a_1/main.mpd'),
     createAsset: jest.fn(async (_p?: unknown) => ({ assetId: 'a_1', status: 'queued' as string, playbackUrl: null as string | null })),
