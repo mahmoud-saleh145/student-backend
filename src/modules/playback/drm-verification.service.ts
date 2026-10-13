@@ -343,6 +343,26 @@ export class DrmVerificationService {
       });
     }
 
+    // DRM intent. `drmRequested` may be established here ONLY from a record of
+    // the request - ours (already true, written by adopt()) or the provider's
+    // (`input.transformations.drm.type` names Widevine, the system the CENC
+    // DASH manifest just proved). Assets adopted before the column existed read
+    // `false` while Gumlet records them as created with DRM; without this, a
+    // verified asset was still refused as DRM_NOT_REQUESTED on every ticket.
+    // With neither record the asset stays unverified: encryption alone does not
+    // say the platform asked for this asset to be protected.
+    const providerRecordsDrm = (asset.drmSystems ?? []).includes('widevine');
+    if (!video.drmRequested && !providerRecordsDrm) {
+      return fail({
+        playable: false,
+        reason: 'DRM_NOT_REQUESTED',
+        detail:
+          asset.drmSystems === null
+            ? 'Gumlet did not report which DRM systems this asset was created with, and DRM was never requested for it here.'
+            : 'Gumlet records this asset as created without Widevine DRM, and DRM was never requested for it here.',
+      });
+    }
+
     const verifiedAt = new Date();
     // Concurrency guard.
     //
@@ -362,6 +382,9 @@ export class DrmVerificationService {
       },
       data: {
         drmVerifiedAt: verifiedAt,
+        // Established above from our own or the provider's record of the
+        // request; always true for a row that reaches this write.
+        drmRequested: true,
         drmBlockedReason: null,
         gumletStatus: asset.status,
         gumletError: null,
@@ -372,9 +395,19 @@ export class DrmVerificationService {
       this.logger.log(
         `DRM verification for video ${videoId} finished after a newer one had already been recorded; keeping the newer result`,
       );
-      return { playable: true, reason: null };
+    } else {
+      this.logger.log(`DRM verified for video ${videoId} (asset ${asset.assetId})`);
     }
-    this.logger.log(`DRM verified for video ${videoId} (asset ${asset.assetId})`);
-    return { playable: true, reason: null };
+
+    // Report exactly what the playback path will now decide for the row as
+    // written, instead of a hard-coded success that could disagree with it.
+    // (count === 0 means a NEWER success is stored; the same verdict holds.)
+    return this.evaluate({
+      ...video,
+      drmRequested: true,
+      drmVerifiedAt: verifiedAt,
+      drmBlockedReason: null,
+      gumletStatus: asset.status,
+    });
   }
 }

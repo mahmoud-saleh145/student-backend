@@ -81,6 +81,27 @@ export interface GumletAssetStatus {
   width: number | null;
   height: number | null;
   frameRate: number | null;
+
+  /// DRM systems the asset was CREATED with, as recorded by the provider under
+  /// `input.transformations.drm.type` (e.g. "widevine,fairplay" -> ['widevine',
+  /// 'fairplay']). This is the provider's own record of the DRM request; it is
+  /// still not proof of encryption - the CENC manifest check is.
+  ///
+  /// NULL when the provider did not report the field at all (unknown), [] when
+  /// it reported no DRM system.
+  drmSystems: string[] | null;
+}
+
+/** Parses Gumlet's `input.transformations.drm` into lower-case system names. */
+export function parseGumletDrmSystems(drm: unknown): string[] | null {
+  if (drm === undefined || drm === null) return null;
+  if (typeof drm !== 'object') return [];
+  const type = (drm as { type?: unknown }).type;
+  if (typeof type !== 'string') return [];
+  return type
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s.length > 0);
 }
 
 const WIDEVINE_LICENSE_BASE = 'https://widevine.gumlet.com/licence';
@@ -408,7 +429,13 @@ export class GumletDrmService {
       status?: string;
       progress?: number;
       output?: { playback_url?: string; dash_playback_url?: string };
-      input?: { duration?: number; width?: number; height?: number; fps?: number };
+      input?: {
+        duration?: number;
+        width?: number;
+        height?: number;
+        fps?: number;
+        transformations?: { drm?: unknown };
+      };
       error?: { message?: string };
     };
 
@@ -423,6 +450,9 @@ export class GumletDrmService {
       width: positiveIntOrNull(a.input?.width),
       height: positiveIntOrNull(a.input?.height),
       frameRate: positiveNumberOrNull(a.input?.fps),
+      drmSystems: a.input?.transformations
+        ? parseGumletDrmSystems(a.input.transformations.drm)
+        : null,
     };
   }
 

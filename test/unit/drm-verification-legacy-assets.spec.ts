@@ -12,6 +12,11 @@ import { DrmVerificationService } from '../../src/modules/playback/drm-verificat
  *
  * The case these tests must ALSO keep red: an asset created WITHOUT DRM is still
  * denied, now by the CENC check rather than by the intent flag.
+ *
+ * Recovery Fix 2: verifying alone was not enough - the hot path still refused
+ * `drmRequested=false`. A successful verification now also records
+ * `drmRequested=true`, but only when the request is on record (ours, or
+ * Gumlet's `input.transformations.drm.type` naming Widevine).
  */
 
 const CENC_MANIFEST =
@@ -22,6 +27,8 @@ function build(opts: {
   row?: Record<string, unknown>;
   manifest?: string;
   assetStatus?: string;
+  /** Gumlet's record of the DRM systems the asset was created with. */
+  drmSystems?: string[] | null;
 }) {
   jest.spyOn(global, 'fetch').mockResolvedValue({
     ok: true,
@@ -64,6 +71,8 @@ function build(opts: {
       playbackUrl: null,
       dashPlaybackUrl: null,
       error: null,
+      // What Gumlet reports for every production asset today.
+      drmSystems: opts.drmSystems === undefined ? ['widevine', 'fairplay'] : opts.drmSystems,
     })),
     isAssetPlayable: (s: string) => s === 'ready',
   };
@@ -172,10 +181,27 @@ describe('DrmVerificationService.verify - pre-migration videos', () => {
     expect(v.reason).toBe('SIGNING_UNAVAILABLE');
   });
 
-  it('does not set drmRequested itself: that stays an adopt()-written intent flag', async () => {
-    // The fix must not quietly mutate the intent column, or a video whose asset
-    // later loses DRM would keep claiming it was requested.
+  // Superseded policy (recovery Fix 2). Leaving drmRequested=false after a
+  // successful verification is what made every pre-column asset unplayable:
+  // evaluate() refuses it as DRM_NOT_REQUESTED on every ticket. The flag is now
+  // established at verification - but ONLY from a record of the request.
+  it('establishes drmRequested from the provider record of the DRM request, so the hot path agrees', async () => {
     const { service, row } = build({});
+    await service.verify('v_old');
+    expect(row.drmRequested).toBe(true);
+    expect(service.evaluate(row as never)).toEqual({ playable: true, reason: null });
+  });
+
+  it('does not establish drmRequested without any record of the request, even for a CENC manifest', async () => {
+    const { service, row } = build({ drmSystems: null });
+    const v = await service.verify('v_old');
+    expect(v).toMatchObject({ playable: false, reason: 'DRM_NOT_REQUESTED' });
+    expect(row.drmRequested).toBe(false);
+    expect(row.drmVerifiedAt).toBeNull();
+  });
+
+  it('a verification failure never sets drmRequested', async () => {
+    const { service, row } = build({ manifest: UNENCRYPTED });
     await service.verify('v_old');
     expect(row.drmRequested).toBe(false);
   });
