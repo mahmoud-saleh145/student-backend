@@ -6,6 +6,7 @@ import {
   NotFoundException,
   Param,
   Post,
+  Query,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
@@ -47,6 +48,11 @@ class InitUploadDto {
 
 class AttachExistingVideoDto {
   @IsString() @MaxLength(32) videoId!: string;
+}
+
+class RemoveVideoQueryDto {
+  /** The lecture the video is being removed from. Required for a shared asset. */
+  @IsOptional() @IsString() @MaxLength(32) lessonId?: string;
 }
 
 class AddCaptionDto {
@@ -140,12 +146,18 @@ export class VideosController {
   @Delete(':videoId')
   @StaffOnly()
   @ApiOperation({
-    summary: 'Archive a video and purge its media objects',
+    summary: 'Remove a video from a lecture; archive it when no other lecture uses it',
     description:
-      'The metadata row is retained because watch events reference it; the HLS output and source file are deleted from storage.',
+      'Pass ?lessonId= to name the lecture it is being removed from; required when the asset is attached to more than one lecture. ' +
+      'While other lectures still use the asset it is only detached from that lecture. Otherwise the metadata row is archived ' +
+      '(retained because watch events reference it) and the HLS output and source file are deleted from storage.',
   })
-  remove(@Param('videoId') videoId: string, @CurrentUser() actor: AuthenticatedUser) {
-    return this.videos.remove(videoId, actor);
+  remove(
+    @Param('videoId') videoId: string,
+    @Query() query: RemoveVideoQueryDto,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    return this.videos.remove(videoId, actor, true, query.lessonId);
   }
 
   // ---------------------------------------------------------------------------
@@ -245,10 +257,13 @@ export class VideosController {
     @Body() dto: AttachExistingVideoDto,
     @CurrentUser() actor: AuthenticatedUser,
   ) {
-    // Destination-course permission is the gate.
+    // Both courses are gates. The destination check stops staff writing into a
+    // course they do not manage; the source check stops staff copying another
+    // course's paid media into a course whose enrolment and pricing they control.
     const lesson = await this.videos.getCourseForLesson(lessonId);
     if (!lesson) throw new NotFoundException('Lesson not found');
     await this.videos.assertCanManageCourseContent(actor.id, actor.role, lesson.courseId);
+    await this.assertCanManageVideo(dto.videoId, actor);
 
     return this.lessonVideos.attach({ lessonId, videoId: dto.videoId, actorId: actor.id });
   }
@@ -270,11 +285,11 @@ export class VideosController {
     @Param('videoId') videoId: string,
     @CurrentUser() actor: AuthenticatedUser,
   ) {
-    const lesson = await this.videos.getCourseForLesson(lessonId);
-    if (!lesson) throw new NotFoundException('Lesson not found');
-    await this.videos.assertCanManageCourseContent(actor.id, actor.role, lesson.courseId);
-
-    return this.lessonVideos.detach({ lessonId, videoId });
+    // Authorised against the lecture's own course inside VideosService.detach,
+    // which also revokes that lecture's live tickets, releases the origin
+    // pointer when the uploading lecture is detached, resets its duration and
+    // recounts its course - none of which the bare row delete did.
+    return this.videos.detach(videoId, lessonId, actor);
   }
 
   private async assertCanManageVideo(videoId: string, actor: AuthenticatedUser): Promise<void> {

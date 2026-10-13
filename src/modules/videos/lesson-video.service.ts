@@ -141,6 +141,19 @@ export class LessonVideoService {
     });
 
     if (!existing) {
+      // One live video per lecture. A second attachment would make lesson detail
+      // and the ticket resolver disagree about which file the lecture plays.
+      const occupied = await this.prisma.lessonVideo.findFirst({
+        where: { lessonId, videoId: { not: videoId }, video: { ...notDeleted } },
+        select: { videoId: true },
+      });
+      if (occupied) {
+        throw new AppException(ErrorCode.CONFLICT, {
+          message: 'This lecture already has a video. Remove it before attaching another.',
+          details: { lessonId, attachedVideoId: occupied.videoId },
+        });
+      }
+
       await this.prisma.lessonVideo.create({
         data: { lessonId, videoId, createdById: actorId, sortOrder: 0 },
       });

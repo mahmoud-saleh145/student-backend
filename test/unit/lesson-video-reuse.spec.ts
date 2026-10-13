@@ -63,7 +63,11 @@ function harness(opts: {
     },
     lessonVideo: {
       findMany: jest.fn(async () => linkRows),
-      findFirst: jest.fn(async () => ({ video })),
+      // The occupancy check ("another live video on this lecture?") filters by
+      // videoId NOT this one; the destination here is empty, so it finds none.
+      findFirst: jest.fn(async (args?: { where?: { videoId?: unknown } }) =>
+        args?.where?.videoId && typeof args.where.videoId === 'object' ? null : { video },
+      ),
       findUnique: jest.fn(async () => null),
       count: jest.fn(async () => linkRows.length),
       create: jest.fn(async (args: Row) => {

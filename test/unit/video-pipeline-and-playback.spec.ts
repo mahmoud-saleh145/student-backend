@@ -156,7 +156,14 @@ function videosService(overrides: { queue?: Record<string, jest.Mock>; heartbeat
     // Attachment rows. A plain owned video has exactly one, pointing back at
     // its own lesson.
     lessonVideo: {
-      findMany: jest.fn(async () => [{ lessonId: 'l1' }]),
+      // Answers by query shape rather than returning one canned list: the
+      // attachment lookup is by videoId, the "does this lecture still have
+      // another video" check is by lessonId IN [...].
+      findMany: jest.fn(async (args: { where: { videoId?: unknown; lessonId?: unknown } }) =>
+        typeof args.where.videoId === 'string'
+          ? [{ lessonId: 'l1', lesson: { courseId: 'c1', deletedAt: null } }]
+          : [],
+      ),
       deleteMany: jest.fn(async () => ({ count: 1 })),
     },
     $transaction: jest.fn(async (fn: (tx: unknown) => unknown): Promise<unknown> => fn(prisma)),
@@ -332,21 +339,43 @@ describe('VideosService.remove', () => {
       sourceKey: 'uploads/vid_1.mp4',
       processingJobId: 'job-1',
     });
-    // Two live attachments: this lesson and one other course.
-    (svc as unknown as { lessonVideos: unknown }).lessonVideos = {
-      countLiveAttachments: jest.fn().mockResolvedValue(2),
-    };
+    // Two live attachments: the uploading lecture and one in another course.
+    prisma.lessonVideo.findMany.mockImplementation(async (args: { where: { videoId?: unknown } }) =>
+      typeof args.where.videoId === 'string'
+        ? [
+            { lessonId: 'l1', lesson: { courseId: 'c1', deletedAt: null } },
+            { lessonId: 'l2', lesson: { courseId: 'c2', deletedAt: null } },
+          ]
+        : [],
+    );
 
-    const result = await svc.remove('vid_1', ACTOR);
+    // Removed from the OTHER course's lecture, which must be named.
+    const result = await svc.remove('vid_1', ACTOR, true, 'l2');
 
-    expect(result).toMatchObject({ ok: true, detached: true });
-    // The asset row survives, so nobody else's playback breaks.
+    expect(result).toMatchObject({ ok: true, detached: true, remainingAttachments: 1 });
+    // The asset row survives (the origin pointer is untouched: l2 is not the origin).
     expect(prisma.video.update).not.toHaveBeenCalled();
     // And the bytes are still there.
     expect(storage.deletePrefix).not.toHaveBeenCalled();
     expect(storage.deleteObject).not.toHaveBeenCalled();
-    // Nor are other courses' live playback grants revoked.
-    expect(prisma.playbackTicket.updateMany).not.toHaveBeenCalled();
+    // Only the detached lecture's grants are revoked - never the other course's.
+    expect(prisma.playbackTicket.updateMany).toHaveBeenCalledTimes(1);
+    expect(prisma.playbackTicket.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { videoId: 'vid_1', lessonId: 'l2', status: 'ACTIVE' } }),
+    );
+    expect(prisma.lessonVideo.deleteMany).toHaveBeenCalledWith({ where: { lessonId: 'l2', videoId: 'vid_1' } });
+  });
+
+  it('refuses to guess which lecture to remove a shared video from', async () => {
+    const { svc, prisma } = videosService();
+    prisma.video.findFirst.mockResolvedValue({ id: 'vid_1', courseId: 'c1', lessonId: 'l1' });
+    prisma.lessonVideo.findMany.mockResolvedValue([
+      { lessonId: 'l1', lesson: { courseId: 'c1', deletedAt: null } },
+      { lessonId: 'l2', lesson: { courseId: 'c2', deletedAt: null } },
+    ]);
+    await expect(svc.remove('vid_1', ACTOR)).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(prisma.lessonVideo.deleteMany).not.toHaveBeenCalled();
+    expect(prisma.video.update).not.toHaveBeenCalled();
   });
 
   it('refuses an already deleted video', async () => {

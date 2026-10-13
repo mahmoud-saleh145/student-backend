@@ -65,7 +65,16 @@ function harness(opts: { liveAttachments?: number; links?: Row[] } = {}) {
       }),
     },
     lessonVideo: {
-      findMany: jest.fn(async () => opts.links ?? [{ lessonId: 'l1' }]),
+      // Answers by query shape: the attachment lookup is by videoId; the
+      // "does this lecture still have another video" check is lessonId IN [...].
+      findMany: jest.fn(async (args: { where?: { videoId?: unknown } } = {}) =>
+        typeof args.where?.videoId === 'string'
+          ? (opts.links ?? [{ lessonId: 'l1' }]).map((l) => ({
+              lessonId: l.lessonId,
+              lesson: { courseId: (l.courseId as string) ?? 'c1', deletedAt: null },
+            }))
+          : [],
+      ),
       findUnique: jest.fn(async () => null),
       count: jest.fn(async () => opts.liveAttachments ?? 1),
       findFirst: jest.fn(async () => ({ lessonId: 'l1' })),
@@ -185,22 +194,27 @@ describe('deleting a video', () => {
     expect(storage.deleteObject).toHaveBeenCalled();
   });
 
-  it('DETACHES instead of destroying when another lesson still uses the asset', async () => {
-    const { service, prisma, storage } = harness({ liveAttachments: 3 });
+  it('DETACHES the named lecture instead of destroying when another lesson still uses the asset', async () => {
+    const { service, prisma, storage } = harness({
+      links: [{ lessonId: 'l1' }, { lessonId: 'l2', courseId: 'c2' }, { lessonId: 'l3', courseId: 'c3' }],
+    });
 
-    const result = await service.remove('vid_1', ACTOR);
+    const result = await service.remove('vid_1', ACTOR, true, 'l2');
 
-    expect(result).toMatchObject({ ok: true, detached: true, remainingAttachments: 3 });
-    // The asset row survives.
+    expect(result).toMatchObject({ ok: true, detached: true, remainingAttachments: 2 });
+    // The asset row survives (l2 is not the origin, so its pointer is untouched).
     expect(prisma.video.update).not.toHaveBeenCalled();
     // The bytes survive.
     expect(storage.deletePrefix).not.toHaveBeenCalled();
     expect(storage.deleteObject).not.toHaveBeenCalled();
-    // Other courses' live streams are untouched.
-    expect(prisma.playbackTicket.updateMany).not.toHaveBeenCalled();
-    // Only this lesson's link is removed.
+    // Only the detached lecture's live streams are revoked.
+    expect(prisma.playbackTicket.updateMany).toHaveBeenCalledTimes(1);
+    expect(prisma.playbackTicket.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { videoId: 'vid_1', lessonId: 'l2', status: 'ACTIVE' } }),
+    );
+    // Only that lesson's link is removed.
     expect(prisma.lessonVideo.deleteMany).toHaveBeenCalledWith({
-      where: { lessonId: 'l1', videoId: 'vid_1' },
+      where: { lessonId: 'l2', videoId: 'vid_1' },
     });
   });
 
@@ -208,15 +222,11 @@ describe('deleting a video', () => {
     // The asset stays live, so a duration reset here would blank a lecture that
     // still plays perfectly.
     const { service, prisma } = harness({
-      liveAttachments: 2,
-      links: [{ lessonId: 'l1' }, { lessonId: 'l2' }],
+      links: [{ lessonId: 'l1' }, { lessonId: 'l2', courseId: 'c2' }],
     });
-    await service.remove('vid_1', ACTOR);
-    for (const call of prisma.lesson.updateMany.mock.calls) {
-      expect(call[0]).not.toMatchObject({
-        data: { durationSeconds: 0 },
-        where: { id: { in: ['l2'] } },
-      });
-    }
+    await service.remove('vid_1', ACTOR, true, 'l1');
+    expect(prisma.lesson.updateMany.mock.calls).toEqual([
+      [{ where: { id: { in: ['l1'] } }, data: { durationSeconds: 0 } }],
+    ]);
   });
 });

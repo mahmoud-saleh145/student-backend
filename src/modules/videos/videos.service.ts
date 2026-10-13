@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import {
   AuditAction,
   NotificationKind,
+  type Prisma,
   type UserRole,
   VideoStatus,
 } from '@prisma/client';
@@ -810,93 +811,88 @@ export class VideosService {
   // ---------------------------------------------------------------------------
 
   /**
-   * Soft-deletes the metadata and purges the media objects.
+   * Removes a video from ONE lecture, archiving the asset only when no other
+   * live lecture still uses it.
    *
-   * The row stays because watch events reference it; the bytes go because
-   * storage costs money and an archived lecture does not need to remain
-   * streamable.
+   * `lessonId` names the lecture the staff member is removing it from. It is
+   * required whenever the asset is attached to more than one live lecture:
+   * guessing would detach the wrong lecture (historically it always detached
+   * the uploading lecture, so "remove from this lecture" in a destination course
+   * silently stripped the SOURCE course instead).
+   *
+   * When the asset is archived, the row stays because watch events reference
+   * it; the bytes go because storage costs money and an archived lecture does
+   * not need to remain streamable. The Gumlet asset is never deleted here.
    */
-  async remove(videoId: string, actor: { id: string; role: UserRole }, purgeObjects = true) {
+  async remove(
+    videoId: string,
+    actor: { id: string; role: UserRole },
+    purgeObjects = true,
+    lessonId?: string,
+  ) {
     const video = await this.prisma.video.findFirst({ where: { id: videoId, ...notDeleted } });
     if (!video) throw AppException.notFound('Video', videoId);
 
-    await this.access.assertCanManageCourse(actor.id, actor.role, video.courseId, 'content');
+    const links = await this.loadAttachments(videoId);
+    const live = links.filter((l) => !l.lesson.deletedAt);
+    const target = this.resolveRemovalTarget(videoId, live, lessonId);
+
+    // Authorise in the course the staff member is acting in: the target
+    // lecture's course. For a reused asset that is the DESTINATION course,
+    // not whichever course happened to upload the file.
+    const actingCourseId = target ? target.lesson.courseId : video.courseId;
+    await this.access.assertCanManageCourse(actor.id, actor.role, actingCourseId, 'content');
     await this.access.assertTeacherCapability(actor.role, 'deleteVideos');
 
+    const others = live.filter((l) => l.lessonId !== target?.lessonId);
+    if (others.length > 0) {
+      // Still in use elsewhere: detach from the target lecture only.
+      return this.detachFromLesson(video, target as AttachmentRow, actor, others.length);
+    }
+
+    // Archiving the asset and purging its bytes is a decision about the
+    // uploading course's media, so it also needs that course's permission when
+    // the last live lecture belongs to a different course.
+    if (actingCourseId !== video.courseId) {
+      await this.access.assertCanManageCourse(actor.id, actor.role, video.courseId, 'content');
+    }
+
     const now = new Date();
-
-    // How many OTHER lectures still reference this asset. This single number
-    // decides whether removing the video may destroy the media, and it is the
-    // whole reason reuse needs this method to be attachment-aware: deleting a
-    // reused video from one lecture used to purge the source object and the HLS
-    // output, blacking out every other course that was still streaming it.
-    const remainingAttachments = await this.lessonVideos.countLiveAttachments(videoId);
-
-    // The asset itself only disappears once nothing points at it any more. While
-    // other lectures are still attached we leave the row live so their playback
-    // keeps working; the lecture that asked for removal is detached instead.
-    const destroyAsset = remainingAttachments <= 1;
+    const attachedLessonIds = links.map((l) => l.lessonId);
 
     await this.prisma.$transaction(async (tx) => {
-      if (destroyAsset) {
-        await tx.video.update({
-          where: { id: videoId },
-          data: { status: VideoStatus.ARCHIVED, deletedAt: now },
-        });
-      } else {
-        // Still in use elsewhere: detach from THIS lesson only.
-        if (video.lessonId) {
-          await tx.lessonVideo.deleteMany({
-            where: { lessonId: video.lessonId, videoId },
-          });
-        }
-      }
+      await tx.video.update({
+        where: { id: videoId },
+        data: { status: VideoStatus.ARCHIVED, deletedAt: now },
+      });
 
       // Anyone mid-stream loses the grant at the next playlist fetch rather
       // than watching a video that no longer exists until the ticket lapses.
-      // Only revoked when the asset is really going away - a detach must not
-      // interrupt students who are legitimately watching the same file in
-      // another course.
-      if (destroyAsset) {
-        await tx.playbackTicket.updateMany({
-          where: { videoId, status: 'ACTIVE' },
-          data: { status: 'REVOKED', revokedAt: now, revokedReason: 'Video deleted' },
-        });
-      }
-
-      // The lecture's duration came from this video (see markReady). Reset it on
-      // every lecture that no longer has a video.
-      const detachedLessonIds = await tx.lessonVideo.findMany({
-        where: { videoId: destroyAsset ? undefined : { not: video.lessonId ?? undefined } },
-        select: { lessonId: true },
+      await tx.playbackTicket.updateMany({
+        where: { videoId, status: 'ACTIVE' },
+        data: { status: 'REVOKED', revokedAt: now, revokedReason: 'Video deleted' },
       });
-      const lessonIdsToClear = destroyAsset
-        ? detachedLessonIds.map((l) => l.lessonId)
-        : [video.lessonId].filter((id): id is string => Boolean(id));
 
-      if (lessonIdsToClear.length > 0) {
-        await tx.lesson.updateMany({
-          where: { id: { in: lessonIdsToClear } },
-          data: { durationSeconds: 0 },
-        });
-      }
+      // The duration came from this video, so it is reset on the lectures that
+      // were attached to THIS video - and only if they have no other live video.
+      await this.clearDurationOfVideolessLessons(tx, videoId, attachedLessonIds);
     });
 
     // Drop any job still waiting so a deleted video is not transcoded later.
-    // Only when the asset is actually going away - an in-flight job for a shared
-    // asset still has a destination lecture that needs it.
-    if (destroyAsset && video.processingJobId) {
+    if (video.processingJobId) {
       await this.queue
         .getJob(video.processingJobId)
         .then((job) => job?.remove())
         .catch(() => undefined);
     }
 
-    await this.courses.recountCourse(video.courseId);
+    for (const courseId of uniqueCourseIds(video.courseId, links)) {
+      await this.courses.recountCourse(courseId);
+    }
 
     // THE PURGE IS THE DANGEROUS PART, so it is gated on the same condition as
-    // the archive: bytes are only deleted once no lecture points at this asset.
-    if (purgeObjects && destroyAsset) {
+    // the archive: bytes are only deleted once no live lecture points at this asset.
+    if (purgeObjects) {
       if (video.hlsPrefix) {
         await this.storage.deletePrefix('media', video.hlsPrefix).catch(() => undefined);
       }
@@ -911,13 +907,139 @@ export class VideosService {
       action: AuditAction.DELETE,
       entity: 'video',
       entityId: videoId,
-      note: destroyAsset
-        ? purgeObjects
-          ? 'Metadata archived, media objects purged'
-          : 'Metadata archived'
-        : `Detached from lesson; asset kept for ${remainingAttachments - 1} other attachment(s)`,
+      note: purgeObjects ? 'Metadata archived, media objects purged' : 'Metadata archived',
     });
 
-    return { ok: true, detached: !destroyAsset, remainingAttachments };
+    return { ok: true, detached: false, remainingAttachments: 0 };
   }
+
+  /**
+   * Detaches a video from one lecture and NEVER archives or purges the asset,
+   * even when this was its last lecture (that stays an explicit `remove()`).
+   * Authorised against the lecture's own course.
+   */
+  async detach(videoId: string, lessonId: string, actor: { id: string; role: UserRole }) {
+    const video = await this.prisma.video.findFirst({ where: { id: videoId, ...notDeleted } });
+    if (!video) throw AppException.notFound('Video', videoId);
+
+    const live = (await this.loadAttachments(videoId)).filter((l) => !l.lesson.deletedAt);
+    const target = this.resolveRemovalTarget(videoId, live, lessonId) as AttachmentRow;
+
+    await this.access.assertCanManageCourse(actor.id, actor.role, target.lesson.courseId, 'content');
+
+    const remaining = live.filter((l) => l.lessonId !== target.lessonId).length;
+    return this.detachFromLesson(video, target, actor, remaining);
+  }
+
+  /** Every attachment row of THIS video, with the lecture's course and deletion state. */
+  private async loadAttachments(videoId: string): Promise<AttachmentRow[]> {
+    if (!videoId) throw new Error('loadAttachments requires a videoId');
+    return this.prisma.lessonVideo.findMany({
+      where: { videoId },
+      select: { lessonId: true, lesson: { select: { courseId: true, deletedAt: true } } },
+    });
+  }
+
+  /**
+   * Which lecture a removal applies to. Never guessed: an explicit lesson must
+   * be one of the asset's live lectures, and a shared asset requires one.
+   * Returns null only when the asset has no live lecture at all.
+   */
+  private resolveRemovalTarget(
+    videoId: string,
+    live: AttachmentRow[],
+    lessonId: string | undefined,
+  ): AttachmentRow | null {
+    if (lessonId) {
+      const match = live.find((l) => l.lessonId === lessonId);
+      if (!match) {
+        throw new AppException(ErrorCode.NOT_FOUND, {
+          message: 'This video is not attached to that lecture',
+          details: { videoId, lessonId },
+        });
+      }
+      return match;
+    }
+    if (live.length <= 1) return live[0] ?? null;
+    throw new AppException(ErrorCode.CONFLICT, {
+      message: `This video is used by ${live.length} lectures. Say which lecture to remove it from.`,
+      details: { videoId, attachedLessons: live.length },
+    });
+  }
+
+  private async detachFromLesson(
+    video: { id: string; lessonId: string | null },
+    target: AttachmentRow,
+    actor: { id: string; role: UserRole },
+    remainingAttachments: number,
+  ) {
+    const now = new Date();
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.lessonVideo.deleteMany({ where: { lessonId: target.lessonId, videoId: video.id } });
+
+      // Students watching through THIS lecture lose the grant; other courses'
+      // streams of the same asset are untouched.
+      await tx.playbackTicket.updateMany({
+        where: { videoId: video.id, lessonId: target.lessonId, status: 'ACTIVE' },
+        data: { status: 'REVOKED', revokedAt: now, revokedReason: 'Video removed from this lecture' },
+      });
+
+      // Detaching the uploading lecture releases the legacy one-video-per-lesson
+      // pointer. Left set, lesson detail would keep showing the "owned" video on
+      // a lecture that can no longer play it, and the unique index would block a
+      // new upload to that lecture.
+      if (video.lessonId === target.lessonId) {
+        await tx.video.update({ where: { id: video.id }, data: { lessonId: null } });
+      }
+
+      await this.clearDurationOfVideolessLessons(tx, video.id, [target.lessonId]);
+    });
+
+    await this.courses.recountCourse(target.lesson.courseId);
+
+    await this.audit.record({
+      actorId: actor.id,
+      actorRole: actor.role,
+      action: AuditAction.DELETE,
+      entity: 'video',
+      entityId: video.id,
+      note: `Detached from lesson ${target.lessonId}; asset kept for ${remainingAttachments} other lecture(s)`,
+    });
+
+    return { ok: true, detached: true, remainingAttachments };
+  }
+
+  /**
+   * Zeroes `durationSeconds` on the given lectures, skipping any that still
+   * have ANOTHER live video attached. The id list is always explicit: an empty
+   * or undefined filter here would rewrite every lecture on the platform.
+   */
+  private async clearDurationOfVideolessLessons(
+    tx: Prisma.TransactionClient,
+    videoId: string,
+    lessonIds: string[],
+  ): Promise<void> {
+    const ids = [...new Set(lessonIds.filter((id): id is string => typeof id === 'string' && id.length > 0))];
+    if (ids.length === 0) return;
+
+    const stillPlaying = await tx.lessonVideo.findMany({
+      where: { lessonId: { in: ids }, videoId: { not: videoId }, video: { deletedAt: null } },
+      select: { lessonId: true },
+    });
+    const keep = new Set(stillPlaying.map((l) => l.lessonId));
+    const clear = ids.filter((id) => !keep.has(id));
+    if (clear.length === 0) return;
+
+    await tx.lesson.updateMany({
+      where: { id: { in: clear } },
+      data: { durationSeconds: 0 },
+    });
+  }
+}
+
+type AttachmentRow = { lessonId: string; lesson: { courseId: string; deletedAt: Date | null } };
+
+function uniqueCourseIds(ownerCourseId: string, links: AttachmentRow[]): string[] {
+  return [...new Set([ownerCourseId, ...links.map((l) => l.lesson.courseId)])];
 }
