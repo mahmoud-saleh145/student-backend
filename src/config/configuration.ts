@@ -59,8 +59,8 @@ export const authConfig = registerAs('auth', () => ({
     parallelism: num(process.env.ARGON_PARALLELISM, 1),
   },
   /** Account lockout after repeated failures. */
-  maxFailedLogins: 8,
-  lockoutMinutes: 15,
+  maxFailedLogins: 20,
+  lockoutMinutes: 10,
 }));
 
 export const deviceConfig = registerAs('device', () => ({

@@ -199,7 +199,12 @@ export class AuthService {
     const valid = await this.passwords.verify(user.passwordHash, dto.password);
 
     if (!valid) {
-      await this.registerFailedAttempt(user.id, user.failedLoginCount, meta);
+      await this.registerFailedAttempt(
+        user.id,
+        user.failedLoginCount,
+        user.lockedUntil,
+        meta,
+      );
       throw new AppException(ErrorCode.INVALID_CREDENTIALS);
     }
 
@@ -236,9 +241,16 @@ export class AuthService {
   private async registerFailedAttempt(
     userId: string,
     currentCount: number,
+    lockedUntil: Date | null,
     meta: RequestMeta,
   ): Promise<void> {
-    const next = currentCount + 1;
+    // A lock that has run out closes the window it was counting. Only success
+    // reset the counter before, so the count stayed at the threshold after the
+    // lock expired and a single typo re-locked the account for another full
+    // lockout period.
+    const lockExpired = lockedUntil !== null && lockedUntil.getTime() <= Date.now();
+    const previous = lockExpired ? 0 : currentCount;
+    const next = previous + 1;
     const shouldLock = next >= this.cfg.maxFailedLogins;
 
     await this.prisma.user.update({

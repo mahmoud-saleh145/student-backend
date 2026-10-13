@@ -76,6 +76,19 @@ export class AllExceptionsFilter implements ExceptionFilter {
       this.logger.debug(logContext, resolved.message);
     }
 
+    // `details` is withheld in production, so a wait the client is meant to
+    // honour travels as the standard header instead — the same one the
+    // throttler already sets on its own 429s.
+    const retryAfter = resolved.details?.retryAfterSeconds;
+    if (
+      resolved.status === HttpStatus.TOO_MANY_REQUESTS &&
+      typeof retryAfter === 'number' &&
+      Number.isFinite(retryAfter) &&
+      retryAfter > 0
+    ) {
+      response.setHeader('Retry-After', String(Math.ceil(retryAfter)));
+    }
+
     response.status(resolved.status).json(body);
   }
 
