@@ -114,6 +114,23 @@ export class DrmVerificationSweepService {
       .map((r) => r.id);
   }
 
+  /**
+   * Whether THIS process is configured well enough to verify anything at all.
+   *
+   * The scheduler MUST consult this before taking the sweep lock, never after.
+   * A process with DRM disabled can still win `acquireLock`, and it would then
+   * release it having verified nothing - which excludes every other process for
+   * a whole interval. That is not hypothetical: a worker container carrying
+   * `DRM_ENABLED=false` held the production lock and skipped, so the sweep that
+   * should have run never did.
+   *
+   * Pure and synchronous (it reads config that was already validated at boot),
+   * so it is safe to call on the path that decides whether to take a lock.
+   */
+  isPlatformUsable(): boolean {
+    return this.drmVerification.isPlatformUsable();
+  }
+
   async sweep(options: { batchSize?: number } = {}): Promise<DrmSweepResult> {
     const batchSize = Math.max(1, Math.min(options.batchSize ?? SWEEP_DEFAULT_BATCH_SIZE, 100));
 

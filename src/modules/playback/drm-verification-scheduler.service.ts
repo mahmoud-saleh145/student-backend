@@ -122,8 +122,30 @@ export class DrmVerificationScheduler implements OnApplicationBootstrap, OnModul
     if (this.timer) clearInterval(this.timer);
   }
 
-  /** One locked sweep. Returns null when another process holds the lock (or Redis is down). */
+  /** One locked sweep. Returns null when this process cannot sweep, when another
+   *  process holds the lock, or when Redis is down. */
   async tick(): Promise<DrmSweepResult | null> {
+    // BEFORE the lock, never after.
+    //
+    // The lock is a scarce, shared resource and taking it is itself the damage:
+    // a process that cannot verify anything would hold it for a whole interval
+    // and release it having done nothing, so every properly configured process
+    // is locked out meanwhile. In production a worker container with
+    // `DRM_ENABLED=false` did exactly this and silently skipped each cycle.
+    //
+    // Returning here also leaves no record behind. Writing `skippedPlatform`
+    // would keep publishing a "last sweep" that verified nothing, which is the
+    // half of the old behaviour that made the problem hard to see; health now
+    // reports an overdue sweep instead, which is the truth.
+    if (!this.sweeper.isPlatformUsable()) {
+      this.logger.warn(
+        'DRM verification sweep skipped on this process: it is not configured for Gumlet DRM ' +
+          '(DRM_ENABLED / DRM_PROVIDER / signing). The sweep lock was NOT taken, so a configured ' +
+          'process can still sweep.',
+      );
+      return null;
+    }
+
     const release = await this.redis.acquireLock('drm-verification-sweep', this.lockSeconds);
     if (!release) return null;
     try {

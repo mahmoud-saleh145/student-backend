@@ -61,13 +61,14 @@ describe('the BullMQ maintenance schedule', () => {
 describe('DrmVerificationScheduler (in-process, Redis-locked)', () => {
   const SWEEP = { skippedFresh: 1, checked: 11, refreshed: 11, failed: 0, errored: 0, skippedPlatform: 0 };
 
-  function build(opts: { lockFree?: boolean; sweepThrows?: boolean; httpTimeoutMs?: number } = {}) {
+  function build(opts: { lockFree?: boolean; sweepThrows?: boolean; httpTimeoutMs?: number; platformUsable?: boolean } = {}) {
     const release = jest.fn(async () => undefined);
     const redis = {
       acquireLock: jest.fn(async (_name: string, _ttl: number) => (opts.lockFree === false ? null : release)),
       setJson: jest.fn(async (_k: string, _v: unknown, _t: number) => undefined),
     };
     const sweeper = {
+      isPlatformUsable: jest.fn(() => opts.platformUsable !== false),
       sweep: jest.fn(async () => {
         if (opts.sweepThrows) throw new Error('db down');
         return SWEEP;
@@ -105,6 +106,67 @@ describe('DrmVerificationScheduler (in-process, Redis-locked)', () => {
     const { scheduler, sweeper } = build({ lockFree: false });
     expect(await scheduler.tick()).toBeNull();
     expect(sweeper.sweep).not.toHaveBeenCalled();
+  });
+
+  describe('a process that cannot verify anything must not take the lock', () => {
+    // Production defect: a worker container carrying DRM_ENABLED=false still won
+    // `acquireLock`, called sweep() - which returned skippedPlatform - and
+    // released it having verified nothing, locking out the configured API for a
+    // whole interval. Taking the lock WAS the damage, so the check must come
+    // first.
+    it('does NOT acquire the lock when DRM is not configured on this process', async () => {
+      const { scheduler, redis, sweeper, release } = build({ platformUsable: false });
+
+      expect(await scheduler.tick()).toBeNull();
+
+      expect(redis.acquireLock).not.toHaveBeenCalled();
+      expect(sweeper.sweep).not.toHaveBeenCalled();
+      expect(release).not.toHaveBeenCalled();
+      // No "last sweep" is published either: health then reports an overdue
+      // sweep rather than a sweep that verified nothing.
+      expect(redis.setJson).not.toHaveBeenCalled();
+    });
+
+    it('still takes the lock and sweeps normally when DRM IS configured', async () => {
+      const { scheduler, redis, sweeper, release } = build({ platformUsable: true });
+
+      expect(await scheduler.tick()).toEqual(SWEEP);
+
+      expect(redis.acquireLock).toHaveBeenCalledWith('drm-verification-sweep', scheduler.lockSeconds);
+      expect(sweeper.sweep).toHaveBeenCalledTimes(1);
+      expect(redis.setJson).toHaveBeenCalledWith(
+        DRM_LAST_SWEEP_KEY,
+        expect.objectContaining({ ...SWEEP, at: expect.any(String), host: expect.any(String) }),
+        7 * 24 * 3600,
+      );
+      expect(release).toHaveBeenCalledTimes(1);
+    });
+
+    it('a disabled process leaves the lock free for a configured one', async () => {
+      const disabled = build({ platformUsable: false });
+      await disabled.scheduler.tick();
+      expect(disabled.redis.acquireLock).not.toHaveBeenCalled();
+
+      const enabled = build({ platformUsable: true });
+      await enabled.scheduler.tick();
+      expect(enabled.redis.acquireLock).toHaveBeenCalledTimes(1);
+      expect(enabled.sweeper.sweep).toHaveBeenCalledTimes(1);
+    });
+
+    it('asks whether the platform is usable BEFORE reaching for the lock', async () => {
+      const order: string[] = [];
+      const { scheduler, redis, sweeper, release } = build();
+      sweeper.isPlatformUsable.mockImplementation(() => {
+        order.push('isPlatformUsable');
+        return true;
+      });
+      redis.acquireLock.mockImplementation(async () => {
+        order.push('acquireLock');
+        return release;
+      });
+      await scheduler.tick();
+      expect(order).toEqual(['isPlatformUsable', 'acquireLock']);
+    });
   });
 
   it('releases the lock even when the sweep throws, and records the failed attempt (time and host only)', async () => {
