@@ -151,6 +151,48 @@ describe('CodesService.generateBatch stores the issued price', () => {
     expect(result).toMatchObject({ priceAmount: null, created: 3 });
   });
 
+  // The dashboard sends no `priceAmount` key at all when the admin leaves the
+  // field blank, and JSON.stringify drops an `undefined`, so "omitted" reaches
+  // the service as a missing property — not as null. Both must store null, and
+  // neither may be quietly turned into 0 or into the catalogue price.
+  it.each([undefined, null])(
+    'treats an explicitly %s price the same as an omitted one',
+    async (priceAmount) => {
+      const { service, batches, codes } = build();
+      const result = await service.generateBatch({ ...BASE, priceAmount }, ADMIN);
+
+      expect(batches[0]).toMatchObject({ priceAmount: null });
+      for (const code of codes) expect(code).toMatchObject({ priceAmount: null });
+      expect(result).toMatchObject({ priceAmount: null });
+    },
+  );
+
+  it.each([
+    CodeTargetType.COURSE,
+    CodeTargetType.PART,
+    CodeTargetType.SECTION,
+    CodeTargetType.TEACHER,
+  ])('issues a %s card with no price at all, stored as null', async (targetType) => {
+    const { service, batches, codes } = build(targetType);
+    const result = await service.generateBatch({ ...BASE, targetType, count: 1 }, ADMIN);
+
+    expect(batches[0]).toMatchObject({ targetType, priceAmount: null });
+    expect(codes[0]).toMatchObject({ targetType, priceAmount: null });
+    expect(result).toMatchObject({ priceAmount: null, created: 1 });
+  });
+
+  // Free and unpriced are different facts about the sale, and they have to
+  // stay different all the way to the column: one is a known zero, the other
+  // is an amount nobody wrote down.
+  it('keeps a free card and an unpriced card distinguishable', async () => {
+    const { service, codes } = build();
+
+    await service.generateBatch({ ...BASE, count: 1, priceAmount: 0 }, ADMIN);
+    await service.generateBatch({ ...BASE, count: 1 }, ADMIN);
+
+    expect(codes.map((c) => c.priceAmount)).toEqual(['0.00', null]);
+  });
+
   describe('deprecated aliases from the 2026-10-14 dashboard', () => {
     it('maps amountCollected onto priceAmount, piastres exact', async () => {
       const { service, codes } = build();

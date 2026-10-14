@@ -114,10 +114,17 @@ export class CodesService {
       accessDurationType?: 'LIFETIME' | 'FIXED_DAYS' | 'UNTIL_DATE';
       accessDurationDays?: number;
       accessEndsAt?: string;
-      priceAmount?: number;
+      /**
+       * Optional, and `null` is the same as omitted. `@IsOptional()` skips
+       * validation for null as well as undefined, so a client that posts
+       * `"priceAmount": null` reaches this method with a null it is entitled
+       * to send — both mean "no price was recorded" and both store null.
+       */
+      priceAmount?: number | null;
       currency?: string;
-      amountCollected?: number;
-      free?: boolean;
+      /** Deprecated aliases; nullable for the same reason `priceAmount` is. */
+      amountCollected?: number | null;
+      free?: boolean | null;
       expiresAt?: string;
       note?: string;
       prefix?: string;
@@ -243,9 +250,9 @@ export class CodesService {
    * nothing else. Contradictory combinations are refused rather than guessed.
    */
   private static issuedPrice(input: {
-    priceAmount?: number;
-    amountCollected?: number;
-    free?: boolean;
+    priceAmount?: number | null;
+    amountCollected?: number | null;
+    free?: boolean | null;
   }): string | null {
     const has = (value: unknown) => value !== undefined && value !== null;
     const toStored = (value: unknown, field: string) => fromPiastres(parseAmount(value, field));
