@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { Prisma, UserRole } from '@prisma/client';
+import { CodeKind, Prisma, UserRole } from '@prisma/client';
 
 import { AppException } from '../../common/errors/app.exception';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
@@ -8,9 +8,12 @@ import { CourseAccessService } from '../courses/course-access.service';
 /**
  * Reporting.
  *
- * Every money figure comes from `revenue_ledger`, never from a course's
- * current price. That is the whole point of the ledger: a course repriced
- * from 100 to 150 must still report its historical sales at 100 (spec §28).
+ * Every money figure comes from a recorded amount, never from a course's
+ * current price: a course repriced from 100 to 150 must still report its
+ * historical sales at 100 (spec §28). Online payments are read from
+ * `revenue_ledger`; the Statistics screen's total also adds card sales
+ * (`access_codes.actualPaidAmount`) and wallet top-ups (`recharge_revenue`) —
+ * see `dashboard()`.
  *
  * Time-series reads hit `daily_course_stats`, the nightly rollup, rather than
  * scanning `watch_events` — which grows by millions of rows a term.
@@ -262,7 +265,19 @@ export class AnalyticsService {
     };
   }
 
-  /** Revenue by day for charting. */
+  /**
+   * Revenue by day for charting.
+   *
+   * `gross`, `net` and `transactions` are the online-payment ledger, exactly
+   * as before. `codeSales` and `walletTopUps` are the other two revenue
+   * sources, under the same rules as `dashboard()`: a paid card on the day of
+   * its first redemption, a top-up on the day its recharge card was redeemed.
+   * `total` is all three, so over the same range the points add up to
+   * `dashboard().revenue.totalInPeriod`.
+   *
+   * With `courseId`, cards are filtered to cards for that course; wallet
+   * top-ups belong to no course and are left out.
+   */
   async revenueSeries(params: { from: Date; to: Date; courseId?: string }) {
     // Composed with Prisma.sql fragments rather than string interpolation:
     // splicing `courseId` into the template directly would be an injection
@@ -270,29 +285,110 @@ export class AnalyticsService {
     const courseFilter = params.courseId
       ? Prisma.sql`AND "courseId" = ${params.courseId}`
       : Prisma.empty;
+    const cardCourseFilter = params.courseId
+      ? Prisma.sql`AND c."courseId" = ${params.courseId}`
+      : Prisma.empty;
 
-    const rows = await this.prisma.$queryRaw<
-      { day: Date; gross: string; net: string; transactions: bigint }[]
-    >(Prisma.sql`
-      SELECT
-        DATE("recognizedAt")                                                   AS day,
-        COALESCE(SUM("grossAmount") FILTER (WHERE "grossAmount" > 0), 0)::text AS gross,
-        COALESCE(SUM("grossAmount"), 0)::text                                  AS net,
-        COUNT(*)                                                               AS transactions
-      FROM revenue_ledger
-      WHERE "recognizedAt" >= ${params.from}
-        AND "recognizedAt" <= ${params.to}
-        ${courseFilter}
-      GROUP BY DATE("recognizedAt")
-      ORDER BY day ASC
-    `);
+    const [ledger, cardSales, topUps] = await Promise.all([
+      this.prisma.$queryRaw<
+        { day: Date; gross: string; net: string; transactions: bigint }[]
+      >(
+        Prisma.sql`
+          SELECT
+            DATE("recognizedAt")                                                   AS day,
+            COALESCE(SUM("grossAmount") FILTER (WHERE "grossAmount" > 0), 0)::text AS gross,
+            COALESCE(SUM("grossAmount"), 0)::text                                  AS net,
+            COUNT(*)                                                               AS transactions
+          FROM revenue_ledger
+          WHERE "recognizedAt" >= ${params.from}
+            AND "recognizedAt" <= ${params.to}
+            ${courseFilter}
+          GROUP BY DATE("recognizedAt")
+          ORDER BY day ASC
+        `,
+      ),
+      // One row per paid card, dated by its first redemption.
+      this.prisma.$queryRaw<{ day: Date; amount: string; sales: bigint }[]>(Prisma.sql`
+        SELECT DATE(s."soldAt") AS day, SUM(s.amount)::text AS amount, COUNT(*) AS sales
+        FROM (
+          SELECT c."actualPaidAmount" AS amount, MIN(r."redeemedAt") AS "soldAt"
+          FROM access_codes c
+          JOIN access_code_redemptions r ON r."codeId" = c.id
+          WHERE c.kind = 'ACCESS'
+            AND c."actualPaidAmount" > 0
+            ${cardCourseFilter}
+          GROUP BY c.id, c."actualPaidAmount"
+        ) s
+        WHERE s."soldAt" >= ${params.from}
+          AND s."soldAt" <= ${params.to}
+        GROUP BY DATE(s."soldAt")
+      `),
+      params.courseId
+        ? Promise.resolve([] as { day: Date; amount: string; topUps: bigint }[])
+        : this.prisma.$queryRaw<{ day: Date; amount: string; topUps: bigint }[]>(
+            Prisma.sql`
+              SELECT DATE("recognizedAt") AS day, SUM("actualPaidAmount")::text AS amount,
+                     COUNT(*) AS "topUps"
+              FROM recharge_revenue
+              WHERE "recognizedAt" >= ${params.from}
+                AND "recognizedAt" <= ${params.to}
+              GROUP BY DATE("recognizedAt")
+            `,
+          ),
+    ]);
 
-    return rows.map((r) => ({
-      day: new Date(r.day).toISOString().slice(0, 10),
-      gross: Number(r.gross),
-      net: Number(r.net),
-      transactions: Number(r.transactions),
-    }));
+    // Merged in whole piastres; a day appears if any source has a row on it.
+    const piastres = (value: unknown): number => Math.round(Number(value ?? 0) * 100);
+    const empty = {
+      gross: 0,
+      net: 0,
+      transactions: 0,
+      codeSales: 0,
+      codeSaleCount: 0,
+      walletTopUps: 0,
+      walletTopUpCount: 0,
+    };
+    const days = new Map<string, typeof empty>();
+    const dayOf = (value: Date) => {
+      const key = new Date(value).toISOString().slice(0, 10);
+      let row = days.get(key);
+      if (!row) {
+        row = { ...empty };
+        days.set(key, row);
+      }
+      return row;
+    };
+
+    for (const r of ledger) {
+      const row = dayOf(r.day);
+      row.gross = piastres(r.gross);
+      row.net = piastres(r.net);
+      row.transactions = Number(r.transactions);
+    }
+    for (const r of cardSales) {
+      const row = dayOf(r.day);
+      row.codeSales = piastres(r.amount);
+      row.codeSaleCount = Number(r.sales);
+    }
+    for (const r of topUps) {
+      const row = dayOf(r.day);
+      row.walletTopUps = piastres(r.amount);
+      row.walletTopUpCount = Number(r.topUps);
+    }
+
+    return [...days.entries()]
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([day, r]) => ({
+        day,
+        gross: r.gross / 100,
+        net: r.net / 100,
+        transactions: r.transactions,
+        codeSales: r.codeSales / 100,
+        codeSaleCount: r.codeSaleCount,
+        walletTopUps: r.walletTopUps / 100,
+        walletTopUpCount: r.walletTopUpCount,
+        total: (r.codeSales + r.walletTopUps + r.net) / 100,
+      }));
   }
 
   /**
@@ -304,13 +400,41 @@ export class AnalyticsService {
    * without the dashboard having to fire eight list requests with pageSize=1
    * just to read their totals.
    *
-   * Money still comes only from `revenue_ledger`, never from a course's
-   * current price.
+   * Revenue is money actually collected, from three sources that never
+   * overlap, each counted once:
+   *
+   *  - **code sales** — the amount collected for a paid ACCESS card
+   *    (`access_codes.actualPaidAmount > 0`), recognised once, when the card
+   *    is first redeemed. An unused card is not revenue. A multi-use card is
+   *    not counted again by its later redemptions: the amount was collected
+   *    once, for the card;
+   *  - **wallet top-ups** — `recharge_revenue`, one immutable row per redeemed
+   *    recharge card at the cash actually paid. Spending the credit (library
+   *    purchases) is not revenue again, and admin wallet adjustments never
+   *    write a `recharge_revenue` row, so they are excluded by construction;
+   *  - **online payments** — `revenue_ledger`, net of completed refunds. The
+   *    channel is disabled today, so this is 0; it is kept in the total so
+   *    enabling it later cannot silently drop revenue. No code redemption or
+   *    recharge ever writes a ledger line, so nothing is counted twice.
+   *
+   * Profit equals total revenue: no expenses or teacher splits are recorded.
+   * Purchases count paid card sales only — not top-ups. A free card's
+   * redemption is an activation, and a redemption of a card whose amount was
+   * never recorded is reported as such; neither is ever valued from a printed
+   * or catalogue price.
+   *
+   * The existing ledger fields (`grossAllTime`, `netInPeriod`, …) keep their
+   * meaning; the new figures are added beside them.
    */
   async dashboard(params: { from?: Date; to?: Date }) {
     const from = params.from ?? new Date(Date.now() - 30 * 24 * 3600 * 1000);
     const to = params.to ?? new Date();
     const prismaAny = this.prisma as any;
+
+    const window = { gte: from, lte: to };
+    const paidCard = { kind: CodeKind.ACCESS, actualPaidAmount: { gt: 0 } };
+    const freeCard = { kind: CodeKind.ACCESS, actualPaidAmount: 0 };
+    const unrecordedCard = { kind: CodeKind.ACCESS, actualPaidAmount: null };
 
     const [
       students,
@@ -329,6 +453,14 @@ export class AnalyticsService {
       supportOpen,
       pendingDeviceRequests,
       refundsWindow,
+      codeSalesAll,
+      codeSalesWindow,
+      topUpsAll,
+      topUpsWindow,
+      freeAll,
+      freeWindow,
+      unrecordedAll,
+      unrecordedWindow,
     ] = await this.prisma.$transaction([
       this.prisma.user.count({ where: { role: UserRole.STUDENT, ...notDeleted } }),
       this.prisma.user.count({
@@ -384,6 +516,42 @@ export class AnalyticsService {
         where: { recognizedAt: { gte: from, lte: to }, grossAmount: { lt: 0 } },
         _sum: { grossAmount: true },
       }),
+      // Paid cards that have been redeemed: each card's amount once.
+      this.prisma.accessCode.aggregate({
+        where: { ...paidCard, redemptions: { some: {} } },
+        _sum: { actualPaidAmount: true },
+        _count: { _all: true },
+      }),
+      // ...whose FIRST redemption falls in the period: one in the window and
+      // none before it. A later redemption of a multi-use card is not a sale.
+      this.prisma.accessCode.aggregate({
+        where: {
+          ...paidCard,
+          redemptions: {
+            some: { redeemedAt: window },
+            none: { redeemedAt: { lt: from } },
+          },
+        },
+        _sum: { actualPaidAmount: true },
+        _count: { _all: true },
+      }),
+      this.prisma.rechargeRevenue.aggregate({
+        _sum: { actualPaidAmount: true },
+        _count: { _all: true },
+      }),
+      this.prisma.rechargeRevenue.aggregate({
+        where: { recognizedAt: window },
+        _sum: { actualPaidAmount: true },
+        _count: { _all: true },
+      }),
+      this.prisma.accessCodeRedemption.count({ where: { code: freeCard } }),
+      this.prisma.accessCodeRedemption.count({
+        where: { code: freeCard, redeemedAt: window },
+      }),
+      this.prisma.accessCodeRedemption.count({ where: { code: unrecordedCard } }),
+      this.prisma.accessCodeRedemption.count({
+        where: { code: unrecordedCard, redeemedAt: window },
+      }),
     ]);
 
     // Prisma types groupBy's `_count` as `true | {...}` depending on the
@@ -403,6 +571,19 @@ export class AnalyticsService {
 
     const grossAll = Number(revenueAll._sum.grossAmount ?? 0);
     const refundedAll = Math.abs(Number(refundsAll._sum.grossAmount ?? 0));
+
+    // Totals are added in whole piastres, so no float error creeps into a sum
+    // the dashboard shows beside its parts.
+    const piastres = (value: unknown): number => Math.round(Number(value ?? 0) * 100);
+    const onlineAll = piastres(grossAll) - piastres(refundedAll);
+    const onlineWindow =
+      piastres(revenueWindow._sum.grossAmount) + piastres(refundsWindow._sum.grossAmount);
+    const codeSalesAllP = piastres(codeSalesAll._sum.actualPaidAmount);
+    const codeSalesWindowP = piastres(codeSalesWindow._sum.actualPaidAmount);
+    const topUpsAllP = piastres(topUpsAll._sum.actualPaidAmount);
+    const topUpsWindowP = piastres(topUpsWindow._sum.actualPaidAmount);
+    const totalAll = (codeSalesAllP + topUpsAllP + onlineAll) / 100;
+    const totalWindow = (codeSalesWindowP + topUpsWindowP + onlineWindow) / 100;
 
     return {
       period: { from: from.toISOString(), to: to.toISOString() },
@@ -445,10 +626,44 @@ export class AnalyticsService {
         transactionsInPeriod: revenueWindow._count._all,
         enrollmentsInPeriod: enrollmentsWindow,
         activeEnrollments,
+        // Paid card sales: cards with a collected amount, counted once at their
+        // first redemption. Wallet top-ups and free cards are not purchases.
+        paidCodeSalesAllTime: codeSalesAll._count._all,
+        paidCodeSalesInPeriod: codeSalesWindow._count._all,
+      },
+
+      // Redemptions that are not revenue, shown so they are not mistaken for it.
+      activations: {
+        // Cards issued as free (amount collected 0).
+        freeAllTime: freeAll,
+        freeInPeriod: freeWindow,
+        // Cards issued before the amount was required: redeemed, but what was
+        // collected for them is unknown, so they are in no revenue figure.
+        unrecordedAllTime: unrecordedAll,
+        unrecordedInPeriod: unrecordedWindow,
       },
 
       revenue: {
         currency: 'EGP',
+
+        // Revenue: money actually collected, each source counted once.
+        totalAllTime: totalAll,
+        totalInPeriod: totalWindow,
+        // No expenses or teacher splits are recorded, so profit is revenue.
+        profitAllTime: totalAll,
+        profitInPeriod: totalWindow,
+        codeSalesAllTime: codeSalesAllP / 100,
+        codeSalesInPeriod: codeSalesWindowP / 100,
+        walletTopUpsAllTime: topUpsAllP / 100,
+        walletTopUpsInPeriod: topUpsWindowP / 100,
+        walletTopUpCountAllTime: topUpsAll._count._all,
+        walletTopUpCountInPeriod: topUpsWindow._count._all,
+        // The online channel's ledger, net of completed refunds (the same
+        // figures as netAllTime / netInPeriod below).
+        onlinePaymentsAllTime: onlineAll / 100,
+        onlinePaymentsInPeriod: onlineWindow / 100,
+
+        // The revenue ledger alone (online payments), unchanged.
         grossAllTime: grossAll,
         refundedAllTime: refundedAll,
         netAllTime: Math.round((grossAll - refundedAll) * 100) / 100,
