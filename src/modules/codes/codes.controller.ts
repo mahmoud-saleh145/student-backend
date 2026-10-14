@@ -27,7 +27,7 @@ import { MAX_MONEY_EGP } from '../wallet/money';
 
 import { CodesService } from './codes.service';
 
-class GenerateCodesDto {
+export class GenerateCodesDto {
   @IsOptional() @IsEnum(CodeTargetType) targetType?: CodeTargetType;
 
   @IsOptional() @IsString() @MaxLength(32) courseId?: string;
@@ -51,6 +51,22 @@ class GenerateCodesDto {
   /** Face value printed on the card, for reporting only. */
   @IsOptional() @Type(() => Number) @IsInt() @Min(0) @Max(1_000_000) priceAmount?: number;
   @IsOptional() @IsString() @MaxLength(8) currency?: string;
+
+  /**
+   * What was actually collected for each card, in EGP. It becomes revenue only
+   * when the card is redeemed. Exactly one of this or `free: true` is required;
+   * `CodesService.generateBatch` enforces that, since "neither" is the case
+   * that left earlier cards with no recorded amount.
+   */
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0.01)
+  @Max(MAX_MONEY_EGP)
+  amountCollected?: number;
+
+  /** A card given away: redeeming it is an activation, never revenue. */
+  @IsOptional() @IsBoolean() free?: boolean;
 
   @Type(() => Number) @IsInt() @Min(1) @Max(5000) count!: number;
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(10000) maxRedemptions?: number;

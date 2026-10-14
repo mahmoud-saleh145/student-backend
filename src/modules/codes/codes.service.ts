@@ -18,7 +18,7 @@ import { PrismaService } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { PlatformSettingsService } from '../settings/platform-settings.service';
 import { resolveDiscount } from '../wallet/discount';
-import { toEgpNumber, toPiastres } from '../wallet/money';
+import { fromPiastres, parseAmount, toEgpNumber, toPiastres } from '../wallet/money';
 
 export interface CodeValidation {
   code: {
@@ -93,6 +93,13 @@ export class CodesService {
    * That is the whole point of the snapshot. A card sold in October must not
    * silently start unlocking a section added in December, because the buyer
    * did not pay for it and the seller did not price it.
+   *
+   * Every card also records what was **actually collected** for it, in
+   * `actualPaidAmount` — the column recharge cards already use for the same
+   * thing. It is required: either an amount, or an explicit `free: true`
+   * (stored as 0). The amount becomes revenue only when the card is redeemed
+   * (see `AnalyticsService.dashboard`); `priceAmount` stays the printed card
+   * price and is never revenue.
    */
   async generateBatch(
     input: {
@@ -110,6 +117,8 @@ export class CodesService {
       accessEndsAt?: string;
       priceAmount?: number;
       currency?: string;
+      amountCollected?: number;
+      free?: boolean;
       expiresAt?: string;
       note?: string;
       prefix?: string;
@@ -119,6 +128,8 @@ export class CodesService {
     if (input.count < 1 || input.count > 5000) {
       throw AppException.validation({ count: ['must be between 1 and 5000'] });
     }
+
+    const amountCollected = CodesService.collectedAmount(input);
 
     const targetType = input.targetType ?? CodeTargetType.COURSE;
     const target = await this.resolveTarget(targetType, input);
@@ -147,6 +158,7 @@ export class CodesService {
           quantity: input.count,
           prefix: prefix || null,
           priceAmount: input.priceAmount ?? null,
+          actualPaidAmount: amountCollected,
           currency: input.currency ?? 'EGP',
           expiresAt,
           note: input.note ?? null,
@@ -171,6 +183,7 @@ export class CodesService {
           accessDurationDays: input.accessDurationDays ?? null,
           accessEndsAt: input.accessEndsAt ? new Date(input.accessEndsAt) : null,
           priceAmount: input.priceAmount ?? null,
+          actualPaidAmount: amountCollected,
           currency: input.currency ?? 'EGP',
           expiresAt,
           note: input.note ?? null,
@@ -200,6 +213,8 @@ export class CodesService {
         frozenSections: target.grantedSectionIds.length,
         frozenCourses: target.grantedCourseIds.length,
         maxRedemptions: input.maxRedemptions ?? 1,
+        amountCollected: Number(amountCollected),
+        free: amountCollected === '0.00',
       },
       note: input.note,
     });
@@ -214,8 +229,50 @@ export class CodesService {
       targetName: target.name,
       requested: input.count,
       created,
+      amountCollected: Number(amountCollected),
+      free: amountCollected === '0.00',
       codes: [...codes],
     };
+  }
+
+  /**
+   * The per-card amount to store, as the decimal string the column expects.
+   *
+   * Exactly one of `free: true` or a positive `amountCollected`. Both, or
+   * neither, is refused rather than guessed: a card issued without a recorded
+   * amount is precisely what made earlier sales unreportable, and a catalogue
+   * or printed price is never a substitute for what was collected.
+   */
+  private static collectedAmount(input: {
+    amountCollected?: number;
+    free?: boolean;
+  }): string {
+    const hasAmount = input.amountCollected != null;
+
+    if (input.free === true) {
+      if (hasAmount) {
+        throw AppException.validation({
+          amountCollected: ['must be left out when the cards are free'],
+        });
+      }
+      return fromPiastres(0);
+    }
+
+    if (!hasAmount) {
+      throw AppException.validation({
+        amountCollected: [
+          'is required: enter the amount collected per card, or mark the cards as free',
+        ],
+      });
+    }
+
+    const piastres = parseAmount(input.amountCollected, 'amountCollected');
+    if (piastres <= 0) {
+      throw AppException.validation({
+        amountCollected: ['must be greater than 0; mark the cards as free instead'],
+      });
+    }
+    return fromPiastres(piastres);
   }
 
   /**
@@ -617,6 +674,9 @@ export class CodesService {
         batchId: c.batchId,
         batchName: c.batch?.name ?? null,
         amount: c.priceAmount === null ? null : Number(c.priceAmount),
+        // What was collected per card: 0 is a free card, null was never
+        // recorded (cards issued before the amount was required).
+        amountCollected: c.actualPaidAmount === null ? null : Number(c.actualPaidAmount),
         currency: c.currency,
         maxRedemptions: c.maxRedemptions,
         redemptionCount: c._count.redemptions,
@@ -707,6 +767,7 @@ export class CodesService {
         cardCount: b._count.codes,
         prefix: b.prefix,
         amount: b.priceAmount === null ? null : Number(b.priceAmount),
+        amountCollected: b.actualPaidAmount === null ? null : Number(b.actualPaidAmount),
         currency: b.currency,
         expiresAt: b.expiresAt?.toISOString() ?? null,
         note: b.note,
@@ -741,6 +802,7 @@ export class CodesService {
         status: true,
         expiresAt: true,
         priceAmount: true,
+        actualPaidAmount: true,
         currency: true,
         redemptionCount: true,
         maxRedemptions: true,
@@ -756,6 +818,8 @@ export class CodesService {
         targetName: batch.targetNameSnapshot,
         quantity: batch.quantity,
         amount: batch.priceAmount === null ? null : Number(batch.priceAmount),
+        amountCollected:
+          batch.actualPaidAmount === null ? null : Number(batch.actualPaidAmount),
         currency: batch.currency,
         expiresAt: batch.expiresAt?.toISOString() ?? null,
         createdBy: batch.createdBy,
@@ -766,6 +830,7 @@ export class CodesService {
         code: c.code,
         status: c.status,
         amount: c.priceAmount === null ? null : Number(c.priceAmount),
+        amountCollected: c.actualPaidAmount === null ? null : Number(c.actualPaidAmount),
         currency: c.currency,
         redemptionCount: c.redemptionCount,
         maxRedemptions: c.maxRedemptions,
