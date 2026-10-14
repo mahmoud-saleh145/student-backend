@@ -34,21 +34,24 @@ export class ResponseInterceptor<T> implements NestInterceptor<T, unknown> {
 
     return next.handle().pipe(
       map((data): SuccessEnvelope<unknown> => {
-        // A handler that returned a paginated result gets its `meta` lifted to
-        // the envelope while `items` stays under `data`, so pagination is
-        // consistent across every list endpoint.
+        // A handler that returned a paginated result keeps `{ items, meta }`
+        // under `data` (the mobile client reads exactly that) and gets a
+        // request id on the envelope.
+        //
+        // Every other key the handler returned beside `items`/`meta` is kept.
+        // This used to rebuild `data` as `{ items, meta }` alone, which silently
+        // dropped `lesson`/`summary` from the lecture viewers report (the
+        // dashboard then crashed reading `data.lesson`) and `totals` from the
+        // recharge, part-purchase and library reports (which rendered as 0).
         if (
           data &&
           typeof data === 'object' &&
           'items' in (data as object) &&
           'meta' in (data as object)
         ) {
-          const page = data as unknown as { items: unknown[]; meta: unknown };
           return {
             success: true,
-            // The mobile client expects `{ items, meta }` under `data` for
-            // paginated endpoints, so the shape is preserved there too.
-            data: { items: page.items, meta: page.meta },
+            data: { ...(data as object) },
             meta: { requestId: request.requestId },
           };
         }

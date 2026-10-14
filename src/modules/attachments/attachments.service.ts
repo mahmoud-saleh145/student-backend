@@ -389,6 +389,26 @@ export class AttachmentsService {
       },
     });
 
+    // Create and delete were audited; an edit that turns a protected file into
+    // a free sample (or back) was not, though it changes who can read it.
+    await this.audit.record({
+      actorId: actor.id,
+      actorRole: actor.role,
+      action: AuditAction.UPDATE,
+      entity: 'attachment',
+      entityId: attachmentId,
+      before: {
+        title: attachment.title,
+        isPreview: attachment.isPreview,
+        isProtected: attachment.isProtected,
+      },
+      after: {
+        title: updated.title,
+        isPreview: updated.isPreview,
+        isProtected: updated.isProtected,
+      },
+    });
+
     return toAttachment(updated, true);
   }
 

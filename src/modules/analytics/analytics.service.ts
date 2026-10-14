@@ -133,13 +133,28 @@ export class AnalyticsService {
       }),
     ]);
 
-    const revenue = canSeeRevenue
-      ? await this.prisma.revenueLedger.aggregate({
-        where: { courseId: params.courseId, recognizedAt: { gte: from, lte: to } },
-        _sum: { grossAmount: true, teacherAmount: true, platformAmount: true },
-        _count: { _all: true },
-      })
-      : null;
+    // Two aggregates, positive (sales) and negative (completed refunds) lines:
+    // a single sum over both used to be reported as `gross` although it was
+    // really net. Teacher/platform stay net (all lines), which is what a
+    // teacher is actually owed.
+    const [revenue, refunds] = canSeeRevenue
+      ? await this.prisma.$transaction([
+        this.prisma.revenueLedger.aggregate({
+          where: { courseId: params.courseId, recognizedAt: { gte: from, lte: to } },
+          _sum: { grossAmount: true, teacherAmount: true, platformAmount: true },
+          _count: { _all: true },
+        }),
+        this.prisma.revenueLedger.aggregate({
+          where: {
+            courseId: params.courseId,
+            recognizedAt: { gte: from, lte: to },
+            grossAmount: { lt: 0 },
+          },
+          _sum: { grossAmount: true },
+          _count: { _all: true },
+        }),
+      ])
+      : [null, null];
 
     return {
       course,
@@ -164,13 +179,24 @@ export class AnalyticsService {
           newEnrollments: d.newEnrollments,
         })),
       },
-      revenue: revenue
-        ? {
-          gross: Number(revenue._sum.grossAmount ?? 0),
-          teacher: Number(revenue._sum.teacherAmount ?? 0),
-          platform: Number(revenue._sum.platformAmount ?? 0),
-          transactions: revenue._count._all,
-        }
+      revenue: revenue && refunds
+        ? (() => {
+          const netCents = Math.round(Number(revenue._sum.grossAmount ?? 0) * 100);
+          const refundCents = Math.round(Number(refunds._sum.grossAmount ?? 0) * 100);
+          return {
+            /** Sales only (positive ledger lines). */
+            gross: (netCents - refundCents) / 100,
+            /** Completed refunds, as a positive amount. */
+            refunded: -refundCents / 100 || 0,
+            /** Gross minus completed refunds. */
+            net: netCents / 100,
+            teacher: Number(revenue._sum.teacherAmount ?? 0),
+            platform: Number(revenue._sum.platformAmount ?? 0),
+            /** Sale lines only; refunds are counted separately. */
+            transactions: revenue._count._all - refunds._count._all,
+            refunds: refunds._count._all,
+          };
+        })()
         : null,
     };
   }
@@ -195,6 +221,21 @@ export class AnalyticsService {
       _count: { _all: true },
     });
 
+    // Completed refunds per course, so `gross` can mean sales only. Earnings
+    // stay net: a refunded sale is not money the teacher keeps.
+    const refundRows = await this.prisma.revenueLedger.groupBy({
+      by: ['courseId', 'courseTitleSnapshot'],
+      where: {
+        teacherId: params.teacherId,
+        recognizedAt: { gte: from, lte: to },
+        grossAmount: { lt: 0 },
+      },
+      _sum: { grossAmount: true },
+      _count: { _all: true },
+    });
+    const refundsFor = (courseId: string, title: string) =>
+      refundRows.find((r) => r.courseId === courseId && r.courseTitleSnapshot === title);
+
     const total = rows.reduce((sum, r) => sum + Number(r._sum.teacherAmount ?? 0), 0);
 
     return {
@@ -202,13 +243,22 @@ export class AnalyticsService {
       total: Math.round(total * 100) / 100,
       // The snapshot title is used so an archived or renamed course still
       // reads correctly in an earnings statement.
-      courses: rows.map((r) => ({
-        courseId: r.courseId,
-        title: r.courseTitleSnapshot,
-        earnings: Number(r._sum.teacherAmount ?? 0),
-        gross: Number(r._sum.grossAmount ?? 0),
-        transactions: r._count._all,
-      })),
+      courses: rows.map((r) => {
+        const refund = refundsFor(r.courseId, r.courseTitleSnapshot);
+        const netCents = Math.round(Number(r._sum.grossAmount ?? 0) * 100);
+        const refundCents = Math.round(Number(refund?._sum.grossAmount ?? 0) * 100);
+        return {
+          courseId: r.courseId,
+          title: r.courseTitleSnapshot,
+          earnings: Number(r._sum.teacherAmount ?? 0),
+          /** Sales only. This used to be the net sum under this name. */
+          gross: (netCents - refundCents) / 100,
+          refunded: -refundCents / 100 || 0,
+          net: netCents / 100,
+          transactions: r._count._all - (refund?._count._all ?? 0),
+          refunds: refund?._count._all ?? 0,
+        };
+      }),
     };
   }
 
@@ -278,6 +328,7 @@ export class AnalyticsService {
       activeEnrollments,
       supportOpen,
       pendingDeviceRequests,
+      refundsWindow,
     ] = await this.prisma.$transaction([
       this.prisma.user.count({ where: { role: UserRole.STUDENT, ...notDeleted } }),
       this.prisma.user.count({
@@ -303,7 +354,12 @@ export class AnalyticsService {
         orderBy: { status: 'asc' },
       }),
       this.prisma.accessCode.count(),
-      this.prisma.payment.count({ where: { status: 'PAID' } }),
+      // Captured payments, including ones later (partly) refunded: a refund
+      // changes the payment's status, but it was still a captured purchase.
+      // Counting PAID alone made every refund silently shrink this number.
+      this.prisma.payment.count({
+        where: { status: { in: ['PAID', 'PARTIALLY_REFUNDED', 'REFUNDED'] } },
+      }),
       this.prisma.revenueLedger.aggregate({
         where: { grossAmount: { gt: 0 } },
         _sum: { grossAmount: true },
@@ -322,6 +378,12 @@ export class AnalyticsService {
       this.prisma.enrollment.count({ where: { state: 'ACTIVE' } }),
       prismaAny.supportTicket.count({ where: { status: { in: ['OPEN', 'PENDING'] } } }),
       prismaAny.deviceChangeRequest.count({ where: { status: 'PENDING' } }),
+      // Completed refunds recognised in the period (pending refund requests
+      // are not ledger lines and so never appear here).
+      this.prisma.revenueLedger.aggregate({
+        where: { recognizedAt: { gte: from, lte: to }, grossAmount: { lt: 0 } },
+        _sum: { grossAmount: true },
+      }),
     ]);
 
     // Prisma types groupBy's `_count` as `true | {...}` depending on the
@@ -391,6 +453,15 @@ export class AnalyticsService {
         refundedAllTime: refundedAll,
         netAllTime: Math.round((grossAll - refundedAll) * 100) / 100,
         grossInPeriod: Number(revenueWindow._sum.grossAmount ?? 0),
+        // Completed refunds in the period, and gross minus them. Before these
+        // the period tile showed gross only, so a refund reduced "Total
+        // revenue" (net) but never the period figure beside it.
+        refundedInPeriod: Math.abs(Number(refundsWindow._sum.grossAmount ?? 0)),
+        netInPeriod:
+          (Math.round(Number(revenueWindow._sum.grossAmount ?? 0) * 100) +
+            Math.round(Number(refundsWindow._sum.grossAmount ?? 0) * 100)) /
+          100,
+        // Gross splits (positive lines only), as before.
         platformInPeriod: Number(revenueWindow._sum.platformAmount ?? 0),
         teachersInPeriod: Number(revenueWindow._sum.teacherAmount ?? 0),
       },
@@ -444,6 +515,11 @@ export class AnalyticsService {
       'students',
     );
 
+    // The phone clause only applies when the query has digits in it. For a name
+    // query the stripped string is '' and `contains: ''` matches every row,
+    // which made searching "Ahmed" return all viewers.
+    const phoneDigits = params.q?.replace(/\D/g, '') ?? '';
+
     const where: Prisma.WatchProgressWhereInput = {
       lessonId: lesson.id,
       ...(params.q
@@ -451,7 +527,7 @@ export class AnalyticsService {
           user: {
             OR: [
               { fullName: { contains: params.q, mode: 'insensitive' } },
-              { phone: { contains: params.q.replace(/\D/g, '') } },
+              ...(phoneDigits ? [{ phone: { contains: phoneDigits } }] : []),
             ],
           },
         }

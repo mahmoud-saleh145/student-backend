@@ -241,6 +241,16 @@ export function toAttachment(attachment: Attachment, hasCourseAccess: boolean) {
     protected: attachment.isProtected,
     downloadable: attachment.isDownloadable && !attachment.isProtected,
     locked: !hasCourseAccess && !attachment.isPreview,
+    // The stored flags under their own names. The dashboard edits these
+    // (create/PATCH take `isPreview`/`isProtected`/`isDownloadable`) and has
+    // always read them back by the same names; without them every row read as
+    // "not a free sample", and the toggle could only ever send `true`.
+    isPreview: attachment.isPreview,
+    isProtected: attachment.isProtected,
+    isDownloadable: attachment.isDownloadable && !attachment.isProtected,
+    // Optional-chained so a caller that selected a partial row still gets a
+    // list rather than a crash.
+    createdAt: attachment.createdAt?.toISOString() ?? null,
   };
 }
 

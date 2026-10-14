@@ -20,6 +20,13 @@ import { withSerializableRetry } from '../../database/serializable-retry';
 import { AuditService } from '../audit/audit.service';
 import { CourseAccessService } from '../courses/course-access.service';
 
+import {
+  CAPTURED_STATUSES,
+  REFUND_TX_INCLUDE,
+  type RefundTxRow,
+  refundStateOf,
+} from './refund-state';
+
 export interface CheckoutSession {
   paymentId: string;
   checkoutUrl: string | null;
@@ -258,8 +265,13 @@ export class PaymentsService {
         return { payment, alreadyPaid: true, enrollmentId: payment.enrollmentId };
       }
 
+      // PARTIALLY_REFUNDED belongs here too: it is a payment that was captured
+      // and then partly returned. It used to fall through, so a late or repeated
+      // provider event set it back to PAID, re-activated the enrollment the
+      // refund had revoked, and wrote a second revenue line.
       if (
         payment.status === PaymentStatus.REFUNDED ||
+        payment.status === PaymentStatus.PARTIALLY_REFUNDED ||
         payment.status === PaymentStatus.CANCELLED
       ) {
         throw new AppException(ErrorCode.INVALID_STATE, {
@@ -399,9 +411,14 @@ export class PaymentsService {
   async fail(paymentId: string, code: string, rawPayload?: Record<string, unknown>) {
     const payment = await this.prisma.payment.findUnique({ where: { id: paymentId } });
     if (!payment) throw AppException.notFound('Payment', paymentId);
-    if (payment.status === PaymentStatus.PAID) {
+    if (
+      payment.status === PaymentStatus.PAID ||
+      payment.status === PaymentStatus.PARTIALLY_REFUNDED ||
+      payment.status === PaymentStatus.REFUNDED
+    ) {
       // A "failure" arriving after a capture is almost always an out-of-order
-      // webhook. Record it, but do not undo the capture.
+      // webhook. Record it, but do not undo the capture — or overwrite a
+      // refunded payment's status, which would hide that money was returned.
       await this.prisma.paymentTransaction.create({
         data: {
           paymentId,
@@ -436,128 +453,6 @@ export class PaymentsService {
     return { id: updated.id, status: updated.status, failureCode: code };
   }
 
-  /**
-   * Refund.
-   *
-   * Additive: the original payment keeps its amount and paidAt; a refund
-   * transaction and a negative revenue line are appended. Reversing the
-   * original row would destroy the record that money was taken at all.
-   */
-  async refund(
-    paymentId: string,
-    input: { amount?: number; reason: string },
-    actor: { id: string; role: UserRole },
-  ) {
-    const result = await withSerializableRetry(this.prisma, async (tx) => {
-      const payment = await tx.payment.findUnique({
-        where: { id: paymentId },
-        include: { course: { select: { title: true } }, revenue: true },
-      });
-
-      if (!payment) throw AppException.notFound('Payment', paymentId);
-      if (payment.status !== PaymentStatus.PAID && payment.status !== PaymentStatus.PARTIALLY_REFUNDED) {
-        throw new AppException(ErrorCode.INVALID_STATE, {
-          message: `Only a paid payment can be refunded (current: ${payment.status})`,
-        });
-      }
-
-      const alreadyRefunded = Number(payment.refundedAmount);
-      const gross = Number(payment.amount);
-      const requested = input.amount ?? gross - alreadyRefunded;
-
-      if (requested <= 0 || alreadyRefunded + requested > gross) {
-        throw AppException.validation({
-          amount: [`must be between 0 and ${gross - alreadyRefunded}`],
-        });
-      }
-
-      const now = new Date();
-      const total = alreadyRefunded + requested;
-      const fullyRefunded = total >= gross;
-
-      const updated = await tx.payment.update({
-        where: { id: paymentId },
-        data: {
-          refundedAmount: total,
-          refundedAt: now,
-          status: fullyRefunded
-            ? PaymentStatus.REFUNDED
-            : PaymentStatus.PARTIALLY_REFUNDED,
-        },
-      });
-
-      await tx.paymentTransaction.create({
-        data: {
-          paymentId,
-          type: 'refund',
-          status: 'succeeded',
-          amount: requested,
-          currency: payment.currency,
-        },
-      });
-
-      // Contra revenue line. Reporting sums the ledger, so a negative row is
-      // the correct way to reduce recognised revenue without editing history.
-      const original = payment.revenue[0];
-      const sharePercent = original ? Number(original.sharePercent) : 0;
-      const teacherPortion = Math.round(requested * (sharePercent / 100) * 100) / 100;
-
-      await tx.revenueLedger.create({
-        data: {
-          paymentId,
-          courseId: payment.courseId,
-          teacherId: original?.teacherId ?? null,
-          grossAmount: -requested,
-          teacherAmount: -teacherPortion,
-          platformAmount: -(Math.round((requested - teacherPortion) * 100) / 100),
-          sharePercent,
-          currency: payment.currency,
-          courseTitleSnapshot: payment.course.title,
-          recognizedAt: now,
-        },
-      });
-
-      // A full refund ends access; a partial one does not.
-      if (fullyRefunded && payment.enrollmentId) {
-        await tx.enrollment.update({
-          where: { id: payment.enrollmentId },
-          data: {
-            state: EnrollmentState.REVOKED,
-            revokedAt: now,
-            revokedById: actor.id,
-            revokedReason: `Refunded: ${input.reason}`,
-          },
-        });
-        await tx.playbackTicket.updateMany({
-          where: { userId: payment.userId, courseId: payment.courseId, status: 'ACTIVE' },
-          data: { status: 'REVOKED', revokedAt: now, revokedReason: 'Payment refunded' },
-        });
-      }
-
-      return { payment: updated, requested, fullyRefunded };
-    });
-
-    await this.audit.record({
-      actorId: actor.id,
-      actorRole: actor.role,
-      action: AuditAction.PAYMENT_REFUND,
-      entity: 'payment',
-      entityId: paymentId,
-      after: {
-        refundedAmount: Number(result.payment.refundedAmount),
-        status: result.payment.status,
-      },
-      note: input.reason,
-    });
-
-    return {
-      id: paymentId,
-      status: result.payment.status,
-      refundedAmount: Number(result.payment.refundedAmount),
-      fullyRefunded: result.fullyRefunded,
-    };
-  }
-
   // ---------------------------------------------------------------------------
   // Reads
   // ---------------------------------------------------------------------------
@@ -571,7 +466,10 @@ export class PaymentsService {
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * pageSize,
         take: pageSize,
-        include: { course: { select: { id: true, title: true } } },
+        include: {
+          course: { select: { id: true, title: true } },
+          transactions: REFUND_TX_INCLUDE,
+        },
       }),
       this.prisma.payment.count({ where }),
     ]);
@@ -651,11 +549,22 @@ export class PaymentsService {
           course: { select: { id: true, title: true } },
           user: { select: { id: true, fullName: true, phone: true } },
           coursePrice: { select: { version: true, amount: true } },
+          transactions: REFUND_TX_INCLUDE,
         },
       }),
       this.prisma.payment.count({ where }),
+      // Captured payments, including (partly) refunded ones. This summed PAID
+      // only, so `refunded` was always 0 — a refunded payment is no longer
+      // PAID — and refunded payments vanished from `paid`. The same scoped
+      // `where` (courseId stays at the top level); an explicit status filter
+      // still narrows it, and a non-captured one totals nothing.
       this.prisma.payment.aggregate({
-        where: { ...where, status: PaymentStatus.PAID },
+        where: {
+          ...where,
+          status: params.status
+            ? { in: CAPTURED_STATUSES.filter((s) => s === params.status) }
+            : { in: CAPTURED_STATUSES },
+        },
         _sum: { amount: true, refundedAmount: true },
       }),
     ]);
@@ -678,7 +587,11 @@ export class PaymentsService {
         totals: {
           paid: Number(sum._sum.amount ?? 0),
           refunded: Number(sum._sum.refundedAmount ?? 0),
-          net: Number(sum._sum.amount ?? 0) - Number(sum._sum.refundedAmount ?? 0),
+          // Whole cents, so 0.1 + 0.2 style drift cannot reach a total.
+          net:
+            (Math.round(Number(sum._sum.amount ?? 0) * 100) -
+              Math.round(Number(sum._sum.refundedAmount ?? 0) * 100)) /
+            100,
         },
       },
     };
@@ -696,7 +609,13 @@ export class PaymentsService {
     createdAt: Date;
     checkoutUrl: string | null;
     course?: { id: string; title: string } | null;
+    transactions?: RefundTxRow[];
   }) {
+    // `status` stays the payment's own state: a payment with a pending refund
+    // is still PAID, because no money has gone back yet. The refund state is
+    // reported beside it, so a client can show "refund pending" without
+    // anyone mislabelling the payment as refunded.
+    const refund = refundStateOf(payment, payment.transactions ?? []);
     return {
       id: payment.id,
       amount: Number(payment.amount),
@@ -704,7 +623,11 @@ export class PaymentsService {
       status: payment.status,
       provider: payment.provider,
       reference: payment.providerReference,
+      /** Completed refunds only. */
       refundedAmount: Number(payment.refundedAmount),
+      /** Reserved by refund requests not yet completed — not refunded money. */
+      pendingRefundAmount: refund.pendingRefundAmount,
+      refundStatus: refund.refundStatus,
       paidAt: payment.paidAt?.toISOString() ?? null,
       createdAt: payment.createdAt.toISOString(),
       checkoutUrl: payment.checkoutUrl,
