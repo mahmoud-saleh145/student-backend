@@ -107,7 +107,9 @@ export async function createUser(
   const passwordHash = await argon2.hash(TEST_PASSWORD, {
     type: argon2.argon2id,
     memoryCost: 8192,
-    timeCost: 1,
+    // The installed argon2 rejects timeCost < 2 ("Invalid timeCost"), which
+    // failed every fixture user before a test could start.
+    timeCost: 2,
     parallelism: 1,
   });
 

@@ -25,7 +25,10 @@ import { grantPartFromCode } from '../course-parts/grant-part-from-code';
 import { CourseAccessService } from '../courses/course-access.service';
 import { CoursesService } from '../courses/courses.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import { REFUND_TX_INCLUDE, refundStateOf } from '../payments/refund-state';
 import { PaymentsService } from '../payments/payments.service';
+
+import { revokeEnrollmentInTx } from './revoke-enrollment';
 
 /** Matches the mobile app's `EnrollmentResult` exactly. */
 export interface EnrollmentResult {
@@ -679,6 +682,10 @@ export class EnrollmentsService {
           ? { in: readable.filter((id) => id === params.courseId) }
           : { in: readable };
 
+    // Only search phones when the query has digits: for a name query the
+    // stripped string is '' and `contains: ''` matches every student.
+    const phoneDigits = params.q?.replace(/\D/g, '') ?? '';
+
     const where: Prisma.EnrollmentWhereInput = {
       ...(courseCondition ? { courseId: courseCondition } : {}),
       ...(params.userId ? { userId: params.userId } : {}),
@@ -696,7 +703,7 @@ export class EnrollmentsService {
             user: {
               OR: [
                 { fullName: { contains: params.q, mode: 'insensitive' } },
-                { phone: { contains: params.q.replace(/\D/g, '') } },
+                ...(phoneDigits ? [{ phone: { contains: phoneDigits } }] : []),
               ],
             },
           }
@@ -729,9 +736,23 @@ export class EnrollmentsService {
             },
           },
           course: { select: { id: true, title: true } },
+          // Captured payments, including refunded ones: a partially refunded
+          // payment still has a refundable balance, and a refunded one is part
+          // of what this student paid. Newest first.
           payments: {
-            where: { status: 'PAID' },
-            select: { id: true, amount: true, currency: true, paidAt: true },
+            where: { status: { in: ['PAID', 'PARTIALLY_REFUNDED', 'REFUNDED'] } },
+            orderBy: { paidAt: 'desc' },
+            select: {
+              id: true,
+              amount: true,
+              currency: true,
+              paidAt: true,
+              status: true,
+              provider: true,
+              refundedAmount: true,
+              // For the refund status shown beside the payment's own status.
+              transactions: REFUND_TX_INCLUDE,
+            },
           },
           redemptions: {
             orderBy: { redeemedAt: 'desc' },
@@ -788,6 +809,11 @@ export class EnrollmentsService {
             amount: Number(p.amount),
             currency: p.currency,
             paidAt: p.paidAt?.toISOString() ?? null,
+            status: p.status,
+            provider: p.provider,
+            refundedAmount: Number(p.refundedAmount),
+            // Beside `status`, never instead of it: see refund-state.ts.
+            ...refundStateOf(p, p.transactions),
           })),
           redemption: redemption
             ? {
@@ -921,62 +947,84 @@ export class EnrollmentsService {
   }
 
   /**
-   * Revokes access. The enrollment row, its payments and its watch history all
-   * remain — only the state changes, plus any live playback is killed.
+   * Removes a student from one course ("Remove from course" in the dashboard).
+   *
+   * This is an ACCESS decision, not a financial one. What it does, in one
+   * Serializable transaction:
+   *
+   *  - the enrollment becomes REVOKED. Every access check (lesson gate,
+   *    playback ticket and heartbeat, attachment ticket, my-courses, search,
+   *    announcements, expiry reminders) reads that state live, so access ends
+   *    at once; ACTIVE playback tickets are revoked as well;
+   *  - the enrollment's section grants are removed and `coversAllSections` is
+   *    cleared, so a later re-enrollment starts from what that later purchase
+   *    buys. Grant-access only ever widens, so without this a student removed
+   *    from a full-course enrollment who later redeemed a one-section card got
+   *    the whole course back. The grants are snapshotted into the audit entry,
+   *    and what was bought stays on the code redemptions and part purchases;
+   *  - the student's live part entitlements on this course are revoked (the
+   *    schema's additive revocation — the rows stay);
+   *  - PENDING payments on this enrollment are CANCELLED. No money has moved on
+   *    a pending payment, and `capture()` sets the enrollment ACTIVE, so leaving
+   *    one open would let a late confirmation silently undo the removal;
+   *  - the course's student count is recounted.
+   *
+   * What it deliberately does NOT do:
+   *
+   *  - refund. PAID payments and their revenue ledger lines are untouched, so
+   *    reported revenue does not move. A refund is the separate, explicit
+   *    `payments/:id/refund` action;
+   *  - return a code. Course cards are sold for cash before they are redeemed;
+   *    a redemption is the record that a sold card was used. There is no
+   *    "returned" code state, and the redemption row stays;
+   *  - touch watch progress, watch events, counted plays, the wallet, other
+   *    courses' enrollments or the account.
+   *
+   * Refused while a payment on this enrollment is AUTHORIZED: that money is
+   * held at a provider and has to be captured or voided there first.
+   *
+   * Idempotent: removing an already-removed student changes nothing and says
+   * so. The state change is conditional, so two concurrent removals cannot both
+   * apply their side effects.
    */
   async revoke(
     enrollmentId: string,
     actor: { id: string; role: UserRole },
     reason: string,
+    expectedCourseId?: string,
   ) {
-    const enrollment = await this.prisma.enrollment.findUnique({
-      where: { id: enrollmentId },
-    });
-    if (!enrollment) throw AppException.notFound('Enrollment', enrollmentId);
-
-    await this.access.assertCanManageCourse(actor.id, actor.role, enrollment.courseId, 'students');
-
-    const now = new Date();
-
-    await this.prisma.$transaction(async (tx) => {
-      await tx.enrollment.update({
-        where: { id: enrollmentId },
-        data: {
-          state: EnrollmentState.REVOKED,
-          revokedAt: now,
-          revokedById: actor.id,
-          revokedReason: reason,
-        },
+    // Removal also cancels payments and revokes purchased parts, so it is an
+    // administrator's decision. It used to be open to any teacher holding the
+    // course's `students` flag, which is a permission to *view* students.
+    if (actor.role !== UserRole.MASTER && actor.role !== UserRole.ADMIN) {
+      throw new AppException(ErrorCode.INSUFFICIENT_ROLE, {
+        message: 'Only administrators can remove a student from a course',
       });
+    }
 
-      await tx.playbackTicket.updateMany({
-        where: {
-          userId: enrollment.userId,
-          courseId: enrollment.courseId,
-          status: 'ACTIVE',
-        },
-        data: { status: 'REVOKED', revokedAt: now, revokedReason: 'Enrollment revoked' },
-      });
+    // The revocation itself is shared with refunds; see revoke-enrollment.ts.
+    const result = await withSerializableRetry(this.prisma, (tx) =>
+      revokeEnrollmentInTx(tx, this.audit, {
+        enrollmentId,
+        actor,
+        reason,
+        expectedCourseId,
+      }),
+    );
 
-      const studentCount = await tx.enrollment.count({
-        where: { courseId: enrollment.courseId, state: EnrollmentState.ACTIVE },
-      });
-      await tx.course.update({
-        where: { id: enrollment.courseId },
-        data: { studentCount },
-      });
-    });
-
-    await this.audit.record({
-      actorId: actor.id,
-      actorRole: actor.role,
-      action: AuditAction.ACCESS_REVOKE,
-      entity: 'enrollment',
-      entityId: enrollmentId,
-      note: reason,
-    });
-
-    return { ok: true };
+    return {
+      ok: true,
+      enrollmentId,
+      userId: result.enrollment.userId,
+      courseId: result.enrollment.courseId,
+      state: EnrollmentState.REVOKED,
+      alreadyRemoved: result.alreadyRevoked,
+      cancelledPayments: result.cancelledPayments,
+      revokedPartEntitlements: result.revokedPartEntitlements,
+      removedSectionGrants: result.removedSectionGrants,
+      revokedPlaybackTickets: result.revokedPlaybackTickets,
+      retained: result.retained,
+    };
   }
 
   /** Extends an access window without creating a new payment. */

@@ -17,7 +17,7 @@ import type { Request } from 'express';
 
 import { CodeThrottle } from '../../common/decorators/throttle.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
-import { StaffOnly, StudentOnly } from '../../common/decorators/roles.decorator';
+import { AdminOnly, StaffOnly, StudentOnly } from '../../common/decorators/roles.decorator';
 import { SearchablePaginationDto } from '../../common/dto/pagination.dto';
 import type { AuthenticatedUser } from '../../common/types/request-context';
 
@@ -55,6 +55,15 @@ class GrantAccessDto {
 
 class ReasonDto {
   @IsString() @MinLength(3) @MaxLength(500) reason!: string;
+}
+
+class RevokeDto extends ReasonDto {
+  /**
+   * The course the caller believes this enrollment belongs to. When sent, an
+   * enrollment of any other course is answered as not found, so a stale or
+   * mistyped id can never remove a student from a different course.
+   */
+  @IsOptional() @IsString() @MaxLength(32) courseId?: string;
 }
 
 class ExtendDto {
@@ -175,18 +184,21 @@ export class EnrollmentsController {
   }
 
   @Post('admin/enrollments/:id/revoke')
-  @StaffOnly()
+  @AdminOnly()
+  @HttpCode(HttpStatus.OK)
   @ApiOperation({
-    summary: 'Revoke access',
+    summary: 'Remove a student from a course (revoke access)',
     description:
-      'Sets the state to REVOKED and kills any live playback. The enrollment row, its payments and watch history are all preserved.',
+      'Sets the state to REVOKED, kills live playback, revokes the student’s part entitlements on this course, clears its section grants and cancels PENDING payments on the enrollment. PAID payments, revenue, code redemptions and watch history are preserved; nothing is refunded. Idempotent: a repeat returns alreadyRemoved=true and changes nothing.',
   })
+  @ApiResponse({ status: 404, description: 'NOT_FOUND — no such enrollment in this course' })
+  @ApiResponse({ status: 409, description: 'INVALID_STATE — a payment is authorised at the provider' })
   revoke(
     @Param('id') id: string,
-    @Body() dto: ReasonDto,
+    @Body() dto: RevokeDto,
     @CurrentUser() actor: AuthenticatedUser,
   ) {
-    return this.enrollments.revoke(id, actor, dto.reason);
+    return this.enrollments.revoke(id, actor, dto.reason, dto.courseId);
   }
 
   @Post('admin/enrollments/:id/extend')

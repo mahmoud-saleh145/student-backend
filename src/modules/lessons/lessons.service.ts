@@ -544,10 +544,17 @@ export class LessonsService {
     const lesson = await this.requireLesson(lessonId);
     await this.access.assertCanManageCourse(actor.id, actor.role, lesson.courseId, 'content');
 
+    // A rename is stored trimmed. The DTO's MinLength(1) counts spaces, so
+    // "   " used to pass validation and leave a lecture with a blank title.
+    const title = typeof input.title === 'string' ? input.title.trim() : undefined;
+    if (title !== undefined && title.length === 0) {
+      throw AppException.validation({ title: ['title must not be empty'] });
+    }
+
     const updated = await this.prisma.lesson.update({
       where: { id: lessonId },
       data: {
-        title: input.title as string | undefined,
+        title,
         titleAr: input.titleAr as string | undefined,
         description: input.description as string | undefined,
         kind: input.kind as LessonKind | undefined,
