@@ -48,15 +48,22 @@ export class GenerateCodesDto {
   /** Optional human label for the generated batch. */
   @IsOptional() @IsString() @MaxLength(120) batchName?: string;
 
-  /** Face value printed on the card, for reporting only. */
+  /**
+   * The price of one card, in EGP: what the card is sold for. It is the
+   * revenue figure when the card is first redeemed (see
+   * `AnalyticsService.dashboard`); 0 is a free card. It never affects whether
+   * the card unlocks anything. Optional, as it always was — a card issued
+   * without one is reported as "not recorded".
+   */
   @IsOptional() @Type(() => Number) @IsInt() @Min(0) @Max(1_000_000) priceAmount?: number;
   @IsOptional() @IsString() @MaxLength(8) currency?: string;
 
   /**
-   * What was actually collected for each card, in EGP. It becomes revenue only
-   * when the card is redeemed. Exactly one of this or `free: true` is required;
-   * `CodesService.generateBatch` enforces that, since "neither" is the case
-   * that left earlier cards with no recorded amount.
+   * Deprecated alias for `priceAmount`, kept for one release only: the
+   * dashboard deployed on 2026-10-14 sends the card price under this name.
+   * Accepting it means the backend can be deployed before the dashboard
+   * without code generation failing in between. It is mapped onto
+   * `priceAmount`; nothing else is written.
    */
   @IsOptional()
   @Type(() => Number)
@@ -65,7 +72,7 @@ export class GenerateCodesDto {
   @Max(MAX_MONEY_EGP)
   amountCollected?: number;
 
-  /** A card given away: redeeming it is an activation, never revenue. */
+  /** Deprecated alias, same release: `free: true` means `priceAmount: 0`. */
   @IsOptional() @IsBoolean() free?: boolean;
 
   @Type(() => Number) @IsInt() @Min(1) @Max(5000) count!: number;

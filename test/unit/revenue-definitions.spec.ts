@@ -4,14 +4,15 @@ import { AnalyticsService } from '../../src/modules/analytics/analytics.service'
  * What the Statistics screen calls revenue.
  *
  *   revenue        = code sales + wallet top-ups + online payments (net)
- *   code sales     = the amount collected for each paid ACCESS card, once,
- *                    at its FIRST redemption (unused cards are not revenue)
+ *   code sales     = the price each paid ACCESS card was issued at
+ *                    (`priceAmount` > 0), once, at its FIRST redemption
+ *                    (unused cards are not revenue)
  *   wallet top-ups = recharge_revenue, the cash actually paid
  *   profit         = revenue (no expenses or teacher splits are recorded)
  *   purchases      = paid card sales only — never top-ups
- *   activations    = redemptions of free cards, and of cards whose amount was
- *                    never recorded; neither is revenue, and no printed or
- *                    catalogue price is ever used to value them.
+ *   activations    = redemptions of free cards (price 0), and of cards issued
+ *                    without a price; neither is revenue, and no catalogue
+ *                    price is ever read to value them.
  *
  * The fake below evaluates the `where` clauses the service actually sends
  * against in-memory rows, so every figure here is computed, not canned. The
@@ -30,7 +31,6 @@ const AFTER = new Date('2026-11-05T12:00:00Z');
 type Code = {
   id: string;
   kind: 'ACCESS' | 'RECHARGE';
-  actualPaidAmount: string | null;
   priceAmount: string | null;
 };
 type Redemption = { codeId: string; redeemedAt: Date };
@@ -100,7 +100,7 @@ function buildPrisma(world: World) {
         return true;
       });
       return {
-        _sum: { actualPaidAmount: sum(rows.map((r) => r.actualPaidAmount ?? 0)) },
+        _sum: { priceAmount: sum(rows.map((r) => r.priceAmount ?? 0)) },
         _count: { _all: rows.length },
       };
     }),
@@ -179,15 +179,10 @@ function buildPrisma(world: World) {
 const build = (world: World) =>
   new AnalyticsService(buildPrisma(world) as never, {} as never);
 
-const code = (
-  id: string,
-  actualPaidAmount: string | null,
-  extra: Partial<Code> = {},
-): Code => ({
+const code = (id: string, priceAmount: string | null, extra: Partial<Code> = {}): Code => ({
   id,
   kind: 'ACCESS',
-  actualPaidAmount,
-  priceAmount: null,
+  priceAmount,
   ...extra,
 });
 
@@ -202,11 +197,13 @@ function scenario(): World {
       code('paid_unused', '700.00'), // never redeemed: not revenue
       code('paid_after', '80.00'), // first redeemed after the period
       code('free', '0.00'), // a free card, three students
-      code('unrecorded_priced', null, { priceAmount: '1000.00' }), // legacy, card price only
-      code('unrecorded_bare', null), // legacy, nothing at all
-      // A recharge card carries actualPaidAmount too. It is counted through
+      // Issued without a price, for courses that DO have a catalogue price.
+      // The catalogue is never read (coursePrice is forbidden below).
+      code('unrecorded_in', null),
+      code('unrecorded_before', null),
+      // A recharge card's priceAmount is its face value. It is counted through
       // recharge_revenue, so it must not ALSO count as a code sale.
-      code('recharge_in', '900.00', { kind: 'RECHARGE' }),
+      code('recharge_in', '1000.00', { kind: 'RECHARGE' }),
     ],
     redemptions: [
       { codeId: 'paid_in', redeemedAt: IN },
@@ -219,8 +216,8 @@ function scenario(): World {
       { codeId: 'free', redeemedAt: BEFORE },
       { codeId: 'free', redeemedAt: IN },
       { codeId: 'free', redeemedAt: IN_LATER },
-      { codeId: 'unrecorded_priced', redeemedAt: IN },
-      { codeId: 'unrecorded_bare', redeemedAt: BEFORE },
+      { codeId: 'unrecorded_in', redeemedAt: IN },
+      { codeId: 'unrecorded_before', redeemedAt: BEFORE },
       { codeId: 'recharge_in', redeemedAt: IN },
     ],
     topUps: [
@@ -231,11 +228,11 @@ function scenario(): World {
   };
 }
 
-describe('Statistics: revenue is money actually collected', () => {
+describe('Statistics: revenue is the issued price of redeemed cards, plus top-ups', () => {
   it('counts each paid card once, at its first redemption, and only ACCESS cards', async () => {
     const { revenue, purchases } = await build(scenario()).dashboard(PERIOD);
 
-    // 600 + 1000 + 250 + 300 + 80. Not 700 (unused), not 900 (recharge card),
+    // 600 + 1000 + 250 + 300 + 80. Not 700 (unused), not 1000 (recharge card),
     // and 250 / 300 once each although each was redeemed twice.
     expect(revenue.codeSalesAllTime).toBe(2230);
     expect(purchases.paidCodeSalesAllTime).toBe(5);
@@ -295,7 +292,7 @@ describe('Statistics: revenue is money actually collected', () => {
       unrecordedAllTime: 2,
       unrecordedInPeriod: 1,
     });
-    // The legacy card printed at 1000 is NOT valued at 1000.
+    // Cards issued without a price add nothing: no catalogue price fills in.
     expect(revenue.totalAllTime).toBe(3580);
   });
 

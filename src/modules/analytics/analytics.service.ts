@@ -12,7 +12,8 @@ import { CourseAccessService } from '../courses/course-access.service';
  * current price: a course repriced from 100 to 150 must still report its
  * historical sales at 100 (spec §28). Online payments are read from
  * `revenue_ledger`; the Statistics screen's total also adds card sales
- * (`access_codes.actualPaidAmount`) and wallet top-ups (`recharge_revenue`) —
+ * (the issued card price, `access_codes.priceAmount`) and wallet top-ups
+ * (`recharge_revenue`) —
  * see `dashboard()`.
  *
  * Time-series reads hit `daily_course_stats`, the nightly rollup, rather than
@@ -311,13 +312,13 @@ export class AnalyticsService {
       this.prisma.$queryRaw<{ day: Date; amount: string; sales: bigint }[]>(Prisma.sql`
         SELECT DATE(s."soldAt") AS day, SUM(s.amount)::text AS amount, COUNT(*) AS sales
         FROM (
-          SELECT c."actualPaidAmount" AS amount, MIN(r."redeemedAt") AS "soldAt"
+          SELECT c."priceAmount" AS amount, MIN(r."redeemedAt") AS "soldAt"
           FROM access_codes c
           JOIN access_code_redemptions r ON r."codeId" = c.id
           WHERE c.kind = 'ACCESS'
-            AND c."actualPaidAmount" > 0
+            AND c."priceAmount" > 0
             ${cardCourseFilter}
-          GROUP BY c.id, c."actualPaidAmount"
+          GROUP BY c.id, c."priceAmount"
         ) s
         WHERE s."soldAt" >= ${params.from}
           AND s."soldAt" <= ${params.to}
@@ -403,11 +404,12 @@ export class AnalyticsService {
    * Revenue is money actually collected, from three sources that never
    * overlap, each counted once:
    *
-   *  - **code sales** — the amount collected for a paid ACCESS card
-   *    (`access_codes.actualPaidAmount > 0`), recognised once, when the card
-   *    is first redeemed. An unused card is not revenue. A multi-use card is
-   *    not counted again by its later redemptions: the amount was collected
-   *    once, for the card;
+   *  - **code sales** — the price a paid ACCESS card was issued at
+   *    (`access_codes.priceAmount > 0`), recognised once, when the card is
+   *    first redeemed. An unused card is not revenue. A multi-use card is not
+   *    counted again by its later redemptions: it was priced once, as a card.
+   *    The price is what the card was sold for; it never decides whether the
+   *    card unlocks anything, and the catalogue price is never read here;
    *  - **wallet top-ups** — `recharge_revenue`, one immutable row per redeemed
    *    recharge card at the cash actually paid. Spending the credit (library
    *    purchases) is not revenue again, and admin wallet adjustments never
@@ -419,9 +421,9 @@ export class AnalyticsService {
    *
    * Profit equals total revenue: no expenses or teacher splits are recorded.
    * Purchases count paid card sales only — not top-ups. A free card's
-   * redemption is an activation, and a redemption of a card whose amount was
-   * never recorded is reported as such; neither is ever valued from a printed
-   * or catalogue price.
+   * (price 0) redemption is an activation, and a redemption of a card issued
+   * without a price is reported as "not recorded"; neither is ever valued from
+   * a course or part catalogue price.
    *
    * The existing ledger fields (`grossAllTime`, `netInPeriod`, …) keep their
    * meaning; the new figures are added beside them.
@@ -432,9 +434,11 @@ export class AnalyticsService {
     const prismaAny = this.prisma as any;
 
     const window = { gte: from, lte: to };
-    const paidCard = { kind: CodeKind.ACCESS, actualPaidAmount: { gt: 0 } };
-    const freeCard = { kind: CodeKind.ACCESS, actualPaidAmount: 0 };
-    const unrecordedCard = { kind: CodeKind.ACCESS, actualPaidAmount: null };
+    // ACCESS only: a recharge card also carries a priceAmount (its face value),
+    // and it is counted through recharge_revenue instead.
+    const paidCard = { kind: CodeKind.ACCESS, priceAmount: { gt: 0 } };
+    const freeCard = { kind: CodeKind.ACCESS, priceAmount: 0 };
+    const unrecordedCard = { kind: CodeKind.ACCESS, priceAmount: null };
 
     const [
       students,
@@ -519,7 +523,7 @@ export class AnalyticsService {
       // Paid cards that have been redeemed: each card's amount once.
       this.prisma.accessCode.aggregate({
         where: { ...paidCard, redemptions: { some: {} } },
-        _sum: { actualPaidAmount: true },
+        _sum: { priceAmount: true },
         _count: { _all: true },
       }),
       // ...whose FIRST redemption falls in the period: one in the window and
@@ -532,7 +536,7 @@ export class AnalyticsService {
             none: { redeemedAt: { lt: from } },
           },
         },
-        _sum: { actualPaidAmount: true },
+        _sum: { priceAmount: true },
         _count: { _all: true },
       }),
       this.prisma.rechargeRevenue.aggregate({
@@ -578,8 +582,8 @@ export class AnalyticsService {
     const onlineAll = piastres(grossAll) - piastres(refundedAll);
     const onlineWindow =
       piastres(revenueWindow._sum.grossAmount) + piastres(refundsWindow._sum.grossAmount);
-    const codeSalesAllP = piastres(codeSalesAll._sum.actualPaidAmount);
-    const codeSalesWindowP = piastres(codeSalesWindow._sum.actualPaidAmount);
+    const codeSalesAllP = piastres(codeSalesAll._sum.priceAmount);
+    const codeSalesWindowP = piastres(codeSalesWindow._sum.priceAmount);
     const topUpsAllP = piastres(topUpsAll._sum.actualPaidAmount);
     const topUpsWindowP = piastres(topUpsWindow._sum.actualPaidAmount);
     const totalAll = (codeSalesAllP + topUpsAllP + onlineAll) / 100;
@@ -626,19 +630,19 @@ export class AnalyticsService {
         transactionsInPeriod: revenueWindow._count._all,
         enrollmentsInPeriod: enrollmentsWindow,
         activeEnrollments,
-        // Paid card sales: cards with a collected amount, counted once at their
-        // first redemption. Wallet top-ups and free cards are not purchases.
+        // Paid card sales: cards issued at a price above 0, counted once at
+        // their first redemption. Wallet top-ups and free cards are not purchases.
         paidCodeSalesAllTime: codeSalesAll._count._all,
         paidCodeSalesInPeriod: codeSalesWindow._count._all,
       },
 
       // Redemptions that are not revenue, shown so they are not mistaken for it.
       activations: {
-        // Cards issued as free (amount collected 0).
+        // Cards issued free (price 0).
         freeAllTime: freeAll,
         freeInPeriod: freeWindow,
-        // Cards issued before the amount was required: redeemed, but what was
-        // collected for them is unknown, so they are in no revenue figure.
+        // Cards issued without a price: redeemed, but what they were sold for
+        // is unknown, so they are in no revenue figure.
         unrecordedAllTime: unrecordedAll,
         unrecordedInPeriod: unrecordedWindow,
       },
