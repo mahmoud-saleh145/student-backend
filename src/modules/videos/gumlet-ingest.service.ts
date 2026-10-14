@@ -8,7 +8,10 @@ import type { VideoConfig } from '../../config/configuration';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { StorageService } from '../storage/storage.service';
 import { GumletDrmService } from '../playback/gumlet-drm.service';
-import { DrmVerificationService } from '../playback/drm-verification.service';
+import {
+  DrmVerificationService,
+  isTransientProviderError,
+} from '../playback/drm-verification.service';
 import { LessonVideoService } from './lesson-video.service';
 
 /**
@@ -40,6 +43,28 @@ import { LessonVideoService } from './lesson-video.service';
  */
 const GUMLET_JOB_POLL_BUDGET_MS = 20 * 60 * 1000;
 const GUMLET_POLL_INTERVAL_MS = 5000;
+
+/**
+ * How many consecutive transient provider failures one job tolerates before it
+ * stops polling and hands the video back to the recovery sweep.
+ *
+ * WHY THIS EXISTS
+ *
+ * `sync()` asks Gumlet for the asset, and `GumletDrmService.timedFetch` wraps
+ * that call in `AbortSignal.timeout(GUMLET_HTTP_TIMEOUT_MS ?? 5000)`. When the
+ * timeout fires, `sync()` THROWS rather than returning a state. The polling loop
+ * below used to let that throw escape, so a single 5-second blip aborted the
+ * entire 20-minute budget and failed the job - the exact opposite of what a
+ * bounded, tolerant poll is for. Two jobs in production failed that way while
+ * their assets were already `ready`.
+ *
+ * Bounded on purpose: an unbounded "retry forever" would hold a worker forever,
+ * which is what the 20-minute budget exists to prevent. Five consecutive
+ * failures at a 5-second interval is ~25 s of sustained inability to reach the
+ * provider, which is well past a blip and firmly a real outage. That is handed
+ * back for the recovery sweep instead of being retried here.
+ */
+const GUMLET_MAX_CONSECUTIVE_TRANSIENT = 5;
 
 @Injectable()
 export class GumletIngestService {
@@ -450,18 +475,53 @@ export class GumletIngestService {
         if (video.height === null && asset.height !== null) update.height = asset.height;
         if (video.frameRate === null && asset.frameRate !== null) update.frameRate = asset.frameRate;
       } else {
-        // Fail-closed: Gumlet says ready but the media is not encrypted.
-        update.gumletError =
-          'Gumlet reported the asset ready but the DASH manifest is not CENC-encrypted. ' +
-          'This video was packaged without DRM and must be reprocessed before it can be played.';
+        // Fail-closed: never mark playable on an unproven asset. But say WHY.
+        //
+        // `playable === false` does NOT mean "the manifest is unencrypted".
+        // `DrmVerificationService.verify()` runs `evaluate()` first, and
+        // `evaluate()` returns DRM_DISABLED_ON_PLATFORM / SIGNING_UNAVAILABLE
+        // from its very first branches. On such a process `verify()` returns at
+        // drm-verification.service.ts:383 having called NEITHER `getAsset()` NOR
+        // `fetchManifest()`, so the packaged media was never looked at.
+        //
+        // The old text asserted "the DASH manifest is not CENC-encrypted" in
+        // both cases. A worker running with DRM_ENABLED=false therefore stamped
+        // two healthy, fully CENC-encrypted assets (verified cbcs + default_KID +
+        // Widevine PSSH) with a confident false claim, and that text is what an
+        // operator reads. Only claim the manifest verdict when this process was
+        // actually able to reach one.
+        const checkedManifest = this.drmVerification.isPlatformUsable();
+
+        update.gumletError = checkedManifest
+          ? 'Gumlet reported the asset ready but the DASH manifest is not CENC-encrypted. ' +
+            'This video was packaged without DRM and must be reprocessed before it can be played.'
+          : 'Gumlet reports the asset ready, but this process is not configured for Gumlet DRM ' +
+            '(DRM_ENABLED / DRM_PROVIDER / signing), so playability could not be established here. ' +
+            'Nothing has been determined about how the media was packaged.';
+
         if (onGumletPath) {
+          // NOTE: this still sets FAILED even when `checkedManifest` is false.
+          //
+          // That is deliberate for now, and it is a known wart rather than an
+          // oversight - see the comment at the end of processFromJob(). There is
+          // no VideoStatus that honestly means "the provider says ready and THIS
+          // process could not judge it", and choosing one silently would change
+          // what operators and the recovery sweep see. Left as-is deliberately.
           update.status = VideoStatus.FAILED;
-          this.logger.error(`asset ${asset.assetId} ready but NOT encrypted - refusing to mark playable`);
+          this.logger.error(
+            checkedManifest
+              ? `asset ${asset.assetId} ready but NOT encrypted - refusing to mark playable`
+              : `asset ${asset.assetId} ready but DRM could not be verified on this process ` +
+                '(platform not configured for Gumlet DRM) - refusing to mark playable',
+          );
         } else {
           // Legacy is still serving this lesson. Leave `status` alone so it keeps
           // playing, and make the provider-side problem visible instead.
           this.logger.warn(
-            `asset ${asset.assetId} ready but NOT encrypted; leaving legacy playback in place for video ${videoId}`,
+            checkedManifest
+              ? `asset ${asset.assetId} ready but NOT encrypted; leaving legacy playback in place for video ${videoId}`
+              : `asset ${asset.assetId} ready but DRM could not be verified on this process; ` +
+                `leaving legacy playback in place for video ${videoId}`,
           );
         }
       }
@@ -559,14 +619,67 @@ export class GumletIngestService {
     // ffmpeg-scale duration.
     const deadline = Date.now() + GUMLET_JOB_POLL_BUDGET_MS;
     let last = 'unknown';
+    let transientStreak = 0;
 
     while (Date.now() < deadline) {
-      const state = await this.sync(videoId);
+      let state: { assetId: string; status: string; playable: boolean };
+
+      try {
+        state = await this.sync(videoId);
+        transientStreak = 0;
+      } catch (error) {
+        // A provider blip is not a verdict on the asset.
+        //
+        // `timedFetch` raises a transient `GumletRequestError` when its
+        // `AbortSignal.timeout` fires, and `sync()` lets that propagate. Without
+        // this guard a single 5-second timeout escaped the loop and failed the
+        // job outright, discarding the whole 20-minute budget over one blip.
+        //
+        // `isTransientProviderError` is the same predicate `verify()` uses: a
+        // definitive answer from Gumlet (HTTP 4xx, unreadable body) is NOT
+        // transient and still fails the job immediately, so this cannot mask a
+        // genuinely dead asset.
+        if (!isTransientProviderError(error)) throw error;
+
+        transientStreak += 1;
+        if (transientStreak >= GUMLET_MAX_CONSECUTIVE_TRANSIENT) {
+          this.logger.warn(
+            `video ${videoId}: giving up after ${transientStreak} consecutive Gumlet timeouts ` +
+              `(${GUMLET_MAX_CONSECUTIVE_TRANSIENT} max); the recovery sweep will re-check it`,
+          );
+          break;
+        }
+        await new Promise((r) => setTimeout(r, GUMLET_POLL_INTERVAL_MS));
+        continue;
+      }
+
       last = state.status;
       if (state.playable) return { handled: true, status: state.status, playable: true };
       if (state.status === 'errored' || state.status === 'failed') {
         return { handled: true, status: state.status, playable: false };
       }
+
+      // TERMINAL: the provider is DONE and this process CAN judge the media.
+      //
+      // `status === 'ready'` means Gumlet has finished packaging; re-polling
+      // cannot change that. And `isPlatformUsable()` means `playable === false`
+      // here is an actual verdict from the real CENC manifest check rather than
+      // this process's own inability to look. Without that guard a DRM-disabled
+      // process would exit early on a verdict it never made.
+      //
+      // Previously neither exit condition matched, so this combination spun for
+      // the entire remaining budget - one `sync()` (and therefore one database
+      // write plus one ERROR log) every ~6 seconds, for up to 20 minutes, per
+      // video. Fail-closed is unchanged: the row was already left non-playable
+      // by sync(); this only stops wasting the worker.
+      if (state.status === 'ready' && this.drmVerification.isPlatformUsable()) {
+        this.logger.warn(
+          `video ${videoId}: Gumlet asset ${state.assetId} is ready but not playable; ` +
+            'ending the poll budget early (a verified verdict, not a pending one)',
+        );
+        return { handled: true, status: state.status, playable: false };
+      }
+
       await new Promise((r) => setTimeout(r, GUMLET_POLL_INTERVAL_MS));
     }
 
@@ -580,6 +693,29 @@ export class GumletIngestService {
       },
     });
 
+    // KNOWN AMBIGUITY, DELIBERATELY NOT RESOLVED HERE
+    //
+    // In sync(), a `ready` asset whose DRM could not be verified on this process
+    // is still set to VideoStatus.FAILED. That is arguably wrong - the failure
+    // is this process's misconfiguration, not the asset's - but there is no
+    // honest status to put there instead, and choosing one silently would change
+    // operational semantics:
+    //
+    //   * VideoStatus has no UNKNOWN / INCONCLUSIVE member
+    //     (UPLOADING, QUEUED, PROCESSING, READY, FAILED, ARCHIVED).
+    //   * Leaving it PROCESSING is also a lie, because no work is ongoing, and
+    //     `recoverStrandedVideos()` (videos.service.ts) only reclaims PROCESSING
+    //     rows after a 3-hour cutoff, then marks them FAILED with
+    //     "Processing was interrupted (job completed); retry to process the
+    //     stored file again" - which is a second misleading message and would
+    //     invite an unnecessary re-ingest that creates a brand-new billed asset.
+    //   * The DRM sweep selects `status: 'READY'` only, so a stranded PROCESSING
+    //     row is never picked up again automatically.
+    //
+    // Both available answers mislead in a different direction, so the existing
+    // fail-closed behaviour is preserved rather than changed unilaterally. The
+    // correct fix is a product decision (a new status, or making the recovery
+    // sweep responsible for re-verifying unjudged rows), not a drive-by edit.
     return { handled: true, status: last, playable: false };
   }
 
