@@ -18,7 +18,7 @@ import { PrismaService } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { PlatformSettingsService } from '../settings/platform-settings.service';
 import { resolveDiscount } from '../wallet/discount';
-import { toEgpNumber, toPiastres } from '../wallet/money';
+import { fromPiastres, parseAmount, toEgpNumber, toPiastres } from '../wallet/money';
 
 export interface CodeValidation {
   code: {
@@ -93,6 +93,12 @@ export class CodesService {
    * That is the whole point of the snapshot. A card sold in October must not
    * silently start unlocking a section added in December, because the buyer
    * did not pay for it and the seller did not price it.
+   *
+   * The card's price is `priceAmount`, on every card and on the batch. It is
+   * the revenue figure when a card is first redeemed (see
+   * `AnalyticsService.dashboard`) and plays no part in redemption: a card
+   * unlocks its scope whatever it was priced at. It is taken only from the
+   * request — never copied from the course or part catalogue price.
    */
   async generateBatch(
     input: {
@@ -108,8 +114,17 @@ export class CodesService {
       accessDurationType?: 'LIFETIME' | 'FIXED_DAYS' | 'UNTIL_DATE';
       accessDurationDays?: number;
       accessEndsAt?: string;
-      priceAmount?: number;
+      /**
+       * Optional, and `null` is the same as omitted. `@IsOptional()` skips
+       * validation for null as well as undefined, so a client that posts
+       * `"priceAmount": null` reaches this method with a null it is entitled
+       * to send — both mean "no price was recorded" and both store null.
+       */
+      priceAmount?: number | null;
       currency?: string;
+      /** Deprecated aliases; nullable for the same reason `priceAmount` is. */
+      amountCollected?: number | null;
+      free?: boolean | null;
       expiresAt?: string;
       note?: string;
       prefix?: string;
@@ -119,6 +134,8 @@ export class CodesService {
     if (input.count < 1 || input.count > 5000) {
       throw AppException.validation({ count: ['must be between 1 and 5000'] });
     }
+
+    const priceAmount = CodesService.issuedPrice(input);
 
     const targetType = input.targetType ?? CodeTargetType.COURSE;
     const target = await this.resolveTarget(targetType, input);
@@ -146,7 +163,7 @@ export class CodesService {
           targetNameSnapshot: target.name,
           quantity: input.count,
           prefix: prefix || null,
-          priceAmount: input.priceAmount ?? null,
+          priceAmount,
           currency: input.currency ?? 'EGP',
           expiresAt,
           note: input.note ?? null,
@@ -170,7 +187,7 @@ export class CodesService {
           accessDurationType: input.accessDurationType ?? null,
           accessDurationDays: input.accessDurationDays ?? null,
           accessEndsAt: input.accessEndsAt ? new Date(input.accessEndsAt) : null,
-          priceAmount: input.priceAmount ?? null,
+          priceAmount,
           currency: input.currency ?? 'EGP',
           expiresAt,
           note: input.note ?? null,
@@ -200,6 +217,9 @@ export class CodesService {
         frozenSections: target.grantedSectionIds.length,
         frozenCourses: target.grantedCourseIds.length,
         maxRedemptions: input.maxRedemptions ?? 1,
+        // Recorded so the issued price is recoverable from the audit trail
+        // even if a card row is later edited.
+        priceAmount: priceAmount === null ? null : Number(priceAmount),
       },
       note: input.note,
     });
@@ -214,8 +234,50 @@ export class CodesService {
       targetName: target.name,
       requested: input.count,
       created,
+      priceAmount: priceAmount === null ? null : Number(priceAmount),
       codes: [...codes],
     };
+  }
+
+  /**
+   * The per-card price to store, as the decimal string the column expects, or
+   * null when none was given (as before: such a card is reported as "not
+   * recorded", and it still redeems normally).
+   *
+   * `priceAmount` is the field. `amountCollected` and `free` are deprecated
+   * aliases accepted for one release, because the dashboard deployed on
+   * 2026-10-14 sends them; they map onto `priceAmount` (`free` → 0) and write
+   * nothing else. Contradictory combinations are refused rather than guessed.
+   */
+  private static issuedPrice(input: {
+    priceAmount?: number | null;
+    amountCollected?: number | null;
+    free?: boolean | null;
+  }): string | null {
+    const has = (value: unknown) => value !== undefined && value !== null;
+    const toStored = (value: unknown, field: string) => fromPiastres(parseAmount(value, field));
+
+    if (input.free === true) {
+      const pricedAboveZero = has(input.priceAmount) && Number(input.priceAmount) !== 0;
+      if (has(input.amountCollected) || pricedAboveZero) {
+        throw AppException.validation({
+          priceAmount: ['must be 0 or left out when the cards are free'],
+        });
+      }
+      return fromPiastres(0);
+    }
+
+    if (has(input.amountCollected)) {
+      const alias = toStored(input.amountCollected, 'amountCollected');
+      if (has(input.priceAmount) && toStored(input.priceAmount, 'priceAmount') !== alias) {
+        throw AppException.validation({
+          priceAmount: ['conflicts with amountCollected; send priceAmount only'],
+        });
+      }
+      return alias;
+    }
+
+    return has(input.priceAmount) ? toStored(input.priceAmount, 'priceAmount') : null;
   }
 
   /**

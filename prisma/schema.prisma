@@ -1885,8 +1885,12 @@ model AccessCode {
   grantedSectionIds String[] @default([])
   grantedCourseIds  String[] @default([])
 
-  /// Face value recorded on the card, for reporting. This is NOT the money
-  /// authority — revenue always comes from revenue_ledger.
+  /// The price the card was issued at. For an ACCESS card this is the revenue
+  /// figure, recognised once, when the card is first redeemed; 0 is a free
+  /// card, and NULL means no price was recorded (reported as such, never
+  /// inferred from a catalogue price). It never affects redemption: a valid
+  /// card unlocks its scope whatever it was priced at. For a RECHARGE card it
+  /// is the face value, and revenue comes from recharge_revenue instead.
   priceAmount Decimal? @db.Decimal(12, 2)
   currency    String   @default("EGP")
 
@@ -1904,6 +1908,7 @@ model AccessCode {
   ///   actualPaidAmount — what the student actually handed over: THE REVENUE
   ///   creditAmount     — what lands in the wallet (equal to actualPaidAmount)
   /// A 100% discount is legal and yields 0 / 0 / 0 for the last three.
+  /// Recharge cards only: an ACCESS card's revenue figure is priceAmount above.
   faceValue        Decimal?     @db.Decimal(12, 2)
   discountType     DiscountType @default(NONE)
   discountPercent  Decimal?     @db.Decimal(5, 2)
