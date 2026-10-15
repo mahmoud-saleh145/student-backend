@@ -212,6 +212,99 @@ describe('CodesService.redeemInTransaction', () => {
     });
   });
 
+  /**
+   * The price is reporting metadata. It is not an input to authorization, and
+   * the strongest way to show that is to run the *whole* decision matrix — the
+   * accept and every refusal — once per price and require identical outcomes.
+   * A future change that starts consulting the price fails this table rather
+   * than passing a single hand-picked case.
+   */
+  describe('the card price never affects authorization', () => {
+    const PRICES: Array<[string, unknown]> = [
+      ['no recorded price', null],
+      ['free', 0],
+      ['priced below the catalogue', 100],
+      ['priced far above the catalogue', 1_000_000],
+    ];
+
+    it.each(PRICES)('redeems a valid card at %s', async (_label, priceAmount) => {
+      const { service, tx, redemptionCreate } = buildService(code({ priceAmount }));
+
+      await expect(
+        service.redeemInTransaction(tx as never, { ...REDEEM, rawCode: 'DEVCIRCUIT01' }),
+      ).resolves.toMatchObject({ scope: expect.objectContaining({ courseIds: ['crs_1'] }) });
+
+      expect(redemptionCreate).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(PRICES)('still refuses a revoked card priced with %s', async (_label, priceAmount) => {
+      const { service, tx, redemptionCreate } = buildService(
+        code({ priceAmount, status: CodeStatus.REVOKED }),
+      );
+
+      await expect(
+        service.redeemInTransaction(tx as never, { ...REDEEM, rawCode: 'DEVCIRCUIT01' }),
+      ).rejects.toMatchObject({ code: ErrorCode.INVALID_CODE });
+      expect(redemptionCreate).not.toHaveBeenCalled();
+    });
+
+    it.each(PRICES)('still refuses an expired card priced with %s', async (_label, priceAmount) => {
+      const { service, tx, redemptionCreate } = buildService(
+        code({ priceAmount, expiresAt: new Date(Date.now() - 1000) }),
+      );
+
+      await expect(
+        service.redeemInTransaction(tx as never, { ...REDEEM, rawCode: 'DEVCIRCUIT01' }),
+      ).rejects.toMatchObject({ code: ErrorCode.INVALID_CODE });
+      expect(redemptionCreate).not.toHaveBeenCalled();
+    });
+
+    it.each(PRICES)(
+      'still refuses a card aimed at another course, priced with %s',
+      async (_label, priceAmount) => {
+        const { service, tx, redemptionCreate } = buildService(
+          code({ priceAmount, courseId: 'crs_other' }),
+        );
+
+        await expect(
+          service.redeemInTransaction(tx as never, { ...REDEEM, rawCode: 'DEVCIRCUIT01' }),
+        ).rejects.toMatchObject({ code: ErrorCode.INVALID_CODE });
+        expect(redemptionCreate).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(PRICES)(
+      'still refuses a single-use card that is spent, priced with %s',
+      async (_label, priceAmount) => {
+        const { service, tx, redemptionCreate } = buildService(
+          code({ priceAmount, redemptionCount: 1, maxRedemptions: 1 }),
+        );
+
+        await expect(
+          service.redeemInTransaction(tx as never, { ...REDEEM, rawCode: 'DEVCIRCUIT01' }),
+        ).rejects.toMatchObject({ code: ErrorCode.CODE_ALREADY_USED });
+        expect(redemptionCreate).not.toHaveBeenCalled();
+      },
+    );
+
+    it('never writes the price, or anything else, onto the redemption row', async () => {
+      // The price belongs to the card for reporting; the redemption records who
+      // took what and when. Copying it here would create a second amount field
+      // that could disagree with the card's.
+      const { service, tx, redemptionCreate } = buildService(code({ priceAmount: null }));
+
+      await service.redeemInTransaction(tx as never, {
+        ...REDEEM,
+        rawCode: 'DEVCIRCUIT01',
+      });
+
+      const written = redemptionCreate.mock.calls[0]![0].data;
+      expect(written).not.toHaveProperty('priceAmount');
+      expect(written).not.toHaveProperty('actualPaidAmount');
+      expect(written).not.toHaveProperty('amount');
+    });
+  });
+
   describe('exhaustion', () => {
     it('flips a code to EXHAUSTED on its final redemption', async () => {
       const { service, tx, codeUpdate } = buildService(
