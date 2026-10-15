@@ -590,6 +590,18 @@ export class CourseAccessService {
    *
    * Staff are not subject to this: an administrator enrolling a student by hand
    * is a deliberate override, which is why callers pass the role through.
+   *
+   * ## Academic year is not one of these dimensions
+   *
+   * A course is also filed against an optional `academicYearId`, and that
+   * column is deliberately NOT compared here. Year/level is a browsing and
+   * homepage-default preference, not an eligibility rule: a student may
+   * enrol in, pay for and study a course from any year or level inside their
+   * own university, faculty and department. Only university, faculty and
+   * department can refuse eligibility. Year is still used to *label* things
+   * (which control reads "Year" or "Level", see catalog.service.ts) and to
+   * filter a listing's result set, but never to decide whether a student may
+   * study a course.
    */
   /** Shared SQL eligibility filter keeps pagination, search and recommendations consistent. */
   async studentCourseWhere(userId: string | null): Promise<Prisma.CourseWhereInput> {
@@ -599,14 +611,28 @@ export class CourseAccessService {
       return {
         universityId: null,
         facultyId: null,
-        academicYearId: null,
+        // No academicYearId term, for the same reason the branch below omits
+        // one: year/level must never decide what a caller can see. A missing
+        // profile already fails closed on the three dimensions that DO define
+        // a scope — university, faculty and department — so it sees only
+        // genuinely global courses. Restricting those by year as well would
+        // make this branch disagree with the equivalent profile-with-no-year
+        // state below, reintroducing exactly the year restriction this rule
+        // removes.
         departments: { none: {} },
       };
     return {
       AND: [
         { OR: [{ universityId: null }, { universityId: profile.universityId }] },
         { OR: [{ facultyId: null }, { facultyId: profile.facultyId }] },
-        { OR: [{ academicYearId: null }, { academicYearId: profile.academicYearId }] },
+        // Academic year/level is deliberately ABSENT.
+        //
+        // It is a browsing and homepage-default preference, not an eligibility
+        // rule: a student may take a course from any year or level inside their
+        // own university, faculty and department. Listing therefore shows every
+        // year, and the Courses page's year control filters the RESULT SET
+        // explicitly (see CoursesService.list's `filters.academicYearId`) rather
+        // than narrowing eligibility.
         {
           OR: [
             { departments: { none: {} } },
@@ -643,15 +669,10 @@ export class CourseAccessService {
     const constrainsDepartment = course.departments.length > 0;
     const constrainsUniversity = course.universityId !== null;
     const constrainsFaculty = course.facultyId !== null;
-    const constrainsYear = course.academicYearId !== null;
 
-    // Untargeted: open to everyone.
-    if (
-      !constrainsDepartment &&
-      !constrainsUniversity &&
-      !constrainsFaculty &&
-      !constrainsYear
-    ) {
+    // Untargeted: open to everyone. Academic year is not part of this test —
+    // see the note in `studentCourseWhere`.
+    if (!constrainsDepartment && !constrainsUniversity && !constrainsFaculty) {
       return true;
     }
 
@@ -678,7 +699,11 @@ export class CourseAccessService {
     if (constrainsUniversity && course.universityId !== profile.universityId)
       return false;
     if (constrainsFaculty && course.facultyId !== profile.facultyId) return false;
-    if (constrainsYear && course.academicYearId !== profile.academicYearId) return false;
+
+    // No academic-year test here, by design: enrolling in, paying for and
+    // studying a course from ANY year or level is permitted inside the
+    // student's own university, faculty and department. Only the university,
+    // faculty and department dimensions above can refuse eligibility.
 
     return true;
   }

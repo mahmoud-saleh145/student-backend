@@ -67,7 +67,14 @@ export class HomeService {
         userId,
         page: 1,
         pageSize: 8,
-        filters: { sort: 'newest' },
+        filters: {
+          sort: 'newest',
+          // Discovery defaults to the student's current year/level. This is a
+          // DISPLAY preference only: it narrows this shelf's result set and
+          // nothing else. It never restricts what the student may enrol in or
+          // study, and `studentCourseWhere` still enforces university/faculty.
+          academicYearId: student?.academicYearId ?? undefined,
+        },
       }),
       this.courses.list({
         userId,

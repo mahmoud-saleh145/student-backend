@@ -110,9 +110,9 @@ describe('isTargetedToStudent', () => {
 
   it('requires every constrained dimension, not just one of them', async () => {
     // The conjunction is the point: matching the faculty does not excuse
-    // failing the year.
+    // failing the department.
     const { service } = buildService(
-      { ...UNTARGETED, facultyId: 'fac_eng', academicYearId: 'yr_2' },
+      { ...UNTARGETED, facultyId: 'fac_eng', departments: [{ departmentId: 'dep_civil' }] },
       {
         universityId: 'uni_1',
         facultyId: 'fac_eng',
@@ -173,15 +173,19 @@ describe('isTargetedToStudent', () => {
   });
 
   it('treats an unset constrained dimension as ineligible', async () => {
-    // The student profile has a department but no year, and the course targets
-    // a specific year. Undetermined is not a match.
+    // The student profile names a university but no faculty, and the course is
+    // assigned to a specific faculty. Undetermined is not a match.
+    //
+    // This uses faculty rather than academic year on purpose: year is no longer
+    // an eligibility dimension, so a year-targeted course is open to any year.
+    // The university/faculty/department dimensions still fail closed.
     const { service } = buildService(
-      { ...UNTARGETED, academicYearId: 'yr_2' },
+      { ...UNTARGETED, facultyId: 'fac_civil' },
       {
         universityId: 'uni_1',
-        facultyId: 'fac_eng',
+        facultyId: null,
         departmentId: 'dep_mech',
-        academicYearId: null,
+        academicYearId: 'yr_2',
       },
     );
 
