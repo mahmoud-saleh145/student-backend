@@ -242,6 +242,19 @@ export class CoursesAdminService {
           faculty: { select: { id: true, name: true, nameAr: true } },
           academicYear: { select: { id: true, name: true, nameAr: true, order: true } },
           subject: { select: { id: true, name: true, nameAr: true } },
+          // A course is offered to several departments at once, and the Access
+          // Code picker names them: `Title (Faculty – University – Department)`.
+          // `detailForStaff` already selected them; the list did not, so the one
+          // part of that sentence it could not finish was the department.
+          // Ordered by the catalogue's own order (`sortOrder`, then `name`) so
+          // the same course reads identically wherever it is listed.
+          departments: {
+            orderBy: [
+              { department: { sortOrder: 'asc' } },
+              { department: { name: 'asc' } },
+            ],
+            select: { department: { select: { id: true, name: true, facultyId: true } } },
+          },
           _count: { select: { enrollments: true, sections: true, lessons: true } },
         },
       }),
@@ -273,6 +286,10 @@ export class CoursesAdminService {
       faculty: course.faculty,
       academicYear: course.academicYear,
       subject: course.subject,
+      // Flattened out of the join rows, for the same reason `detailForStaff`
+      // flattens them: a consumer wants the departments, not the fact that they
+      // arrive through a link table.
+      departments: course.departments.map((link) => link.department),
       publishedAt: course.publishedAt?.toISOString() ?? null,
       archivedAt: course.archivedAt?.toISOString() ?? null,
       createdAt: course.createdAt.toISOString(),
