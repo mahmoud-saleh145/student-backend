@@ -1,6 +1,6 @@
-import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { VideoStatus } from '@prisma/client';
+import { VideoStatus, type UserRole } from '@prisma/client';
 
 import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
@@ -12,7 +12,9 @@ import {
   DrmVerificationService,
   isTransientProviderError,
 } from '../playback/drm-verification.service';
+import { AuditService } from '../audit/audit.service';
 import { LessonVideoService } from './lesson-video.service';
+import { resolveGumletIngestUrlTtlSeconds } from './gumlet-ingest-url-ttl';
 
 /**
  * Gumlet-backed video lifecycle.
@@ -66,11 +68,24 @@ const GUMLET_POLL_INTERVAL_MS = 5000;
  */
 const GUMLET_MAX_CONSECUTIVE_TRANSIENT = 5;
 
+/**
+ * Claim marker written to `gumletStatus` while a failed asset is being replaced.
+ *
+ * It is not a Gumlet status - Gumlet never reports it. It exists because a
+ * replacement must be atomic across several network round trips, and
+ * `gumletStatus` is a plain string column, so it can carry a lock without a
+ * migration. Every reader already treats an unrecognised value as neither
+ * playable nor a terminal failure, which is exactly the right reading: the row
+ * is mid-repair and no verdict exists for it yet.
+ */
+const GUMLET_ASSET_REPLACING = 'replacing';
+
 @Injectable()
 export class GumletIngestService {
   private readonly logger = new Logger(GumletIngestService.name);
   private readonly cfg: VideoConfig['drm']['gumlet'];
   private readonly drm: VideoConfig['drm'];
+  private readonly audit?: AuditService;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -79,7 +94,13 @@ export class GumletIngestService {
     private readonly drmVerification: DrmVerificationService,
     config: ConfigService,
     private readonly lessonVideos: LessonVideoService,
+    // Optional so the unit tests that build this service from plain doubles do
+    // not have to carry a Nest module graph, and so an application that runs
+    // without AuditModule still works. AuditModule is @Global, so in the real
+    // app this resolves.
+    @Optional() @Inject(AuditService) audit?: AuditService,
   ) {
+    this.audit = audit;
     const videoCfg = config.getOrThrow<VideoConfig>('video');
     this.cfg = videoCfg.drm.gumlet;
     this.drm = videoCfg.drm;
@@ -126,72 +147,131 @@ export class GumletIngestService {
       });
     }
 
-    // A short-lived, single-object read URL that Gumlet's servers can actually
-    // fetch. This is NOT `signMediaUrl`: that builds a viewer-bound CDN URL
-    // (uid/sid/tid + HMAC) which the edge Worker refuses for the `source/`
-    // namespace by design - cloudflare-worker.js:112-117, "never serve the
-    // source upload, whatever the signature says". Handing Gumlet that URL is
-    // what made asset creation succeed and then fail instantly with
-    // ERR_ASSET_NOT_FOUND. A SigV4 presign bypasses the CDN and stays scoped
-    // to this one private object until it expires.
+    const created = await this.createGumletAsset(video);
+
+    await this.markAdopted(videoId, created);
+
+    return { assetId: created.assetId, status: created.status };
+  }
+
+  /**
+   * Mint a fresh presigned source URL and ask Gumlet to create the asset.
+   *
+   * THE ORDERING IS THE SAFETY PROPERTY. Both network calls happen BEFORE any
+   * database write, so an R2 signing failure or a Gumlet rejection throws while
+   * the row still describes whatever asset it described before - nothing is
+   * half-adopted, and no previously recorded asset id has been discarded.
+   *
+   * This is why `adopt()` and `replaceFailedAsset()` share it: both must be
+   * able to fail without leaving an unrecoverable row.
+   */
+  private async createGumletAsset(video: {
+    id: string;
+    sourceKey: string | null;
+    lesson?: { title: string } | null;
+  }): Promise<{ assetId: string; status: string; playbackUrl: string | null }> {
+    if (!video.sourceKey) {
+      // Both callers assert this first, but the selected row is re-read data -
+      // a null here would otherwise become a presign for the key "null".
+      throw new BadRequestException('This video has no uploaded source to hand to Gumlet');
+    }
+
+    // A presigned URL that stays readable long enough for a QUEUED provider
+    // side to actually reach the file. This is NOT `signMediaUrl`: that builds
+    // a viewer-bound CDN URL (uid/sid/tid + HMAC) which the edge Worker refuses
+    // for the `source/` namespace by design - cloudflare-worker.js:112-117,
+    // "never serve the source upload, whatever the signature says". Handing
+    // Gumlet that URL is what made asset creation succeed and then fail
+    // instantly with ERR_ASSET_NOT_FOUND. A SigV4 presign bypasses the CDN and
+    // stays scoped to this one private object until it expires.
+    //
+    // The lifetime is deliberately NOT derived from the source duration. The
+    // 2026-10-15 failure proved duration does not predict it: a 47-minute source
+    // took Gumlet 86.8 minutes, while a 63.5-minute source finished in 2.6. See
+    // `gumlet-ingest-url-ttl.ts` for the evidence and the bounds.
+    //
+    // The resolver runs HERE as well as in `configuration.ts`. That is not
+    // duplication for its own sake: configuration.ts resolves what the operator
+    // asked for, but the only place the floor and ceiling are guaranteed to hold
+    // is where the signature is actually produced. A caller that builds this
+    // service with a hand-made config object (the migration CLI, a test, a
+    // future script) would otherwise be able to sign a window shorter than the
+    // one that already broke in production. The resolver is idempotent, so
+    // resolving an already-resolved value changes nothing.
+    //
+    // The URL itself is never logged, never returned to a client, never stored.
     const sourceUrl = await this.storage.presignIngestionUrl({
       bucket: 'uploads',
       objectKey: video.sourceKey,
-      expiresIn: 3600,
+      expiresIn: resolveGumletIngestUrlTtlSeconds(this.cfg.ingestUrlTtlSeconds),
     });
 
-    const created = await this.gumlet.createAsset({
+    return this.gumlet.createAsset({
       sourceUrl,
       title: video.lesson?.title ?? undefined,
       enableDrm: true,
       tag: [`edu-video:${video.id}`],
     });
+  }
 
+  /**
+   * Record a newly created asset on the row and move it into PROCESSING.
+   *
+   * Written by `update` rather than `updateMany` because `adopt()` has already
+   * confirmed the row holds NO asset id - there is nothing to lose the race
+   * against, and `replaceFailedAsset()` uses the stricter guarded variant below.
+   */
+  private async markAdopted(
+    videoId: string,
+    created: { assetId: string; status: string },
+  ): Promise<void> {
     await this.prisma.video.update({
       where: { id: videoId },
-      data: {
-        drmProvider: 'gumlet',
-        // Records that WE asked for DRM. This is our intent, not proof - the
-        // proof is drmVerifiedAt, which only verify() may set.
-        drmRequested: true,
-        // A new asset has never been checked. Clearing this is what stops a
-        // previously-verified video from staying playable across a re-ingest.
-        drmVerifiedAt: null,
-        // ...and a definitive failure recorded against the PREVIOUS asset says
-        // nothing about this one. Left set, the playback path would treat the
-        // new asset as definitively failed and never verify it on demand.
-        drmBlockedReason: null,
-        gumletAssetId: created.assetId,
-        gumletWorkspaceId: this.cfg.workspaceId,
-        gumletStatus: created.status,
-        gumletError: null,
-        gumletUpdatedAt: new Date(),
-        // The video is not playable until Gumlet reports ready.
-        status: VideoStatus.PROCESSING,
-        // No local transcode job is in flight for a Gumlet-backed video, so the
-        // previous pipeline's job fields must not survive into this state.
-        //
-        // recoverStrandedVideos() treats PROCESSING rows whose
-        // processingStartedAt is older than three hours as abandoned work and
-        // marks them FAILED. Left carrying a timestamp from an earlier local
-        // transcode, a freshly adopted video matched that predicate on the very
-        // next sweep and was failed while its Gumlet asset was still healthy -
-        // observed in production as "Processing was interrupted (job missing)".
-        //
-        // null rather than "now": SQL never satisfies `NULL < cutoff`, so this
-        // is a permanent guard instead of a three-hour reprieve. It is also
-        // accurate - the worker path still sets its own timestamp through
-        // markProcessing(), so a genuinely stuck local job is still recovered.
-        processingStartedAt: null,
-        processingJobId: null,
-      },
+      data: this.buildAdoptionUpdate(created),
     });
 
     this.logger.log(
       `video ${videoId} adopted by Gumlet as asset ${created.assetId} (status ${created.status})`,
     );
+  }
 
-    return { assetId: created.assetId, status: created.status };
+  /**
+   * The single definition of "this row now points at a brand-new Gumlet asset".
+   *
+   * Shared so the normal ingest path and the repair path can never disagree
+   * about which fields an adoption resets.
+   */
+  private buildAdoptionUpdate(created: { assetId: string; status: string }): Record<string, unknown> {
+    return {
+      drmProvider: 'gumlet',
+      // Records that WE asked for DRM. This is our intent, not proof - the
+      // proof is drmVerifiedAt, which only verify() may set.
+      drmRequested: true,
+      // A new asset has never been checked. Clearing this is what stops a
+      // previously-verified video from staying playable across a re-ingest.
+      drmVerifiedAt: null,
+      // ...and a definitive failure recorded against the PREVIOUS asset says
+      // nothing about this one. Left set, the playback path would treat the
+      // new asset as definitively failed and never verify it on demand.
+      drmBlockedReason: null,
+      gumletAssetId: created.assetId,
+      gumletWorkspaceId: this.cfg.workspaceId,
+      gumletStatus: created.status,
+      gumletError: null,
+      gumletUpdatedAt: new Date(),
+      // The video is not playable until Gumlet reports ready.
+      status: VideoStatus.PROCESSING,
+      // No local transcode job is in flight for a Gumlet-backed video, so the
+      // previous pipeline's job fields must not survive into this state.
+      //
+      // This nulling is deliberate and safe BECAUSE the recovery sweep now
+      // looks at `drmProvider`/`gumletAssetId` too rather than requiring
+      // `processingStartedAt` to be old - see `recoverStrandedVideos()`. A
+      // Gumlet row therefore cannot be orphaned by having no local job, and it
+      // still cannot be failed by a sweep that only understands ffmpeg jobs.
+      processingStartedAt: null,
+      processingJobId: null,
+    };
   }
 
   /**
@@ -241,7 +321,18 @@ export class GumletIngestService {
    */
   async replaceFailedAsset(
     videoId: string,
-    options: { allowGumletProviderReplacement?: boolean } = {},
+    options: {
+      allowGumletProviderReplacement?: boolean;
+      /**
+       * Who asked for the repair, when a human did.
+       *
+       * Optional because the migration CLI has no user, and that run is a
+       * deliberate operator action recorded in its own report. When an HTTP
+       * caller supplies it, the audit row names that person - which is the
+       * project's convention for every other write on `videos`.
+       */
+      actor?: { id: string; role: UserRole };
+    } = {},
   ): Promise<{ assetId: string; status: string }> {
     const video = await this.prisma.video.findFirst({
       where: { id: videoId, ...notDeleted },
@@ -341,29 +432,107 @@ export class GumletIngestService {
 
     const failedAssetId = video.gumletAssetId;
 
-    // Drop only the dead asset identity, and only now that every precondition
-    // above has passed. On the legacy path `drmProvider` stays null and `status`
-    // stays READY, so legacy keeps serving this lesson while the replacement
-    // processes. On the repair path the video is already FAILED, so there is
-    // nothing to preserve.
-    await this.prisma.video.update({
-      where: { id: videoId },
+    // ---- CLAIM the replacement ----------------------------------------------
+    // Two callers hitting the same dead asset at once (an admin and a retry, or
+    // two admin clicks) would otherwise BOTH pass every guard above, BOTH mint a
+    // presigned URL and BOTH call createAsset - two live, double-billed assets
+    // for one lesson. A conditional write is the only thing that makes this
+    // atomic without a new column: the loser's `updateMany` matches zero rows.
+    //
+    // `gumletStatus` is a plain string column, so a claim marker can live in it
+    // without a migration. Everything that reads the column already treats an
+    // unrecognised value as "not playable / not a terminal failure".
+    const claimed = await this.prisma.video.updateMany({
+      where: {
+        id: videoId,
+        deletedAt: null,
+        gumletAssetId: failedAssetId,
+        gumletStatus: video.gumletStatus,
+      },
+      data: { gumletStatus: GUMLET_ASSET_REPLACING, gumletUpdatedAt: new Date() },
+    });
+
+    if (claimed.count === 0) {
+      // Either a concurrent caller won the race, or a newer sync() already
+      // mirrored a different provider verdict. Either way a second asset must
+      // not be created here.
+      throw new AppException(ErrorCode.VIDEO_PROCESSING_FAILED, {
+        message: `A replacement for Gumlet asset ${failedAssetId} is already in progress. Wait for the current attempt to finish.`,
+      });
+    }
+
+    let created: { assetId: string; status: string; playbackUrl: string | null };
+    try {
+      // Create FIRST, write SECOND.
+      //
+      // The old implementation cleared `gumletAssetId` and only then called
+      // `adopt()`. That order is why its own regression suite has a test about
+      // a missing R2 credential destroying the asset reference: everything that
+      // can fail (config, signing, source existence, Gumlet rejection) now
+      // happens while the dead asset id is STILL on the row. A failure here
+      // leaves the video exactly as diagnosable as it was before.
+      created = await this.createGumletAsset(video);
+    } catch (error) {
+      // Restore the terminal marker so the row stays diagnosable AND still
+      // replaceable. Without this, a failed attempt would leave `gumletStatus`
+      // stuck at the claim marker forever, which every subsequent guard reads
+      // as "not a terminal failure" and would refuse to repair.
+      await this.prisma.video.updateMany({
+        where: { id: videoId, gumletAssetId: failedAssetId },
+        data: { gumletStatus: video.gumletStatus, gumletUpdatedAt: new Date() },
+      });
+      throw error;
+    }
+
+    // ---- COMMIT the replacement ---------------------------------------------
+    // Guarded on the dead asset id AND the claim marker, so this write can only
+    // land for the attempt that actually owns the row.
+    const committed = await this.prisma.video.updateMany({
+      where: {
+        id: videoId,
+        deletedAt: null,
+        gumletAssetId: failedAssetId,
+        gumletStatus: GUMLET_ASSET_REPLACING,
+      },
       data: {
-        gumletAssetId: null,
-        gumletStatus: null,
-        gumletError: null,
-        gumletUpdatedAt: new Date(),
+        ...this.buildAdoptionUpdate(created),
+        // The dead asset is NOT deleted from Gumlet, so the row has to be able
+        // to say which asset it used to point at. That is the only record left
+        // after the id is replaced, and it is what an operator needs to clean
+        // up, or to understand why a video failed before.
+        gumletError: `Replaced failed Gumlet asset ${failedAssetId} (was ${video.gumletStatus ?? 'unknown'}) with a freshly ingested asset. The old asset was left at the provider and can be deleted once this one is proven.`,
       },
     });
 
     this.logger.warn(
-      `video ${videoId}: discarded failed Gumlet asset ${failedAssetId} and requesting a replacement`,
+      `video ${videoId}: replaced failed Gumlet asset ${failedAssetId} with asset ${created.assetId}`,
     );
 
-    // adopt() now sees no asset id and creates a fresh one from the same R2
-    // source object. It still sets PROCESSING, which is the one window in which
-    // this lesson is not playable - see the runbook.
-    return this.adopt(videoId);
+    await this.audit?.record({
+      actorId: options.actor?.id ?? null,
+      actorRole: options.actor?.role ?? null,
+      action: 'UPDATE',
+      entity: 'video',
+      entityId: videoId,
+      // Both ids travel in the audit `before`/`after` pair, so the trail keeps
+      // the dead asset addressable even after the row has moved on.
+      before: { gumletAssetId: failedAssetId, gumletStatus: video.gumletStatus },
+      after: { gumletAssetId: created.assetId, gumletStatus: created.status },
+      note: committed.count === 1
+        ? 'Gumlet failed-asset replacement committed'
+        : 'Gumlet failed-asset replacement created an asset but the row was already advanced',
+    });
+
+    if (committed.count === 0) {
+      // A concurrent adoption already replaced the id. The new asset exists at
+      // Gumlet and is now referenced only by this audit row; do not silently
+      // paper over that.
+      this.logger.error(
+        `video ${videoId}: created replacement asset ${created.assetId} but the row no longer pointed at ${failedAssetId}; the asset is unreferenced and must be inspected manually`,
+      );
+    }
+
+    return { assetId: created.assetId, status: created.status };
   }
 
   /**

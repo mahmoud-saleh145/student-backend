@@ -20,6 +20,7 @@ type Row = {
   gumletError: string | null;
   lesson?: { title: string } | null;
   sourceKey?: string | null;
+  sourceSizeBytes?: number | null;
 };
 
 const DRM_MANIFEST = `<?xml version="1.0" encoding="UTF-8"?>
@@ -43,6 +44,7 @@ function build(opts: {
   manifestOk?: boolean;
 }) {
   const updates: Record<string, unknown>[] = [];
+  const updateManyCalls: Array<{ where?: Record<string, unknown>; data: Record<string, unknown> }> = [];
   const row: Row = opts.row ?? {
     id: 'v1',
     status: 'UPLOADING',
@@ -65,11 +67,23 @@ function build(opts: {
       }),
       // `verify()` writes its success conditionally, so that a slower
       // overlapping verification cannot overwrite a newer timestamp.
-      updateMany: jest.fn(async (args: { data: Record<string, unknown> }) => {
-        updates.push(args.data);
-        Object.assign(row, args.data);
-        return { count: 1 };
-      }),
+      //
+      // A real Prisma `updateMany` does NOT mutate the object `findFirst` already
+      // returned - the caller keeps using its own in-memory copy. Mocking it as
+      // mutating would make a guarded write look like it rewrote the caller's
+      // state, which is precisely what `replaceFailedAsset`'s claim depends on
+      // NOT happening. So: record only, and honour the `where` guard.
+      updateMany: jest.fn(
+        async (args: { where?: Record<string, unknown>; data: Record<string, unknown> }) => {
+          updateManyCalls.push(args);
+          updates.push(args.data);
+          const assetMismatch =
+            args.where?.gumletAssetId !== undefined && args.where.gumletAssetId !== row.gumletAssetId;
+          const statusMismatch =
+            typeof args.where?.gumletStatus === 'string' && args.where.gumletStatus !== row.gumletStatus;
+          return { count: assetMismatch || statusMismatch ? 0 : 1 };
+        },
+      ),
     },
   };
 
@@ -134,7 +148,7 @@ function build(opts: {
     lessonVideos as never,
   );
 
-  return { service, updates, row, gumlet, storage };
+  return { service, updates, updateManyCalls, row, gumlet, storage };
 }
 
 describe('GumletIngestService.adopt', () => {
@@ -269,10 +283,17 @@ describe('replaceFailedAsset', () => {
       gumletStatus: 'errored',
     }) as Row;
 
-  it('clears the dead asset id and creates a replacement', async () => {
+  it('creates a replacement and points the row at it', async () => {
     const t = build({ row: deadOnLegacy() });
     await t.service.replaceFailedAsset('v1');
-    expect(t.updates[0]).toMatchObject({ gumletAssetId: null, gumletStatus: null, gumletError: null });
+
+    // The claim (a guarded conditional write) then the commit. The old ordering
+    // wrote `{ gumletAssetId: null }` first and adopted afterwards; the row is now
+    // never left describing no asset at all, so the video stays diagnosable even
+    // if the replacement itself fails.
+    const committed = t.updateManyCalls.at(-1)!.data;
+    expect(committed).not.toMatchObject({ gumletAssetId: null });
+    expect(committed.gumletAssetId).toBe('asset_1');
     expect(t.gumlet.createAsset).toHaveBeenCalledTimes(1);
   });
 
@@ -464,14 +485,40 @@ describe('the ingestion URL handed to Gumlet', () => {
     );
   });
 
-  it('keeps the presign short-lived rather than long-lived', async () => {
+  it('keeps the presign BOUNDED, not a long-lived credential', async () => {
     const { service, storage } = build({ row: row() });
 
     await service.adopt('v1');
 
     const call = (storage.presignIngestionUrl.mock.calls[0] as unknown as [{ expiresIn: number }])[0];
-    expect(call.expiresIn).toBe(3600);
-    expect(call.expiresIn).toBeLessThanOrEqual(3600);
+
+    // This used to assert exactly 3600. It is now the CONFIGURED lifetime,
+    // because a one-hour window is what expired underneath a queued Gumlet job
+    // on 2026-10-15 - see gumlet-ingest-url-ttl.ts.
+    //
+    // What must NOT change is the bound. This is a single-object, single-use
+    // ingest grant, never a viewer URL, and the ceiling is one day so a leaked
+    // URL has a bounded life. The floor is one hour, which is also the old value,
+    // so no configuration can make the window shorter than it was.
+    expect(call.expiresIn).toBe(6 * 60 * 60);
+    expect(call.expiresIn).toBeGreaterThanOrEqual(3600);
+    expect(call.expiresIn).toBeLessThanOrEqual(24 * 60 * 60);
+  });
+
+  it('scales the presign with the CONFIGURED lifetime, never with the source duration', async () => {
+    // Duration is not a predictor: a 47-minute source needed 86.8 minutes of
+    // provider time while a 63.5-minute source finished in 2.6. Any duration-based
+    // formula here would have been wrong in one direction or the other.
+    const short = build({ row: row({ sourceSizeBytes: 5_000_000 }) });
+    const long = build({ row: row({ sourceSizeBytes: 5_000_000_000 }) });
+
+    await short.service.adopt('v1');
+    await long.service.adopt('v1');
+
+    const shortCall = (short.storage.presignIngestionUrl.mock.calls[0] as unknown as [{ expiresIn: number }])[0];
+    const longCall = (long.storage.presignIngestionUrl.mock.calls[0] as unknown as [{ expiresIn: number }])[0];
+
+    expect(shortCall.expiresIn).toBe(longCall.expiresIn);
   });
 
   it('refuses to adopt when there is no stored source to hand over', async () => {

@@ -1,6 +1,7 @@
 import { registerAs } from '@nestjs/config';
 
 import { type EnvironmentVariables, NodeEnv, resolvePublicApiUrl } from './env.validation';
+import { resolveGumletIngestUrlTtlSeconds } from '../modules/videos/gumlet-ingest-url-ttl';
 
 const env = () => process.env as unknown as EnvironmentVariables;
 
@@ -206,6 +207,17 @@ export const videoConfig = registerAs('video', () => ({
        * unsigned ones - a fail-open webhook would let anyone mark an asset ready.
        */
       webhookSecret: process.env.GUMLET_WEBHOOK_SECRET ?? null,
+      /**
+       * Lifetime, in seconds, of the R2 presigned URL handed to Gumlet as the
+       * ingest input. Was a bare `3600` inside `adopt()`, which is precisely how
+       * the 2026-10-15 failure happened: Gumlet had already fetched and probed
+       * the file, then reported `ERR_ASSET_NOT_FOUND` 27 minutes after the
+       * signature expired. See `modules/videos/gumlet-ingest-url-ttl.ts` for the
+       * evidence, the bounds, and what a wider window does not buy.
+       */
+      ingestUrlTtlSeconds: resolveGumletIngestUrlTtlSeconds(
+        process.env.GUMLET_INGEST_URL_TTL_SECONDS,
+      ),
       tokenLifetimeSeconds: num(process.env.GUMLET_TOKEN_LIFETIME_SECONDS, 300),
       /**
        * Per-request timeout for Gumlet's asset API and manifest reads. Without

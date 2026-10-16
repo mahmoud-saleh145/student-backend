@@ -197,6 +197,19 @@ export class EnvironmentVariables {
   @IsOptional() @IsString() GUMLET_ORG_ID?: string;
   @IsOptional() @IsString() GUMLET_SIGN_SECRET?: string;
   /**
+   * Lifetime, in seconds, of the R2 presigned URL handed to Gumlet as the
+   * ingest input. Unset uses the 6-hour default; anything outside the floor
+   * (1h) or ceiling (24h) is clamped. Widen this only for a reason - the wider
+   * the window, the longer a leaked URL stays usable. See
+   * `modules/videos/gumlet-ingest-url-ttl.ts`.
+   */
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(3600)
+  @Max(86400)
+  GUMLET_INGEST_URL_TTL_SECONDS = 21600;
+  /**
    * Shared secret for verifying Gumlet asset webhooks. Optional because the app
    * must boot without it, but when blank the webhook endpoint refuses every
    * event rather than trusting unsigned payloads.

@@ -222,6 +222,58 @@ export class VideosController {
   }
 
   /**
+   * Repair a TERMINALLY FAILED Gumlet asset by creating a fresh one from the
+   * same stored source.
+   *
+   * WHY THIS ENDPOINT HAS TO EXIST
+   *
+   * `adopt()` is deliberately idempotent: once a row carries a
+   * `gumletAssetId`, it re-syncs that asset rather than creating a second one.
+   * That is what stops a re-run producing duplicate, double-billed assets - and
+   * it is also why a video whose asset died at the provider could never be
+   * recovered. `POST /videos/:id/retry` and `POST /videos/:id/gumlet/sync` both
+   * re-read the same dead asset and return the same terminal verdict, forever.
+   * `replaceFailedAsset()` was written to break that deadlock by discarding the
+   * dead id and ingesting a fresh one, but it was only reachable from the
+   * migration CLI, so the operational path out of a failed asset did not exist.
+   *
+   * IT IS DELIBERATELY NARROW. It does NOT delete the video, the R2 source, the
+   * lesson relationships or the failed Gumlet asset; it does NOT touch any other
+   * video; it refuses a `processing` or `ready` asset; it is atomic against
+   * concurrent attempts; and it still requires the caller to have write access
+   * to the video's course. There is no bulk or "repair everything" route.
+   */
+  @Post(':videoId/gumlet/replace-failed-asset')
+  @StaffOnly()
+  @ApiOperation({
+    summary: 'Replace a terminally failed Gumlet asset with a freshly ingested one',
+    description: [
+      'For an asset Gumlet reports as `errored`/`failed`. Creates a new asset from the',
+      'SAME stored R2 source with a fresh presigned URL, and keeps the old asset id',
+      'recorded in the audit trail and on the row. Refuses a `processing` or `ready`',
+      'asset. Sets the video to PROCESSING; it becomes PLAYABLE only once Gumlet reports',
+      'the new asset ready AND the manifest is confirmed CENC-encrypted.',
+    ].join('\n'),
+  })
+  async gumletReplaceFailedAsset(
+    @Param('videoId') videoId: string,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    await this.assertCanManageVideo(videoId, actor);
+    return this.gumletIngest.replaceFailedAsset(videoId, {
+      // This endpoint exists ONLY to repair a video already routed through
+      // Gumlet, so the deliberate-opt-in that `replaceFailedAsset` requires for
+      // that case is passed explicitly here. The terminal-failure guard, which
+      // is the actual protection against destroying a live asset, still applies
+      // in full - see gumlet-ingest.service.ts.
+      allowGumletProviderReplacement: true,
+      // Recorded on the audit row, so the replacement is attributable rather
+      // than an anonymous mutation of an asset reference.
+      actor: { id: actor.id, role: actor.role },
+    });
+  }
+
+  /**
    * Staff can reach these endpoints, but only for content they are allowed to
    * manage. Without this, any staff account could ingest or inspect a video
    * belonging to a course outside their scope - which is exactly the ownership

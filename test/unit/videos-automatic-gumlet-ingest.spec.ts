@@ -116,6 +116,7 @@ function build(opts: { drm: DrmCfg; existing?: { drmProvider: string | null } | 
     {} as never,
     config as never,
     lessonVideos as never,
+    {} as never, // gumletIngest - unused here
   );
 
   return { service, creates, updates, storage };

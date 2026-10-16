@@ -115,6 +115,7 @@ function build(existing: {
     {} as never,
     config as never,
     lessonVideos as never,
+    {} as never, // gumletIngest - unused here
   );
 
   return { service, updates, prisma, access, storage };

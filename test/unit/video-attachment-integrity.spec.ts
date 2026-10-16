@@ -123,6 +123,7 @@ function harness(opts: { liveAttachments?: number; links?: Row[] } = {}) {
     { add: jest.fn(async () => ({ id: 'job-1' })), getJob: jest.fn(async () => null) } as never,
     { getOrThrow: () => ({ drm: { enabled: true, provider: 'gumlet', gumlet: { apiKey: 'k', workspaceId: 'w', orgId: 'o', signSecret: 's' } }, ladder: [720] }) } as never,
     lessonVideos as never,
+    {} as never, // gumletIngest - only the recovery sweep touches it
   );
 
   return {

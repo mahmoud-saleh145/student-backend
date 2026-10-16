@@ -13,15 +13,12 @@ import { GumletIngestService } from '../../src/modules/videos/gumlet-ingest.serv
  * Gumlet credential rather than a missing R2 one.
  *
  * The invariant these tests pin down: NOTHING IS WRITTEN until every
- * configuration and source precondition has passed.
+ * configuration and source precondition has passed - and, since the 2026-10-15
+ * incident, not until the replacement asset HAS BEEN CREATED. The old ordering
+ * cleared the row and only then ingested; the current ordering claims the row,
+ * creates the asset, and only then commits, so a failure at any point leaves the
+ * previous asset id exactly where it was.
  */
-
-const READY_CFG = {
-  accessKeyId: 'ak',
-  secretAccessKey: 'sk',
-  endpoint: 'https://example.r2.cloudflarestorage.com',
-  buckets: { uploads: 'edu-uploads', media: 'edu-media', library: 'edu-library' },
-};
 
 function build(over: {
   video?: Record<string, unknown>;
@@ -50,12 +47,22 @@ function build(over: {
         updates.push(args.data);
         return {};
       }),
+      // The claim and the commit are both guarded conditional writes.
+      updateMany: jest.fn(async (args: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+        updates.push(args.data);
+        // Succeeds only while the row still points at the dead asset, which is
+        // exactly the guard the service applies.
+        return { count: args.where.gumletAssetId === video.gumletAssetId ? 1 : 0 };
+      }),
     },
   };
 
   const storage = {
     isConfigured: over.storageConfigured ?? true,
     exists: jest.fn(async () => over.sourceExists ?? true),
+    // The replacement now really does sign a fresh URL and create the asset, so
+    // the double has to be able to answer both.
+    presignIngestionUrl: jest.fn(async () => 'https://r2.example/fresh?X-Amz-Signature=REDACTED'),
   };
 
   const gumlet = {
@@ -165,27 +172,41 @@ describe('GumletIngestService.replaceFailedAsset - ordering guarantees', () => {
     expect(prisma.video.update).not.toHaveBeenCalled();
   });
 
-  it('clears the dead asset id only after every check has passed', async () => {
-    const { service, prisma, updates, video } = build();
-    // adopt() is reached last; stub the tail so only the clearing is observed.
-    jest
-      .spyOn(service, 'adopt')
-      .mockResolvedValue({ assetId: 'asset_new', status: 'pre-queued' });
+  it('creates the asset BEFORE writing, and never clears the row first', async () => {
+    const { service, prisma, storage, gumlet, updates, video } = build();
+    // A real asset creation result rather than a stubbed adopt(): the point of
+    // this test is the ordering of writes AROUND the creation.
+    (gumlet as unknown as { createAsset: jest.Mock }).createAsset = jest.fn(async () => ({
+      assetId: 'asset_new',
+      status: 'pre-queued',
+      playbackUrl: null,
+    }));
 
     const result = await service.replaceFailedAsset('v_1', {
       allowGumletProviderReplacement: true,
     });
 
     expect(result.assetId).toBe('asset_new');
-    expect(updates).toHaveLength(1);
-    expect(updates[0]).toMatchObject({
-      gumletAssetId: null,
-      gumletStatus: null,
-      gumletError: null,
-    });
-    // The provider is NOT rewritten by the clear: adopt() owns that field.
-    expect(updates[0]).not.toHaveProperty('drmProvider');
+    // The fresh URL really was minted.
+    expect(storage.presignIngestionUrl).toHaveBeenCalledWith(
+      expect.objectContaining({ bucket: 'uploads', objectKey: 'source/videos/v_1/video.mp4' }),
+    );
+
+    // THE STRONGER INVARIANT.
+    //
+    // The old ordering wrote `{ gumletAssetId: null }` and then adopted, so the
+    // row described no asset at all while adopt() signed a URL and called Gumlet
+    // - and if that failed, nothing pointed back at the dead asset. The current
+    // ordering never writes a null asset id at all.
+    for (const write of updates) {
+      expect(write).not.toMatchObject({ gumletAssetId: null });
+    }
+
+    // The dead asset id is still on the row: the commit re-pointed it, it was
+    // never erased.
     expect(video.gumletAssetId).toBe('asset_dead');
+    // One claim, one commit.
+    expect(prisma.video.updateMany).toHaveBeenCalledTimes(2);
   });
 
   it('does not clear on the legacy path when status is not READY', async () => {

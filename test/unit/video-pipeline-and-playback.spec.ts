@@ -189,6 +189,9 @@ function videosService(overrides: { queue?: Record<string, jest.Mock>; heartbeat
     getOrThrow: () => ({ ladder: [360, 720], encryptionEnabled: true }),
   };
   const lessonVideos = { countLiveAttachments: jest.fn().mockResolvedValue(1) };
+  // The recovery sweep routes Gumlet rows through this. A no-op double keeps
+  // every legacy-path test in this file behaving exactly as before.
+  const gumletIngest = { sync: jest.fn(async () => ({ assetId: 'a', status: 'ready', playable: false })) };
   const svc = new VideosService(
     prisma as never,
     storage as never,
@@ -200,8 +203,11 @@ function videosService(overrides: { queue?: Record<string, jest.Mock>; heartbeat
     queue as never,
     config as never,
     lessonVideos as never,
+    // gumletIngest: the sweep calls this for any Gumlet row. A double that
+    // records the call and does nothing keeps the legacy rows unaffected.
+    gumletIngest as never,
   );
-  return { svc, prisma, queue, updates, redis, storage };
+  return { svc, prisma, queue, updates, redis, storage, gumletIngest };
 }
 
 const ACTOR = { id: 'usr_admin', role: 'ADMIN' as never };
@@ -286,7 +292,7 @@ describe('VideosService.recoverStrandedVideos', () => {
       { id: 'vid_live', status: 'QUEUED', sourceKey: 'k2', lessonId: 'l2', courseId: 'c1', processingJobId: 'job-live' },
     ]);
 
-    await expect(svc.recoverStrandedVideos()).resolves.toEqual({ requeued: 1, failed: 0 });
+    await expect(svc.recoverStrandedVideos()).resolves.toEqual({ requeued: 1, failed: 0, synced: 0 });
     expect(queue.add).toHaveBeenCalledTimes(1);
     expect((queue.add.mock.calls[0] as unknown[])[1]).toMatchObject({ videoId: 'vid_lost' });
   });
@@ -296,7 +302,7 @@ describe('VideosService.recoverStrandedVideos', () => {
     prisma.video.findMany.mockResolvedValue([
       { id: 'vid_dead', status: 'PROCESSING', sourceKey: 'k', lessonId: 'l', courseId: 'c', processingJobId: 'job-x' },
     ]);
-    await expect(svc.recoverStrandedVideos()).resolves.toEqual({ requeued: 0, failed: 1 });
+    await expect(svc.recoverStrandedVideos()).resolves.toEqual({ requeued: 0, failed: 1, synced: 0 });
     expect(prisma.video.update).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ status: 'FAILED' }) }),
     );

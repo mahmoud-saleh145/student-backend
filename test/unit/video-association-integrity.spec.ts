@@ -67,6 +67,7 @@ function harness(s: Seed) {
       }),
     } as never,
     {} as never,
+    {} as never, // gumletIngest - only the recovery sweep reads it
   );
   const links = () => db.tables.lessonVideo.map((l) => `${l.lessonId}:${l.videoId}`).sort();
   return { service, db, txWrites, links };

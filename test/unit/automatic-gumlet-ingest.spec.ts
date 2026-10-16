@@ -227,6 +227,7 @@ describe('upload completion triggers ingestion', () => {
       queue as never,
       { getOrThrow: () => cfg } as never,
       lessonVideos as never,
+      {} as never, // gumletIngest - unused by completeUpload
     );
 
     await svc.completeUpload('v_1', { id: 'u_1', role: 'ADMIN' } as never);

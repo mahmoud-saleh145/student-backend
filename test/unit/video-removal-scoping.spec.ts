@@ -125,6 +125,8 @@ function harness(s: Seed = seed()) {
     // The real attachment service over the same in-memory tables, so attachment
     // counts come from the data rather than from a canned number.
     new LessonVideoService(db.prisma as never, courses as never),
+    // gumletIngest: only the recovery sweep reads this; these tests never sweep.
+    {} as never,
   );
 
   const as = (actor: unknown) => {

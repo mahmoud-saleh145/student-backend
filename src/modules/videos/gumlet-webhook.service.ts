@@ -62,6 +62,27 @@ export class GumletWebhookService {
     config: ConfigService,
   ) {
     this.secret = (config.get<string>('video.drm.gumlet.webhookSecret') ?? '').trim();
+
+    // WHY THIS WARNING EXISTS
+    //
+    // Refusing every event when no secret is configured is correct and stays
+    // that way - a fail-open webhook would let anyone mark an asset ready. But
+    // refusing silently is its own operational trap.
+    //
+    // GUMLET_WEBHOOK_SECRET is absent from this project's environment and is not
+    // even listed in .env.example, so on 2026-10-15 the endpoint was rejecting
+    // 100% of Gumlet's asset-lifecycle callbacks while looking, from the outside,
+    // like a healthy no-op. The only symptom was that an asset which went terminal
+    // at the provider was not observed here for 41 minutes. One line at boot
+    // makes the state of the integration legible in the deploy log instead of
+    // requiring a forensic reconstruction afterwards.
+    if (!this.secret) {
+      this.logger.warn(
+        'GUMLET_WEBHOOK_SECRET is not set: POST /webhooks/gumlet/assets will REFUSE every event. ' +
+          'Asset status changes are then only learned by polling. This is safe but not live - ' +
+          'set the secret and register the endpoint in Gumlet to receive them.',
+      );
+    }
   }
 
   /** True when a shared secret is configured. Without it nothing is accepted. */

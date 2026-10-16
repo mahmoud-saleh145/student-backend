@@ -27,6 +27,7 @@ import { CourseAccessService } from '../courses/course-access.service';
 import { CoursesService } from '../courses/courses.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { StorageService } from '../storage/storage.service';
+import { GumletIngestService } from './gumlet-ingest.service';
 import { LessonVideoService } from './lesson-video.service';
 
 const ALLOWED_VIDEO_TYPES = new Set([
@@ -72,6 +73,10 @@ export class VideosService {
     @InjectQueue(QUEUE_NAMES.video) private readonly queue: Queue<TranscodeJobData>,
     config: ConfigService,
     private readonly lessonVideos: LessonVideoService,
+    // Only the recovery sweep uses this, and only for rows already routed to
+    // Gumlet. `GumletIngestService`'s own graph never reaches back into
+    // `VideosService`, so this introduces no cycle.
+    private readonly gumletIngest: GumletIngestService,
   ) {
     this.cfg = config.getOrThrow<VideoConfig>('video');
   }
@@ -477,9 +482,13 @@ export class VideosService {
    * (out of memory on a large source), a retention sweep. Such a video sits
    * in QUEUED or PROCESSING indefinitely; this is what moves it again.
    */
-  async recoverStrandedVideos(now = new Date()): Promise<{ requeued: number; failed: number }> {
+  async recoverStrandedVideos(now = new Date()): Promise<{ requeued: number; failed: number; synced: number }> {
     const queuedCutoff = new Date(now.getTime() - 10 * 60_000);
     const processingCutoff = new Date(now.getTime() - 3 * 3600_000);
+    // A Gumlet row is re-checked sooner than the 3-hour legacy cutoff, because
+    // nothing about it is stuck locally - the only question is what the provider
+    // says, and the provider can answer at any time.
+    const gumletCutoff = new Date(now.getTime() - 5 * 60_000);
 
     const stranded = await this.prisma.video.findMany({
       where: {
@@ -487,6 +496,24 @@ export class VideosService {
         OR: [
           { status: VideoStatus.QUEUED, updatedAt: { lt: queuedCutoff } },
           { status: VideoStatus.PROCESSING, processingStartedAt: { lt: processingCutoff } },
+          // Gumlet rows deliberately carry NO local job: `adopt()` nulls
+          // `processingStartedAt` and `processingJobId` because transcoding
+          // happens at the provider, not in a worker. The clause above required
+          // `processingStartedAt` to be non-null AND old, and SQL never satisfies
+          // `NULL < cutoff`, so every Gumlet row in PROCESSING was permanently
+          // invisible to this sweep. That is the bug that left
+          // cmv9ju1yz00ngcr01tztxv6u7 sitting in PROCESSING for 108 minutes with
+          // a job budget that had already expired.
+          //
+          // These rows are handled by ASKING THE PROVIDER, never by requeue:
+          // see the loop below. The 5-minute floor stops a row adopted seconds
+          // ago from being swept on its very first run.
+          {
+            status: VideoStatus.PROCESSING,
+            drmProvider: 'gumlet',
+            gumletAssetId: { not: null },
+            updatedAt: { lt: gumletCutoff },
+          },
         ],
       },
       select: {
@@ -496,14 +523,42 @@ export class VideosService {
         lessonId: true,
         courseId: true,
         processingJobId: true,
+        drmProvider: true,
+        gumletAssetId: true,
       },
       take: 50,
     });
 
     let requeued = 0;
     let failed = 0;
+    let synced = 0;
 
     for (const video of stranded) {
+      // ---- Gumlet rows: the provider is the authority -----------------------
+      // Treating these like ffmpeg rows is what made the sweep DANGEROUS rather
+      // than merely useless: a Gumlet row always has a missing local job, so
+      // `markFailed` fired on every one of them - including assets that were
+      // still faithfully transcoding at the provider. That is exactly the
+      // "observed in production as Processing was interrupted (job missing)"
+      // failure this service already documents on `adopt()`.
+      if (video.drmProvider === 'gumlet' && video.gumletAssetId) {
+        try {
+          // Idempotent and bounded: sync() mirrors whatever Gumlet says, so a
+          // still-processing asset stays PROCESSING, a terminal failure becomes
+          // FAILED, and a ready+drm-verified asset becomes READY. Repeated sweeps
+          // converge rather than compounding.
+          await this.gumletIngest.sync(video.id);
+          synced += 1;
+        } catch (error) {
+          // Could not reach the provider. That says nothing about the asset, and
+          // marking it failed here would replace a live asset with an outage.
+          this.logger.warn(
+            `Gumlet sweep could not sync video ${video.id}: ${(error as Error).message}`,
+          );
+        }
+        continue;
+      }
+
       const job = video.processingJobId ? await this.queue.getJob(video.processingJobId) : null;
       const state = job ? await job.getState() : 'missing';
 
@@ -531,10 +586,12 @@ export class VideosService {
       requeued += 1;
     }
 
-    if (requeued || failed) {
-      this.logger.warn(`stranded videos: requeued ${requeued}, marked failed ${failed}`);
+    if (requeued || failed || synced) {
+      this.logger.warn(
+        `stranded videos: requeued ${requeued}, marked failed ${failed}, gumlet synced ${synced}`,
+      );
     }
-    return { requeued, failed };
+    return { requeued, failed, synced };
   }
 
   // ---------------------------------------------------------------------------

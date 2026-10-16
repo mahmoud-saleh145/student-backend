@@ -78,6 +78,7 @@ describe('legacy path: VideosService.markReady', () => {
       {} as never,
       { getOrThrow: () => ({ drm: { enabled: false }, ladder: [720] }) } as never,
       {} as never,
+      {} as never, // gumletIngest - unused by markReady
     );
 
     await svc.markReady('vS', {
