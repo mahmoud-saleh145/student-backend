@@ -21,6 +21,7 @@ import {
   type TranscodeJobData,
 } from '../../jobs/queue.constants';
 import { readWorkerHeartbeat } from '../../jobs/worker-heartbeat';
+import { TRANSCODE_BACKOFF_BASE_MS, TRANSCODE_BACKOFF_JITTER } from '../../jobs/queue.tuning';
 import { RedisService } from '../../redis/redis.service';
 import { AuditService } from '../audit/audit.service';
 import { CourseAccessService } from '../courses/course-access.service';
@@ -407,10 +408,18 @@ export class VideosService {
    * behind it whenever Redis refused the write (a quota, a blip), and nothing
    * would ever pick it up. On failure the row returns to UPLOADING with the
    * reason, so the dashboard can offer the retry and the error is visible.
+   *
+   * `failureStatus` overrides that fallback. The legacy path wants UPLOADING,
+   * because a video that never reached the queue is an unfinished upload. A
+   * Gumlet video does not: its asset already exists at the provider, and
+   * sending the row back to UPLOADING would report a live provider asset as an
+   * upload that never happened. It falls back to PROCESSING instead, which the
+   * recovery sweep knows how to re-check.
    */
   private async enqueueTranscode(
     video: { id: string; sourceKey: string; lessonId: string | null; courseId: string },
     requestedById?: string,
+    options?: { failureStatus?: VideoStatus },
   ): Promise<string> {
     let jobId: string;
     try {
@@ -429,6 +438,20 @@ export class VideosService {
           ...DEFAULT_JOB_OPTIONS,
           // Transcoding is expensive; two attempts, not three.
           attempts: 2,
+          /**
+           * Bounded exponential backoff WITH JITTER.
+           *
+           * The queue default is a 5-second exponential curve with no
+           * jitter, so a batch of videos that failed together - a provider
+           * outage, a full disk - all comes back at the same instant and
+           * repeats the load that caused the failure. Randomising the delay
+           * spreads the retries out.
+           */
+          backoff: {
+            type: 'exponential',
+            delay: TRANSCODE_BACKOFF_BASE_MS,
+            jitter: TRANSCODE_BACKOFF_JITTER,
+          },
           jobId: `transcode:${video.id}:${Date.now()}`,
         },
       );
@@ -438,7 +461,7 @@ export class VideosService {
       await this.prisma.video.update({
         where: { id: video.id },
         data: {
-          status: VideoStatus.UPLOADING,
+          status: options?.failureStatus ?? VideoStatus.UPLOADING,
           processingError: `Could not queue processing: ${message}`.slice(0, 1000),
         },
       });
@@ -696,8 +719,91 @@ export class VideosService {
     };
   }
 
+  /**
+   * Is this video's local job still in the queue?
+   *
+   * A video can be QUEUED or PROCESSING and still have nothing running: the
+   * job can have been evicted, removed, or lost when a worker was killed
+   * mid-transcode. The maintenance sweep finds those every thirty minutes,
+   * but an administrator looking at a stuck lecture should not have to wait
+   * for a timer to find out that nothing is happening.
+   *
+   * The states below are the ones BullMQ considers "still in the pipeline".
+   * A job that is `completed`, `failed` or absent is NOT live, and the video
+   * is stranded - which is exactly the condition a reprocess is for.
+   */
+  private async localJobIsLive(processingJobId: string | null): Promise<boolean> {
+    if (!processingJobId) return false;
+    const job = await this.queue.getJob(processingJobId).catch(() => null);
+    if (!job) return false;
+    const state = await job.getState().catch(() => 'missing');
+    return (
+      state === 'waiting' ||
+      state === 'active' ||
+      state === 'delayed' ||
+      state === 'prioritized' ||
+      state === 'waiting-children'
+    );
+  }
+
+  /**
+   * Re-run processing for a video that failed.
+   *
+   * WHAT THIS ACTUALLY DOES, AND WHY IT IS NOT ONE THING
+   *
+   * A video reaches this endpoint in one of two very different states, and
+   * treating them the same is what made "Try processing again" a button that
+   * could never work.
+   *
+   * On the LEGACY path (local ffmpeg → AES-128 HLS in R2) the right action is
+   * to run the transcode again from the stored source. That is what this
+   * endpoint always did, and it is still what it does.
+   *
+   * On the GUMLET path the transcode happens at the provider, and the video's
+   * state is an asset id. A Gumlet asset that reached a terminal failure
+   * (`errored` / `failed`) is DEAD: the provider will not revive it, and
+   * `adopt()` is idempotent by design - a row that already carries an asset id
+   * is re-synced, never re-created, so that a repeated job cannot mint a
+   * second (and separately billed) asset. The consequence is that re-syncing a
+   * dead asset re-reads the same terminal verdict, forever.
+   *
+   * So for a terminally failed Gumlet asset the only repair is to discard the
+   * dead id and ingest a fresh one from the SAME stored source. That is what
+   * `GumletIngestService.replaceFailedAsset()` does, and this endpoint now
+   * routes to it. Without that, the sequence was: upgrade the plan, press
+   * Retry, watch the same video stay failed - because the plan was never the
+   * thing that was broken. The plan was the reason the ASSET died; the asset
+   * was the thing that stayed dead.
+   *
+   * GUARANTEES
+   *
+   *   * The source object is verified to still exist BEFORE anything is
+   *     enqueued or created, so a doomed attempt is never started.
+   *   * A repeated click is safe. A replacement is claimed atomically, so a
+   *     second concurrent attempt is refused rather than minting a second
+   *     asset, and a click that arrives while the new asset is in flight is
+   *     refused as already in progress.
+   *   * A video that is already queued or processing is not given a second
+   *     job.
+   *   * The source video, the R2 object and any valid output are preserved. A
+   *     failed provider asset is left at the provider, inert, for the operator
+   *     to delete once the replacement is proven.
+   */
   async retryProcessing(videoId: string, actor: { id: string; role: UserRole }) {
-    const video = await this.prisma.video.findFirst({ where: { id: videoId, ...notDeleted } });
+    const video = await this.prisma.video.findFirst({
+      where: { id: videoId, ...notDeleted },
+      select: {
+        id: true,
+        courseId: true,
+        lessonId: true,
+        sourceKey: true,
+        status: true,
+        drmProvider: true,
+        gumletAssetId: true,
+        gumletStatus: true,
+        processingJobId: true,
+      },
+    });
     if (!video) throw AppException.notFound('Video', videoId);
 
     await this.access.assertCanManageCourse(actor.id, actor.role, video.courseId, 'content');
@@ -707,8 +813,41 @@ export class VideosService {
         message: 'No source file to reprocess — re-upload the video',
       });
     }
-    if (video.status === VideoStatus.PROCESSING) {
-      throw new AppException(ErrorCode.INVALID_STATE, { message: 'Already processing' });
+    // Narrowed once, so the branch below does not have to re-prove it.
+    const sourceKey = video.sourceKey;
+
+    // The source object has to still be there. A recorded key only says it was
+    // written once; a missing object would otherwise produce another doomed
+    // attempt - and on the Gumlet path, another dead asset.
+    const sourcePresent = await this.storage.exists('uploads', sourceKey);
+    if (!sourcePresent) {
+      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
+        message:
+          'The stored source file is no longer in storage, so this video cannot be reprocessed — ' +
+          're-upload the file and it will be processed from scratch',
+      });
+    }
+
+    if (video.drmProvider === 'gumlet') {
+      return this.retryGumletProcessing({ ...video, sourceKey }, actor);
+    }
+
+    // Already in the pipeline. A second job would transcode the same source
+    // twice and race the first one to write the output - UNLESS the job is
+    // gone, in which case the video is stranded and a new one is exactly what
+    // is being asked for.
+    if (video.status === VideoStatus.QUEUED || video.status === VideoStatus.PROCESSING) {
+      if (await this.localJobIsLive(video.processingJobId)) {
+        throw new AppException(ErrorCode.INVALID_STATE, {
+          message:
+            video.status === VideoStatus.QUEUED
+              ? 'This video is already queued for processing'
+              : 'This video is already being processed',
+        });
+      }
+      this.logger.warn(
+        `video ${videoId}: the recorded job is gone, so the video is stranded; reprocessing it`,
+      );
     }
 
     await this.prisma.video.update({
@@ -717,11 +856,136 @@ export class VideosService {
     });
 
     const jobId = await this.enqueueTranscode(
-      { id: video.id, sourceKey: video.sourceKey, lessonId: video.lessonId, courseId: video.courseId },
+      { id: video.id, sourceKey, lessonId: video.lessonId, courseId: video.courseId },
       actor.id,
     );
 
-    return { videoId, status: VideoStatus.QUEUED, jobId, ...(await this.workerStatus()) };
+    await this.audit.record({
+      actorId: actor.id,
+      actorRole: actor.role,
+      action: AuditAction.UPDATE,
+      entity: 'video',
+      entityId: videoId,
+      note: 'Reprocessing requested (legacy ffmpeg path); a new transcode job was queued',
+    });
+
+    return { videoId, status: VideoStatus.QUEUED, jobId, provider: 'legacy', ...(await this.workerStatus()) };
+  }
+
+  /**
+   * The Gumlet half of "reprocess".
+   *
+   * Three cases, and the difference between them is the whole point:
+   *
+   *   1. The asset reached a TERMINAL failure. The asset is dead and only a
+   *      fresh ingest can replace it, so the dead id is discarded and a new
+   *      asset is created from the same stored source.
+   *   2. The asset is alive but not finished (or was never created). A poll is
+   *      all that is needed - re-syncing is idempotent and safe.
+   *   3. The video is already queued or processing. Refused, so a repeated
+   *      click cannot start a second attempt.
+   */
+  private async retryGumletProcessing(
+    video: {
+      id: string;
+      courseId: string;
+      lessonId: string | null;
+      sourceKey: string;
+      status: VideoStatus;
+      gumletAssetId: string | null;
+      gumletStatus: string | null;
+      processingJobId: string | null;
+    },
+    actor: { id: string; role: UserRole },
+  ) {
+    const terminalAssetFailure = video.gumletStatus === 'errored' || video.gumletStatus === 'failed';
+
+    if (terminalAssetFailure) {
+      // Mint a replacement asset. This is atomic: a concurrent attempt loses
+      // the claim and is refused, so two clicks can never produce two live,
+      // separately billed assets. It also checks the account's allowance
+      // first, so an exhausted plan is reported as such instead of producing
+      // another dead asset.
+      const replaced = await this.gumletIngest.replaceFailedAsset(video.id, {
+        allowGumletProviderReplacement: true,
+        actor: { id: actor.id, role: actor.role },
+      });
+
+      // A poll job so the worker drives the new asset to READY rather than
+      // leaving it to the half-hourly sweep.
+      const jobId = await this.enqueueTranscode(
+        { id: video.id, sourceKey: video.sourceKey, lessonId: video.lessonId, courseId: video.courseId },
+        actor.id,
+        // The asset already exists at the provider, so a queue failure must
+        // not send the row back to UPLOADING: that would misreport a live
+        // provider asset as an unfinished upload.
+        { failureStatus: VideoStatus.PROCESSING },
+      );
+
+      await this.audit.record({
+        actorId: actor.id,
+        actorRole: actor.role,
+        action: AuditAction.UPDATE,
+        entity: 'video',
+        entityId: video.id,
+        after: { gumletAssetId: replaced.assetId, gumletStatus: replaced.status },
+        note: 'Reprocessing requested (Gumlet path); the failed provider asset was replaced with a fresh ingest of the same stored source',
+      });
+
+      this.logger.warn(
+        `video ${video.id}: replaced the failed Gumlet asset with ${replaced.assetId} at the request of ${actor.id}`,
+      );
+
+      return {
+        videoId: video.id,
+        status: VideoStatus.QUEUED,
+        jobId,
+        provider: 'gumlet',
+        assetId: replaced.assetId,
+        recovered: true,
+        ...(await this.workerStatus()),
+      };
+    }
+
+    // The asset is alive (or absent). Re-syncing it is idempotent, so a poll
+    // job is safe - but a video that is already in the pipeline is not given
+    // a second one.
+    if (video.status === VideoStatus.QUEUED || video.status === VideoStatus.PROCESSING) {
+      if (await this.localJobIsLive(video.processingJobId)) {
+        throw new AppException(ErrorCode.INVALID_STATE, {
+          message:
+            video.status === VideoStatus.QUEUED
+              ? 'This video is already queued for processing'
+              : 'This video is already being processed by Gumlet — wait for it to finish',
+        });
+      }
+      // The job is gone but the provider asset is alive: the video is stranded
+      // between the two. Re-queue a poll so the worker drives the asset to
+      // READY instead of waiting for the next sweep.
+      this.logger.warn(
+        `video ${video.id}: the recorded job is gone, so the video is stranded; re-queueing a poll`,
+      );
+    }
+
+    await this.prisma.video.update({
+      where: { id: video.id },
+      data: { processingError: null, processingStartedAt: null },
+    });
+
+    const jobId = await this.enqueueTranscode(
+      { id: video.id, sourceKey: video.sourceKey, lessonId: video.lessonId, courseId: video.courseId },
+      actor.id,
+      { failureStatus: VideoStatus.PROCESSING },
+    );
+
+    return {
+      videoId: video.id,
+      status: VideoStatus.QUEUED,
+      jobId,
+      provider: 'gumlet',
+      recovered: false,
+      ...(await this.workerStatus()),
+    };
   }
 
   // ---------------------------------------------------------------------------

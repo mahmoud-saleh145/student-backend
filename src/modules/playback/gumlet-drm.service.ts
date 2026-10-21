@@ -90,6 +90,50 @@ export interface GumletAssetStatus {
   /// NULL when the provider did not report the field at all (unknown), [] when
   /// it reported no DRM system.
   drmSystems: string[] | null;
+
+  /**
+   * The provider's own error CODE, when it gave one (e.g. `ERR_ASSET_NOT_FOUND`).
+   *
+   * Optional because a provider is free to answer with only a message, and
+   * because the code is what makes a failure CLASSIFIABLE rather than merely
+   * quotable. A quota rejection and an unreachable input read almost the same
+   * in prose and are completely different in remedy, and the code is the part
+   * that tells them apart.
+   */
+  errorCode?: string | null;
+}
+
+/**
+ * The account's current allowance, as the provider reports it.
+ *
+ * UNITS - this is the part that has bitten before, so it is stated explicitly.
+ *
+ * `GET /v1/org/data` reports `plan_data.video.quota.storage` and
+ * `plan_data.video.usage.storage` in SECONDS, while the same account's
+ * dashboard shows the same number in MINUTES (`storage_data_unit: "min"`).
+ * The API value is the authoritative one and is 60x the dashboard figure: a
+ * Business plan reads as 15000 minutes in the dashboard and 900000 here, and
+ * the Free plan read as 60 minutes and 3600. Everything below is therefore in
+ * seconds, and nothing in this project converts it.
+ *
+ * `storageDataUnit` is carried through only so a reader can see what the
+ * provider says it is - it is NOT the unit these numbers are in.
+ */
+export interface GumletAccountQuota {
+  /** The plan id, e.g. `businessVideoMay26`. */
+  plan: string | null;
+  /** The plan's display name, e.g. `Business`. */
+  planDisplayName: string | null;
+  /** Total storage allowance, in seconds. */
+  storageQuotaSeconds: number | null;
+  /** Storage already used, in seconds. */
+  storageUsageSeconds: number | null;
+  /** Bandwidth allowance, in the provider's own unit. */
+  bandwidthQuota: number | null;
+  /** The longest single source the provider will ingest, in seconds. */
+  maxProcessingDurationSeconds: number | null;
+  /** The unit the provider's dashboard renders these in. Not the API's unit. */
+  storageDataUnit: string | null;
 }
 
 /**
@@ -464,7 +508,7 @@ export class GumletDrmService {
         fps?: number;
         transformations?: { drm?: unknown };
       };
-      error?: { message?: string };
+      error?: { message?: string; code?: string };
     };
 
     return {
@@ -474,6 +518,7 @@ export class GumletDrmService {
       playbackUrl: a.output?.playback_url ?? null,
       dashPlaybackUrl: a.output?.dash_playback_url ?? null,
       error: a.error?.message ?? null,
+      errorCode: a.error?.code ?? null,
       durationSeconds: normalizeProviderDurationSeconds(a.input?.duration),
       width: positiveIntOrNull(a.input?.width),
       height: positiveIntOrNull(a.input?.height),
@@ -481,6 +526,72 @@ export class GumletDrmService {
       drmSystems: a.input?.transformations
         ? parseGumletDrmSystems(a.input.transformations.drm)
         : null,
+    };
+  }
+
+  /**
+   * Read the account's current allowance.
+   *
+   * WHY THIS IS HERE
+   *
+   * A quota rejection is a permanent failure until an operator changes the
+   * plan. Without a way to ASK the account how much room is left, the only
+   * honest answer to "can this video be processed again?" is a guess - and the
+   * guess that gets made is "yes, press retry", which is what produced a
+   * dashboard button that could never work.
+   *
+   * `GET /v1/org/data` is the endpoint the provider already documents for
+   * this, and it is read-only.
+   *
+   * It throws rather than returning a partial answer: a caller that cannot
+   * confirm the allowance must not act as though it had.
+   */
+  async getAccountQuota(): Promise<GumletAccountQuota> {
+    if (!this.isAssetApiConfigured()) {
+      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
+        message: 'Gumlet asset API is not configured',
+      });
+    }
+
+    const res = await this.timedFetch(
+      'https://api.gumlet.com/v1/org/data',
+      { headers: { authorization: `Bearer ${this.cfg.apiKey}` } },
+      'Gumlet account read',
+    );
+
+    const json = (await res.json().catch(() => null)) as {
+      plan?: string;
+      plan_data?: {
+        video?: {
+          display_name?: string;
+          quota?: { storage?: number; bandwidth?: number };
+          usage?: { storage?: number };
+          storage_data_unit?: string;
+          max_allowed_processing_duration?: number;
+        };
+      };
+    } | null;
+
+    if (!res.ok || !json) {
+      throw new GumletRequestError(
+        `Gumlet account read failed with HTTP ${res.status}`,
+        isTransientHttpStatus(res.status),
+        res.status,
+      );
+    }
+
+    const video = json.plan_data?.video;
+    const numberOrNull = (v: unknown): number | null =>
+      typeof v === 'number' && Number.isFinite(v) ? v : null;
+
+    return {
+      plan: json.plan ?? null,
+      planDisplayName: video?.display_name ?? null,
+      storageQuotaSeconds: numberOrNull(video?.quota?.storage),
+      storageUsageSeconds: numberOrNull(video?.usage?.storage),
+      bandwidthQuota: numberOrNull(video?.quota?.bandwidth),
+      maxProcessingDurationSeconds: numberOrNull(video?.max_allowed_processing_duration),
+      storageDataUnit: video?.storage_data_unit ?? null,
     };
   }
 

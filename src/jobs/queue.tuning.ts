@@ -48,3 +48,29 @@ export const BACKGROUND_WORKER = {
   drainDelay: seconds(process.env.QUEUE_BACKGROUND_DRAIN_DELAY_SECONDS, 60),
   stalledInterval: seconds(process.env.QUEUE_BACKGROUND_STALLED_INTERVAL_SECONDS, 300) * 1000,
 } as const;
+
+/**
+ * The first retry delay for a failed transcode.
+ *
+ * Longer than the queue default (5 s) because a transcode that failed has
+ * usually failed for a reason that will not clear in five seconds: the
+ * provider was unreachable, the disk filled, the source was unreadable.
+ */
+export const TRANSCODE_BACKOFF_BASE_MS = 15_000;
+
+/**
+ * The fraction of the computed delay that is randomised.
+ *
+ * WHY JITTER MATTERS
+ *
+ * Exponential backoff without jitter is a synchronised stampede. A provider
+ * outage fails every queued video at once; they then all come back at the same
+ * moment, in lockstep, and knock the provider over again as it recovers. The
+ * delay each job waits is randomised across a fraction of its window, so the
+ * retries spread out instead.
+ *
+ * BullMQ implements this natively: a backoff of
+ * `{ type: 'exponential', delay, jitter }` picks a uniform delay in
+ * `[delay * (1 - jitter), delay]`.
+ */
+export const TRANSCODE_BACKOFF_JITTER = 0.5;
