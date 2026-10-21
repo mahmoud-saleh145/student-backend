@@ -54,6 +54,7 @@ type Row = {
   gumletAssetId: string | null;
   gumletStatus: string | null;
   gumletError?: string | null;
+  processingJobId?: string | null;
   deletedAt?: Date | null;
 };
 
@@ -72,6 +73,7 @@ function gumletRow(over: Partial<Row> = {}): Row {
     gumletAssetId: 'asset_dead',
     gumletStatus: 'errored',
     gumletError: QUOTA_ERROR,
+    processingJobId: 'transcode:vid_1:1',
     deletedAt: null,
     ...over,
   };
@@ -88,6 +90,7 @@ function legacyRow(over: Partial<Row> = {}): Row {
     gumletAssetId: null,
     gumletStatus: null,
     gumletError: null,
+    processingJobId: 'transcode:vid_1:1',
     deletedAt: null,
     ...over,
   };
@@ -95,7 +98,13 @@ function legacyRow(over: Partial<Row> = {}): Row {
 
 const ACTOR = { id: 'usr_admin', role: 'ADMIN' as never };
 
-function build(opts: { row?: Row; sourceExists?: boolean; canManage?: boolean } = {}) {
+function build(opts: {
+  row?: Row;
+  sourceExists?: boolean;
+  canManage?: boolean;
+  /** The state BullMQ reports for the video's recorded job. */
+  jobState?: string | null;
+} = {}) {
   const row = opts.row ?? gumletRow();
   const updates: Array<Record<string, unknown>> = [];
   const enqueued: unknown[] = [];
@@ -124,12 +133,15 @@ function build(opts: { row?: Row; sourceExists?: boolean; canManage?: boolean } 
     }),
   };
 
+  // A job that is still in the pipeline, unless a test says otherwise: the
+  // guard that refuses a duplicate attempt has to see a LIVE job to refuse.
+  const jobState = opts.jobState === undefined ? 'waiting' : opts.jobState;
   const queue = {
     add: jest.fn(async (name: unknown, data: unknown) => {
       enqueued.push({ name, data });
       return { id: `job-${enqueued.length}` };
     }),
-    getJob: jest.fn(async () => null),
+    getJob: jest.fn(async () => (jobState ? { getState: jest.fn(async () => jobState) } : null)),
   };
 
   const audit = {
@@ -241,6 +253,53 @@ describe('VideosService.retryProcessing - a repeated click', () => {
   });
 });
 
+describe('VideosService.retryProcessing - a stranded video', () => {
+  it('re-queues a poll when the recorded job is gone but the provider asset is alive', async () => {
+    // The job was lost (evicted, or the worker was killed mid-poll) while the
+    // asset kept working at the provider. The video looks "processing" but
+    // nothing is happening locally - exactly the case a reprocess is for.
+    const h = build({
+      row: gumletRow({ status: 'PROCESSING', gumletStatus: 'validated' }),
+      jobState: 'missing',
+    });
+
+    const result = await h.service.retryProcessing('vid_1', ACTOR);
+
+    expect(h.enqueued).toHaveLength(1);
+    expect(result).toMatchObject({ status: 'QUEUED', provider: 'gumlet', recovered: false });
+    // No new asset: the existing one is alive and re-syncing it is idempotent.
+    expect(h.gumletIngest.replaceFailedAsset).not.toHaveBeenCalled();
+  });
+
+  it('refuses while the recorded job is genuinely still running', async () => {
+    for (const state of ['waiting', 'active', 'delayed']) {
+      const h = build({
+        row: gumletRow({ status: 'PROCESSING', gumletStatus: 'processing' }),
+        jobState: state,
+      });
+
+      await expect(h.service.retryProcessing('vid_1', ACTOR)).rejects.toMatchObject({
+        code: ErrorCode.INVALID_STATE,
+      });
+
+      expect(h.enqueued).toHaveLength(0);
+      expect(h.gumletIngest.replaceFailedAsset).not.toHaveBeenCalled();
+    }
+  });
+
+  it('re-queues a stranded legacy video instead of refusing it', async () => {
+    const h = build({
+      row: legacyRow({ status: 'QUEUED' }),
+      jobState: 'missing',
+    });
+
+    const result = await h.service.retryProcessing('vid_1', ACTOR);
+
+    expect(h.enqueued).toHaveLength(1);
+    expect(result).toMatchObject({ status: 'QUEUED', provider: 'legacy' });
+  });
+});
+
 describe('VideosService.retryProcessing - preconditions', () => {
   it('refuses when the stored source object is gone, and creates nothing', async () => {
     const h = build({ sourceExists: false });
@@ -298,7 +357,7 @@ describe('VideosService.retryProcessing - the legacy path is unchanged', () => {
   });
 
   it('does not give a queued legacy video a second job', async () => {
-    const h = build({ row: legacyRow({ status: 'QUEUED' }) });
+    const h = build({ row: legacyRow({ status: 'QUEUED' }), jobState: 'waiting' });
 
     await expect(h.service.retryProcessing('vid_1', ACTOR)).rejects.toMatchObject({
       code: ErrorCode.INVALID_STATE,

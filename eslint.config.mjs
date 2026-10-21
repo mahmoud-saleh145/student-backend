@@ -29,6 +29,41 @@ export default [
   },
   js.configs.recommended,
   {
+    // Node globals for the plain-JS operator scripts under scripts/.
+    //
+    // The TypeScript block below declares them for `**/*.ts`, but a `.js` file
+    // falls back to the bare recommended config, where `process`, `require`
+    // and `__dirname` are undefined identifiers. The repository's own `lint`
+    // script only covers `{src,test}/**/*.ts`, so those errors were invisible
+    // - but the scripts are Node programs, and linting them must not report
+    // the runtime they actually run on as undefined.
+    files: ['**/*.js'],
+    languageOptions: {
+      ecmaVersion: 2023,
+      sourceType: 'commonjs',
+      globals: {
+        process: 'readonly',
+        console: 'readonly',
+        Buffer: 'readonly',
+        __dirname: 'readonly',
+        __filename: 'readonly',
+        require: 'readonly',
+        module: 'writable',
+        exports: 'writable',
+        setTimeout: 'readonly',
+        clearTimeout: 'readonly',
+        setInterval: 'readonly',
+        clearInterval: 'readonly',
+        URL: 'readonly',
+        URLSearchParams: 'readonly',
+        TextEncoder: 'readonly',
+        TextDecoder: 'readonly',
+        fetch: 'readonly',
+        AbortController: 'readonly',
+      },
+    },
+  },
+  {
     files: ['**/*.ts'],
     languageOptions: {
       parser: tsParser,

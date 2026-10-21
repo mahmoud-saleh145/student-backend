@@ -705,6 +705,33 @@ export class VideosService {
   }
 
   /**
+   * Is this video's local job still in the queue?
+   *
+   * A video can be QUEUED or PROCESSING and still have nothing running: the
+   * job can have been evicted, removed, or lost when a worker was killed
+   * mid-transcode. The maintenance sweep finds those every thirty minutes,
+   * but an administrator looking at a stuck lecture should not have to wait
+   * for a timer to find out that nothing is happening.
+   *
+   * The states below are the ones BullMQ considers "still in the pipeline".
+   * A job that is `completed`, `failed` or absent is NOT live, and the video
+   * is stranded - which is exactly the condition a reprocess is for.
+   */
+  private async localJobIsLive(processingJobId: string | null): Promise<boolean> {
+    if (!processingJobId) return false;
+    const job = await this.queue.getJob(processingJobId).catch(() => null);
+    if (!job) return false;
+    const state = await job.getState().catch(() => 'missing');
+    return (
+      state === 'waiting' ||
+      state === 'active' ||
+      state === 'delayed' ||
+      state === 'prioritized' ||
+      state === 'waiting-children'
+    );
+  }
+
+  /**
    * Re-run processing for a video that failed.
    *
    * WHAT THIS ACTUALLY DOES, AND WHY IT IS NOT ONE THING
@@ -759,6 +786,7 @@ export class VideosService {
         drmProvider: true,
         gumletAssetId: true,
         gumletStatus: true,
+        processingJobId: true,
       },
     });
     if (!video) throw AppException.notFound('Video', videoId);
@@ -790,14 +818,21 @@ export class VideosService {
     }
 
     // Already in the pipeline. A second job would transcode the same source
-    // twice and race the first one to write the output.
+    // twice and race the first one to write the output - UNLESS the job is
+    // gone, in which case the video is stranded and a new one is exactly what
+    // is being asked for.
     if (video.status === VideoStatus.QUEUED || video.status === VideoStatus.PROCESSING) {
-      throw new AppException(ErrorCode.INVALID_STATE, {
-        message:
-          video.status === VideoStatus.QUEUED
-            ? 'This video is already queued for processing'
-            : 'This video is already being processed',
-      });
+      if (await this.localJobIsLive(video.processingJobId)) {
+        throw new AppException(ErrorCode.INVALID_STATE, {
+          message:
+            video.status === VideoStatus.QUEUED
+              ? 'This video is already queued for processing'
+              : 'This video is already being processed',
+        });
+      }
+      this.logger.warn(
+        `video ${videoId}: the recorded job is gone, so the video is stranded; reprocessing it`,
+      );
     }
 
     await this.prisma.video.update({
@@ -844,6 +879,7 @@ export class VideosService {
       status: VideoStatus;
       gumletAssetId: string | null;
       gumletStatus: string | null;
+      processingJobId: string | null;
     },
     actor: { id: string; role: UserRole },
   ) {
@@ -900,12 +936,20 @@ export class VideosService {
     // job is safe - but a video that is already in the pipeline is not given
     // a second one.
     if (video.status === VideoStatus.QUEUED || video.status === VideoStatus.PROCESSING) {
-      throw new AppException(ErrorCode.INVALID_STATE, {
-        message:
-          video.status === VideoStatus.QUEUED
-            ? 'This video is already queued for processing'
-            : 'This video is already being processed by Gumlet — wait for it to finish',
-      });
+      if (await this.localJobIsLive(video.processingJobId)) {
+        throw new AppException(ErrorCode.INVALID_STATE, {
+          message:
+            video.status === VideoStatus.QUEUED
+              ? 'This video is already queued for processing'
+              : 'This video is already being processed by Gumlet — wait for it to finish',
+        });
+      }
+      // The job is gone but the provider asset is alive: the video is stranded
+      // between the two. Re-queue a poll so the worker drives the asset to
+      // READY instead of waiting for the next sweep.
+      this.logger.warn(
+        `video ${video.id}: the recorded job is gone, so the video is stranded; re-queueing a poll`,
+      );
     }
 
     await this.prisma.video.update({
