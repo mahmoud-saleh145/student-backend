@@ -15,6 +15,7 @@ import {
 import { AuditService } from '../audit/audit.service';
 import { LessonVideoService } from './lesson-video.service';
 import { resolveGumletIngestUrlTtlSeconds } from './gumlet-ingest-url-ttl';
+import { classifyGumletFailure, sanitizeProviderText } from './gumlet-failure';
 
 /**
  * Gumlet-backed video lifecycle.
@@ -342,7 +343,9 @@ export class GumletIngestService {
         drmProvider: true,
         gumletAssetId: true,
         gumletStatus: true,
+        gumletError: true,
         sourceKey: true,
+        durationSeconds: true,
       },
     });
     if (!video) throw new NotFoundException('Video not found');
@@ -418,6 +421,28 @@ export class GumletIngestService {
         message: `Refusing to replace the asset of a video whose status is "${video.status}". It is not currently playing, so this is a repair, not a migration recovery.`,
       });
     }
+
+    /**
+     * THE ACCOUNT HAS TO BE ABLE TO TAKE THE NEW ASSET.
+     *
+     * This is the check that makes "Retry" mean something.
+     *
+     * A quota rejection is permanent until an operator changes the plan, and a
+     * new asset is rejected exactly like the old one. Creating one anyway
+     * produces a second dead asset, a second provider-side object to clean up,
+     * and - because the row now points at the newest dead asset rather than the
+     * one the operator was shown - a video whose recorded reason no longer
+     * matches the asset it names.
+     *
+     * So the allowance is ASKED for rather than assumed. Note what this does
+     * NOT do: it does not treat a stale recorded error as the current truth.
+     * The recorded reason is only used to decide whether the account's state is
+     * worth checking; the account's live numbers decide the outcome. That is
+     * what lets a video that failed on an exhausted plan recover immediately
+     * after the plan is increased, instead of staying stuck on a reason that
+     * stopped being true.
+     */
+    await this.assertAccountCanTakeAnotherAsset(video);
 
     // The source object must actually exist. A non-null `sourceKey` only means
     // it was recorded once; a missing object would otherwise produce a second
@@ -536,6 +561,81 @@ export class GumletIngestService {
   }
 
   /**
+   * Refuse to mint a replacement asset when the account cannot take one.
+   *
+   * The rule is deliberately narrow: the account is only interrogated when the
+   * recorded failure is an ACCOUNT-level one (a spent allowance, a broken
+   * credential). Every other failure - an unreachable input, a provider blip -
+   * is exactly what a fresh ingest is for, and asking the account about it
+   * would be noise.
+   *
+   * And when the allowance IS checked, the answer comes from the account's
+   * live numbers, not from the recorded error. A video that failed on an
+   * exhausted plan and is retried after the plan was increased passes here,
+   * which is the whole point.
+   *
+   * If the account cannot be read, the attempt is ALLOWED. The provider is the
+   * authority on whether it will accept the asset, and a provider that rejects
+   * it produces an errored asset - which is recoverable, and costs nothing,
+   * because an asset that never processed stored nothing. Refusing to try
+   * because a status endpoint was briefly unreachable would be a worse
+   * failure than trying.
+   */
+  private async assertAccountCanTakeAnotherAsset(video: {
+    id: string;
+    gumletError: string | null;
+    durationSeconds: number;
+  }): Promise<void> {
+    const recorded = classifyGumletFailure({ message: video.gumletError });
+    if (recorded.kind !== 'QUOTA_EXCEEDED' && recorded.kind !== 'ACCOUNT_OR_CREDENTIALS') {
+      return;
+    }
+
+    let quota: Awaited<ReturnType<GumletDrmService['getAccountQuota']>>;
+    try {
+      quota = await this.gumlet.getAccountQuota();
+    } catch (error) {
+      this.logger.warn(
+        `video ${video.id}: could not read the Gumlet account allowance (${(error as Error).message}); ` +
+          'proceeding with the replacement and letting the provider decide',
+      );
+      return;
+    }
+
+    const { storageQuotaSeconds, storageUsageSeconds } = quota;
+    if (storageQuotaSeconds === null || storageUsageSeconds === null) {
+      return;
+    }
+
+    const free = storageQuotaSeconds - storageUsageSeconds;
+    if (free <= 0) {
+      throw new AppException(ErrorCode.VIDEO_PROCESSING_FAILED, {
+        message:
+          `The Gumlet account's storage allowance is exhausted ` +
+          `(${Math.round(storageUsageSeconds / 60)} of ${Math.round(storageQuotaSeconds / 60)} minutes used). ` +
+          'Increase the plan allowance before reprocessing this video - a new asset would be rejected the same way.',
+      });
+    }
+
+    // The video's own length is only known once a provider has measured it, so
+    // this is a best-effort check; the provider is still the authority.
+    if (video.durationSeconds > 0 && video.durationSeconds > free) {
+      throw new AppException(ErrorCode.VIDEO_PROCESSING_FAILED, {
+        message:
+          `The Gumlet account's storage allowance cannot fit this video ` +
+          `(${Math.round(video.durationSeconds / 60)} minutes needed, ${Math.round(free / 60)} minutes free). ` +
+          'Increase the plan allowance before reprocessing it.',
+      });
+    }
+
+    this.logger.log(
+      `video ${video.id}: the Gumlet account has room for another asset ` +
+        `(${Math.round(storageUsageSeconds / 60)} of ${Math.round(storageQuotaSeconds / 60)} minutes used); ` +
+        'proceeding with the replacement',
+    );
+  }
+
+  /**
    * Poll Gumlet and mirror the result onto the video row.
    *
    * Sets READY only when BOTH conditions hold:
@@ -573,8 +673,33 @@ export class GumletIngestService {
       });
     }
 
-    const asset = await this.gumlet.getAsset(video.gumletAssetId);
+    /**
+     * THE ASSET THIS CALL IS ABOUT.
+     *
+     * `adopt()` can replace a video's asset while this call is in flight, and a
+     * replacement is exactly what a recovery does. Without this, the verdict
+     * read from the OLD asset would be written over the NEW one - a stale
+     * answer from a previous attempt overwriting the current one, which is how
+     * a freshly recovered video ends up marked failed again. Every write below
+     * is conditional on the row still holding this asset.
+     *
+     * Captured BEFORE the provider is called, because that is the moment the
+     * question was asked. Reading it afterwards would answer a different
+     * question - the one being asked now - and defeat the guard entirely.
+     */
+    const observedAssetId = video.gumletAssetId;
+
+    const asset = await this.gumlet.getAsset(observedAssetId);
     const playable = this.gumlet.isAssetPlayable(asset.status);
+
+    /**
+     * WHAT THE PROVIDER'S ERROR MEANS.
+     *
+     * A quota rejection and an unreachable input read almost the same in prose
+     * and need completely different remedies, so the provider's own words are
+     * classified once here and the result is what the administrator is shown.
+     */
+    const failure = classifyGumletFailure({ code: asset.errorCode, message: asset.error });
 
     // THE LEGACY-PRESERVATION GUARD.
     //
@@ -613,6 +738,10 @@ export class GumletIngestService {
       if (verdict.playable) {
         update.status = VideoStatus.READY;
         update.gumletError = null;
+        // The video is playable, so whatever the previous attempt left behind
+        // is no longer true of it. Leaving a stale reason on a working video
+        // is how an operator ends up chasing a failure that has been fixed.
+        update.processingError = null;
         update.processedAt = new Date();
 
         // PERSIST THE PROVIDER'S MEASURED METADATA.
@@ -698,6 +827,18 @@ export class GumletIngestService {
       update.gumletError = asset.error ?? `Gumlet processing ended with status "${asset.status}"`;
       if (onGumletPath) {
         update.status = VideoStatus.FAILED;
+        // The reason has to be visible where a failure is actually read.
+        //
+        // `processingError` is the column the dashboard's failure panel renders,
+        // and until now a Gumlet failure left it null - so the operator saw
+        // "Processing failed" with no reason at all, next to a provider string
+        // they had to know to go and look for. The provider's own words stay in
+        // `gumletError`; what lands here is the classified, actionable summary
+        // that says whether a retry can help or an operator has to act.
+        update.processingError = failure.adminMessage;
+        this.logger.warn(
+          `video ${videoId}: Gumlet asset ${asset.assetId} failed (${failure.kind}): ${sanitizeProviderText(asset.error)}`,
+        );
       } else {
         // The asset failed, but this video is not being delivered by Gumlet.
         // Marking it FAILED would black out a lesson that is currently playing
@@ -708,7 +849,24 @@ export class GumletIngestService {
       }
     }
 
-    await this.prisma.video.update({ where: { id: videoId }, data: update });
+    /**
+     * THE WRITE IS CONDITIONAL ON THE ASSET.
+     *
+     * The same rule the DRM verifier uses (`drm-verification.service.ts`): a
+     * result may only be written while the row still describes the thing the
+     * result is about. A sync that lost the row to a replacement writes
+     * nothing, so a stale verdict can never overwrite a newer attempt.
+     */
+    const written = await this.prisma.video.updateMany({
+      where: { id: videoId, gumletAssetId: observedAssetId },
+      data: update,
+    });
+
+    if (written.count === 0) {
+      this.logger.warn(
+        `video ${videoId}: the Gumlet asset was replaced while it was being read; keeping the newer state`,
+      );
+    }
 
     // Keep every ATTACHED lecture's denormalised duration in step.
     //

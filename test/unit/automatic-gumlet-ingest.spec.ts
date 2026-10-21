@@ -47,6 +47,16 @@ function ingestHarness(rowOverrides: Record<string, unknown> = {}) {
         Object.assign(row, a.data);
         return row;
       }),
+      // `sync()` writes its verdict conditionally, so that a result read from
+      // an asset that has since been replaced cannot overwrite the newer
+      // attempt. The double honours that guard the way the database would.
+      updateMany: jest.fn(async (a: { where?: Record<string, unknown>; data: Record<string, unknown> }) => {
+        updates.push(a.data);
+        const guarded = a.where?.gumletAssetId;
+        const matches = guarded === undefined || guarded === row.gumletAssetId;
+        if (matches) Object.assign(row, a.data);
+        return { count: matches ? 1 : 0 };
+      }),
     },
   };
   const storage = {
