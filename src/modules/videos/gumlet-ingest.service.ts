@@ -81,6 +81,31 @@ const GUMLET_MAX_CONSECUTIVE_TRANSIENT = 5;
  */
 const GUMLET_ASSET_REPLACING = 'replacing';
 
+/**
+ * Is this provider failure worth running the SAME request again?
+ *
+ * Two rules, in this order:
+ *
+ *   1. An ACCOUNT-level failure never is. An exhausted allowance, a revoked
+ *      key, a wrong workspace: the same request will be refused identically
+ *      however many times it is made, and on a quota each attempt risks
+ *      another dead asset. Retrying is not "persistence" here, it is waste.
+ *   2. Otherwise the provider's own notion decides. A timeout, a dropped
+ *      connection, a 5xx, a 429 - those clear on their own.
+ *
+ * The order matters: the provider's notion of transient treats "we could not
+ * ask" as transient, and a quota rejection IS a definitive answer, so the
+ * account-level rule has to be checked first or it would never apply.
+ */
+export function isRetryableProviderFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  const classified = classifyGumletFailure({ message });
+  if (classified.kind === 'QUOTA_EXCEEDED' || classified.kind === 'ACCOUNT_OR_CREDENTIALS') {
+    return false;
+  }
+  return isTransientProviderError(error);
+}
+
 @Injectable()
 export class GumletIngestService {
   private readonly logger = new Logger(GumletIngestService.name);
@@ -937,7 +962,45 @@ export class GumletIngestService {
       return { handled: true, status: 'failed', playable: false };
     }
 
-    const { assetId } = await this.adopt(videoId);
+    /**
+     * CREATE THE ASSET, AND STOP IF THE PROVIDER SAYS NO PERMANENTLY.
+     *
+     * `adopt()` is where a new asset is created, and creating one is the step
+     * that can be refused for an ACCOUNT reason: the allowance is spent, the
+     * key was revoked, the workspace is wrong. Running that same request again
+     * cannot change the answer - it can only spend another attempt and, on a
+     * quota, produce another dead asset.
+     *
+     * So a permanent refusal is recorded and the job ends there. A transient
+     * one is re-thrown, and the queue's bounded, jittered backoff decides when
+     * to try again.
+     */
+    let assetId: string;
+    try {
+      ({ assetId } = await this.adopt(videoId));
+    } catch (error) {
+      if (isRetryableProviderFailure(error)) throw error;
+
+      const failure = classifyGumletFailure({
+        message: error instanceof Error ? error.message : String(error),
+      });
+      await this.prisma.video.update({
+        where: { id: videoId },
+        data: {
+          status: VideoStatus.FAILED,
+          processingError: failure.adminMessage,
+          gumletError: sanitizeProviderText(
+            error instanceof Error ? error.message : String(error),
+          ),
+          gumletUpdatedAt: new Date(),
+        },
+      });
+      this.logger.error(
+        `video ${videoId}: Gumlet refused the asset permanently (${failure.kind}); ` +
+          'not retrying, because the same request cannot succeed until the account changes',
+      );
+      return { handled: true, status: 'failed', playable: false };
+    }
 
     // Poll with a bounded budget. Gumlet's own processing is asynchronous and
     // can outlive a single job execution, so a timeout is recorded on the row

@@ -300,6 +300,25 @@ describe('VideosService.retryProcessing - a stranded video', () => {
   });
 });
 
+describe('VideosService.retryProcessing - the queued job', () => {
+  it('asks for a bounded, jittered backoff so a batch of failures does not return in lockstep', async () => {
+    const h = build({ row: legacyRow() });
+
+    await h.service.retryProcessing('vid_1', ACTOR);
+
+    const options = (h.queue.add as jest.Mock).mock.calls[0][2] as {
+      attempts: number;
+      backoff: { type: string; delay: number; jitter: number };
+    };
+
+    expect(options.attempts).toBe(2);
+    expect(options.backoff.type).toBe('exponential');
+    // A fraction of the delay is randomised, so retries spread out.
+    expect(options.backoff.jitter).toBeGreaterThan(0);
+    expect(options.backoff.jitter).toBeLessThanOrEqual(1);
+  });
+});
+
 describe('VideosService.retryProcessing - preconditions', () => {
   it('refuses when the stored source object is gone, and creates nothing', async () => {
     const h = build({ sourceExists: false });

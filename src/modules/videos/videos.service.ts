@@ -21,6 +21,7 @@ import {
   type TranscodeJobData,
 } from '../../jobs/queue.constants';
 import { readWorkerHeartbeat } from '../../jobs/worker-heartbeat';
+import { TRANSCODE_BACKOFF_BASE_MS, TRANSCODE_BACKOFF_JITTER } from '../../jobs/queue.tuning';
 import { RedisService } from '../../redis/redis.service';
 import { AuditService } from '../audit/audit.service';
 import { CourseAccessService } from '../courses/course-access.service';
@@ -437,6 +438,20 @@ export class VideosService {
           ...DEFAULT_JOB_OPTIONS,
           // Transcoding is expensive; two attempts, not three.
           attempts: 2,
+          /**
+           * Bounded exponential backoff WITH JITTER.
+           *
+           * The queue default is a 5-second exponential curve with no
+           * jitter, so a batch of videos that failed together - a provider
+           * outage, a full disk - all comes back at the same instant and
+           * repeats the load that caused the failure. Randomising the delay
+           * spreads the retries out.
+           */
+          backoff: {
+            type: 'exponential',
+            delay: TRANSCODE_BACKOFF_BASE_MS,
+            jitter: TRANSCODE_BACKOFF_JITTER,
+          },
           jobId: `transcode:${video.id}:${Date.now()}`,
         },
       );
