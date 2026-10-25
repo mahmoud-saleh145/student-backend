@@ -468,7 +468,11 @@ export class LessonsService {
         select: { sortOrder: true },
       });
 
-      const target = input.sortOrder ?? (last?.sortOrder ?? 0) + 1;
+      // The clamp to 1 is not redundant with the read above: `remove()` now
+      // parks a deleted lecture at a NEGATIVE position, so in a section where
+      // every lecture has been deleted `last` is negative and the next lecture
+      // would otherwise be born below zero.
+      const target = input.sortOrder ?? Math.max((last?.sortOrder ?? 0) + 1, 1);
 
       if (input.sortOrder !== undefined) {
         // An explicit position cannot be silently moved onto an occupied slot.
@@ -682,11 +686,40 @@ export class LessonsService {
         data: { status: 'REVOKED', revokedAt: now, revokedReason: 'Lecture deleted' },
       });
 
+      // Release this lecture's position, and every position still held by an
+      // already-deleted lecture of this section.
+      //
+      // `@@unique([sectionId, sortOrder])` is NOT partial: the index
+      // (`CREATE UNIQUE INDEX "lessons_sectionId_sortOrder_key"`) covers every
+      // row, soft-deleted ones included. The `lesson.update` above leaves
+      // `sortOrder` intact, so this row still occupies its slot when the next
+      // statement runs.
+      //
+      // That statement used to be "shift every lecture below up by one", which
+      // moved a live lecture onto the slot this row still holds - and onto the
+      // slots held by lectures deleted earlier in this section. Two rows, one
+      // position: 23505 -> P2002 -> the whole transaction rolled back, so the
+      // delete never happened and the API answered 409 CONFLICT "A record with
+      // this sectionId already exists" (the P2002 handler reports `target[0]`
+      // of the compound key). It failed for every lecture that was not the
+      // LAST one of its section - which is 8 of the 9 stranded ones.
+      //
+      // Vacating the slots instead is one statement over rows no reader can
+      // see. `sortOrder -> -sortOrder - 1000` is injective, so two rows can
+      // never meet, and every value it writes is negative while every live
+      // lecture stays exactly where it is. Nothing here asks whether a video
+      // exists: this path holds no storage client, no Gumlet client and no
+      // queue, and a stranded upload is only an archived metadata row.
+      //
+      // The gaps left behind are harmless - readers only ORDER BY sortOrder,
+      // `create()` allocates above the highest row, and `reorder()` recompacts
+      // 1..N (which this also unblocks: a deleted row sitting on a live
+      // position is what made THAT collide too).
       await tx.$executeRaw`
-        UPDATE lessons SET "sortOrder" = "sortOrder" - 1
+        UPDATE lessons SET "sortOrder" = -"sortOrder" - 1000
         WHERE "sectionId" = ${lesson.sectionId}
-          AND "sortOrder" > ${lesson.sortOrder}
-          AND "deletedAt" IS NULL
+          AND "deletedAt" IS NOT NULL
+          AND "sortOrder" >= 0
       `;
     });
 
