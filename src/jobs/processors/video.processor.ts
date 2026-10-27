@@ -1,15 +1,19 @@
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import type { Job } from 'bullmq';
+import { UnrecoverableError, type Job } from 'bullmq';
 import { spawn } from 'node:child_process';
 import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { VideoConfig } from '../../config/configuration';
+import { describeDatabaseError, isTransientDatabaseError } from '../../database/transient-db-error';
 import { HLS_CODECS, ManifestService } from '../../modules/playback/manifest.service';
 import { StorageService } from '../../modules/storage/storage.service';
-import { GumletIngestService } from '../../modules/videos/gumlet-ingest.service';
+import {
+  GumletAdoptionNotRecordedError,
+  GumletIngestService,
+} from '../../modules/videos/gumlet-ingest.service';
 import { VideosService } from '../../modules/videos/videos.service';
 import { QUEUE_NAMES, VIDEO_JOBS, type TranscodeJobData } from '../queue.constants';
 import { RESPONSIVE_WORKER } from '../queue.tuning';
@@ -220,8 +224,54 @@ export class VideoProcessor extends WorkerHost {
       return { videoId, renditions: renditions.length };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+
+      // A DATABASE OUTAGE IS NOT A VERDICT ON THE VIDEO.
+      //
+      // Writing FAILED here was wrong in both directions. While the database
+      // was still unreachable, `markFailed` failed the same way and replaced
+      // the original error. Once it was reachable again, a Gumlet video whose
+      // asset was healthy got stamped FAILED - which the recovery sweep never
+      // looks at - with the raw Prisma text (naming the database host) as the
+      // reason shown in the dashboard.
+      //
+      // So the row is left exactly as the last successful write left it, and
+      // the error goes back to BullMQ for its bounded, jittered retry. Every
+      // state that can be left behind is one the sweep already resumes: QUEUED
+      // is re-queued, a Gumlet row with an asset id is re-synced against the
+      // provider, and a stale local PROCESSING row is failed with a retryable
+      // reason after the sweep's cutoff.
+      if (isTransientDatabaseError(error)) {
+        this.logger.warn(
+          `video ${videoId}: database unreachable during processing (${describeDatabaseError(error)}; ` +
+            `job ${job.id}, attempt ${job.attemptsMade + 1} of ${job.opts?.attempts ?? 1}). ` +
+            'The row is left unchanged; a queue retry or the recovery sweep resumes it.',
+        );
+        throw error;
+      }
+
+      // GUMLET SUCCEEDED, THE DATABASE DID NOT.
+      //
+      // A retry would create a second asset, so this must not be retried, and
+      // the database is the thing that is down, so there is nowhere to write a
+      // failure either. The message names the asset for the operator.
+      if (error instanceof GumletAdoptionNotRecordedError) {
+        this.logger.error(`transcode for ${videoId} stopped without retry: ${message}`);
+        throw new UnrecoverableError(message);
+      }
+
       this.logger.error(`transcode failed for ${videoId}: ${message}`);
-      await this.videos.markFailed(videoId, message);
+      try {
+        await this.videos.markFailed(videoId, message);
+      } catch (markError) {
+        // Never let the bookkeeping failure replace the reason the job failed.
+        this.logger.error(
+          `video ${videoId}: could not record the failure (` +
+            (isTransientDatabaseError(markError)
+              ? describeDatabaseError(markError)
+              : (markError as Error)?.message ?? String(markError)) +
+            '); keeping the original error',
+        );
+      }
       throw error;
     } finally {
       // Always clean up. A leftover 2 GB scratch directory per failed job

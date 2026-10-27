@@ -6,6 +6,11 @@ import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
 import type { VideoConfig } from '../../config/configuration';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
+import {
+  describeDatabaseError,
+  isTransientDatabaseError,
+  withDatabaseRetry,
+} from '../../database/transient-db-error';
 import { StorageService } from '../storage/storage.service';
 import { GumletDrmService } from '../playback/gumlet-drm.service';
 import {
@@ -68,6 +73,51 @@ const GUMLET_POLL_INTERVAL_MS = 5000;
  * back for the recovery sweep instead of being retried here.
  */
 const GUMLET_MAX_CONSECUTIVE_TRANSIENT = 5;
+
+/**
+ * How many consecutive DATABASE failures one poll loop tolerates, and how long
+ * it waits between them.
+ *
+ * Kept apart from the Gumlet streak above on purpose. `sync()` reads and writes
+ * the video row, so when the database is unreachable it throws a Prisma
+ * connectivity error - which `isTransientProviderError` (true for anything that
+ * is not a `GumletRequestError`) used to count as a "Gumlet timeout". Five of
+ * those, 5 s apart, ended the poll with a misleading message and then attempted
+ * one more database write, which failed the same way and escaped to the worker.
+ *
+ * A Neon resume or a home-network blip can take longer than 25 s, so database
+ * failures get their own jittered exponential backoff (2 s, 4 s, 8 s, 16 s,
+ * 30 s windows). If the database is still gone after that, the error is handed
+ * back to the queue instead of being written down as a verdict: the asset id is
+ * already recorded, so the retry resumes the same asset.
+ */
+const GUMLET_MAX_CONSECUTIVE_DB_FAILURES = 6;
+const GUMLET_DB_BACKOFF_BASE_MS = 2000;
+const GUMLET_DB_BACKOFF_MAX_MS = 30_000;
+
+/**
+ * Gumlet created an asset, but the database never learned its id.
+ *
+ * This is the one state in the ingest flow a retry cannot repair: the row still
+ * has no `gumletAssetId`, so `adopt()` would create ANOTHER asset - a duplicate,
+ * separately billed, and the first one orphaned. The worker therefore stops the
+ * job without retrying (BullMQ `UnrecoverableError`) and the error names the
+ * asset, so an operator can record it or delete it before reprocessing.
+ */
+export class GumletAdoptionNotRecordedError extends Error {
+  constructor(
+    readonly videoId: string,
+    readonly assetId: string,
+    readonly dbError: unknown,
+  ) {
+    super(
+      `Gumlet created asset ${assetId} for video ${videoId}, but the database could not record it ` +
+        `(${describeDatabaseError(dbError)}). Not retried automatically, because a retry would create a ` +
+        `second asset. Record asset ${assetId} on this video, or delete it at Gumlet, before reprocessing.`,
+    );
+    this.name = 'GumletAdoptionNotRecordedError';
+  }
+}
 
 /**
  * Claim marker written to `gumletStatus` while a failed asset is being replaced.
@@ -251,10 +301,38 @@ export class GumletIngestService {
     videoId: string,
     created: { assetId: string; status: string },
   ): Promise<void> {
-    await this.prisma.video.update({
-      where: { id: videoId },
-      data: this.buildAdoptionUpdate(created),
-    });
+    // THE ASSET ALREADY EXISTS AT THE PROVIDER.
+    //
+    // This write is the only record of it. Losing it to a database blip used to
+    // mean the job failed, BullMQ retried, `adopt()` found no asset id and
+    // created a second asset. So the write is retried in place (it sets fixed
+    // values, so repeating it is safe), and if the database stays unreachable
+    // the failure is escalated as non-retryable rather than handed to a retry
+    // that would duplicate the asset.
+    try {
+      await withDatabaseRetry(
+        () =>
+          this.prisma.video.update({
+            where: { id: videoId },
+            data: this.buildAdoptionUpdate(created),
+          }),
+        {
+          onRetry: (error, attempt, delayMs) =>
+            this.logger.warn(
+              `video ${videoId}: could not record new Gumlet asset ${created.assetId} ` +
+                `(${describeDatabaseError(error)}, attempt ${attempt}); retrying in ${delayMs} ms`,
+            ),
+        },
+      );
+    } catch (error) {
+      if (!isTransientDatabaseError(error)) throw error;
+      this.logger.error(
+        `ORPHANED_GUMLET_ASSET video ${videoId}: Gumlet created asset ${created.assetId} ` +
+          `(tag edu-video:${videoId}) but the database stayed unreachable, so it was not recorded. ` +
+          'The job will not be retried automatically, because a retry would create a second asset.',
+      );
+      throw new GumletAdoptionNotRecordedError(videoId, created.assetId, error);
+    }
 
     this.logger.log(
       `video ${videoId} adopted by Gumlet as asset ${created.assetId} (status ${created.status})`,
@@ -979,6 +1057,13 @@ export class GumletIngestService {
     try {
       ({ assetId } = await this.adopt(videoId));
     } catch (error) {
+      // Neither of these is the provider's answer. A database blip is retried by
+      // the queue; an asset that exists but could not be recorded must NOT be
+      // classified (its message would otherwise be read as a provider refusal)
+      // and must not be retried. Both are re-thrown untouched for the worker.
+      if (isTransientDatabaseError(error) || error instanceof GumletAdoptionNotRecordedError) {
+        throw error;
+      }
       if (isRetryableProviderFailure(error)) throw error;
 
       const failure = classifyGumletFailure({
@@ -1010,6 +1095,7 @@ export class GumletIngestService {
     const deadline = Date.now() + GUMLET_JOB_POLL_BUDGET_MS;
     let last = 'unknown';
     let transientStreak = 0;
+    let dbStreak = 0;
 
     while (Date.now() < deadline) {
       let state: { assetId: string; status: string; playable: boolean };
@@ -1017,7 +1103,38 @@ export class GumletIngestService {
       try {
         state = await this.sync(videoId);
         transientStreak = 0;
+        dbStreak = 0;
       } catch (error) {
+        // THE DATABASE, NOT THE PROVIDER.
+        //
+        // Checked first, because `isTransientProviderError` below is true for
+        // every non-Gumlet error and would otherwise count this as a provider
+        // timeout. See GUMLET_MAX_CONSECUTIVE_DB_FAILURES.
+        if (isTransientDatabaseError(error)) {
+          dbStreak += 1;
+          if (dbStreak >= GUMLET_MAX_CONSECUTIVE_DB_FAILURES) {
+            this.logger.warn(
+              `video ${videoId}: the database stayed unreachable for ${dbStreak} consecutive polls ` +
+                `(${describeDatabaseError(error)}); handing the job back to the queue. Asset ${assetId} ` +
+                'is recorded, so the retry resumes it rather than creating another.',
+            );
+            throw error;
+          }
+          const window = Math.min(
+            GUMLET_DB_BACKOFF_BASE_MS * 2 ** (dbStreak - 1),
+            GUMLET_DB_BACKOFF_MAX_MS,
+          );
+          const delayMs = Math.round(Math.random() * window);
+          this.logger.warn(
+            `video ${videoId}: database unreachable while polling Gumlet (${describeDatabaseError(error)}); ` +
+              `retry ${dbStreak}/${GUMLET_MAX_CONSECUTIVE_DB_FAILURES - 1} in ${delayMs} ms`,
+          );
+          await new Promise((r) => setTimeout(r, delayMs));
+          continue;
+        }
+        // The provider answered (or failed to), so the database did not.
+        dbStreak = 0;
+
         // A provider blip is not a verdict on the asset.
         //
         // `timedFetch` raises a transient `GumletRequestError` when its
@@ -1075,13 +1192,17 @@ export class GumletIngestService {
 
     // Still processing when the budget ran out: leave it PROCESSING so the
     // recovery sweep re-checks it. Never mark playable.
-    await this.prisma.video.update({
-      where: { id: videoId },
-      data: {
-        status: VideoStatus.PROCESSING,
-        gumletStatus: last,        gumletError: `Gumlet processing did not finish within the job budget (asset ${assetId}). It will be re-checked automatically.`,        gumletUpdatedAt: new Date(),
-      },
-    });
+    // Retried in place: it sets fixed values, and losing it to a blip would
+    // send an otherwise-healthy poll back through the queue for nothing.
+    await withDatabaseRetry(() =>
+      this.prisma.video.update({
+        where: { id: videoId },
+        data: {
+          status: VideoStatus.PROCESSING,
+          gumletStatus: last,        gumletError: `Gumlet processing did not finish within the job budget (asset ${assetId}). It will be re-checked automatically.`,        gumletUpdatedAt: new Date(),
+        },
+      }),
+    );
 
     // KNOWN AMBIGUITY, DELIBERATELY NOT RESOLVED HERE
     //
