@@ -82,6 +82,40 @@ const MAX_MESSAGE_LENGTH = 400;
  * row a dashboard renders, and a presigned URL in a log is a credential in a
  * log.
  */
+/**
+ * Provider statuses after which an asset will NEVER become playable.
+ *
+ * `errored` and `failed` are processing failures. `deleted` is the asset having
+ * been removed at Gumlet: the asset API still answers 200 for it, with
+ * `status: "deleted"`, and its manifest is gone.
+ *
+ * `deleted` used to be missing from every check, so it was read as "not ready
+ * YET". That is observed in production: cmv09znia000thl01wixuismf sits at READY
+ * in our database while Gumlet reports its asset deleted. Playback was correctly
+ * refused by the verifier, but nothing could repair the video - "replace failed
+ * asset" refused a status it did not recognise, and "Try processing again"
+ * treated the asset as alive, so it would have flipped the row to PROCESSING
+ * and polled a deleted asset until the budget ran out, then left it PROCESSING
+ * for the recovery sweep to re-poll indefinitely.
+ *
+ * Every non-terminal status (`pre-queued`, `queued`, `processing`, ...) keeps
+ * its existing meaning: still in progress, safe to keep polling.
+ */
+const GUMLET_TERMINAL_FAILURE_STATUSES: ReadonlySet<string> = new Set([
+  'errored',
+  'failed',
+  'deleted',
+]);
+
+export function isTerminalGumletFailure(status: string | null | undefined): boolean {
+  return status != null && GUMLET_TERMINAL_FAILURE_STATUSES.has(status);
+}
+
+/** What an administrator is told about an asset that was deleted at Gumlet. */
+export const GUMLET_ASSET_DELETED_MESSAGE =
+  'The Gumlet asset for this video was deleted at Gumlet, so it can no longer be played. ' +
+  'Use "Try processing again" to create a new asset from the stored source file.';
+
 export function sanitizeProviderText(value: string | null | undefined): string {
   if (value === null || value === undefined) return '';
   return String(value)

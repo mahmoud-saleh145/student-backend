@@ -28,6 +28,7 @@ import { CourseAccessService } from '../courses/course-access.service';
 import { CoursesService } from '../courses/courses.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { StorageService } from '../storage/storage.service';
+import { isTerminalGumletFailure } from './gumlet-failure';
 import { GumletIngestService } from './gumlet-ingest.service';
 import { LessonVideoService } from './lesson-video.service';
 
@@ -1061,7 +1062,9 @@ export class VideosService {
     },
     actor: { id: string; role: UserRole },
   ) {
-    const terminalAssetFailure = video.gumletStatus === 'errored' || video.gumletStatus === 'failed';
+    // `deleted` included: a deleted asset is as dead as a failed one, and only a
+    // fresh ingest can bring the lecture back. See isTerminalGumletFailure().
+    const terminalAssetFailure = isTerminalGumletFailure(video.gumletStatus);
 
     if (terminalAssetFailure) {
       // Mint a replacement asset. This is atomic: a concurrent attempt loses

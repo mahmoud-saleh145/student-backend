@@ -20,7 +20,12 @@ import {
 import { AuditService } from '../audit/audit.service';
 import { LessonVideoService } from './lesson-video.service';
 import { resolveGumletIngestUrlTtlSeconds } from './gumlet-ingest-url-ttl';
-import { classifyGumletFailure, sanitizeProviderText } from './gumlet-failure';
+import {
+  GUMLET_ASSET_DELETED_MESSAGE,
+  classifyGumletFailure,
+  isTerminalGumletFailure,
+  sanitizeProviderText,
+} from './gumlet-failure';
 
 /**
  * Gumlet-backed video lifecycle.
@@ -509,7 +514,7 @@ export class GumletIngestService {
           'recovery and must be done deliberately.',
       });
     }
-    if (video.gumletStatus !== 'errored' && video.gumletStatus !== 'failed') {
+    if (!isTerminalGumletFailure(video.gumletStatus)) {
       throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
         message: `Refusing to replace a Gumlet asset whose status is "${video.gumletStatus ?? 'unknown'}". Only a terminal failure can be replaced.`,
       });
@@ -926,8 +931,13 @@ export class GumletIngestService {
           );
         }
       }
-    } else if (asset.status === 'errored' || asset.status === 'failed') {
-      update.gumletError = asset.error ?? `Gumlet processing ended with status "${asset.status}"`;
+    } else if (isTerminalGumletFailure(asset.status)) {
+      const deletedAtProvider = asset.status === 'deleted';
+      update.gumletError =
+        asset.error ??
+        (deletedAtProvider
+          ? 'Gumlet reports this asset as deleted.'
+          : `Gumlet processing ended with status "${asset.status}"`);
       if (onGumletPath) {
         update.status = VideoStatus.FAILED;
         // The reason has to be visible where a failure is actually read.
@@ -938,7 +948,7 @@ export class GumletIngestService {
         // they had to know to go and look for. The provider's own words stay in
         // `gumletError`; what lands here is the classified, actionable summary
         // that says whether a retry can help or an operator has to act.
-        update.processingError = failure.adminMessage;
+        update.processingError = deletedAtProvider ? GUMLET_ASSET_DELETED_MESSAGE : failure.adminMessage;
         this.logger.warn(
           `video ${videoId}: Gumlet asset ${asset.assetId} failed (${failure.kind}): ${sanitizeProviderText(asset.error)}`,
         );
@@ -1162,7 +1172,7 @@ export class GumletIngestService {
 
       last = state.status;
       if (state.playable) return { handled: true, status: state.status, playable: true };
-      if (state.status === 'errored' || state.status === 'failed') {
+      if (isTerminalGumletFailure(state.status)) {
         return { handled: true, status: state.status, playable: false };
       }
 
@@ -1275,7 +1285,7 @@ export class GumletIngestService {
     const drmState = ((): 'READY_DRM_VERIFIED' | 'PENDING_SUBMISSION' | 'PROCESSING' | 'FAILED' | 'DRM_NOT_VERIFIABLE' => {
       if (drmVerified) return 'READY_DRM_VERIFIED';
       if (!video.gumletAssetId) return 'PENDING_SUBMISSION';
-      if (video.gumletStatus === 'errored' || video.gumletStatus === 'failed') return 'FAILED';
+      if (isTerminalGumletFailure(video.gumletStatus)) return 'FAILED';
       if (video.gumletStatus) return 'PROCESSING';
       return 'DRM_NOT_VERIFIABLE';
     })();

@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import type { VideoConfig } from '../../config/configuration';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { GumletDrmService, GumletRequestError } from '../playback/gumlet-drm.service';
+import { isTerminalGumletFailure } from '../videos/gumlet-failure';
 
 /**
  * Reasons a fresh provider check can resolve. Everything else is either a
@@ -216,7 +217,7 @@ export class DrmVerificationService {
       return {
         playable: false,
         reason:
-          video.gumletStatus === 'errored' || video.gumletStatus === 'failed'
+          isTerminalGumletFailure(video.gumletStatus)
             ? 'ASSET_FAILED'
             : 'ASSET_NOT_READY',
         detail: `Gumlet asset status is "${video.gumletStatus ?? 'unknown'}".`,
@@ -416,7 +417,7 @@ export class DrmVerificationService {
         {
           playable: false,
           reason:
-            asset.status === 'errored' || asset.status === 'failed' ? 'ASSET_FAILED' : 'ASSET_NOT_READY',
+            isTerminalGumletFailure(asset.status) ? 'ASSET_FAILED' : 'ASSET_NOT_READY',
           detail: asset.error ?? `Gumlet reports the asset as "${asset.status}".`,
         },
         { gumletStatus: asset.status, gumletError: asset.error ?? null },
