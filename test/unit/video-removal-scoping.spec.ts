@@ -185,6 +185,12 @@ describe('removing an UNSHARED video', () => {
     expect(h.ticket('t_S')).toBe('ACTIVE');
     expect(h.storage.deletePrefix).toHaveBeenCalledWith('media', 'hls/vN/');
     expect(h.storage.deleteObject).toHaveBeenCalledWith('uploads', 'source/vN/file.mp4');
+    // The WHOLE source prefix, not just the key the row points at. Every
+    // upload attempt mints a fresh key, so a video uploaded more than once has
+    // source objects under this prefix that no row references. Deleting only
+    // the current one left those behind: unreachable bytes that still cost
+    // money on a bucket meant to hold nothing but live material.
+    expect(h.storage.deletePrefix).toHaveBeenCalledWith('uploads', 'source/videos/vN/');
     expectEveryAttachmentQueryScoped(h.db);
   });
 
@@ -347,5 +353,84 @@ describe('the dedicated detach route (VideosService.detach)', () => {
     await expect(h.service.detach('vS', 'lD2', h.as(teacherOf('cD1')))).rejects.toBeInstanceOf(AppException);
     await h.service.detach('vS', 'lD1', h.as(teacherOf('cD1')));
     expect(h.links()).toEqual(['lD2:vS', 'lN:vN', 'lS:vS', 'lU:vU', 'lX:vX']);
+  });
+});
+
+/**
+ * THE STRANDED UPLOAD
+ * -------------------
+ * Nine production videos sit in UPLOADING: `initUpload` minted the key and the
+ * row, the presigned PUT never landed, so `processingJobId` and `gumletAssetId`
+ * are NULL and neither bucket holds an object for them. Deleting such a video
+ * must work - and it must not turn "there is nothing to delete" into an error,
+ * nor ask a provider about an asset that was never registered.
+ *
+ * `gumletIngest` is `{}` in this harness on purpose: any call into it would be
+ * a TypeError, so a green test is the proof that no provider request was made.
+ */
+describe('removing a video whose upload never landed (no asset, no stored bytes)', () => {
+  it('archives the row, revokes its grant and purges prefixes without needing an object', async () => {
+    const h = harness(
+      seed({
+        lesson: [lesson('lU', 'cU', 2913)],
+        video: [
+          video('vStranded', 'cU', 'lU', {
+            status: 'UPLOADING',
+            hlsPrefix: null, // no HLS output was ever produced
+            processingJobId: null, // nothing is queued
+            gumletAssetId: null, // the provider asset was never created
+            durationSeconds: 0,
+          }),
+        ],
+        lessonVideo: [{ lessonId: 'lU', videoId: 'vStranded' }],
+        playbackTicket: [{ id: 't_U', videoId: 'vStranded', lessonId: 'lU', status: 'ACTIVE' }],
+      }),
+    );
+
+    const result = await h.service.remove('vStranded', h.as(ADMIN));
+
+    expect(result).toEqual({ ok: true, detached: false, remainingAttachments: 0 });
+    expect(h.row('vStranded')).toMatchObject({
+      status: 'ARCHIVED',
+      deletedAt: expect.any(Date),
+      gumletAssetId: null, // archived, never invented
+    });
+    // The link row is retained next to the soft-deleted video; every read
+    // filters `video: { deletedAt: null }`, so the lecture simply sees no
+    // video any more.
+    expect(h.links()).toEqual(['lU:vStranded']);
+    expect(h.duration('lU')).toBe(0);
+    expect(h.ticket('t_U')).toBe('REVOKED');
+
+    // Nothing to delete is not a failure. No HLS prefix exists, so the media
+    // prefix is never listed; the source key is still named (the object simply
+    // is not in the bucket) and the whole upload prefix is swept.
+    expect(h.storage.deletePrefix).toHaveBeenCalledTimes(1);
+    expect(h.storage.deletePrefix).toHaveBeenCalledWith('uploads', 'source/videos/vStranded/');
+    expect(h.storage.deletePrefix).not.toHaveBeenCalledWith('media', expect.anything());
+    expect(h.storage.deleteObject).toHaveBeenCalledWith('uploads', 'source/vStranded/file.mp4');
+    expectEveryAttachmentQueryScoped(h.db);
+  });
+
+  it('never asks the provider to delete an asset that was never registered', async () => {
+    const h = harness(
+      seed({
+        lesson: [lesson('lU', 'cU', 2913)],
+        video: [
+          video('vStranded', 'cU', 'lU', {
+            status: 'UPLOADING',
+            hlsPrefix: null,
+            processingJobId: null,
+            gumletAssetId: null,
+            durationSeconds: 0,
+          }),
+        ],
+        lessonVideo: [{ lessonId: 'lU', videoId: 'vStranded' }],
+        playbackTicket: [],
+      }),
+    );
+
+    // gumletIngest is `{}` here: this resolves only if nothing is called on it.
+    await expect(h.service.remove('vStranded', h.as(ADMIN))).resolves.toMatchObject({ ok: true });
   });
 });

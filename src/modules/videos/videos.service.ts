@@ -39,7 +39,17 @@ const ALLOWED_VIDEO_TYPES = new Set([
   'video/x-msvideo',
 ]);
 
-const MAX_SOURCE_BYTES = 8 * 1024 * 1024 * 1024; // 8 GB
+/**
+ * Largest source a lecture upload can actually store.
+ *
+ * The dashboard uploads the file to Cloudflare R2 in ONE presigned PUT, and R2
+ * caps a single PUT at 5 GiB minus 5 MiB (4.995 GiB, 5,363,466,240 bytes) -
+ * anything larger needs the multipart API, which this flow does not use. The
+ * limit used to be advertised as 8 GB, so a 5-8 GB file was accepted here, sent
+ * in full over the uploader's connection, and then refused by R2: an upload
+ * that could never succeed, discovered only after the whole transfer.
+ */
+export const MAX_SOURCE_BYTES = 5 * 1024 * 1024 * 1024 - 5 * 1024 * 1024;
 
 /**
  * Video lifecycle.
@@ -150,7 +160,7 @@ export class VideosService {
     }
     if (params.sizeBytes > MAX_SOURCE_BYTES) {
       throw AppException.validation({
-        sizeBytes: [`exceeds the ${MAX_SOURCE_BYTES / 1024 ** 3} GB limit`],
+        sizeBytes: [`exceeds the ${MAX_SOURCE_BYTES} byte (4.99 GB) single-upload limit`],
       });
     }
 
@@ -209,7 +219,17 @@ export class VideosService {
     // is the operation the "edit video URLs" switch governs; a first upload
     // onto an empty lesson — or onto one whose video was deleted — is
     // ordinary content authoring and is not gated by it.
-    const liveVideo = lesson.video && !lesson.video.deletedAt ? lesson.video : null;
+    //
+    // "Live" means READY: that is the only state a student can stream. A row
+    // left at UPLOADING / FAILED (an interrupted or refused first upload) or
+    // still QUEUED / PROCESSING has never been watched, so retrying it is still
+    // the first upload. Gating those too meant a teacher whose first attempt
+    // failed could never retry without the "edit video URLs" switch (off by
+    // default) - the lecture stayed empty until an admin stepped in.
+    const liveVideo =
+      lesson.video && !lesson.video.deletedAt && lesson.video.status === VideoStatus.READY
+        ? lesson.video
+        : null;
     if (liveVideo) {
       await this.access.assertTeacherCapability(actor.role, 'editVideoUrls');
     }
@@ -335,11 +355,63 @@ export class VideosService {
    * Verifying the object exists (and its size) closes the gap where a client
    * claims success without having uploaded anything — otherwise the queue
    * fills with jobs that fail minutes later in the worker.
+   *
+   * THIS ENDPOINT IS ALSO THE RECOVERY PATH, AND THAT IS DELIBERATE.
+   *
+   * A large direct-to-storage upload can fail in a way that leaves the file in
+   * the bucket but the browser convinced that it did not. Cloudflare R2
+   * documents its `InternalError` (HTTP 500) on `PutObject` as "retry the
+   * request", and the failure this file was written for is exactly that: on
+   * 2026-10-21 a 522 MB lecture was committed by R2 (the object is in
+   * `edu-uploads`, byte-exact, `ftyp`+`mdat`+`moov`) and the browser was
+   * answered with a 500. The client therefore never called `complete`, so:
+   *
+   *   - `sourceSizeBytes` stayed NULL, so the row did not describe reality;
+   *   - no transcode job was enqueued, so nothing ever processed the file;
+   *   - no Gumlet asset was created, because the ingest is driven by that job;
+   *   - the row sat at `UPLOADING` forever, and the dashboard told the admin
+   *     that "Gumlet is packaging this video" when Gumlet had never heard of
+   *     it.
+   *
+   * The bytes were there the whole time. Nothing in the flow ever went back
+   * and LOOKED.
+   *
+   * So `complete` is written to be safe to call at any time, for any reason:
+   *
+   *   - it is IDEMPOTENT. Calling it again on a video that is already queued
+   *     or processing returns the current state instead of enqueuing a second
+   *     job, so a client that retries after a dropped response cannot start
+   *     the pipeline twice;
+   *   - it RECOVERS. A row stranded at `UPLOADING` whose object is already in
+   *     the bucket is completed here, with no re-upload - which is the
+   *     difference between an administrator losing 522 MB of upload time and
+   *     pressing one button;
+   *   - it VERIFIES THE LENGTH. The client may declare how many bytes it
+   *     sent; a stored object of a different length is a truncated upload and
+   *     is refused rather than processed into a broken lecture;
+   *   - it CLEANS UP. Once the current object is confirmed, the superseded
+   *     objects left by earlier attempts are removed from the bucket.
+   *
+   * It never sets `READY`. Readiness is the worker's verdict, reached only
+   * after the provider reports the asset ready AND the manifest is confirmed
+   * CENC-encrypted.
    */
-  async completeUpload(videoId: string, actor: { id: string; role: UserRole }) {
+  async completeUpload(
+    videoId: string,
+    actor: { id: string; role: UserRole },
+    declaredSizeBytes?: number | null,
+  ) {
     const video = await this.prisma.video.findFirst({
       where: { id: videoId, ...notDeleted },
-      select: { id: true, courseId: true, sourceKey: true, status: true, lessonId: true },
+      select: {
+        id: true,
+        courseId: true,
+        sourceKey: true,
+        status: true,
+        lessonId: true,
+        processingJobId: true,
+        gumletAssetId: true,
+      },
     });
     if (!video) throw AppException.notFound('Video', videoId);
 
@@ -351,17 +423,35 @@ export class VideosService {
 
     const size = await this.storage.objectSize('uploads', video.sourceKey);
     if (size === null) {
+      // The bytes are not there. The message has to say what to do about it,
+      // because the reader is looking at a failed upload and needs to know
+      // whether re-sending the file is the fix.
+      this.logger.warn(
+        `video ${videoId}: complete found no stored object for key ${video.sourceKey}`,
+      );
       throw new AppException(ErrorCode.UPLOAD_FAILED, {
-        message: 'The uploaded object was not found in storage',
+        message:
+          'The uploaded file was not found in storage, so the upload did not complete. ' +
+          'Upload the file again.',
       });
     }
 
-    if (video.status === VideoStatus.PROCESSING) {
-      throw new AppException(ErrorCode.INVALID_STATE, {
-        message: 'This video is already being processed',
+    if (declaredSizeBytes != null && size !== declaredSizeBytes) {
+      // A stored object of a different length than the client sent is a
+      // truncated upload. Processing it would produce a lecture that ends
+      // mid-sentence, so it is refused and the file has to be sent again.
+      this.logger.warn(
+        `video ${videoId}: stored object is ${size} bytes but the client sent ${declaredSizeBytes}`,
+      );
+      throw new AppException(ErrorCode.UPLOAD_FAILED, {
+        message:
+          `The file in storage is ${size} bytes but ${declaredSizeBytes} bytes were uploaded, ` +
+          'so the upload was cut short. Upload the file again.',
       });
     }
 
+    // Record what is actually in the bucket before anything else, so the row
+    // describes the stored file even if the queue write below fails.
     await this.prisma.video.update({
       where: { id: videoId },
       data: {
@@ -370,6 +460,58 @@ export class VideosService {
         processingStartedAt: null,
       },
     });
+
+    // Already in the pipeline. A second job would process the same source
+    // twice and race the first one to write the output - so the existing job
+    // is reported instead. The one case that still needs work is a job that
+    // is GONE: the video is stranded between "queued" and "running", and that
+    // is exactly what a repeated `complete` should repair.
+    if (video.status === VideoStatus.QUEUED || video.status === VideoStatus.PROCESSING) {
+      if (await this.localJobIsLive(video.processingJobId)) {
+        this.logger.log(
+          `video ${videoId}: complete called again on a video that is already ${video.status}; ` +
+            'no second job was enqueued',
+        );
+        return {
+          videoId,
+          status: video.status,
+          jobId: video.processingJobId,
+          sourceSizeBytes: size,
+          alreadyQueued: true,
+          ...(await this.workerStatus()),
+        };
+      }
+
+      this.logger.warn(
+        `video ${videoId}: the recorded job is gone, so the upload was never finished; re-queueing it`,
+      );
+    }
+
+    // A video that is already READY has been through this endpoint. Queueing
+    // it again would transcode a finished lecture for nothing.
+    if (video.status === VideoStatus.READY || video.status === VideoStatus.ARCHIVED) {
+      return {
+        videoId,
+        status: video.status,
+        jobId: video.processingJobId,
+        sourceSizeBytes: size,
+        alreadyQueued: true,
+        ...(await this.workerStatus()),
+      };
+    }
+
+    // The confirmed file is the one that stays. Anything an earlier attempt
+    // left behind is removed, so a retried upload does not accumulate
+    // gigabytes of unreachable originals.
+    try {
+      await this.storage.pruneSupersededSources(videoId, video.sourceKey);
+    } catch (error) {
+      // Housekeeping only. The upload itself is fine, so this must not fail
+      // the request - it is logged and the objects are cleaned up on the next
+      // successful completion.
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`video ${videoId}: could not prune superseded sources: ${message}`);
+    }
 
     // -------------------------------------------------------------------------
     // AUTOMATIC GUMLET INGESTION
@@ -397,7 +539,13 @@ export class VideosService {
 
     this.logger.log(`queued transcode job ${jobId} for video ${videoId} (${size} bytes)`);
 
-    return { videoId, status: VideoStatus.QUEUED, jobId, ...(await this.workerStatus()) };
+    return {
+      videoId,
+      status: VideoStatus.QUEUED,
+      jobId,
+      sourceSizeBytes: size,
+      ...(await this.workerStatus()),
+    };
   }
 
   /**
@@ -711,6 +859,21 @@ export class VideosService {
       processingStartedAt: video.processingStartedAt?.toISOString() ?? null,
       processedAt: video.processedAt?.toISOString() ?? null,
       sourceSizeBytes: video.sourceSizeBytes ? Number(video.sourceSizeBytes) : null,
+      /**
+       * True when the bytes were CONFIRMED in storage.
+       *
+       * `sourceSizeBytes` is only written by `completeUpload`, after a HEAD on
+       * the object proved it is really there. So this is the difference between
+       * "an upload was started" and "the file is in the bucket".
+       *
+       * The dashboard needs that distinction because a video whose upload was
+       * interrupted can sit at `UPLOADING` with no job and no provider asset,
+       * and the honest thing to say about that is "the file did not arrive",
+       * not "it is being processed". It is also what makes the recovery
+       * button meaningful: it is offered exactly when the file has not been
+       * confirmed.
+       */
+      uploadConfirmed: video.sourceSizeBytes !== null,
       deleted: Boolean(video.deletedAt),
       // Only worth a Redis read while the answer can explain a wait.
       ...(video.status === VideoStatus.QUEUED || video.status === VideoStatus.PROCESSING
@@ -1270,6 +1433,16 @@ export class VideosService {
       if (video.sourceKey) {
         await this.storage.deleteObject('uploads', video.sourceKey).catch(() => undefined);
       }
+      // The whole source prefix, not just the key the row points at.
+      //
+      // Every upload attempt mints a fresh key, so a video that was uploaded
+      // more than once has objects under this prefix that no row references.
+      // Deleting only the current one left those behind — unreachable bytes
+      // that still cost money, on a bucket that is supposed to hold nothing
+      // but live material.
+      await this.storage
+        .deletePrefix('uploads', `source/videos/${videoId}/`)
+        .catch(() => undefined);
     }
 
     await this.audit.record({

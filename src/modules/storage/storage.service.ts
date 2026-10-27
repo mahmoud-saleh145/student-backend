@@ -726,6 +726,80 @@ export class StorageService {
       .catch((e) => this.logger.warn(`delete failed for ${objectKey}: ${e.message}`));
   }
 
+  /**
+   * Remove every source object of ONE video except the one that is current.
+   *
+   * WHY THIS EXISTS
+   * ---------------
+   * Every upload attempt mints a FRESH object key (`videoSource` embeds a
+   * random UUID) and points the row at it. A retried upload therefore leaves
+   * the previous attempt's object behind, unreferenced by the database and
+   * invisible to every other reader of the bucket. For an 8 GB lecture that is
+   * 8 GB of somebody's money, per retry.
+   *
+   * The objects that accumulate are exactly the ones a FAILED attempt left
+   * behind - the very case this whole flow has to survive. An upload that
+   * fails after the bytes landed (Cloudflare R2 answers a committed PUT with
+   * `InternalError`/500 - it documents that code as "retry the request") used
+   * to leave the file in the bucket AND the row pointing at nothing, because
+   * the client never got to call `complete`.
+   *
+   * WHY IT IS SAFE
+   * --------------
+   * The scope is the video's OWN prefix, `source/videos/<videoId>/`, and the
+   * key that is being kept is passed in. Nothing outside that prefix is
+   * touched, no other video's source is reachable from here, and the object
+   * that the row currently points at is explicitly preserved.
+   *
+   * The caller runs this only once the CURRENT object has been confirmed in
+   * storage, so the file that survives is the one that is about to be
+   * processed.
+   *
+   * @returns the keys that were removed, for the server-side log.
+   */
+  async pruneSupersededSources(videoId: string, keepObjectKey: string): Promise<string[]> {
+    this.assertConfigured();
+
+    const bucket = this.bucketName('uploads');
+    const prefix = `source/videos/${videoId}/`;
+    const removed: string[] = [];
+    let token: string | undefined;
+
+    do {
+      const listing = await this.client.send(
+        new ListObjectsV2Command({
+          Bucket: bucket,
+          Prefix: prefix,
+          ContinuationToken: token,
+        }),
+      );
+
+      const stale = (listing.Contents ?? [])
+        .map((o) => o.Key)
+        .filter((key): key is string => Boolean(key) && key !== keepObjectKey);
+
+      if (stale.length > 0) {
+        await this.client.send(
+          new DeleteObjectsCommand({
+            Bucket: bucket,
+            Delete: { Objects: stale.map((Key) => ({ Key })) },
+          }),
+        );
+        removed.push(...stale);
+      }
+
+      token = listing.IsTruncated ? listing.NextContinuationToken : undefined;
+    } while (token);
+
+    if (removed.length > 0) {
+      this.logger.log(
+        `pruned ${removed.length} superseded source object(s) for video ${videoId}, keeping ${keepObjectKey}`,
+      );
+    }
+
+    return removed;
+  }
+
   /** Removes an entire prefix — used when a video's HLS output is replaced. */
   async deletePrefix(bucket: Bucket, prefix: string): Promise<number> {
     let removed = 0;

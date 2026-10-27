@@ -26,7 +26,7 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { StaffOnly } from '../../common/decorators/roles.decorator';
 import type { AuthenticatedUser } from '../../common/types/request-context';
 
-import { VideosService } from './videos.service';
+import { MAX_SOURCE_BYTES, VideosService } from './videos.service';
 import { GumletIngestService } from './gumlet-ingest.service';
 import { DrmVerificationService } from '../playback/drm-verification.service';
 import { LessonVideoService } from './lesson-video.service';
@@ -43,7 +43,7 @@ class InitUploadDto {
 
   @IsString() @MaxLength(100) contentType!: string;
 
-  @Type(() => Number) @IsInt() @Min(1) @Max(8 * 1024 * 1024 * 1024) sizeBytes!: number;
+  @Type(() => Number) @IsInt() @Min(1) @Max(MAX_SOURCE_BYTES) sizeBytes!: number;
 }
 
 class AttachExistingVideoDto {
@@ -53,6 +53,23 @@ class AttachExistingVideoDto {
 class RemoveVideoQueryDto {
   /** The lecture the video is being removed from. Required for a shared asset. */
   @IsOptional() @IsString() @MaxLength(32) lessonId?: string;
+}
+
+/**
+ * What the client claims it sent.
+ *
+ * OPTIONAL ON PURPOSE. A client that never got an answer does not know
+ * whether the bytes landed, and this endpoint is exactly how it finds out -
+ * so the endpoint has to be callable without the claim.
+ *
+ * When the claim IS present it is checked against the object actually stored:
+ * a truncated upload is refused rather than processed into a lecture that ends
+ * mid-sentence.
+ */
+class CompleteUploadDto {
+  /** How many bytes the client sent. Checked against the stored object. */
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(MAX_SOURCE_BYTES)
+  sizeBytes?: number;
 }
 
 class AddCaptionDto {
@@ -94,11 +111,24 @@ export class VideosController {
   @StaffOnly()
   @ApiOperation({
     summary: 'Confirm the upload and queue transcoding',
-    description:
+    description: [
       'Verifies the object actually landed in storage before enqueueing, so the queue does not fill with jobs that fail minutes later.',
+      '',
+      'Idempotent and recoverable. Calling it again on a video that is already queued returns the',
+      'current state instead of enqueuing a second job, and calling it on a video whose upload was',
+      'interrupted - including one whose bytes reached storage but whose acknowledgement did not -',
+      'completes the upload without the file being sent again.',
+      '',
+      'Optional body: { sizeBytes }. When present it is compared with the stored object, so a',
+      'truncated upload is refused rather than processed.',
+    ].join('\n'),
   })
-  complete(@Param('videoId') videoId: string, @CurrentUser() actor: AuthenticatedUser) {
-    return this.videos.completeUpload(videoId, actor);
+  complete(
+    @Param('videoId') videoId: string,
+    @CurrentUser() actor: AuthenticatedUser,
+    @Body() dto: CompleteUploadDto,
+  ) {
+    return this.videos.completeUpload(videoId, actor, dto?.sizeBytes ?? null);
   }
 
   @Get(':videoId/status')
