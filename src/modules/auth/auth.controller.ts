@@ -4,6 +4,7 @@ import type { Request } from 'express';
 
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Public } from '../../common/decorators/public.decorator';
+import { StaffOnly } from '../../common/decorators/roles.decorator';
 import { CredentialThrottle } from '../../common/decorators/throttle.decorator';
 import type { AuthenticatedUser, DeviceContext } from '../../common/types/request-context';
 import { UsersService } from '../users/users.service';
@@ -129,15 +130,22 @@ export class AuthController {
     return this.auth.listSessions(user.id);
   }
 
+  // Staff only. Students may not change their own password — that is a product
+  // decision, not a missing screen: a student's password is set by an
+  // administrator (PUT /admin/users/:id/password) after the student contacts
+  // support. Enforced here by RolesGuard and again in AuthService, so calling
+  // the API directly does not get around it.
   @Post('password')
+  @StaffOnly()
   @CredentialThrottle()
   @ApiBearerAuth('access-token')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
-    summary: 'Change your own password',
+    summary: 'Change your own password (staff only)',
     description:
-      'Requires the current password. Every other session is revoked. Forgotten passwords are reset administratively — see PUT /admin/users/{id}/password.',
+      'MASTER, ADMIN and TEACHER accounts only; a STUDENT gets 403 INSUFFICIENT_ROLE. Requires the current password. Every session of the account is revoked, the calling one included, so the caller signs in again with the new password. Student passwords are set administratively — see PUT /admin/users/{id}/password.',
   })
+  @ApiResponse({ status: 403, description: 'INSUFFICIENT_ROLE for a student account' })
   changePassword(
     @CurrentUser() user: AuthenticatedUser,
     @Body() dto: ChangePasswordDto,

@@ -1,6 +1,6 @@
 import 'source-map-support/register';
 
-import { Logger, ValidationPipe, VersioningType } from '@nestjs/common';
+import { Logger, VersioningType } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { NestFactory, Reflector } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
@@ -11,8 +11,7 @@ import helmet from 'helmet';
 import { AppModule } from './app.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
-import { AppException } from './common/errors/app.exception';
-import { ErrorCode } from './common/errors/error-codes';
+import { createAppValidationPipe } from './common/pipes/app-validation.pipe';
 import type { AppConfig } from './config/configuration';
 
 async function bootstrap(): Promise<void> {
@@ -102,35 +101,7 @@ async function bootstrap(): Promise<void> {
   // ---------------------------------------------------------------------------
   // Validation
   // ---------------------------------------------------------------------------
-  app.useGlobalPipes(
-    new ValidationPipe({
-      // Strip unknown properties instead of trusting them — this is what stops
-      // a client from setting `role: "MASTER"` on a registration payload.
-      whitelist: true,
-      forbidNonWhitelisted: true,
-      transform: true,
-      transformOptions: { enableImplicitConversion: false },
-      stopAtFirstError: false,
-      validationError: { target: false, value: false },
-      exceptionFactory: (errors) => {
-        const fields: Record<string, string[]> = {};
-        const walk = (list: typeof errors, prefix = '') => {
-          for (const error of list) {
-            const path = prefix ? `${prefix}.${error.property}` : error.property;
-            const messages = Object.values(error.constraints ?? {});
-            if (messages.length) fields[path] = messages;
-            if (error.children?.length) walk(error.children, path);
-          }
-        };
-        walk(errors);
-
-        return new AppException(ErrorCode.VALIDATION_ERROR, {
-          message: 'Request validation failed',
-          fields,
-        });
-      },
-    }),
-  );
+  app.useGlobalPipes(createAppValidationPipe());
 
   // ---------------------------------------------------------------------------
   // Cross-cutting response handling

@@ -45,7 +45,9 @@ class SetAvatarDto {
  * Student-facing profile endpoints.
  *
  * Path shapes match the mobile app's `Endpoints.profile` map exactly:
- * GET/PATCH /profile, PUT /profile/avatar, PUT /profile/password.
+ * GET/PATCH /profile, PUT /profile/avatar. There is no password route here,
+ * and the DTO cannot carry one: students cannot change their own password
+ * (an administrator sets it — PUT /admin/users/:id/password).
  */
 @ApiTags('auth')
 @ApiBearerAuth('access-token')

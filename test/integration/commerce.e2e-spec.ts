@@ -52,7 +52,14 @@ describe('commerce', () => {
     await resetDatabase(prisma);
   });
 
-  async function fixture(price = 450) {
+  /**
+   * A teacher may change a course price only when BOTH the course assignment
+   * grants `canEditPricing` AND an administrator has turned on the platform
+   * switch `teacher.canEditCoursePrices` (off by default). The fixture turns
+   * the switch on through the real admin API unless told not to, so each
+   * pricing test exercises the rule it names rather than the switch.
+   */
+  async function fixture(price = 450, { teacherPricing = true } = {}) {
     const admin = await createUser(prisma, { role: UserRole.ADMIN });
     const teacher = await createUser(prisma, { role: UserRole.TEACHER });
     const student = await createUser(prisma, { role: UserRole.STUDENT });
@@ -65,12 +72,19 @@ describe('commerce', () => {
       accessDurationDays: 180,
     });
 
+    const adminSession = await login(app, admin.phone, 'admin-device');
+    await http(app)
+      .put(`${API}/admin/settings`)
+      .set(adminSession.headers)
+      .send({ settings: { 'teacher.canEditCoursePrices': teacherPricing } })
+      .expect(200);
+
     return {
       admin,
       teacher,
       student,
       course,
-      adminSession: await login(app, admin.phone, 'admin-device'),
+      adminSession,
       teacherSession: await login(app, teacher.phone, 'teacher-device'),
       studentSession: await login(app, student.phone, 'student-device'),
     };
@@ -177,6 +191,19 @@ describe('commerce', () => {
         .send({ amount: 1 });
 
       expect(response.status).toBeGreaterThanOrEqual(403);
+    });
+
+    it('refuses an assigned teacher while the platform pricing switch is off', async () => {
+      const { course, teacherSession } = await fixture(450, { teacherPricing: false });
+
+      const response = await http(app)
+        .post(`${API}/admin/courses/${course.id}/price`)
+        .set(teacherSession.headers)
+        .send({ amount: 550 });
+
+      expect(response.status).toBe(403);
+      const prices = await prisma.coursePrice.findMany({ where: { courseId: course.id } });
+      expect(prices).toHaveLength(1);
     });
 
     it('refuses a negative price', async () => {

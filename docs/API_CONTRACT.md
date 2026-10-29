@@ -122,7 +122,7 @@ POST /auth/logout-all      → { ok, sessions }
 GET  /auth/me              → { user }
 GET  /auth/session         → { session, device }
 GET  /auth/sessions        → [ { session } ]
-POST /auth/password        → { ok }              (change own password)
+POST /auth/password        → { ok }              (staff only: change own password)
 ```
 
 Access tokens last 15 minutes; refresh tokens 30 days and **rotate on every
@@ -139,9 +139,34 @@ sign-in:
 
 So revocation takes effect within one request, not one token lifetime.
 
-**There is no forgot-password flow.** By product decision (spec §13) a student
-who forgets their password contacts administration, and a staff member resets
-it via `PUT /admin/users/:id/password`. There is no OTP anywhere in the system.
+**Student passwords are administered, never self-service.** This is a product
+decision, not a missing feature. A student cannot change their own password
+(`POST /auth/password` answers a student `403 INSUFFICIENT_ROLE`) and cannot
+recover it: there is no forgot-password, OTP, e-mailed link or reset token
+anywhere in the system. A student who forgets their password, or needs it
+changed, contacts the administration through the support channels the apps
+show; a MASTER or ADMIN verifies their identity and sets a new password with
+`PUT /admin/users/:id/password` (the dashboard's student drawer → *Reset
+password*). That revokes every session and refresh token, clears any sign-in
+lockout and writes a `PASSWORD_RESET` audit row with the acting administrator
+and the note. `POST /auth/password` remains for MASTER, ADMIN and TEACHER
+accounts; it revokes every session of the account, the calling one included.
+
+**Password policy** (`src/modules/auth/password-policy.ts`) — applies whenever a
+password is set by an administrator or a staff member: administrative reset, staff
+creation, staff self-change. Sign-in does not apply it, so an older password
+keeps working. Registration still uses its earlier rule (8+ characters, upper,
+lower, digit) until every student client mirrors this policy.
+
+- 8–128 characters, never trimmed or otherwise altered;
+- an uppercase and a lowercase Latin letter, or an Arabic letter (Arabic has
+  no case, so one Arabic letter counts as both);
+- a digit, Western `0-9` or Arabic-Indic;
+- not trivially guessable: not a well-known password (`Password1`,
+  `Qwerty123`, …), at least five different characters, and not a number with a
+  letter or two attached (`Aa123456`).
+
+A rejected password is `422 VALIDATION_ERROR` with the reason on the field.
 
 ---
 
@@ -163,9 +188,8 @@ PATCH /profile                                          update allowed fields
 PUT   /profile/avatar                                   presigned upload
 ```
 
-> **Note.** The app's map lists `POST /profile/password`. The backend exposes
-> password change at `POST /auth/password` and keeps `/profile` for profile
-> data only. See MOBILE_CHANGES.md.
+> **Note.** There is no `/profile/password`. `/profile` is profile data only,
+> and students cannot change their password at all — see §3.
 
 ### Courses
 
@@ -482,8 +506,9 @@ Recorded here so a client author does not rediscover them.
 
 1. **Both error shapes are emitted.** Documented in §1. Do not remove the flat
    mirror while the current mobile build is in the field.
-2. **`/profile/password` vs `/auth/password`.** Password change lives under
-   `/auth`. The app's endpoint map needs a one-line change.
+2. **No student password change.** `POST /auth/password` is staff-only and
+   there is no `/profile/password`. The student apps route password help to
+   the administration.
 3. **Video ids are real ids.** The app's player route currently derives a video
    id by stripping a `v-` prefix from a mock identifier. Real ids come from the
    lesson payload's `video.id`.

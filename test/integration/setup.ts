@@ -41,7 +41,9 @@ if (!databaseName.endsWith('_test')) {
 // Keep hashing cheap; these tests create dozens of users and argon2 at
 // production settings would dominate the runtime.
 process.env.ARGON_MEMORY_COST = '8192';
-process.env.ARGON_TIME_COST = '1';
+// 2, not 1: the installed argon2 rejects timeCost < 2 ("Invalid timeCost"),
+// which failed PasswordService's constructor and so every suite at boot.
+process.env.ARGON_TIME_COST = '2';
 process.env.NODE_ENV = 'test';
 process.env.RUN_WORKERS = 'false';
 

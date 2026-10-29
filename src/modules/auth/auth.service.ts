@@ -806,7 +806,8 @@ export class AuthService {
   }
 
   // ---------------------------------------------------------------------------
-  // Password change (self-service) — reset is administrative, see UsersService
+  // Password change (staff self-service). Students cannot change their own
+  // password: an administrator sets it — see UsersService.resetPasswordByAdmin.
   // ---------------------------------------------------------------------------
 
   async changePassword(
@@ -819,6 +820,15 @@ export class AuthService {
       where: { id: userId },
       select: { id: true, passwordHash: true, role: true },
     });
+
+    // The route is @StaffOnly(); this is the second wall, so the policy holds
+    // even if the decorator is ever dropped. Checked before the current
+    // password, so the answer says nothing about whether it was right.
+    if (user.role === UserRole.STUDENT) {
+      throw new AppException(ErrorCode.INSUFFICIENT_ROLE, {
+        message: 'Students cannot change their own password; contact the administration',
+      });
+    }
 
     const valid = await this.passwords.verify(user.passwordHash, currentPassword);
     if (!valid) {
@@ -836,9 +846,8 @@ export class AuthService {
         where: { id: userId },
         data: { passwordHash, credentialsChangedAt: now },
       }),
-      // Every other session dies; the current one is re-established by the
-      // client's next refresh, which is why credentialsChangedAt is compared
-      // with a 1s tolerance in the guard.
+      // Every session dies, the calling one included: its refresh token is
+      // revoked here too, so the caller signs in again with the new password.
       this.prisma.refreshToken.updateMany({
         where: { userId, revokedAt: null },
         data: { revokedAt: now, revokedReason: 'Password changed' },

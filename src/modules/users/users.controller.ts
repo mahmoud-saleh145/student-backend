@@ -20,6 +20,7 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { AdminOnly } from '../../common/decorators/roles.decorator';
 import { SearchablePaginationDto } from '../../common/dto/pagination.dto';
 import type { AuthenticatedUser } from '../../common/types/request-context';
+import { IsNewPassword } from '../auth/password-policy';
 
 import { UsersService } from './users.service';
 
@@ -47,7 +48,7 @@ class CreateStaffDto {
   @Matches(/^(?:\+?20|0020|0)?1[0125]\d{8}$/, { message: 'phone must be a valid Egyptian mobile' })
   phone!: string;
 
-  @IsString() @MinLength(8) @MaxLength(128) password!: string;
+  @IsString() @IsNewPassword() password!: string;
   @IsString() @MinLength(3) @MaxLength(120) fullName!: string;
 
   /** MASTER is rejected by the service — it is created out of band only. */
@@ -70,8 +71,13 @@ class UpdateUserDto {
   @IsOptional() @IsObject() teacher?: TeacherProfileDto;
 }
 
-class ResetPasswordDto {
-  @IsString() @MinLength(8) @MaxLength(128) newPassword!: string;
+/**
+ * An administrative reset. `newPassword` follows the new-password policy
+ * (password-policy.ts); the dashboard's confirmation field is checked
+ * client-side and never sent. `note` is stored on the audit row.
+ */
+export class ResetPasswordDto {
+  @IsString() @IsNewPassword() newPassword!: string;
   @IsOptional() @IsString() @MaxLength(500) note?: string;
 }
 
@@ -155,7 +161,7 @@ export class UsersController {
   @ApiOperation({
     summary: 'Reset a user password',
     description:
-      'The platform has no self-service password reset (spec §13). Staff verify identity out of band and set a new password here; every session for that user is revoked.',
+      'The only way a student password changes: students cannot change or recover their own (product decision). Staff verify identity out of band and set a new password here. MASTER may reset any admin, teacher or student; ADMIN may reset teachers and students; nobody may reset the master. Every session and refresh token for that user is revoked, any sign-in lockout is cleared, and the reset is audit-logged with the acting administrator and the optional note.',
   })
   resetPassword(
     @Param('id') id: string,

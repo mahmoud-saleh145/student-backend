@@ -207,25 +207,34 @@ describe('course access', () => {
   // ---------------------------------------------------------------------------
 
   describe('POST /playback/videos/:id/ticket', () => {
-    it('issues a short-lived ticket to an enrolled student on a bound device', async () => {
+    // Playback is DRM-only: a ticket is issued only for a video whose Gumlet DRM
+    // has been verified against the live provider (drm-verification.service).
+    // These fixtures are legacy self-hosted HLS assets with no Gumlet asset, and
+    // this suite has no provider, so the success path — ticket shape, TTL,
+    // server-composed watermark — is exercised against the real gate with a
+    // provider double in test/unit/drm-only-playback.spec.ts and
+    // test/unit/playback-ticket-platform.spec.ts. What this suite can and does
+    // prove end to end is the refusal.
+    it('refuses an asset with no verified DRM, even to an enrolled student on a bound device', async () => {
       const { course, student, session, firstVideo } = await scenario();
       await enroll(prisma, student.id, course.id);
 
       const response = await http(app)
         .post(`${API}/playback/videos/${firstVideo.id}/ticket`)
         .set(session.headers)
-        .send({})
-        .expect(201);
+        .send({});
 
-      const ticket = response.body.data ?? response.body;
-
-      expect(ticket.ticketId).toBeTruthy();
-      expect(ticket.manifestUrl).toBeTruthy();
-      expect(ticket.ttlSeconds).toBeLessThanOrEqual(600);
-
-      // The mark is composed server-side from the authenticated identity.
-      expect(ticket.watermark.primary).toBe(student.fullName);
-      expect(ticket.watermark.sessionTag).toBeTruthy();
+      // Refused before any ticket exists. Which gate answers depends on the
+      // playback build: `main` refuses at the platform-DRM check (403
+      // PLAYBACK_DENIED); the stricter verify-then-play gate refuses the
+      // unverified asset (404 VIDEO_UNAVAILABLE, drmState NO_GUMLET_ASSET).
+      // Both are refusals; neither may issue a ticket.
+      expect([403, 404]).toContain(response.status);
+      expect(['PLAYBACK_DENIED', 'VIDEO_UNAVAILABLE']).toContain(errorCode(response.body));
+      const body = response.body.data ?? response.body;
+      expect(body.ticketId).toBeUndefined();
+      expect(body.manifestUrl).toBeUndefined();
+      expect(await prisma.playbackTicket.count({ where: { userId: student.id } })).toBe(0);
     });
 
     it('never returns a permanent or direct media URL', async () => {
@@ -284,7 +293,15 @@ describe('course access', () => {
         .set(other.headers)
         .send({});
 
-      expect(errorCode(response.body)).toBe('DEVICE_NOT_AUTHORIZED');
+      // The second handset is parked PENDING_APPROVAL with a change request an
+      // administrator can act on (DevicesService.resolveOnLogin), so the gate
+      // answers DEVICE_CHANGE_PENDING (403) rather than the generic
+      // DEVICE_NOT_AUTHORIZED. Either way: refused, and queued for review.
+      expect(response.status).toBe(403);
+      expect(errorCode(response.body)).toBe('DEVICE_CHANGE_PENDING');
+      expect(
+        await prisma.deviceChangeRequest.count({ where: { userId: student.id } }),
+      ).toBeGreaterThan(0);
     });
 
     it('refuses when the device header is missing entirely', async () => {

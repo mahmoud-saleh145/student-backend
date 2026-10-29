@@ -1,4 +1,4 @@
-import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { INestApplication, VersioningType } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { Test } from '@nestjs/testing';
 import {
@@ -20,6 +20,8 @@ import request from 'supertest';
 import { AppModule } from '../../src/app.module';
 import { AllExceptionsFilter } from '../../src/common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from '../../src/common/interceptors/response.interceptor';
+import { createAppValidationPipe } from '../../src/common/pipes/app-validation.pipe';
+import { PrismaService } from '../../src/database/prisma.service';
 
 export const TEST_PASSWORD = 'TestPassword123!';
 
@@ -44,16 +46,20 @@ export async function bootstrapTestApp() {
   const app = moduleRef.createNestApplication();
 
   app.setGlobalPrefix('api');
-  app.enableVersioning({ type: 1 as never, defaultVersion: '1' });
-  app.useGlobalPipes(
-    new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
-  );
+  // URI versioning, as main.ts does. `type: 1` was VersioningType.HEADER, so
+  // every `/api/v1/...` request answered 404.
+  app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1' });
+  // The production pipe itself (422 VALIDATION_ERROR, values kept out of
+  // errors), not a look-alike.
+  app.useGlobalPipes(createAppValidationPipe());
   app.useGlobalInterceptors(new ResponseInterceptor(app.get(Reflector)));
   app.useGlobalFilters(new AllExceptionsFilter(false));
 
   await app.init();
 
-  const prisma = app.get(PrismaClient, { strict: false }) as PrismaClient;
+  // The app registers PrismaService (a PrismaClient subclass), not the
+  // PrismaClient token itself — asking for PrismaClient found no provider.
+  const prisma = app.get(PrismaService, { strict: false }) as PrismaClient;
 
   cached = { app, prisma };
   return cached;
@@ -233,6 +239,10 @@ export async function createCourse(
         },
       });
 
+      // The lesson_videos link is what playback authorises against (shared
+      // video assets, 20261012120000): `video.lessonId` alone is only the
+      // uploading lecture and is deliberately not trusted. Uploads write both
+      // (VideosService), so the fixture does too.
       await prisma.video.create({
         data: {
           lessonId: lesson.id,
@@ -243,6 +253,7 @@ export async function createCourse(
           durationSeconds: 600,
           isEncrypted: true,
           encryptionKeyId: 'k1',
+          lessonLinks: { create: { lessonId: lesson.id } },
         },
       });
 

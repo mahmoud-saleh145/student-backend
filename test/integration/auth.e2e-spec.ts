@@ -1,5 +1,8 @@
 import type { INestApplication } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
 import { AccountStatus, PrismaClient, UserRole } from '@prisma/client';
+
+import { authConfig } from '../../src/config/configuration';
 
 import {
   API,
@@ -291,6 +294,16 @@ describe('auth', () => {
         .send({ refreshToken: session.refreshToken })
         .expect(200);
 
+      // A reuse within `refreshReuseGraceSeconds` of the rotation is answered
+      // as an idempotent retry (two tabs refreshing at once), by design — see
+      // AuthService.refresh and test/unit/auth-session-lifetime.spec.ts. A
+      // replay is a reuse AFTER that window, so move the rotation back past it.
+      const grace = authConfig().refreshReuseGraceSeconds;
+      await prisma.refreshToken.updateMany({
+        where: { userId: user.id, usedAt: { not: null } },
+        data: { usedAt: new Date(Date.now() - (grace + 5) * 1000) },
+      });
+
       // Replay the original.
       const replay = await http(app)
         .post(`${API}/auth/refresh`)
@@ -306,12 +319,30 @@ describe('auth', () => {
     });
 
     it('rejects a syntactically valid but unknown token', async () => {
+      // A well-formed JWT (it passes RefreshDto's @IsJWT) that this API never
+      // issued: signed with a secret that is not the refresh secret.
+      const forged = new JwtService().sign(
+        { sub: 'usr_unknown', sid: 'ses_unknown', fam: 'fam_unknown', jti: 'jti_unknown' },
+        { secret: 'not-the-refresh-secret-but-long-enough-0001', expiresIn: '1h' },
+      );
+
+      const response = await http(app)
+        .post(`${API}/auth/refresh`)
+        .set('X-Device-Id', 'd1')
+        .send({ refreshToken: forged });
+
+      expect(response.status).toBe(401);
+      expect(errorCode(response.body)).toBe('SESSION_EXPIRED');
+    });
+
+    it('rejects a malformed token before looking anything up', async () => {
       const response = await http(app)
         .post(`${API}/auth/refresh`)
         .set('X-Device-Id', 'd1')
         .send({ refreshToken: 'not.a.real.token' });
 
-      expect(response.status).toBe(401);
+      expect(response.status).toBe(422);
+      expect(errorCode(response.body)).toBe('VALIDATION_ERROR');
     });
   });
 
