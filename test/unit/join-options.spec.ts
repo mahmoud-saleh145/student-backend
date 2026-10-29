@@ -16,8 +16,9 @@ import { CoursePartsService } from '../../src/modules/course-parts/course-parts.
  *   2. `methods.wallet` is false. The wallet belongs to the Library and a
  *      course must never debit it. Reported rather than omitted so the app
  *      never infers it.
- *   3. `methods.onlinePayment` follows configuration, not code. It ships off,
- *      and the payment implementation stays intact behind it.
+ *   3. `methods.onlinePayment` is permanently false (Phase 6 §4.1): there are
+ *      no online payments in Student Center, so the JOIN sheet must never
+ *      advertise one, whatever the configuration says.
  */
 
 interface Options {
@@ -108,7 +109,9 @@ function build(options: Options = {}) {
   // `joinOptions` composes `decide()` + `toCourseAccess()` precisely so the
   // JOIN sheet and the course screen cannot disagree, and stubbing those two
   // is what keeps this test honest about that. PAYMENT is filtered out here
-  // the way the real service filters it when no provider is configured.
+  // the way the real service filters it since Phase 6 §4.1: unconditionally,
+  // whatever `options.provider` says (online-payment-disabled.spec.ts pins
+  // that on the real CourseAccessService).
   const access = {
     decide: jest.fn((_status: unknown, _enrollment: unknown) => ({ state: 'NOT_ENROLLED' })),
     toCourseAccess: jest.fn(
@@ -117,10 +120,7 @@ function build(options: Options = {}) {
         configured: EnrollmentMethod[],
         _status: unknown,
       ) => ({
-        availableMethods:
-          (options.provider ?? 'none') === 'none'
-            ? configured.filter((m) => m !== EnrollmentMethod.PAYMENT)
-            : configured,
+        availableMethods: configured.filter((m) => m !== EnrollmentMethod.PAYMENT),
       }),
     ),
   };
@@ -281,12 +281,14 @@ describe('available mechanisms', () => {
     expect(out.methods.onlinePayment).toBe(false);
   });
 
-  it('report it as on the moment a provider is configured', async () => {
-    // The implementation is dormant, not deleted: this flag is the whole
-    // switch, so re-enabling it later is configuration rather than code.
+  it('reports it as off even if a provider value reaches the config (Phase 6 §4.1)', async () => {
+    // Inverted on 2026-10-30: this flag used to follow the configured
+    // provider. The owner's decision is that there are no online payments on
+    // any platform, so advertising one — under any configuration — would be
+    // false advertising; the flag is hard-coded false.
     const { service } = build({ provider: 'paymob' });
     const out = await service.joinOptions('crs_1', 'usr_1');
 
-    expect(out.methods.onlinePayment).toBe(true);
+    expect(out.methods.onlinePayment).toBe(false);
   });
 });

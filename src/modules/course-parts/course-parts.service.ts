@@ -46,7 +46,9 @@ export class CoursePartsService {
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
     private readonly access: CourseAccessService,
-    private readonly config: ConfigService,
+    // Kept in the constructor signature so existing call sites and test
+    // doubles keep compiling; no payment configuration is read any more.
+    _config: ConfigService,
     // StorageModule is @Global, so this needs no module import. Used to turn a
     // thumbnail key into a URL, and to refuse a key from a namespace this API
     // never issues for course thumbnails.
@@ -357,9 +359,11 @@ export class CoursePartsService {
    *   * `wallet` is ALWAYS false here, and deliberately so. The wallet belongs
    *     to the Library; a course must never debit it. It is reported rather
    *     than omitted so the app never has to infer it.
-   *   * `onlinePayment` follows the configured provider, which ships as
-   *     'none'. The payment implementation is intact and dormant behind this
-   *     flag — turning it on is a configuration change, not a code change.
+   *   * `onlinePayment` is ALWAYS false. Owner decision (2026-10-30, Phase 6
+   *     §4.1): there are no online payments in Student Center, on any
+   *     platform, so advertising one here — even behind configuration — would
+   *     be false advertising. Reported rather than omitted so the app never
+   *     has to infer it.
    */
   async joinOptions(courseId: string, userId: string) {
     const [course, partsView, enrollment, enrollmentRow] = await Promise.all([
@@ -388,7 +392,6 @@ export class CoursePartsService {
 
     if (!course) throw AppException.notFound('Course', courseId);
 
-    const paymentProvider = this.config.get<string>('payment.provider') ?? 'none';
     const courseEnrollmentMethods = course.enrollmentMethods;
 
     // Same rule as the parts list: only a LIVE whole-course enrollment owns it.
@@ -420,7 +423,8 @@ export class CoursePartsService {
       methods: {
         accessCode: true,
         wallet: false,
-        onlinePayment: paymentProvider !== 'none',
+        // Hard false (Phase 6 §4.1) — never a configuration read.
+        onlinePayment: false,
       },
       /**
        * The enrolment methods this course actually permits right now, from
