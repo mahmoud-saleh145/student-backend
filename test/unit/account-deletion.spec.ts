@@ -12,6 +12,7 @@ import {
 } from '../../src/modules/account-deletion/account-deletion.controller';
 import {
   CancelAccountDeletionDto,
+  ConfirmSettlementDto,
   RecoverAccountDeletionDto,
   RequestAccountDeletionDto,
 } from '../../src/modules/account-deletion/account-deletion.dto';
@@ -26,6 +27,7 @@ import {
   DELETION_MAX_ATTEMPTS,
   describeEraseError,
   DELETION_GRACE_DAYS,
+  DELETION_SETTLEMENT_MARKER,
   REDACTED_TEXT,
   UNUSABLE_PASSWORD_HASH,
 } from '../../src/modules/account-deletion/account-deletion.service';
@@ -70,9 +72,14 @@ function build(opts: { password?: boolean; open?: Row | null } = {}) {
         scheduledFor: new Date(Date.now() + DELETION_GRACE_DAYS * DAY),
       })),
       update: track('deletion.update'),
+      updateMany: track('deletion.updateMany'),
       // erase() re-reads its own request inside the transaction.
       findUnique: jest.fn(async () => ({ userId: 'usr_s', status: AccountDeletionStatus.PROCESSING })),
     },
+    // READ-ONLY: the settlement guard checks the balance; nothing here may
+    // write to the wallet. No update/updateMany/delete exists on this double,
+    // so a write attempt throws.
+    wallet: { findUnique: jest.fn(async (): Promise<{ balance: unknown } | null> => null) },
     user: {
       update: track('user.update'),
       findUnique: jest.fn(async () => ({ role: UserRole.STUDENT })),
@@ -106,6 +113,7 @@ function build(opts: { password?: boolean; open?: Row | null } = {}) {
       update: jest.fn(async () => ({})),
       count: jest.fn(async () => 0),
     },
+    wallet: { findUnique: jest.fn(async (): Promise<{ balance: unknown } | null> => null) },
     $transaction: jest.fn(async (fn: (t: typeof tx) => unknown) => fn(tx)),
   };
   const passwords = { verify: jest.fn(async () => opts.password ?? true) };
@@ -116,6 +124,8 @@ function build(opts: { password?: boolean; open?: Row | null } = {}) {
   const redis = { del: jest.fn(async () => undefined) };
   const storage = { isConfigured: true, deletePrefix: jest.fn(async () => 1) };
 
+  const wallet = { debit: jest.fn(async () => ({ id: 'wtx_1', replayed: false })) };
+
   const service = new AccountDeletionService(
     prisma as never,
     auth as never,
@@ -123,8 +133,9 @@ function build(opts: { password?: boolean; open?: Row | null } = {}) {
     audit as never,
     redis as never,
     storage as never,
+    wallet as never,
   );
-  return { service, prisma, tx, passwords, auth, audit, redis, storage, calls };
+  return { service, prisma, tx, passwords, auth, audit, redis, storage, wallet, calls };
 }
 
 describe('requesting deletion', () => {
@@ -258,7 +269,7 @@ describe('the scheduled sweep', () => {
 
     const result = await service.sweep();
 
-    expect(result).toEqual({ claimed: 1, completed: 1, failed: 0, skipped: 0, needsAttention: 0 });
+    expect(result).toEqual({ claimed: 1, completed: 1, failed: 0, skipped: 0, needsAttention: 0, needsSettlement: 0 });
     const claim = (prisma.accountDeletionRequest.updateMany.mock.calls[0] as unknown as [{ where: Record<string, unknown>; data: Record<string, unknown> }])[0];
     expect(claim.where).toMatchObject({ id: 'del_1', status: AccountDeletionStatus.PENDING });
     expect(claim.data).toMatchObject({ status: AccountDeletionStatus.PROCESSING });
@@ -294,14 +305,20 @@ describe('the scheduled sweep', () => {
     expect(revert.data).toEqual({ status: AccountDeletionStatus.PENDING, lastError: 'Error' });
   });
 
-  it('only ever asks for due PENDING rows or stranded PROCESSING rows, skipping requests that ran out of attempts', async () => {
+  it('only ever asks for due PENDING rows or stranded PROCESSING rows, skipping requests that ran out of attempts or hold for settlement', async () => {
     const { service, prisma } = build();
     await service.sweep();
-    const where = (prisma.accountDeletionRequest.findMany.mock.calls[0] as unknown as [{ where: { OR: unknown[]; failedAt: unknown } }])[0].where;
+    const where = (prisma.accountDeletionRequest.findMany.mock.calls[0] as unknown as [{ where: { AND: unknown[]; failedAt: unknown } }])[0].where;
     expect(where.failedAt).toBeNull();
-    expect(where.OR).toEqual([
-      { status: AccountDeletionStatus.PENDING, scheduledFor: { lte: expect.any(Date) } },
-      { status: AccountDeletionStatus.PROCESSING },
+    expect(where.AND).toEqual([
+      // Held for settlement (and not yet settled) = excluded until confirmed.
+      { OR: [{ settlementRequiredAt: null }, { settledAt: { not: null } }] },
+      {
+        OR: [
+          { status: AccountDeletionStatus.PENDING, scheduledFor: { lte: expect.any(Date) } },
+          { status: AccountDeletionStatus.PROCESSING },
+        ],
+      },
     ]);
   });
 });
@@ -339,12 +356,15 @@ describe('what the erase removes and what it keeps', () => {
     expect(redis.del).toHaveBeenCalledWith('pb:slots:usr_s');
   });
 
-  it('never touches payments, wallet, ledger, enrollments, purchases, revenue or audit history', async () => {
+  it('never touches payments, ledger, enrollments, purchases, revenue or audit history; the wallet is only READ', async () => {
     const { service, tx } = build();
     await service.erase('del_1', 'usr_s');
+    // The settlement guard reads the balance; the double exposes nothing but
+    // findUnique, so any write to the wallet would have thrown above.
+    expect(tx.wallet.findUnique).toHaveBeenCalledWith({ where: { userId: 'usr_s' }, select: { balance: true } });
+    expect(Object.keys(tx.wallet)).toEqual(['findUnique']);
     for (const kept of [
       'payment',
-      'wallet',
       'walletTransaction',
       'enrollment',
       'coursePartPurchase',
@@ -551,8 +571,12 @@ function stateful(failErase: () => boolean) {
     if (data.attempts) row.attempts += data.attempts.increment;
     return {};
   }) as never);
-  r.count.mockImplementation((async () =>
-    row.failedAt !== null && row.status === AccountDeletionStatus.PENDING ? 1 : 0) as never);
+  r.count.mockImplementation((async ({ where }: { where: Record<string, unknown> } = { where: {} }) =>
+    where && where.settlementRequiredAt !== undefined
+      ? 0 // no settlement holds in these scenarios
+      : row.failedAt !== null && row.status === AccountDeletionStatus.PENDING
+        ? 1
+        : 0) as never);
   harness.prisma.$transaction.mockImplementation((async (fn: (t: typeof harness.tx) => unknown) => {
     if (failErase()) {
       // A message that echoes personal data, which must never be stored or logged.
@@ -757,5 +781,264 @@ describe('describeEraseError', () => {
     [null, 'UnknownError'],
   ])('%p -> %p', (input, expected) => {
     expect(describeEraseError(input)).toBe(expected);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Settlement before erasure (Phase 6 §4.2)
+// ---------------------------------------------------------------------------
+
+describe('settlement before erasure (Phase 6 §4.2)', () => {
+  let warns: jest.SpyInstance;
+  let errors: jest.SpyInstance;
+  beforeEach(() => {
+    warns = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    errors = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+  });
+  afterEach(() => {
+    warns.mockRestore();
+    errors.mockRestore();
+  });
+
+  const dueRow = (settledAt: Date | null = null) => ({
+    id: 'del_1',
+    userId: 'usr_s',
+    status: AccountDeletionStatus.PENDING,
+    requestedAt: new Date(Date.now() - 31 * DAY),
+    scheduledFor: new Date(Date.now() - DAY),
+    attempts: 0,
+    settledAt,
+  });
+
+  it('a due request with money in the wallet holds instead of erasing', async () => {
+    const h = build();
+    h.prisma.accountDeletionRequest.findMany.mockResolvedValueOnce([dueRow()] as never);
+    h.prisma.wallet.findUnique.mockResolvedValueOnce({ balance: '150.00' });
+
+    const result = await h.service.sweep();
+
+    expect(result).toMatchObject({ claimed: 0, completed: 0, failed: 0, heldForSettlement: 1 });
+    const hold = (h.prisma.accountDeletionRequest.updateMany.mock.calls[0] as unknown as [
+      { where: Record<string, unknown>; data: Record<string, unknown> },
+    ])[0];
+    // The conditional write is what makes two sweeps racing on the same row safe.
+    expect(hold.where).toEqual({ id: 'del_1', settlementRequiredAt: null, settledAt: null });
+    expect(hold.data.settlementRequiredAt).toBeInstanceOf(Date);
+    expect(hold.data.outstandingAmount).toBe('150.00');
+    // Nothing was claimed and nothing was erased: identity survives the hold.
+    expect(h.tx.user.update).not.toHaveBeenCalled();
+    expect(warns.mock.calls.some((c) => String(c[0]).includes(DELETION_SETTLEMENT_MARKER))).toBe(true);
+  });
+
+  it('erase refuses while the wallet holds money — the authoritative in-transaction guard', async () => {
+    const h = build();
+    h.tx.wallet.findUnique.mockResolvedValueOnce({ balance: 25 });
+    await expect(h.service.erase('del_1', 'usr_s')).rejects.toMatchObject({
+      name: 'DeletionSettlementRequired',
+    });
+    expect(h.tx.user.update).not.toHaveBeenCalled();
+  });
+
+  it('an account with no wallet row, or a zero balance, erases normally', async () => {
+    const h = build();
+    h.prisma.accountDeletionRequest.findMany.mockResolvedValueOnce([dueRow()] as never);
+    // build() defaults both wallet reads to null — no wallet row at all.
+    await expect(h.service.sweep()).resolves.toMatchObject({ claimed: 1, completed: 1 });
+    expect(h.tx.user.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('a settled request rejoins the sweep and erases', async () => {
+    const h = build();
+    h.prisma.accountDeletionRequest.findMany.mockResolvedValueOnce([dueRow(new Date())] as never);
+    await expect(h.service.sweep()).resolves.toMatchObject({ claimed: 1, completed: 1 });
+  });
+
+  it('money reappearing AFTER a settlement is never erased and never re-held silently', async () => {
+    const h = build();
+    h.prisma.accountDeletionRequest.findMany.mockResolvedValueOnce([dueRow(new Date())] as never);
+    h.prisma.wallet.findUnique.mockResolvedValueOnce({ balance: '10.00' });
+
+    const result = await h.service.sweep();
+
+    expect(result).toMatchObject({ claimed: 0, completed: 0, skipped: 1 });
+    // No hold overwrote the settlement record, nothing was claimed or erased,
+    // and the marker calls for an administrator.
+    expect(h.prisma.accountDeletionRequest.updateMany).not.toHaveBeenCalled();
+    expect(h.tx.user.update).not.toHaveBeenCalled();
+    expect(errors.mock.calls.some((c) => String(c[0]).includes(DELETION_SETTLEMENT_MARKER))).toBe(true);
+  });
+
+  // ---- confirmation -------------------------------------------------------
+
+  function holding(h: ReturnType<typeof build>, opts: { settledAt?: Date | null; balance?: string | null } = {}) {
+    h.tx.accountDeletionRequest.findUnique.mockResolvedValueOnce({
+      id: 'del_1',
+      userId: 'usr_s',
+      settlementRequiredAt: new Date(),
+      settledAt: opts.settledAt ?? null,
+    } as never);
+    h.tx.wallet.findUnique.mockResolvedValueOnce(
+      opts.balance === null ? null : ({ balance: opts.balance ?? '150.00' } as never),
+    );
+  }
+
+  const CONFIRM = {
+    amount: 150,
+    method: 'cash at the centre',
+    reference: 'RCPT-9',
+    reason: 'Settled in person, support ticket SC-11',
+  };
+
+  it('confirming records the ledger debit and the settlement, audited, with the actor', async () => {
+    const h = build();
+    holding(h);
+
+    const out = await h.service.confirmSettlement('del_1', ADMIN_ACTOR, CONFIRM, META);
+
+    expect(out).toEqual({ id: 'del_1', settled: true, amount: 150, transactionId: 'wtx_1' });
+    // Every financial change is a ledger transaction (§4.4): a REFUND from the
+    // ADMIN source, idempotent per request, attributed to the actor.
+    expect(h.wallet.debit).toHaveBeenCalledWith(
+      h.tx,
+      expect.objectContaining({
+        userId: 'usr_s',
+        amount: '150.00',
+        type: 'REFUND',
+        source: 'ADMIN',
+        performedByAdminId: 'usr_admin',
+        idempotencyKey: 'deletion-settlement:del_1',
+        reference: { type: 'account_deletion', id: 'del_1' },
+      }),
+    );
+    const upd = (h.tx.accountDeletionRequest.updateMany.mock.calls[0] as unknown as [
+      { where: Record<string, unknown>; data: Record<string, unknown> },
+    ])[0];
+    expect(upd.where).toEqual({ id: 'del_1', settledAt: null });
+    expect(upd.data).toMatchObject({ settledById: 'usr_admin', settledAmount: '150.00', settlementTxId: 'wtx_1' });
+    expect(upd.data.settledAt).toBeInstanceOf(Date);
+    expect(h.audit.recordTx).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        actorId: 'usr_admin',
+        entityId: 'del_1',
+        note: expect.stringContaining('RCPT-9'),
+      }),
+    );
+  });
+
+  it('refuses an amount that does not equal the current balance, moving nothing', async () => {
+    const h = build();
+    holding(h, { balance: '150.00' });
+    await expect(
+      h.service.confirmSettlement('del_1', ADMIN_ACTOR, { ...CONFIRM, amount: 100 }, META),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    expect(h.wallet.debit).not.toHaveBeenCalled();
+    expect(h.tx.accountDeletionRequest.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('refuses a duplicate confirmation', async () => {
+    const h = build();
+    holding(h, { settledAt: new Date() });
+    await expect(h.service.confirmSettlement('del_1', ADMIN_ACTOR, CONFIRM, META)).rejects.toMatchObject({
+      code: 'INVALID_STATE',
+    });
+    expect(h.wallet.debit).not.toHaveBeenCalled();
+  });
+
+  it('refuses a racing duplicate even past the first read (conditional update decides)', async () => {
+    const h = build();
+    holding(h);
+    h.tx.accountDeletionRequest.updateMany.mockResolvedValueOnce({ count: 0 } as never);
+    await expect(h.service.confirmSettlement('del_1', ADMIN_ACTOR, CONFIRM, META)).rejects.toMatchObject({
+      code: 'INVALID_STATE',
+    });
+    // The debit already ran, but it is idempotent per request
+    // (deletion-settlement:del_1), so the retry that wins cannot move money twice.
+  });
+
+  it('refuses a request that is not holding for settlement', async () => {
+    const h = build();
+    // Default findUnique: a PROCESSING request with no settlement hold.
+    await expect(h.service.confirmSettlement('del_1', ADMIN_ACTOR, CONFIRM, META)).rejects.toMatchObject({
+      code: 'INVALID_STATE',
+    });
+    expect(h.wallet.debit).not.toHaveBeenCalled();
+  });
+
+  it('a balance drained after the hold is confirmed with amount 0 and no ledger line', async () => {
+    const h = build();
+    holding(h, { balance: '0.00' });
+    const out = await h.service.confirmSettlement('del_1', ADMIN_ACTOR, { ...CONFIRM, amount: 0 }, META);
+    expect(out).toEqual({ id: 'del_1', settled: true, amount: 0, transactionId: null });
+    // Nothing moved, so nothing may be written to the ledger (§4.4 is about
+    // changes; a no-op debit row would be a fabricated transaction).
+    expect(h.wallet.debit).not.toHaveBeenCalled();
+    expect(h.audit.recordTx).toHaveBeenCalled();
+  });
+
+  it('the settlement list carries minimal identity, both amounts, and nothing else', async () => {
+    const h = build();
+    h.prisma.accountDeletionRequest.findMany.mockResolvedValueOnce([
+      {
+        id: 'del_1',
+        userId: 'usr_s',
+        status: AccountDeletionStatus.PENDING,
+        requestedAt: new Date(),
+        scheduledFor: new Date(),
+        settlementRequiredAt: new Date(),
+        outstandingAmount: '150.00',
+        user: { fullName: 'Ahmed Mohamed', phone: '01001234567', wallet: { balance: '140.00' } },
+      },
+    ] as never);
+
+    const [item] = await h.service.listPendingSettlements();
+    expect(Object.keys(item).sort()).toEqual(
+      [
+        'currentBalance',
+        'fullName',
+        'id',
+        'outstandingAmount',
+        'phone',
+        'requestedAt',
+        'scheduledFor',
+        'settlementRequiredAt',
+        'status',
+        'userId',
+      ].sort(),
+    );
+    // The live balance is the authoritative amount; the hold amount is context.
+    expect(item).toMatchObject({ outstandingAmount: 150, currentBalance: 140, fullName: 'Ahmed Mohamed' });
+    const where = (h.prisma.accountDeletionRequest.findMany.mock.calls.at(-1) as unknown as [
+      { where: Record<string, unknown> },
+    ])[0].where;
+    expect(where).toEqual({ settlementRequiredAt: { not: null }, settledAt: null });
+  });
+
+  it('both settlement endpoints are administrator-only, and the body is validated', async () => {
+    const roles = (handler: object) => (Reflect.getMetadata(ROLES_KEY, handler) as string[]).slice().sort();
+    for (const handler of [
+      AccountDeletionAdminController.prototype.settlements,
+      AccountDeletionAdminController.prototype.confirmSettlement,
+    ]) {
+      expect(roles(handler)).toEqual(['ADMIN', 'MASTER']);
+      expect(Reflect.getMetadata(IS_PUBLIC_KEY, handler)).toBeUndefined();
+    }
+    const pipe = new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true });
+    // A written reason and an explicit amount are not optional.
+    await expect(
+      pipe.transform({ method: 'cash', reason: 'Settled in person, SC-11' }, { type: 'body', metatype: ConfirmSettlementDto }),
+    ).rejects.toBeDefined();
+    await expect(
+      pipe.transform({ amount: 150, method: 'cash', reason: 'short' }, { type: 'body', metatype: ConfirmSettlementDto }),
+    ).rejects.toBeDefined();
+    await expect(
+      pipe.transform({ amount: -5, method: 'cash', reason: 'Settled in person, SC-11' }, { type: 'body', metatype: ConfirmSettlementDto }),
+    ).rejects.toBeDefined();
+    await expect(
+      pipe.transform(
+        { amount: 150, method: 'cash at the centre', reference: 'RCPT-9', reason: 'Settled in person, SC-11' },
+        { type: 'body', metatype: ConfirmSettlementDto },
+      ),
+    ).resolves.toMatchObject({ amount: 150 });
   });
 });

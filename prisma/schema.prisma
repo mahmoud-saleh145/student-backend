@@ -2994,9 +2994,25 @@ model AccountDeletionRequest {
   /// then skips the request until an administrator retries or cancels it.
   failedAt     DateTime?
 
+  /// D5 settlement (Phase 6 §4.2): set by the sweep when the deletion date
+  /// arrived with money still in the wallet. The request holds here — identity
+  /// intact — until an authorized administrator confirms the physical
+  /// settlement; erasure then resumes at the next sweep.
+  settlementRequiredAt DateTime?
+  /// Wallet balance observed when the hold was placed. For display; the
+  /// confirmation re-reads the live balance, which is authoritative.
+  outstandingAmount    Decimal?  @db.Decimal(12, 2)
+  /// Physical settlement confirmed: when, by whom, how much, and the wallet
+  /// ledger transaction that recorded the debit.
+  settledAt            DateTime?
+  settledById          String?
+  settledAmount        Decimal?  @db.Decimal(12, 2)
+  settlementTxId       String?
+
   user User @relation(fields: [userId], references: [id], onDelete: Restrict)
 
   @@index([status, scheduledFor])
   @@index([userId, status])
+  @@index([settlementRequiredAt])
   @@map("account_deletion_requests")
 }

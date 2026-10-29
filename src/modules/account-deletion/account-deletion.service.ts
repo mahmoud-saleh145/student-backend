@@ -8,17 +8,22 @@ import {
   Prisma,
   SessionStatus,
   UserRole,
+  WalletTxSource,
+  WalletTxType,
 } from '@prisma/client';
 
 import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
 import type { AuthenticatedUser } from '../../common/types/request-context';
 import { PrismaService } from '../../database/prisma.service';
+import { withSerializableRetry } from '../../database/serializable-retry';
 import { RedisService } from '../../redis/redis.service';
 import { AuditService } from '../audit/audit.service';
 import { AuthService, type RequestMeta } from '../auth/auth.service';
 import { PasswordService } from '../auth/password.service';
 import { StorageService } from '../storage/storage.service';
+import { fromPiastres, toPiastres } from '../wallet/money';
+import { WalletService } from '../wallet/wallet.service';
 
 /**
  * Owner decision D5: a student can delete their own account from the app.
@@ -60,6 +65,14 @@ export const DELETION_MAX_ATTEMPTS = 10;
 export const DELETION_ALERT_MARKER = 'ACCOUNT_DELETION_NEEDS_ATTENTION';
 
 /**
+ * Log marker for deletion requests holding for physical settlement (Phase 6
+ * §4.2): the deletion date arrived with money still in the wallet, so erasure
+ * waits for an administrator to confirm the settlement. Ids only, never
+ * personal data or amounts.
+ */
+export const DELETION_SETTLEMENT_MARKER = 'ACCOUNT_DELETION_SETTLEMENT_REQUIRED';
+
+/**
  * What is stored in `lastError` and written to logs: the error's class and
  * Prisma/Node code, never its message. Messages can echo query arguments.
  */
@@ -94,6 +107,10 @@ export interface DeletionSweepResult {
   skipped: number;
   /** Requests stopped after repeated failures, waiting for an administrator. */
   needsAttention?: number;
+  /** Requests this sweep stopped before erasure because the wallet still holds money. */
+  heldForSettlement?: number;
+  /** Standing count of requests waiting for a settlement confirmation. */
+  needsSettlement?: number;
 }
 
 function view(row: {
@@ -129,6 +146,7 @@ export class AccountDeletionService {
     private readonly audit: AuditService,
     private readonly redis: RedisService,
     private readonly storage: StorageService,
+    private readonly wallet: WalletService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -282,20 +300,69 @@ export class AccountDeletionService {
       where: {
         // Requests that ran out of attempts wait for an administrator.
         failedAt: null,
-        OR: [
-          { status: AccountDeletionStatus.PENDING, scheduledFor: { lte: now } },
-          // A PROCESSING row is one whose sweep died between the claim and the
-          // erase transaction (which is atomic, so nothing half-done is left).
-          // Erasure is idempotent, so it is simply run again.
-          { status: AccountDeletionStatus.PROCESSING },
+        AND: [
+          {
+            // A request holding for settlement (Phase 6 §4.2) waits for the
+            // administrator's confirmation; once settled it rejoins the sweep.
+            OR: [{ settlementRequiredAt: null }, { settledAt: { not: null } }],
+          },
+          {
+            OR: [
+              { status: AccountDeletionStatus.PENDING, scheduledFor: { lte: now } },
+              // A PROCESSING row is one whose sweep died between the claim and the
+              // erase transaction (which is atomic, so nothing half-done is left).
+              // Erasure is idempotent, so it is simply run again.
+              { status: AccountDeletionStatus.PROCESSING },
+            ],
+          },
         ],
       },
       orderBy: { scheduledFor: 'asc' },
       take: DELETION_SWEEP_BATCH,
-      select: { id: true, userId: true, status: true, attempts: true },
+      select: { id: true, userId: true, status: true, attempts: true, settledAt: true },
     });
 
     for (const row of due) {
+      // D5 settlement (Phase 6 §4.2): erasure never runs over money. If the
+      // wallet still holds a balance, the request stops here — identity
+      // intact — and is listed for an administrator, who confirms the physical
+      // settlement outside the app (confirmSettlement). erase() re-checks the
+      // balance inside its transaction, so this read being stale can only
+      // delay a hold, never let an erase through with money in the wallet.
+      const walletRow = await this.prisma.wallet.findUnique({
+        where: { userId: row.userId },
+        select: { balance: true },
+      });
+      const balance = walletRow ? Number(walletRow.balance) : 0;
+      if (balance > 0) {
+        if (row.settledAt) {
+          // Settled once, then money appeared again (only an administrative
+          // credit can do that — the account has been signed out since the
+          // request). Never erase value silently and never overwrite the
+          // settlement record: an administrator drains the wallet through the
+          // audited adjustment flow, and the next sweep proceeds.
+          this.logger.error(
+            `${DELETION_SETTLEMENT_MARKER}: request=${row.id} was settled but the wallet is no longer empty; administrator action required`,
+          );
+          result.skipped += 1;
+          continue;
+        }
+        const held = await this.prisma.accountDeletionRequest.updateMany({
+          where: { id: row.id, settlementRequiredAt: null, settledAt: null },
+          data: { settlementRequiredAt: now, outstandingAmount: walletRow!.balance },
+        });
+        if (held.count > 0) {
+          result.heldForSettlement = (result.heldForSettlement ?? 0) + 1;
+          this.logger.warn(
+            `${DELETION_SETTLEMENT_MARKER}: request=${row.id} holds for physical settlement before erasure`,
+          );
+        } else {
+          // Already held by a concurrent sweep.
+          result.skipped += 1;
+        }
+        continue;
+      }
+
       const attempt = row.attempts + 1;
       if (row.status === AccountDeletionStatus.PENDING) {
         const claim = await this.prisma.accountDeletionRequest.updateMany({
@@ -351,6 +418,18 @@ export class AccountDeletionService {
       this.logger.error(`${DELETION_ALERT_MARKER}: ${waiting} account deletion request(s) stopped after repeated failures`);
     }
     result.needsAttention = waiting;
+
+    // Same standing-signal pattern for settlements: the marker keeps firing
+    // every sweep until each settlement is confirmed.
+    const awaitingSettlement = await this.prisma.accountDeletionRequest
+      .count({ where: { settlementRequiredAt: { not: null }, settledAt: null } })
+      .catch(() => 0);
+    if (awaitingSettlement > 0) {
+      this.logger.warn(
+        `${DELETION_SETTLEMENT_MARKER}: ${awaitingSettlement} deletion request(s) waiting for physical settlement`,
+      );
+    }
+    result.needsSettlement = awaitingSettlement;
 
     return result;
   }
@@ -442,6 +521,149 @@ export class AccountDeletionService {
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // Physical settlement before erasure (Phase 6 §4.2)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Deletion requests holding for physical settlement. Minimal identity is
+   * included deliberately: nothing has been erased yet (that is the point of
+   * the hold), and the administrator must be able to identify the person they
+   * are settling with. The LIVE wallet balance is the authoritative amount;
+   * `outstandingAmount` is what the sweep saw when it placed the hold.
+   */
+  async listPendingSettlements() {
+    const rows = await this.prisma.accountDeletionRequest.findMany({
+      where: { settlementRequiredAt: { not: null }, settledAt: null },
+      orderBy: { settlementRequiredAt: 'asc' },
+      take: 100,
+      select: {
+        id: true,
+        userId: true,
+        status: true,
+        requestedAt: true,
+        scheduledFor: true,
+        settlementRequiredAt: true,
+        outstandingAmount: true,
+        user: { select: { fullName: true, phone: true, wallet: { select: { balance: true } } } },
+      },
+    });
+    return rows.map((r) => ({
+      id: r.id,
+      userId: r.userId,
+      status: r.status,
+      requestedAt: r.requestedAt.toISOString(),
+      scheduledFor: r.scheduledFor.toISOString(),
+      settlementRequiredAt: r.settlementRequiredAt?.toISOString() ?? null,
+      outstandingAmount: r.outstandingAmount === null ? 0 : Number(r.outstandingAmount),
+      currentBalance: r.user.wallet ? Number(r.user.wallet.balance) : 0,
+      fullName: r.user.fullName,
+      phone: r.user.phone,
+    }));
+  }
+
+  /**
+   * Records that the remaining balance was physically settled with the account
+   * holder outside the application, and lets erasure resume (Phase 6 §4.2).
+   *
+   * The administrator states the exact amount handed over, and it must equal
+   * the wallet's CURRENT balance — the record can never claim an amount other
+   * than what the ledger then moves. The debit is a REFUND/ADMIN ledger line
+   * carrying the actor and the offline method, with idempotency key
+   * `deletion-settlement:<requestId>`: a confirmation that crashed between the
+   * debit and the request update can be repeated without moving money twice,
+   * while the request-level `updateMany … settledAt: null` guard refuses an
+   * outright duplicate confirmation. A zero balance (drained through the
+   * audited adjustment flow after the hold) is confirmed with amount 0 and no
+   * ledger line — there is nothing to move. Erasure resumes at the next sweep.
+   */
+  async confirmSettlement(
+    requestId: string,
+    actor: AuthenticatedUser,
+    input: { amount: number; method: string; reference?: string; reason: string },
+    meta: RequestMeta,
+  ) {
+    return withSerializableRetry(this.prisma, async (tx) => {
+      const request = await tx.accountDeletionRequest.findUnique({
+        where: { id: requestId },
+        select: { id: true, userId: true, settlementRequiredAt: true, settledAt: true },
+      });
+      if (!request || !request.settlementRequiredAt) {
+        throw new AppException(ErrorCode.INVALID_STATE, {
+          message: 'Only a deletion request holding for settlement can be confirmed here.',
+        });
+      }
+      if (request.settledAt) {
+        throw new AppException(ErrorCode.INVALID_STATE, {
+          message: 'This settlement was already confirmed.',
+        });
+      }
+
+      const walletRow = await tx.wallet.findUnique({
+        where: { userId: request.userId },
+        select: { balance: true },
+      });
+      const balancePiastres = walletRow ? toPiastres(String(walletRow.balance), 'balance') : 0;
+      if (toPiastres(input.amount, 'amount') !== balancePiastres) {
+        throw AppException.validation(
+          { amount: ['Must equal the current wallet balance.'] },
+          `The stated amount must equal the current wallet balance (${fromPiastres(balancePiastres)} EGP).`,
+        );
+      }
+
+      const detail = `${input.method}${input.reference ? `, ref ${input.reference}` : ''}`;
+      let transactionId: string | null = null;
+      if (balancePiastres > 0) {
+        const entry = await this.wallet.debit(tx, {
+          userId: request.userId,
+          amount: fromPiastres(balancePiastres),
+          type: WalletTxType.REFUND,
+          source: WalletTxSource.ADMIN,
+          performedByAdminId: actor.id,
+          reference: { type: 'account_deletion', id: requestId },
+          note: `Wallet settled physically outside the app (${detail}): ${input.reason}`,
+          idempotencyKey: `deletion-settlement:${requestId}`,
+        });
+        transactionId = entry.id;
+      }
+
+      const now = new Date();
+      const { count } = await tx.accountDeletionRequest.updateMany({
+        where: { id: requestId, settledAt: null },
+        data: {
+          settledAt: now,
+          settledById: actor.id,
+          settledAmount: fromPiastres(balancePiastres),
+          settlementTxId: transactionId,
+        },
+      });
+      if (count === 0) {
+        throw new AppException(ErrorCode.INVALID_STATE, {
+          message: 'This settlement was already confirmed.',
+        });
+      }
+
+      await this.audit.recordTx(tx, {
+        actorId: actor.id,
+        actorRole: actor.role,
+        action: AuditAction.UPDATE,
+        entity: 'account_deletion_request',
+        entityId: requestId,
+        note: `Physical settlement confirmed: ${fromPiastres(balancePiastres)} EGP (${detail}). ${input.reason}`,
+        ipAddress: meta.ip,
+        userAgent: meta.userAgent,
+        requestId: meta.requestId,
+      });
+
+      return {
+        id: requestId,
+        settled: true as const,
+        amount: Number(fromPiastres(balancePiastres)),
+        transactionId,
+      };
+    });
+  }
+
   /**
    * Erases the person and keeps the records. One transaction: either every
    * step happens and the request is COMPLETED, or none does and the request is
@@ -468,6 +690,18 @@ export class AccountDeletionService {
         if (!target || target.role !== UserRole.STUDENT) {
           throw Object.assign(new Error('deletion target is not a student account'), {
             name: 'DeletionTargetNotStudent',
+          });
+        }
+
+        // D5 settlement (Phase 6 §4.2): the authoritative barrier. The sweep
+        // holds such requests before claiming them; this in-transaction
+        // re-read means no path — present or future — can erase an account
+        // whose wallet still holds money. The throw rolls everything back and
+        // the next sweep places the hold.
+        const walletRow = await tx.wallet.findUnique({ where: { userId }, select: { balance: true } });
+        if (walletRow && Number(walletRow.balance) > 0) {
+          throw Object.assign(new Error('wallet balance must be settled before erasure'), {
+            name: 'DeletionSettlementRequired',
           });
         }
 

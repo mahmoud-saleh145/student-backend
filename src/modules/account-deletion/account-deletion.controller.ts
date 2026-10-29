@@ -11,6 +11,7 @@ import type { RequestMeta } from '../auth/auth.service';
 
 import {
   CancelAccountDeletionDto,
+  ConfirmSettlementDto,
   RecoverAccountDeletionDto,
   RequestAccountDeletionDto,
 } from './account-deletion.dto';
@@ -70,6 +71,39 @@ export class AccountDeletionAdminController {
   @ApiOperation({ summary: 'Deletion requests whose erasure stopped after repeated failures' })
   attention() {
     return this.deletion.listNeedingAttention();
+  }
+
+  @Get('settlements')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Deletion requests holding for physical settlement (wallet not empty)',
+    description:
+      'Unlike the attention list, these rows include the holder\'s name and phone: nothing has been erased yet, and the administrator must identify the person to settle with. The live wallet balance is the authoritative amount.',
+  })
+  settlements() {
+    return this.deletion.listPendingSettlements();
+  }
+
+  @Post(':id/confirm-settlement')
+  @AdminOnly()
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Confirm that the remaining balance was settled physically outside the app',
+    description:
+      'The stated amount must equal the current wallet balance. Records a REFUND ledger transaction with the actor, method and reference; refuses a duplicate confirmation; erasure resumes at the next sweep.',
+  })
+  confirmSettlement(
+    @Param('id') id: string,
+    @Body() dto: ConfirmSettlementDto,
+    @CurrentUser() actor: AuthenticatedUser,
+    @Req() req: Request,
+  ) {
+    return this.deletion.confirmSettlement(
+      id,
+      actor,
+      { amount: dto.amount, method: dto.method, reference: dto.reference, reason: dto.reason },
+      meta(req),
+    );
   }
 
   @Post(':id/retry')
