@@ -45,10 +45,22 @@ export class MetaController {
 
     const byKey = new Map(settings.map((s) => [s.key, s.value]));
 
-    const [deviceLimit, contacts, allowAcademicYearChange] = await Promise.all([
+    const [
+      deviceLimit,
+      contacts,
+      allowAcademicYearChange,
+      canDeleteLectures,
+      canDeleteVideos,
+      canEditVideoUrls,
+      canEditCoursePrices,
+    ] = await Promise.all([
       this.platformSettings.deviceLimit(),
       this.platformSettings.contacts(),
       this.platformSettings.allowsAcademicYearChange(),
+      this.platformSettings.teacherMay('deleteLectures'),
+      this.platformSettings.teacherMay('deleteVideos'),
+      this.platformSettings.teacherMay('editVideoUrls'),
+      this.platformSettings.teacherMay('editCoursePrices'),
     ]);
 
     return {
@@ -71,6 +83,19 @@ export class MetaController {
         // Tells the app whether to refuse protected playback when its native
         // protection module is unavailable.
         requiresSecureSurface: true,
+      },
+
+      // What an administrator currently allows teachers to do. The dashboard
+      // reads this to decide which controls a teacher sees; without it every
+      // switch read as OFF and teachers never saw a control an admin had
+      // enabled. Policy flags only (the API enforces them on every request),
+      // so they are safe on this public route. Additive: clients that do not
+      // know the block ignore it.
+      teacher: {
+        canDeleteLectures,
+        canDeleteVideos,
+        canEditVideoUrls,
+        canEditCoursePrices,
       },
 
       features: {

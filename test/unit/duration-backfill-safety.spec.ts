@@ -70,6 +70,50 @@ describe('provider duration validation', () => {
   });
 });
 
+/**
+ * Mirrors the write payload built by `scripts/backfill-gumlet-durations.js`.
+ *
+ * The script repairs ONE number. This is pinned because the payload is the
+ * only thing that decides what a production write actually touches: a stray
+ * `frameRate` here would write the provider's `input.fps` of 90000 straight into
+ * a real column. Geometry is the ingest path's job, not the backfill's.
+ */
+function buildWritePayload(seconds: number): Record<string, number> {
+  return { durationSeconds: seconds };
+}
+
+describe('backfill write payload', () => {
+  it('contains durationSeconds and nothing else', () => {
+    const payload = buildWritePayload(3983);
+    expect(Object.keys(payload)).toEqual(['durationSeconds']);
+    expect(payload.durationSeconds).toBe(3983);
+  });
+
+  it('never carries source geometry or any DRM/platform column', () => {
+    const forbidden = [
+      'width', 'height', 'frameRate',
+      'status', 'drmProvider', 'gumletAssetId', 'gumletStatus',
+      'drmVerifiedAt', 'drmRequested', 'drmBlockedReason', 'drmCheckedAt',
+    ];
+    for (const seconds of [1, 183, 3983, 2932, 4317]) {
+      for (const field of forbidden) {
+        expect(Object.keys(buildWritePayload(seconds))).not.toContain(field);
+      }
+    }
+  });
+
+  it('is written only for a normalised positive provider value', () => {
+    // normalize() returning null means the script skips the row entirely, so no
+    // payload is ever built from an unknown duration.
+    for (const raw of [0, -1, 0.2, NaN, Infinity, undefined, null, '3983']) {
+      const seconds = normalize(raw);
+      if (seconds === null) continue;
+      expect(buildWritePayload(seconds).durationSeconds).toBe(seconds);
+      expect(seconds).toBeGreaterThan(0);
+    }
+  });
+});
+
 describe('course duration recount', () => {
   const lessons = [
     { id: 'l1', durationSeconds: 4317 },

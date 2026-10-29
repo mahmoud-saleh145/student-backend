@@ -55,6 +55,46 @@ const COURSE_INCLUDE = {
 } satisfies Prisma.CourseInclude;
 
 /**
+ * A course a student (or an anonymous visitor) may read: published, or
+ * archived for those who already hold it. Shared by `detail`, `sections` and
+ * `attachments`; the last two used to have no status check at all, so a guessed
+ * id listed the outline and documents of a DRAFT or HIDDEN course (audit F-14).
+ */
+function assertReadableByStudents(status: CourseStatus, isStaff: boolean): void {
+  if (!isStaff && status !== CourseStatus.PUBLISHED && status !== CourseStatus.ARCHIVED) {
+    throw new AppException(ErrorCode.COURSE_NOT_AVAILABLE);
+  }
+}
+
+/**
+ * Documents a student may see listed: none that belongs to an unpublished
+ * lecture or section.
+ *
+ * A lecture-scoped row carries `lessonId` and a NULL `sectionId` - the two are
+ * mutually exclusive - so its section has to be checked THROUGH the lesson.
+ * Testing `sectionId: null` alone would wave every lecture document through
+ * regardless of the section it hangs off.
+ */
+const STUDENT_VISIBLE_ATTACHMENTS: Prisma.AttachmentWhereInput = {
+  AND: [
+    {
+      OR: [
+        { lessonId: null },
+        {
+          lesson: {
+            status: ContentStatus.PUBLISHED,
+            section: { status: ContentStatus.PUBLISHED },
+          },
+        },
+      ],
+    },
+    {
+      OR: [{ sectionId: null }, { section: { status: ContentStatus.PUBLISHED } }],
+    },
+  ],
+};
+
+/**
  * Student-facing course reads.
  *
  * The guiding rule from the spec: browsing and joining are separate states. A
@@ -281,13 +321,7 @@ export class CoursesService {
 
     // A draft or hidden course is invisible to students even by direct id —
     // otherwise a guessed id leaks unpublished content.
-    if (
-      !isStaff &&
-      course.status !== CourseStatus.PUBLISHED &&
-      course.status !== CourseStatus.ARCHIVED
-    ) {
-      throw new AppException(ErrorCode.COURSE_NOT_AVAILABLE);
-    }
+    assertReadableByStudents(course.status, Boolean(isStaff));
 
     const decision = await this.access.resolve({
       userId: params.userId,
@@ -328,37 +362,13 @@ export class CoursesService {
     // refuses their documents, so listing them here would advertise the title of
     // a lecture the student is not allowed to open, then fail on click.
     //
-    // A lecture-scoped row carries `lessonId` and a NULL `sectionId` - the two
-    // are mutually exclusive - so its section has to be checked THROUGH the
-    // lesson. Testing `sectionId: null` alone would wave every lecture document
-    // through regardless of the section it hangs off.
+    // See STUDENT_VISIBLE_ATTACHMENTS for why the section is checked through
+    // the lesson.
     const attachments = await this.prisma.attachment.findMany({
       where: {
         courseId: course.id,
         ...notDeleted,
-        ...(isStaff
-          ? {}
-          : {
-              AND: [
-                {
-                  OR: [
-                    { lessonId: null },
-                    {
-                      lesson: {
-                        status: ContentStatus.PUBLISHED,
-                        section: { status: ContentStatus.PUBLISHED },
-                      },
-                    },
-                  ],
-                },
-                {
-                  OR: [
-                    { sectionId: null },
-                    { section: { status: ContentStatus.PUBLISHED } },
-                  ],
-                },
-              ],
-            }),
+        ...(isStaff ? {} : STUDENT_VISIBLE_ATTACHMENTS),
       },
       orderBy: [{ lessonId: 'asc' }, { sortOrder: 'asc' }],
     });
@@ -401,6 +411,9 @@ export class CoursesService {
     });
     if (!course) throw AppException.notFound('Course', params.courseId);
 
+    const isStaff = Boolean(params.role && params.role !== UserRole.STUDENT);
+    assertReadableByStudents(course.status, isStaff);
+
     const decision = await this.access.resolve({
       userId: params.userId,
       role: params.role,
@@ -408,7 +421,7 @@ export class CoursesService {
     });
 
     const sections = await this.loadSections(course.id, {
-      includeUnpublished: Boolean(params.role && params.role !== UserRole.STUDENT),
+      includeUnpublished: isStaff,
     });
 
     const progressRows = params.userId
@@ -499,10 +512,22 @@ export class CoursesService {
   }
 
   async attachments(courseId: string, userId: string | null, role?: UserRole) {
+    // Same visibility rules as `detail()`, which is what student-web renders
+    // from: no DRAFT/HIDDEN/SUSPENDED course, and no document of an
+    // unpublished lecture or section, for students and anonymous callers.
+    const course = await this.prisma.course.findFirst({
+      where: { id: courseId, ...notDeleted },
+      select: { id: true, status: true },
+    });
+    if (!course) throw AppException.notFound('Course', courseId);
+
+    const isStaff = Boolean(role && role !== UserRole.STUDENT);
+    assertReadableByStudents(course.status, isStaff);
+
     const decision = await this.access.resolve({ userId, role, courseId });
 
     const rows = await this.prisma.attachment.findMany({
-      where: { courseId, ...notDeleted },
+      where: { courseId, ...notDeleted, ...(isStaff ? {} : STUDENT_VISIBLE_ATTACHMENTS) },
       orderBy: [{ lessonId: 'asc' }, { sortOrder: 'asc' }],
     });
 

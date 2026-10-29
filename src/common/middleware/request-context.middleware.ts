@@ -1,7 +1,9 @@
-import { Injectable, type NestMiddleware } from '@nestjs/common';
+import { Injectable, Optional, type NestMiddleware } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import type { NextFunction, Request, Response } from 'express';
 import { randomUUID } from 'node:crypto';
 
+import { applyClientIp } from '../net/client-ip';
 import type { DeviceContext } from '../types/request-context';
 
 const SUPPORTED_LOCALES = new Set(['en', 'ar']);
@@ -14,7 +16,19 @@ const SUPPORTED_LOCALES = new Set(['en', 'ar']);
  */
 @Injectable()
 export class RequestContextMiddleware implements NestMiddleware {
+  private readonly webProxySecret: string | null;
+
+  constructor(@Optional() config?: ConfigService) {
+    this.webProxySecret =
+      config?.get<{ webProxySharedSecret?: string | null }>('app')?.webProxySharedSecret ?? null;
+  }
+
   use(req: Request, res: Response, next: NextFunction): void {
+    // First, so every later reader of `req.ip` (throttler, sessions, security
+    // events, audit) sees the same attribution, and so the proxy secret is
+    // gone from the request before anything else can see it (D6).
+    applyClientIp(req, this.webProxySecret);
+
     const incoming = req.header('x-request-id');
     req.requestId = incoming && incoming.length <= 64 ? incoming : randomUUID();
     res.setHeader('X-Request-Id', req.requestId);

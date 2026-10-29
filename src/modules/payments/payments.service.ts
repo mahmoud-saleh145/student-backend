@@ -314,6 +314,11 @@ export class PaymentsService {
             accessEndsAt,
             revokedAt: null,
             revokedReason: null,
+            // A payment buys the WHOLE course. Without this a student whose
+            // earlier enrollment was section-scoped (a part code) or revoked
+            // (which clears coverage) paid full price and stayed limited to
+            // the old sections, or to none.
+            coversAllSections: true,
           },
         });
       }

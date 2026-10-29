@@ -103,6 +103,9 @@ function build(options: Options = {}) {
   const refreshTokenUpdateMany = jest.fn(
     async (_args: { where: Record<string, unknown> }) => ({ count: 2 }),
   );
+  const pushTokenUpdateMany = jest.fn(
+    async (_args: { where: Record<string, unknown>; data: Record<string, unknown> }) => ({ count: 1 }),
+  );
 
   // Only the array form is modelled. The callback form would have to hand the
   // callback a client, which means referencing `prisma` inside its own
@@ -125,6 +128,7 @@ function build(options: Options = {}) {
     session: { updateMany: sessionUpdateMany },
     playbackTicket: { updateMany: ticketUpdateMany },
     refreshToken: { updateMany: refreshTokenUpdateMany },
+    pushToken: { updateMany: pushTokenUpdateMany },
     $transaction: jest.fn(async (operations: readonly unknown[]) => Promise.all(operations)),
   };
 
@@ -157,6 +161,7 @@ function build(options: Options = {}) {
     sessionUpdateMany,
     ticketUpdateMany,
     refreshTokenUpdateMany,
+    pushTokenUpdateMany,
     audit,
   };
 }
@@ -244,6 +249,19 @@ describe('resetting a binding frees the handset', () => {
     const where = call[0].where as { userId: string; revokedAt: null };
     expect(where.userId).toBe(STUDENT_ID);
     expect(where.revokedAt).toBeNull();
+  });
+
+  it('stops pushes to the old handset (2026-10-29)', async () => {
+    // A lost or stolen phone kept receiving every announcement: the reset
+    // revoked its sessions but never touched its push token.
+    const { service, pushTokenUpdateMany } = build();
+
+    await service.resetBinding(STUDENT_ID, ADMIN, 'phone stolen');
+
+    const call = pushTokenUpdateMany.mock.calls[0];
+    if (!call) throw new Error('pushToken.updateMany was never called');
+    expect(call[0].where).toEqual({ userId: STUDENT_ID, isActive: true });
+    expect(call[0].data).toEqual({ isActive: false });
   });
 
   it('the next sign-in from the same handset binds it ACTIVE', async () => {

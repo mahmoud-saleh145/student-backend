@@ -30,9 +30,12 @@ async function bootstrap(): Promise<void> {
   // ---------------------------------------------------------------------------
 
   if (cfg.trustProxy) {
-    // Only enable behind a balancer that overwrites X-Forwarded-For, otherwise
-    // clients can spoof their IP and defeat rate limiting.
-    app.set('trust proxy', 1);
+    // Only enable behind a balancer that appends to X-Forwarded-For. The count
+    // is the number of hops that do (TRUST_PROXY_HOPS, default 1): Express then
+    // takes the address that many entries from the RIGHT, which the client
+    // cannot forge. Too low a count yields a balancer address (every caller
+    // shares one bucket); too high lets a client choose its own address.
+    app.set('trust proxy', cfg.trustProxyHops);
   }
 
   app.use(

@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
+  AccountDeletionStatus,
   AccountStatus,
   AuditAction,
   DeviceStatus,
@@ -156,8 +157,15 @@ export class AuthService {
   // Login
   // ---------------------------------------------------------------------------
 
-  async login(dto: LoginDto, meta: RequestMeta): Promise<AuthResult> {
-    const phone = UsersService.normalizePhone(dto.phone);
+  /**
+   * The phone + password check, shared by sign-in and the account-deletion
+   * cancel flow so both get the same timing equalisation, lockout and
+   * failed-attempt accounting. Returns the user only when the password is
+   * correct. Account status is deliberately NOT checked here: each caller
+   * decides what a correct password on a disabled or pending account means.
+   */
+  async verifyCredentials(phoneInput: string, password: string, meta: RequestMeta) {
+    const phone = UsersService.normalizePhone(phoneInput);
 
     const user = await this.prisma.user.findUnique({
       where: { phone },
@@ -175,7 +183,7 @@ export class AuthService {
     if (!user || user.deletedAt) {
       // Spend the same CPU as a real verification so response time doesn't
       // reveal whether the number is registered.
-      await this.passwords.burnTiming(dto.password);
+      await this.passwords.burnTiming(password);
       await this.security.record({
         type: SecurityEventType.LOGIN_FAILED,
         ipAddress: meta.ip,
@@ -196,7 +204,7 @@ export class AuthService {
       });
     }
 
-    const valid = await this.passwords.verify(user.passwordHash, dto.password);
+    const valid = await this.passwords.verify(user.passwordHash, password);
 
     if (!valid) {
       await this.registerFailedAttempt(
@@ -207,6 +215,12 @@ export class AuthService {
       );
       throw new AppException(ErrorCode.INVALID_CREDENTIALS);
     }
+
+    return user;
+  }
+
+  async login(dto: LoginDto, meta: RequestMeta): Promise<AuthResult> {
+    const user = await this.verifyCredentials(dto.phone, dto.password, meta);
 
     // Status is checked AFTER the password so a disabled-account response
     // can't be used to enumerate valid numbers.
@@ -220,6 +234,34 @@ export class AuthService {
     }
     if (user.status === AccountStatus.PENDING) {
       throw new AppException(ErrorCode.ACCOUNT_PENDING);
+    }
+
+    // A pending account deletion (owner decision D5) blocks ordinary use. It
+    // is checked after the password, like the status checks above, so the
+    // answer cannot be used to learn which numbers have asked for deletion.
+    // The cancel flow (`POST /auth/account-deletion/cancel`) is the way back.
+    const deletion = await this.prisma.accountDeletionRequest.findFirst({
+      where: {
+        userId: user.id,
+        status: { in: [AccountDeletionStatus.PENDING, AccountDeletionStatus.PROCESSING] },
+      },
+      select: { status: true, scheduledFor: true },
+    }).catch((error: unknown) => {
+      // P2021 = the table does not exist: the API was deployed before its
+      // migration. No request can exist then, so sign-in must not break.
+      if ((error as { code?: string })?.code === 'P2021') return null;
+      throw error;
+    });
+    if (deletion) {
+      const cancellable =
+        deletion.status === AccountDeletionStatus.PENDING &&
+        deletion.scheduledFor.getTime() > Date.now();
+      throw new AppException(ErrorCode.ACCOUNT_DELETION_PENDING, {
+        message: cancellable
+          ? 'This account is scheduled for deletion. Cancel the deletion to sign in again.'
+          : 'This account is being deleted and can no longer be restored.',
+        details: { scheduledFor: deletion.scheduledFor.toISOString(), cancellable },
+      });
     }
 
     // Opportunistic upgrade if the hashing parameters were raised.
@@ -357,6 +399,14 @@ export class AuthService {
    * again.
    */
   async refresh(refreshToken: string, meta: RequestMeta): Promise<AuthResult> {
+    return this.rotateRefresh(refreshToken, meta, false);
+  }
+
+  private async rotateRefresh(
+    refreshToken: string,
+    meta: RequestMeta,
+    isRetry: boolean,
+  ): Promise<AuthResult> {
     let claims;
     try {
       claims = await this.tokens.verifyRefresh(refreshToken);
@@ -471,7 +521,21 @@ export class AuthService {
       familyId: stored.familyId,
     });
 
-    await this.prisma.$transaction(async (tx) => {
+    const rotated = await this.prisma.$transaction(async (tx) => {
+      // Compare-and-set (audit F-12). `stored` was read outside this
+      // transaction, so two refreshes presenting the same token at the same
+      // instant could both pass the `usedAt` check above, both create a
+      // successor and both commit: two live chains in one family, the second
+      // `replacedById` silently overwriting the first. Claiming the row only
+      // while it is still unused makes exactly one of them the rotation; under
+      // READ COMMITTED the loser's UPDATE waits for the winner's commit,
+      // re-evaluates `usedAt IS NULL`, and matches nothing.
+      const claimed = await tx.refreshToken.updateMany({
+        where: { id: stored.id, usedAt: null, revokedAt: null },
+        data: { usedAt: new Date() },
+      });
+      if (claimed.count !== 1) return false;
+
       const next = await tx.refreshToken.create({
         data: {
           userId: user.id,
@@ -484,7 +548,7 @@ export class AuthService {
 
       await tx.refreshToken.update({
         where: { id: stored.id },
-        data: { usedAt: new Date(), replacedById: next.id },
+        data: { replacedById: next.id },
       });
 
       // The session expiry slides with the refresh token.
@@ -508,7 +572,21 @@ export class AuthService {
           expiresAt: issued.refreshExpiresAt,
         },
       });
+      return true;
     });
+
+    if (!rotated) {
+      // The other request rotated this token a moment ago. Re-reading it now
+      // finds `usedAt` set and takes the ordinary path for that case: the
+      // grace-window reissue, or family revocation beyond the window. One
+      // retry only; losing twice means something else is going on.
+      if (isRetry) {
+        throw new AppException(ErrorCode.SESSION_EXPIRED, {
+          message: 'Refresh token rotation conflict',
+        });
+      }
+      return this.rotateRefresh(refreshToken, meta, true);
+    }
 
     // Re-evaluate the device on refresh too: an admin may have revoked it
     // mid-session, and the client should learn that at the next refresh

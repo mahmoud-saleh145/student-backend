@@ -1,0 +1,562 @@
+diff --git a/package-lock.json b/package-lock.json
+index 2033e14..ab2dfc0 100755
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -10,6 +10,7 @@
+       "dependencies": {
+         "@hookform/resolvers": "^3.9.1",
+         "@tanstack/react-query": "^5.62.0",
++        "@vercel/analytics": "^2.0.1",
+         "clsx": "^2.1.1",
+         "hls.js": "^1.7.3",
+         "i18next": "^24.2.0",
+@@ -2322,6 +2323,48 @@
+         "win32"
+       ]
+     },
++    "node_modules/@vercel/analytics": {
++      "version": "2.0.1",
++      "resolved": "https://registry.npmjs.org/@vercel/analytics/-/analytics-2.0.1.tgz",
++      "integrity": "sha512-MTQG6V9qQrt1tsDeF+2Uoo5aPjqbVPys1xvnIftXSJYG2SrwXRHnqEvVoYID7BTruDz4lCd2Z7rM1BdkUehk2g==",
++      "license": "MIT",
++      "peerDependencies": {
++        "@remix-run/react": "^2",
++        "@sveltejs/kit": "^1 || ^2",
++        "next": ">= 13",
++        "nuxt": ">= 3",
++        "react": "^18 || ^19 || ^19.0.0-rc",
++        "svelte": ">= 4",
++        "vue": "^3",
++        "vue-router": "^4"
++      },
++      "peerDependenciesMeta": {
++        "@remix-run/react": {
++          "optional": true
++        },
++        "@sveltejs/kit": {
++          "optional": true
++        },
++        "next": {
++          "optional": true
++        },
++        "nuxt": {
++          "optional": true
++        },
++        "react": {
++          "optional": true
++        },
++        "svelte": {
++          "optional": true
++        },
++        "vue": {
++          "optional": true
++        },
++        "vue-router": {
++          "optional": true
++        }
++      }
++    },
+     "node_modules/acorn": {
+       "version": "8.18.0",
+       "resolved": "https://registry.npmjs.org/acorn/-/acorn-8.18.0.tgz",
+diff --git a/package.json b/package.json
+index 164d130..3cfa0ac 100755
+--- a/package.json
++++ b/package.json
+@@ -18,6 +18,7 @@
+   "dependencies": {
+     "@hookform/resolvers": "^3.9.1",
+     "@tanstack/react-query": "^5.62.0",
++    "@vercel/analytics": "^2.0.1",
+     "clsx": "^2.1.1",
+     "hls.js": "^1.7.3",
+     "i18next": "^24.2.0",
+diff --git a/src/app/api/auth/login/route.ts b/src/app/api/auth/login/route.ts
+index 4b687c2..7ba78f7 100755
+--- a/src/app/api/auth/login/route.ts
++++ b/src/app/api/auth/login/route.ts
+@@ -85,11 +85,14 @@ export async function POST(request: NextRequest) {
+ 
+     // Any refresh still in flight belongs to the previous session and must not be
+     // able to write its result over the tokens set below.
+-    bumpSessionGeneration();
++    // Scoped to THIS browser (see refresh-lock.ts): a sign-in elsewhere must
++    // not invalidate another student's refresh.
++    const refreshScope = identity.deviceId;
++    bumpSessionGeneration(refreshScope);
+ 
+     // A fresh sign-in starts unencumbered: any cooldown left over from a
+     // previous session must not suppress this session's first refresh.
+-    resetRefreshState();
++    resetRefreshState(refreshScope);
+ 
+     setSessionCookies(response, { accessToken, refreshToken });
+ 
+diff --git a/src/app/api/auth/logout/route.ts b/src/app/api/auth/logout/route.ts
+index 4b7c14e..f11e26a 100755
+--- a/src/app/api/auth/logout/route.ts
++++ b/src/app/api/auth/logout/route.ts
+@@ -1,7 +1,8 @@
+ import { NextResponse, type NextRequest } from 'next/server';
+ 
+-import { backendRequest, getAccessToken } from '@/lib/session';
+-import { bumpSessionGeneration, resetRefreshState } from '@/lib/refresh-lock';
++import { asApiError } from '@/lib/errors';
++import { backendRequest, getAccessToken, getDeviceId, getRefreshToken } from '@/lib/session';
++import { bumpSessionGeneration, resetRefreshState, singleFlightRefresh } from '@/lib/refresh-lock';
+ import { clearSessionCookies } from '@/lib/session-cookies';
+ import { hasWebRequestHeader } from '@/lib/web-request';
+ 
+@@ -32,23 +33,49 @@ export async function POST(request: NextRequest) {
+     );
+   }
+ 
+-  bumpSessionGeneration();
++  // Scoped to THIS browser: signing out must not discard other students'
++  // in-flight refreshes (see refresh-lock.ts).
++  const refreshScope = (await getDeviceId()) ?? 'no-device';
++  bumpSessionGeneration(refreshScope);
+ 
+   const accessToken = await getAccessToken();
+ 
+-  if (accessToken) {
++  const revoke = async (token: string): Promise<'ok' | 'unauthorized' | 'failed'> => {
+     try {
+-      await backendRequest({
+-        method: 'POST',
+-        path: '/auth/logout',
+-        accessToken,
+-      });
+-    } catch {
++      await backendRequest({ method: 'POST', path: '/auth/logout', accessToken: token });
++      return 'ok';
++    } catch (e) {
+       // best-effort
++      return asApiError(e).status === 401 ? 'unauthorized' : 'failed';
+     }
++  };
++
++  const outcome = accessToken ? await revoke(accessToken) : 'unauthorized';
++
++  // The access cookie lives 12h but the token in it 15 min, so most sign-outs
++  // present an expired token. The backend can only revoke the session behind a
++  // valid one; ignoring that 401 left the server session and its 30-day
++  // refresh token alive after the student pressed "sign out". Exchange the
++  // refresh token once (sharing any refresh already in flight) and revoke.
++  const refreshToken = outcome === 'unauthorized' ? await getRefreshToken() : null;
++  if (refreshToken) {
++    const refreshed = await singleFlightRefresh(refreshToken, async () => {
++      try {
++        const result = await backendRequest<{ accessToken: string; refreshToken: string }>({
++          method: 'POST',
++          path: '/auth/refresh',
++          body: { refreshToken },
++        });
++        return { ok: true as const, ...result.data };
++      } catch (e) {
++        const err = asApiError(e);
++        return { ok: false as const, status: err.status, code: err.code, message: err.message };
++      }
++    }).catch(() => null);
++    if (refreshed?.ok) await revoke(refreshed.accessToken);
+   }
+ 
+-  resetRefreshState();
++  resetRefreshState(refreshScope);
+ 
+   const response = NextResponse.json({ success: true, data: { ok: true } });
+ 
+diff --git a/src/app/api/auth/register/route.ts b/src/app/api/auth/register/route.ts
+index ef7294c..16ea93f 100755
+--- a/src/app/api/auth/register/route.ts
++++ b/src/app/api/auth/register/route.ts
+@@ -59,8 +59,10 @@ export async function POST(request: NextRequest) {
+ 
+     const response = NextResponse.json({ success: true, data: { user } });
+ 
+-    bumpSessionGeneration();
+-    resetRefreshState();
++    // Scoped to THIS browser (see refresh-lock.ts).
++    const refreshScope = identity.deviceId;
++    bumpSessionGeneration(refreshScope);
++    resetRefreshState(refreshScope);
+ 
+     setSessionCookies(response, { accessToken, refreshToken });
+ 
+diff --git a/src/app/api/proxy/[...path]/route.ts b/src/app/api/proxy/[...path]/route.ts
+index ef68366..47ce330 100755
+--- a/src/app/api/proxy/[...path]/route.ts
++++ b/src/app/api/proxy/[...path]/route.ts
+@@ -1,6 +1,6 @@
+ import { NextRequest, NextResponse } from 'next/server';
+ 
+-import { asApiError, httpStatusFor } from '@/lib/errors';
++import { ApiError, asApiError, httpStatusFor } from '@/lib/errors';
+ import { isBlockedPath, isPublicReadPath } from '@/lib/proxy-rules';
+ import {
+   currentSessionGeneration,
+@@ -22,6 +22,13 @@ import { hasWebRequestHeader } from '@/lib/web-request';
+ import { contentLocale } from '@/lib/locale';
+ import { setProfileCookie, type ProfileSnapshot } from '@/lib/session-cookies';
+ 
++/**
++ * The 401 codes that mean "the access token is not (or no longer) valid", i.e.
++ * the ones a refresh can fix. Everything else the API answers 401 for -
++ * PLAYBACK_TICKET_EXPIRED, INVALID_CREDENTIALS - is relayed untouched.
++ */
++const TOKEN_FAILURE_CODES: ReadonlySet<string> = new Set(['UNAUTHORIZED', 'SESSION_EXPIRED']);
++
+ export async function GET(
+   request: NextRequest,
+   { params }: { params: Promise<{ path: string[] }> }
+@@ -108,8 +115,17 @@ async function handleProxy(
+   const queryString = url.searchParams.toString();
+   const backendPath = queryString ? `${pathStr}?${queryString}` : pathStr;
+ 
++  // The scope that this browser's refresh bookkeeping lives in (see
++  // refresh-lock.ts). A signed-in browser always holds the device cookie.
++  const refreshScope = existingDeviceId ?? 'no-device';
++
+   const accessToken = await getAccessToken();
+-  if (!accessToken) {
++  // The access cookie lives 12h; the refresh cookie 30 days. A student who
++  // comes back after 12h has no access cookie but a perfectly good session, so
++  // a missing access token goes straight to the refresh below instead of
++  // answering "not signed in" (which the client treats as a sign-out).
++  const canRefreshWithoutAccess = !accessToken && (await getRefreshToken()) !== null;
++  if (!accessToken && !(canRefreshWithoutAccess && !isPublicReadPath(method, pathStr))) {
+     if (isPublicReadPath(method, pathStr)) {
+       // Registration lists, read before the student has an account. No token,
+       // no refresh and no cookies are involved, so this path ends here.
+@@ -138,6 +154,10 @@ async function handleProxy(
+ 
+   // --- attempt 1 ------------------------------------------------------------
+   try {
++    if (!accessToken) {
++      // No access token to try: go straight to the refresh path below.
++      throw new ApiError({ code: 'UNAUTHORIZED', status: 401, message: 'Access token missing' });
++    }
+     const result = await backendRequest({
+       method,
+       path: `/${backendPath}`,
+@@ -154,7 +174,10 @@ async function handleProxy(
+   } catch (e) {
+     const apiErr = asApiError(e);
+ 
+-    if (apiErr.status !== 401) {
++    // Only a 401 about the TOKEN is worth a refresh. The API also answers 401
++    // for an expired playback ticket and for wrong credentials; refreshing and
++    // then relaying those as a failed session signed the student out.
++    if (apiErr.status !== 401 || !TOKEN_FAILURE_CODES.has(apiErr.code)) {
+       return jsonError(apiErr.status, apiErr.code, apiErr.message);
+     }
+ 
+@@ -164,7 +187,7 @@ async function handleProxy(
+       return jsonError(401, 'UNAUTHORIZED', 'Not signed in');
+     }
+ 
+-    if (isRefreshCoolingDown()) {
++    if (isRefreshCoolingDown(Date.now(), refreshScope)) {
+       // A refresh failed very recently for a reason unrelated to the token.
+       // Retrying now would hammer the failing endpoint.
+       //
+@@ -183,7 +206,7 @@ async function handleProxy(
+     // Captured before the refresh starts. Sign-out and sign-in bump the
+     // generation, so a result that arrives afterwards is discarded instead of
+     // resurrecting a dead session or overwriting a newer account's tokens.
+-    const generationAtRefresh = currentSessionGeneration();
++    const generationAtRefresh = currentSessionGeneration(refreshScope);
+ 
+     const outcome = await singleFlightRefresh(refreshToken, () =>
+       performRefresh(refreshToken)
+@@ -205,7 +228,7 @@ async function handleProxy(
+       // exactly the bug: a 401 here ends the session client-side no matter how
+       // valid it still is. Retryable is the honest answer, because nothing has
+       // said this session is over.
+-      noteRefreshFailure();
++      noteRefreshFailure(Date.now(), refreshScope);
+       return jsonError(
+         503,
+         'SESSION_REFRESH_UNAVAILABLE',
+@@ -216,7 +239,7 @@ async function handleProxy(
+     // The refresh may have been overtaken: the user signed out or signed in
+     // again while it was in flight. Writing these cookies would resurrect a dead
+     // session or overwrite a newer account's tokens.
+-    if (currentSessionGeneration() !== generationAtRefresh) {
++    if (currentSessionGeneration(refreshScope) !== generationAtRefresh) {
+       return jsonError(401, 'SESSION_CHANGED', 'Session changed during refresh');
+     }
+ 
+diff --git a/src/app/courses/page.tsx b/src/app/courses/page.tsx
+index ad81e02..5842c5e 100755
+--- a/src/app/courses/page.tsx
++++ b/src/app/courses/page.tsx
+@@ -110,7 +110,7 @@ export default function CoursesPage() {
+     asking by department could offer only a subset of the years a student may
+     browse. The faculty is the unit the catalogue is actually scoped to.
+   */
+-  const years = useAcademicYears(profile.data?.faculty?.id);
++  const years = useAcademicYears(undefined, profile.data?.faculty?.id);
+   const items = query.data?.items ?? [];
+   const total = query.data?.total ?? 0;
+   const activeFilterCount =
+diff --git a/src/app/my-courses/page.tsx b/src/app/my-courses/page.tsx
+index 35e8b97..7df54be 100755
+--- a/src/app/my-courses/page.tsx
++++ b/src/app/my-courses/page.tsx
+@@ -59,10 +59,11 @@ export default function MyCoursesPage() {
+     [all]
+   );
+   const completed = React.useMemo(() => all.filter((c) => (c.progress?.percent ?? 0) >= 100), [all]);
+-  const other = React.useMemo(
+-    () => all.filter((c) => c.access.state === 'EXPIRED' || c.access.state === 'ARCHIVED' || c.access.state === 'REVOKED'),
+-    [all]
+-  );
++  // The tab is labelled "All", and it is the only place a PENDING enrolment
++  // (awaiting approval or payment) can appear: it used to hold only expired,
++  // archived and revoked courses, so a student who had just asked to join saw
++  // the course in no tab at all.
++  const other = all;
+ 
+   const rows = tab === 'active' ? active : tab === 'completed' ? completed : other;
+ 
+diff --git a/src/features/api.ts b/src/features/api.ts
+index 317394f..c6b8dba 100755
+--- a/src/features/api.ts
++++ b/src/features/api.ts
+@@ -82,9 +82,15 @@ export const catalogApi = {
+     api.get<Department[]>(
+       `catalog/faculties/${facultyId}/departments${studyType ? `?studyType=${studyType}` : ""}`,
+     ),
+-  academicYears: (departmentId?: string) =>
++  academicYears: (departmentId?: string, facultyId?: string) =>
+     api.get<AcademicYear[]>(
+-      `catalog/academic-years${departmentId ? `?departmentId=${departmentId}` : ""}`,
++      `catalog/academic-years${
++        departmentId
++          ? `?departmentId=${departmentId}`
++          : facultyId
++            ? `?facultyId=${facultyId}`
++            : ""
++      }`,
+     ),
+   /**
+    * The resolved academic system AND the matching year/level list, in one call.
+@@ -127,10 +133,16 @@ export function useDepartments(
+     staleTime: 30 * 60_000,
+   });
+ }
+-export function useAcademicYears(departmentId?: string) {
++/**
++ * `facultyId` scopes the list to a college (the catalogue filter); the API
++ * accepts university, faculty or department. It used to be impossible to ask
++ * by faculty, so the catalogue passed a FACULTY id as `departmentId`, matched
++ * no department, and got the platform-wide ladder.
++ */
++export function useAcademicYears(departmentId?: string, facultyId?: string) {
+   return useQuery({
+-    queryKey: [...qk.catalog.academicYears(), departmentId],
+-    queryFn: () => catalogApi.academicYears(departmentId),
++    queryKey: [...qk.catalog.academicYears(), departmentId, facultyId],
++    queryFn: () => catalogApi.academicYears(departmentId, facultyId),
+     staleTime: 60 * 60_000,
+   });
+ }
+@@ -330,6 +342,12 @@ export function useAttachmentTicket(
+     staleTime: 0,
+     gcTime: 0,
+     retry: false,
++    // A new ticket means a new signed URL, and a new URL makes the viewer load
++    // the document again from page 1. The PDF is already in memory once
++    // opened, so returning to the tab (or the network blinking) must not
++    // re-issue it. Opening the viewer again still fetches a fresh ticket.
++    refetchOnWindowFocus: false,
++    refetchOnReconnect: false,
+   });
+ }
+ 
+diff --git a/src/lib/error-messages.test.ts b/src/lib/error-messages.test.ts
+index ed54a89..7aa7754 100755
+--- a/src/lib/error-messages.test.ts
++++ b/src/lib/error-messages.test.ts
+@@ -32,6 +32,14 @@ describe('endsSession', () => {
+     assert.equal(endsSession({ code: 'ACCOUNT_DISABLED', status: 403 }), true);
+   });
+ 
++  it('keeps the session for 401s that are not about the session', () => {
++    // An expired playback ticket is re-issued by the player; a wrong password
++    // is a form error. Neither may sign the student out.
++    assert.equal(endsSession({ code: 'PLAYBACK_TICKET_EXPIRED', status: 401 }), false);
++    assert.equal(endsSession({ code: 'INVALID_CREDENTIALS', status: 401 }), false);
++    assert.equal(endsSession({ code: 'SESSION_EXPIRED', status: 401 }), true);
++  });
++
+   it('keeps the session for device-binding problems, like the mobile app', () => {
+     assert.equal(endsSession({ code: 'DEVICE_NOT_AUTHORIZED', status: 403 }), false);
+     assert.equal(endsSession({ code: 'FORBIDDEN', status: 403 }), false);
+diff --git a/src/lib/error-messages.ts b/src/lib/error-messages.ts
+index 28c2654..44cb127 100755
+--- a/src/lib/error-messages.ts
++++ b/src/lib/error-messages.ts
+@@ -44,6 +44,19 @@ export function errorMessageKey(code: string, status: number, hasKey: (key: stri
+  */
+ export const SESSION_ENDING_CODES: ReadonlySet<string> = new Set(['SESSION_EXPIRED', 'ACCOUNT_DISABLED']);
+ 
++/**
++ * 401s that are NOT about the session: an expired playback ticket (the player
++ * re-issues it) and wrong credentials on a form. Treating them as a sign-out
++ * logged a student out mid-lesson.
++ */
++const NON_SESSION_401_CODES: ReadonlySet<string> = new Set([
++  'PLAYBACK_TICKET_EXPIRED',
++  'INVALID_CREDENTIALS',
++]);
++
+ export function endsSession(error: { code: string; status: number }): boolean {
+-  return error.status === 401 || SESSION_ENDING_CODES.has(error.code);
++  return (
++    (error.status === 401 && !NON_SESSION_401_CODES.has(error.code)) ||
++    SESSION_ENDING_CODES.has(error.code)
++  );
+ }
+diff --git a/src/lib/refresh-lock.test.ts b/src/lib/refresh-lock.test.ts
+index 23cd2c2..414c1d9 100755
+--- a/src/lib/refresh-lock.test.ts
++++ b/src/lib/refresh-lock.test.ts
+@@ -505,3 +505,37 @@ describe('P0-1 — comprehensive scenario coverage', () => {
+   });
+ });
+ 
++describe('per-browser scope (one server process answers many students)', () => {
++  beforeEach(() => resetRefreshState());
++
++  test("one browser's sign-in does not invalidate another browser's in-flight refresh", () => {
++    const capturedByB = currentSessionGeneration('browser-B');
++    bumpSessionGeneration('browser-A'); // student A signs in or out
++    assert.equal(currentSessionGeneration('browser-B'), capturedByB);
++  });
++
++  test("a browser's own sign-out still invalidates its in-flight refresh", () => {
++    const captured = currentSessionGeneration('browser-A');
++    bumpSessionGeneration('browser-A');
++    assert.notEqual(currentSessionGeneration('browser-A'), captured);
++  });
++
++  test("one browser's failed refresh does not put other browsers into the cooldown", () => {
++    noteRefreshFailure(1_000, 'browser-A');
++    assert.equal(isRefreshCoolingDown(1_000, 'browser-A'), true);
++    assert.equal(isRefreshCoolingDown(1_000, 'browser-B'), false);
++  });
++
++  test("a scoped reset clears only that browser's cooldown and leaves in-flight refreshes alone", async () => {
++    noteRefreshFailure(1_000, 'browser-A');
++    noteRefreshFailure(1_000, 'browser-B');
++    let release: (v: RefreshOutcome) => void = () => undefined;
++    const pending = singleFlightRefresh('token-of-B', () => new Promise<RefreshOutcome>((r) => (release = r)));
++    resetRefreshState('browser-A');
++    assert.equal(isRefreshCoolingDown(1_000, 'browser-A'), false);
++    assert.equal(isRefreshCoolingDown(1_000, 'browser-B'), true);
++    assert.equal(inflightCount(), 1);
++    release({ ok: true, accessToken: 'a', refreshToken: 'r' });
++    await pending;
++  });
++});
+diff --git a/src/lib/refresh-lock.ts b/src/lib/refresh-lock.ts
+index 9c0cfea..ce94778 100755
+--- a/src/lib/refresh-lock.ts
++++ b/src/lib/refresh-lock.ts
+@@ -66,21 +66,59 @@ const inflight = new Map<string, Promise<RefreshOutcome>>();
+  */
+ export const REFRESH_COOLDOWN_MS = 30_000;
+ 
+-let refreshBlockedUntil = 0;
++/**
++ * Per-BROWSER scope for the cooldown and the session generation.
++ *
++ * One server process answers many students at once. Both values used to be a
++ * single module-level number, so:
++ *   - one student's failed refresh put EVERY student whose token expired in
++ *     the next 30s into the cooldown, and
++ *   - every sign-in, registration or sign-out anywhere bumped the one
++ *     generation, so a refresh in flight for somebody else was discarded as
++ *     "session changed" AFTER the backend had already rotated their token -
++ *     and their forced sign-out bumped it again, chaining at peak times.
++ * Callers pass the browser's device-id cookie as the scope. Omitting it keeps
++ * the old single-scope behaviour (used by tests and as a safe default).
++ */
++const GLOBAL_SCOPE = '*';
++/** Bounds the maps on a long-lived process; stale entries are only cooldowns. */
++const MAX_SCOPES = 50_000;
++
++const refreshBlockedUntil = new Map<string, number>();
+ 
+ /** True while a recent failure means another refresh attempt is pointless. */
+-export function isRefreshCoolingDown(now: number = Date.now()): boolean {
+-  return now < refreshBlockedUntil;
++export function isRefreshCoolingDown(now: number = Date.now(), scope: string = GLOBAL_SCOPE): boolean {
++  const until = refreshBlockedUntil.get(scope);
++  if (until === undefined) return false;
++  if (now >= until) {
++    refreshBlockedUntil.delete(scope);
++    return false;
++  }
++  return true;
+ }
+ 
+ /** Records an inconclusive refresh failure and starts the cooldown. */
+-export function noteRefreshFailure(now: number = Date.now()): void {
+-  refreshBlockedUntil = now + REFRESH_COOLDOWN_MS;
++export function noteRefreshFailure(now: number = Date.now(), scope: string = GLOBAL_SCOPE): void {
++  if (refreshBlockedUntil.size >= MAX_SCOPES) {
++    for (const [key, until] of refreshBlockedUntil) if (until <= now) refreshBlockedUntil.delete(key);
++    if (refreshBlockedUntil.size >= MAX_SCOPES) refreshBlockedUntil.clear();
++  }
++  refreshBlockedUntil.set(scope, now + REFRESH_COOLDOWN_MS);
+ }
+ 
+-/** Clears the cooldown. Called on sign-in so a fresh session starts unencumbered. */
+-export function resetRefreshState(): void {
+-  refreshBlockedUntil = 0;
++/**
++ * Clears the cooldown. Called on sign-in so a fresh session starts unencumbered.
++ *
++ * With a scope, only that browser's cooldown is cleared: other students' in-flight
++ * refreshes are left alone (clearing them made their concurrent requests start a
++ * second refresh with the same token). Without one, everything is reset.
++ */
++export function resetRefreshState(scope?: string): void {
++  if (scope !== undefined) {
++    refreshBlockedUntil.delete(scope);
++    return;
++  }
++  refreshBlockedUntil.clear();
+   inflight.clear();
+ }
+ 
+@@ -101,15 +139,20 @@ export function resetRefreshState(): void {
+  *
+  * Same single-process caveat as `inflight` above.
+  */
+-let sessionGeneration = 0;
++const sessionGeneration = new Map<string, number>();
+ 
+-export function currentSessionGeneration(): number {
+-  return sessionGeneration;
++export function currentSessionGeneration(scope: string = GLOBAL_SCOPE): number {
++  return sessionGeneration.get(scope) ?? 0;
+ }
+ 
+-/** Invalidates every refresh that captured the previous generation. */
+-export function bumpSessionGeneration(): void {
+-  sessionGeneration += 1;
++/** Invalidates every refresh (in this browser's scope) that captured the previous generation. */
++export function bumpSessionGeneration(scope: string = GLOBAL_SCOPE): void {
++  if (sessionGeneration.size >= MAX_SCOPES && !sessionGeneration.has(scope)) {
++    // Dropping entries can only make an in-flight refresh look "changed"
++    // (the safe direction), never apply one that should have been discarded.
++    sessionGeneration.clear();
++  }
++  sessionGeneration.set(scope, (sessionGeneration.get(scope) ?? 0) + 1);
+ }
+ 
+ /** Number of refreshes currently in flight. Exposed for tests. */

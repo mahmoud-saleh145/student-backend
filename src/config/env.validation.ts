@@ -56,6 +56,18 @@ export class EnvironmentVariables {
   @IsBoolean()
   TRUST_PROXY = false;
 
+  /// How many proxy hops in front of the API append to X-Forwarded-For
+  /// (Express `trust proxy` count). Only read when TRUST_PROXY is on.
+  @Type(() => Number) @IsInt() @Min(1) @Max(10) TRUST_PROXY_HOPS = 1;
+
+  /// Owner decision D6: shared with the student web server ONLY (server-side
+  /// env there, never NEXT_PUBLIC_*). When the web server presents it, the
+  /// browser address it forwards is believed. Unset = never believed.
+  @IsOptional()
+  @IsString()
+  @MinLength(32)
+  WEB_PROXY_SHARED_SECRET?: string;
+
   // --- database -------------------------------------------------------------
   @IsString()
   @MinLength(10)
@@ -265,6 +277,14 @@ export class EnvironmentVariables {
   @Min(0)
   @Max(86400)
   DRM_SWEEP_INTERVAL_SECONDS = 900;
+
+  /// Owner decision D5: how often the API sweeps due account deletions
+  /// (0 disables it on this process; values under 300 are raised to 300).
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(86400)
+  ACCOUNT_DELETION_SWEEP_INTERVAL_SECONDS = 3600;
 
   /** Per-request timeout for Gumlet's asset API and manifest reads, in milliseconds. */
   @IsOptional()

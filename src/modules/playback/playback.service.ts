@@ -363,6 +363,7 @@ export class PlaybackService {
       userId: user.id,
       role: user.role,
       deviceKey: user.deviceKey,
+      sessionDeviceId: user.deviceId,
       integritySuspect: params.integritySuspect,
       ip: params.ip,
       userAgent: params.userAgent,
@@ -610,6 +611,20 @@ export class PlaybackService {
         playId: params.playId,
       },
     });
+
+    // Remembered for rotation (see heartbeat). Best effort: if Redis is down a
+    // rotation falls back to the previous behaviour (no platform hint).
+    if (params.platform || params.delivery) {
+      await Promise.resolve()
+        .then(() =>
+          this.redis.setJson(
+            `pb:tk:${ticket.id}`,
+            { platform: params.platform ?? null, delivery: params.delivery ?? null },
+            ttl + this.cfg.playResumeWindow,
+          ),
+        )
+        .catch(() => undefined);
+    }
 
     // The manifest is served by this API, not from storage, so every segment
     // URI inside it can be signed for THIS viewer and the AES key can be tied
@@ -1045,6 +1060,24 @@ export class PlaybackService {
     }
   }
 
+  /** The platform/delivery a ticket was issued for, recorded by mintTicket. */
+  private async readTicketDelivery(
+    ticketId: string,
+  ): Promise<{ platform?: 'ios' | 'android' | 'web'; delivery?: 'embed' } | null> {
+    const stored = await Promise.resolve()
+      .then(() =>
+        this.redis.getJson<{ platform: string | null; delivery: string | null }>(`pb:tk:${ticketId}`),
+      )
+      .catch(() => null);
+    if (!stored) return null;
+    const platform =
+      stored.platform === 'ios' || stored.platform === 'android' || stored.platform === 'web'
+        ? stored.platform
+        : undefined;
+    const delivery = stored.delivery === 'embed' ? 'embed' : undefined;
+    return { platform, delivery };
+  }
+
   private async touchStreamSlot(userId: string, sessionId: string): Promise<void> {
     try {
       await this.redis.client.zadd(this.redis.key(`pb:slots:${userId}`), Date.now(), sessionId);
@@ -1095,6 +1128,9 @@ export class PlaybackService {
             lesson: { select: { id: true, title: true } },
           },
         },
+        // The lecture this grant was AUTHORISED in (not the uploading one), so
+        // its section scope can be re-checked on every beat.
+        lesson: { select: { sectionId: true, isPreview: true } },
       },
     });
 
@@ -1110,6 +1146,26 @@ export class PlaybackService {
 
     if (ticket.status === PlaybackTicketStatus.RELEASED) {
       return { ok: false, terminate: { reason: 'Playback session already ended' } };
+    }
+
+    // An EXPIRED grant is over. Without this, an expired ticket fell straight
+    // into the rotation branch below (its remaining time is negative, which is
+    // "about to expire") and was exchanged for a FRESH ticket with new signed
+    // DRM licence URLs - skipping the device, concurrency, issuance-rate and
+    // play-limit checks that only `issueTicket` runs. A ticket id therefore
+    // worked forever. A small grace absorbs a late beat or clock skew; beyond
+    // it the client issues a new ticket through the full chain (the play
+    // resume window keeps that from costing the student a play).
+    //
+    // Answered as a 200 `terminate`, not a thrown 401: the web proxy treats
+    // every upstream 401 as an expired login.
+    const expiryGraceMs = this.cfg.heartbeatInterval * 2 * 1000;
+    if (
+      ticket.status === PlaybackTicketStatus.EXPIRED ||
+      ticket.expiresAt.getTime() + expiryGraceMs < Date.now()
+    ) {
+      await this.releaseStreamSlot(params.user.id, params.user.sessionId);
+      return { ok: false, terminate: { reason: ErrorCode.PLAYBACK_TICKET_EXPIRED } };
     }
 
     // --- client-reported capture state --------------------------------------
@@ -1160,6 +1216,24 @@ export class PlaybackService {
       await this.revokeTicket(ticket.id, `Access lost mid-playback: ${decision.state}`);
       await this.releaseStreamSlot(params.user.id, params.user.sessionId);
       return { ok: false, terminate: { reason: decision.denialCode ?? 'PLAYBACK_DENIED' } };
+    }
+
+    // Course access alone is not the grant: a section-scoped student (a part
+    // purchase or a section card) is entitled to SOME sections. Issuance
+    // enforces this; the heartbeat has to as well, or a section revoked
+    // mid-lesson keeps streaming and keeps rotating.
+    if (params.user.role === UserRole.STUDENT && ticket.lesson && !ticket.lesson.isPreview) {
+      try {
+        await this.access.assertSectionAccessible({
+          userId: params.user.id,
+          courseId: ticket.courseId,
+          sectionId: ticket.lesson.sectionId,
+        });
+      } catch {
+        await this.revokeTicket(ticket.id, 'Section access lost mid-playback');
+        await this.releaseStreamSlot(params.user.id, params.user.sessionId);
+        return { ok: false, terminate: { reason: ErrorCode.NOT_ENROLLED } };
+      }
     }
 
     // --- record position ------------------------------------------------------
@@ -1218,10 +1292,43 @@ export class PlaybackService {
     const shouldRotate = remainingMs < this.cfg.heartbeatInterval * 2 * 1000;
 
     if (shouldRotate) {
+      // A rotation mints new playable credentials, so it re-checks the device
+      // the same way issuance does, and insists on the SAME device the grant
+      // was issued to. Otherwise another device of the same account (pending,
+      // revoked or never approved) could keep a ticket id alive and receive
+      // fresh licence URLs without ever passing device binding.
+      if (params.user.role === UserRole.STUDENT) {
+        let deviceId: string | null = null;
+        try {
+          ({ deviceId } = await this.devices.assertAuthorizedForProtectedContent({
+            userId: params.user.id,
+            role: params.user.role,
+            deviceKey: params.user.deviceKey,
+            sessionDeviceId: params.user.deviceId,
+            integritySuspect: false,
+            ip: params.ip,
+          }));
+        } catch {
+          deviceId = null;
+        }
+        if (!deviceId || (ticket.deviceId !== null && deviceId !== ticket.deviceId)) {
+          await this.revokeTicket(ticket.id, 'Device not authorized for this playback grant');
+          await this.releaseStreamSlot(params.user.id, params.user.sessionId);
+          return { ok: false, terminate: { reason: ErrorCode.DEVICE_NOT_AUTHORIZED } };
+        }
+      }
+
       // Refused before the live ticket is released: a video that stopped
       // verifying ends playback with the current grant, not with a half-rotation.
       // The pass is handed to mintTicket so the rotation verifies once, not three times.
       const drmGate = await this.assertStrictDrmGate(ticket.video);
+
+      // The key system and delivery the ORIGINAL ticket was issued for. The
+      // ticket row does not record them, and the heartbeat body does not carry
+      // them, so before this a rotation re-minted with no platform: an iOS
+      // FairPlay session (native app or Safari) was handed Widevine + DASH
+      // about four minutes in and playback failed.
+      const delivery = await this.readTicketDelivery(ticket.id);
 
       await this.prisma.playbackTicket.update({
         where: { id: ticket.id },
@@ -1247,6 +1354,8 @@ export class PlaybackService {
         // one — carrying the id forward is what stops a long lesson spending
         // the student's whole allowance on a single sitting.
         playId: ticket.playId,
+        platform: delivery?.platform,
+        delivery: delivery?.delivery,
         drmGate,
       });
 

@@ -12,6 +12,7 @@ import { ConfigModule } from './config/config.module';
 import type { RedisConfig, ThrottleConfig } from './config/configuration';
 import { DatabaseModule } from './database/database.module';
 import { JobsModule } from './jobs/jobs.module';
+import { AccountDeletionModule } from './modules/account-deletion/account-deletion.module';
 import { AnalyticsModule } from './modules/analytics/analytics.module';
 import { AttachmentsModule } from './modules/attachments/attachments.module';
 import { AuditInterceptor } from './modules/audit/audit.interceptor';
@@ -22,6 +23,7 @@ import { CodesModule } from './modules/codes/codes.module';
 import { CoursePartsModule } from './modules/course-parts/course-parts.module';
 import { CoursesModule } from './modules/courses/courses.module';
 import { DevicesModule } from './modules/devices/devices.module';
+import { DiagnosticsModule } from './modules/diagnostics/diagnostics.module';
 import { EnrollmentsModule } from './modules/enrollments/enrollments.module';
 import { HomeModule } from './modules/home/home.module';
 import { LessonsModule } from './modules/lessons/lessons.module';
@@ -144,6 +146,7 @@ import { RedisModule } from './redis/redis.module';
 
     // --- identity ------------------------------------------------------------
     AuthModule,
+    AccountDeletionModule,
     UsersModule,
     DevicesModule,
     SessionsModule,
@@ -186,13 +189,20 @@ import { RedisModule } from './redis/redis.module';
     AnalyticsModule,
     MasterModule,
     MetaModule,
+    DiagnosticsModule,
 
     // --- async work -----------------------------------------------------------
     JobsModule,
   ],
   providers: [
-    { provide: APP_GUARD, useClass: ThrottlerProxyGuard },
+    // Authentication runs FIRST so the throttler can key authenticated
+    // requests by user id (ThrottlerProxyGuard.getTracker). In the opposite
+    // order `req.user` was never set when the tracker ran, so every request was
+    // keyed by IP: all students behind one school NAT - and all web students,
+    // whose requests reach the API from the web app's server-side proxy -
+    // shared one bucket, including the 60-tickets/hour playback ceiling.
     { provide: APP_GUARD, useClass: JwtAuthGuard },
+    { provide: APP_GUARD, useClass: ThrottlerProxyGuard },
     { provide: APP_GUARD, useClass: RolesGuard },
     { provide: APP_INTERCEPTOR, useClass: AuditInterceptor },
   ],

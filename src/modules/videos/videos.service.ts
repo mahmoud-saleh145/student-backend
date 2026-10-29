@@ -27,7 +27,7 @@ import { AuditService } from '../audit/audit.service';
 import { CourseAccessService } from '../courses/course-access.service';
 import { CoursesService } from '../courses/courses.service';
 import { NotificationsService } from '../notifications/notifications.service';
-import { StorageService } from '../storage/storage.service';
+import { assertObjectKeyInNamespace, StorageService } from '../storage/storage.service';
 import { isTerminalGumletFailure } from './gumlet-failure';
 import { GumletIngestService } from './gumlet-ingest.service';
 import { LessonVideoService } from './lesson-video.service';
@@ -1308,6 +1308,12 @@ export class VideosService {
     if (!video) throw AppException.notFound('Video', videoId);
 
     await this.access.assertCanManageCourse(actor.id, actor.role, video.courseId, 'content');
+
+    // The key is signed for every viewer of this video on each ticket, so it
+    // must be one issued for THIS video's captions. Without the check a staff
+    // member could point a caption at any object in storage (another course's
+    // attachment, a paid library PDF) and receive a signed URL for it.
+    assertObjectKeyInNamespace(input.objectKey, `captions/${videoId}/`, 'objectKey');
 
     if (input.isDefault) {
       await this.prisma.captionTrack.updateMany({

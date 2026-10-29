@@ -40,6 +40,7 @@ type StorageControllerLike = {
     dto: Record<string, unknown>,
   ): Promise<{ url: string; fields: Record<string, string> }>;
   attachmentContent(
+    actor: { id: string; role: 'ADMIN' },
     query: Record<string, unknown>,
     req: unknown,
   ): Promise<{ objectKey: string; sizeBytes: number }>;
@@ -233,6 +234,7 @@ describe('streamed attachment upload (the path the dashboard uses)', () => {
     const t = build();
 
     await t.controller.attachmentContent(
+      ADMIN,
       { courseId: 'crs_1', filename: 'slides.pdf', contentType: 'application/pdf' } as never,
       req(),
     );
@@ -252,6 +254,7 @@ describe('streamed attachment upload (the path the dashboard uses)', () => {
       { courseId: 'crs_1', filename: 'slides.pdf', contentType: 'application/pdf' } as never,
     );
     await t.controller.attachmentContent(
+      ADMIN,
       { courseId: 'crs_1', filename: 'slides.pdf', contentType: 'application/pdf' } as never,
       req(),
     );
@@ -265,6 +268,7 @@ describe('streamed attachment upload (the path the dashboard uses)', () => {
   it('returns a key in the namespace bucketForKey resolves back to media', async () => {
     const t = build();
     const result = (await t.controller.attachmentContent(
+      ADMIN,
       { courseId: 'crs_1', filename: 'slides.pdf', contentType: 'application/pdf' } as never,
       req(),
     )) as { objectKey: string; sizeBytes: number };
@@ -278,6 +282,7 @@ describe('streamed attachment upload (the path the dashboard uses)', () => {
 
     await expect(
       t.controller.attachmentContent(
+        ADMIN,
         { courseId: 'crs_1', filename: 'a/b.pdf', contentType: 'application/pdf' } as never,
         req(),
       ),
@@ -290,6 +295,7 @@ describe('the failure this prevents is diagnosable, not silent', () => {
   it('writes to exactly one bucket, so a mismatch cannot half-apply', async () => {
     const t = build();
     await t.controller.attachmentContent(
+      ADMIN,
       { courseId: 'crs_1', filename: 'slides.pdf', contentType: 'application/pdf' } as never,
       req(),
     );

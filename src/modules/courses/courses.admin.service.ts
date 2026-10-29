@@ -4,7 +4,7 @@ import {
   AcademicStructureKind,
   AuditAction,
   CourseStatus,
-  type EnrollmentMethod,
+  EnrollmentMethod,
   EnrollmentState,
   type Prisma,
   UserRole,
@@ -23,6 +23,59 @@ import { assertObjectKeyInNamespace, StorageService } from '../storage/storage.s
 
 import { CourseAccessService } from './course-access.service';
 import { CoursesService } from './courses.service';
+
+/**
+ * Key in `archive_records.snapshot` listing the enrollments that were still
+ * PENDING_APPROVAL when the course was archived, so `restore` can put them
+ * back as requests instead of granting access.
+ */
+export const PENDING_APPROVAL_SNAPSHOT_KEY = 'pendingApprovalEnrollmentIds';
+
+/** The recorded pending-approval ids, or [] for archives made before the record existed. */
+export function pendingApprovalIdsFrom(snapshot: unknown): string[] {
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return [];
+  const value = (snapshot as Record<string, unknown>)[PENDING_APPROVAL_SNAPSHOT_KEY];
+  return Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string') : [];
+}
+
+/**
+ * Whether a course PATCH changes its commercial terms - how students may join
+ * and how long access lasts. Those are pricing decisions, so a teacher who may
+ * only edit content must not make them (audit F-16). Only an actual change
+ * counts: the dashboard sends the whole form on every save, and resending the
+ * current values must keep working for a content-only teacher.
+ */
+export function changesCommercialTerms(
+  before: {
+    enrollmentMethods: EnrollmentMethod[];
+    accessDurationType: string;
+    accessDurationDays: number | null;
+    accessEndsAt: Date | null;
+  },
+  input: {
+    enrollmentMethods?: EnrollmentMethod[];
+    accessDurationType?: string;
+    accessDurationDays?: number;
+    accessEndsAt?: string;
+  },
+): boolean {
+  if (input.enrollmentMethods !== undefined) {
+    const was = new Set(before.enrollmentMethods);
+    const now = new Set(input.enrollmentMethods);
+    if (was.size !== now.size || [...now].some((m) => !was.has(m))) return true;
+  }
+  if (input.accessDurationType !== undefined && input.accessDurationType !== before.accessDurationType) {
+    return true;
+  }
+  if (input.accessDurationDays !== undefined && input.accessDurationDays !== before.accessDurationDays) {
+    return true;
+  }
+  if (input.accessEndsAt) {
+    const next = new Date(input.accessEndsAt).getTime();
+    if (before.accessEndsAt === null || next !== before.accessEndsAt.getTime()) return true;
+  }
+  return false;
+}
 
 export interface CreateCourseInput {
   title: string;
@@ -526,6 +579,11 @@ export class CoursesAdminService {
       throw new AppException(ErrorCode.INVALID_STATE, {
         message: 'Use the publish/unpublish/archive endpoints to change status',
       });
+    }
+
+    // Joining methods and access duration are commercial terms (F-16).
+    if (changesCommercialTerms(before, input)) {
+      await this.access.assertCanManageCourse(actor.id, actor.role, courseId, 'pricing');
     }
 
     const data: Prisma.CourseUpdateInput = {
@@ -1056,6 +1114,15 @@ export class CoursesAdminService {
         data: { status: CourseStatus.ARCHIVED, archivedAt: now },
       });
 
+      // Which requests were still awaiting approval. ARCHIVED alone does not
+      // say what a row was before, and `restore` must put an unapproved
+      // request back as unapproved - never ACTIVE. Recorded in the archive
+      // record only (not in the audit row or the response).
+      const pendingApproval = await tx.enrollment.findMany({
+        where: { courseId, state: EnrollmentState.PENDING_APPROVAL },
+        select: { id: true },
+      });
+
       // Enrollments move to ARCHIVED so the student sees the right state, but
       // the rows — and their payment links — remain.
       await tx.enrollment.updateMany({
@@ -1078,7 +1145,10 @@ export class CoursesAdminService {
           entityId: courseId,
           courseId,
           reason,
-          snapshot: frozen as Prisma.InputJsonValue,
+          snapshot: {
+            ...frozen,
+            [PENDING_APPROVAL_SNAPSHOT_KEY]: pendingApproval.map((e) => e.id),
+          } as Prisma.InputJsonValue,
           archivedById: actor.id,
         },
       });
@@ -1121,8 +1191,35 @@ export class CoursesAdminService {
         data: { status: CourseStatus.DRAFT, archivedAt: null },
       });
 
-      // Enrollments come back to ACTIVE only if their access window still
-      // holds; the rest become EXPIRED, which is the honest state.
+      // Requests that were awaiting approval when the course was archived go
+      // back to PENDING_APPROVAL. Restoring a course must never approve
+      // anyone. Two sources, combined:
+      //  - the ids recorded at archive time (archives made after this fix);
+      //  - for older archives with no record, rows that can only have been an
+      //    unapproved request: ADMIN_APPROVAL with no approval stamp. Every
+      //    real grant of that method stamps `approvedAt` (grantByAdmin always
+      //    passes the approver), so this cannot catch an approved student.
+      const archiveRecord = await tx.archiveRecord.findFirst({
+        where: { entity: 'course', entityId: courseId, restoredAt: null },
+        orderBy: { archivedAt: 'desc' },
+        select: { snapshot: true },
+      });
+      const recordedPending = pendingApprovalIdsFrom(archiveRecord?.snapshot);
+      await tx.enrollment.updateMany({
+        where: {
+          courseId,
+          state: EnrollmentState.ARCHIVED,
+          OR: [
+            ...(recordedPending.length > 0 ? [{ id: { in: recordedPending } }] : []),
+            { method: EnrollmentMethod.ADMIN_APPROVAL, approvedAt: null },
+          ],
+        },
+        data: { state: EnrollmentState.PENDING_APPROVAL },
+      });
+
+      // Everything else archived was ACTIVE. It comes back to ACTIVE only if
+      // its access window still holds; the rest become EXPIRED, which is the
+      // honest state.
       const now = new Date();
       await tx.enrollment.updateMany({
         where: {

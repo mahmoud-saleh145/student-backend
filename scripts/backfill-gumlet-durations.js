@@ -16,6 +16,11 @@
  *     transient API problem must not take a working lecture offline.
  *   * No clobbering. It only writes where the stored duration is 0, and only
  *     writes a value the provider actually reported.
+ *   * No geometry. The ONLY column written is `durationSeconds`. `width`,
+ *     `height` and `frameRate` are never touched, even when the row is null
+ *     and the provider reports a value - see the note at the write below.
+ *   * No archived videos. Candidates are `status = 'READY'`, so an ARCHIVED
+ *     row is invisible here by design.
  *
  * Usage:
  *   node scripts/backfill-gumlet-durations.js            # dry run, reports only
@@ -79,7 +84,7 @@ function normalizeDurationSeconds(raw) {
     },
     select: {
       id: true, gumletAssetId: true, durationSeconds: true,
-      width: true, height: true, frameRate: true, courseId: true, lessonId: true,
+      courseId: true,
     },
   });
 
@@ -116,11 +121,7 @@ function normalizeDurationSeconds(raw) {
       continue;
     }
 
-    console.log(
-      '  %s: %ds (width=%s height=%s fps=%s) %s',
-      video.id, seconds, json?.input?.width ?? '-', json?.input?.height ?? '-',
-      json?.input?.fps ?? '-', APPLY ? '' : '[dry run]',
-    );
+    console.log('  %s: %ds %s', video.id, seconds, APPLY ? '' : '[dry run]');
 
     if (APPLY) {
       // A GUARDED update, not `update`.
@@ -131,10 +132,19 @@ function normalizeDurationSeconds(raw) {
       // changes nothing. That makes the script safe to run concurrently with the
       // app and safe to re-run.
       //
-      // The data payload deliberately contains ONLY metadata: durationSeconds and
-      // the source geometry. `status`, `drmProvider`, `gumletAssetId`,
-      // `gumletStatus`, `drmVerifiedAt`, `drmRequested` and `drmBlockedReason`
-      // are never written, so this script cannot move a video on or off the
+      // The data payload deliberately contains ONLY `durationSeconds`.
+      //
+      // This script exists to repair one number. Source geometry (`width`,
+      // `height`, `frameRate`) is NOT written here, even where the row is null
+      // and the provider reports a value: the provider's `input.fps` for these
+      // assets reads 90000, which is plainly not a frame rate, and a backfill is
+      // not the place to decide what it really means. Today's ingest path
+      // (`gumlet-ingest.service.ts`) is the single place that geometry is
+      // written, from the same provider response, under the same normalisation.
+      //
+      // `status`, `drmProvider`, `gumletAssetId`, `gumletStatus`,
+      // `drmVerifiedAt`, `drmRequested` and `drmBlockedReason` are never
+      // written either, so this script cannot move a video on or off the
       // strict-DRM gate, cannot demote a playable video and cannot fabricate
       // verification.
       const res = await p.video.updateMany({
@@ -144,18 +154,7 @@ function normalizeDurationSeconds(raw) {
           status: 'READY',
           durationSeconds: 0,
         },
-        data: {
-          durationSeconds: seconds,
-          ...(video.width == null && Number.isFinite(json?.input?.width)
-            ? { width: Math.round(json.input.width) }
-            : {}),
-          ...(video.height == null && Number.isFinite(json?.input?.height)
-            ? { height: Math.round(json.input.height) }
-            : {}),
-          ...(video.frameRate == null && Number.isFinite(json?.input?.fps)
-            ? { frameRate: json.input.fps }
-            : {}),
-        },
+        data: { durationSeconds: seconds },
       });
       if (res.count === 0) {
         console.log('  %s: precondition changed mid-run - nothing written', video.id);

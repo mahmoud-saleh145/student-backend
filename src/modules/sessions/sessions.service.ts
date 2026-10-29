@@ -127,7 +127,7 @@ export class SessionsService {
   async revoke(params: { sessionId: string; actor: AuthenticatedUser; reason: string }) {
     const session = await this.prisma.session.findUnique({
       where: { id: params.sessionId },
-      select: { id: true, userId: true, status: true },
+      select: { id: true, userId: true, status: true, device: { select: { deviceKey: true } } },
     });
 
     if (!session) throw AppException.notFound('Session', params.sessionId);
@@ -165,6 +165,16 @@ export class SessionsService {
           revokedReason: params.reason,
         },
       });
+
+      // So do the pushes to that session's handset, exactly as a user logout
+      // does (`AuthService.logout`). The app re-registers at its next sign-in.
+      const deviceKey = session.device?.deviceKey;
+      if (deviceKey) {
+        await tx.pushToken.updateMany({
+          where: { userId: session.userId, deviceKey, isActive: true },
+          data: { isActive: false },
+        });
+      }
     });
 
     await this.audit.record({
@@ -218,6 +228,13 @@ export class SessionsService {
           revokedAt: now,
           revokedReason: params.reason,
         },
+      });
+
+      // Signed out everywhere by an administrator means no more pushes
+      // anywhere either, as with the user's own `logoutAll`.
+      await tx.pushToken.updateMany({
+        where: { userId: params.userId, isActive: true },
+        data: { isActive: false },
       });
 
       return ids.length;

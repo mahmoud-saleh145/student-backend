@@ -1,0 +1,263 @@
+diff --git a/.env.example b/.env.example
+index 0548dfc..e4e6c66 100755
+--- a/.env.example
++++ b/.env.example
+@@ -25,3 +25,11 @@ NEXT_PUBLIC_APP_VERSION=1.0.0
+ NEXT_PUBLIC_SUPPORT_WHATSAPP=
+ NEXT_PUBLIC_SUPPORT_PHONE=
+ NEXT_PUBLIC_SUPPORT_EMAIL=
++
++# Owner decision D6: shared secret with the API (same value as the API's
++# WEB_PROXY_SHARED_SECRET, at least 32 characters). SERVER-SIDE ONLY: never
++# rename it NEXT_PUBLIC_*. When set, this server forwards each browser's
++# address (from Vercel's X-Real-IP / X-Vercel-Forwarded-For) so the API's
++# per-address limits and security records see the student, not Vercel.
++# Leave unset to keep the old behaviour. Generate with: openssl rand -base64 48
++# WEB_PROXY_SHARED_SECRET=
+diff --git a/src/i18n/dictionaries.ts b/src/i18n/dictionaries.ts
+index 83f164f..207f76c 100755
+--- a/src/i18n/dictionaries.ts
++++ b/src/i18n/dictionaries.ts
+@@ -464,6 +464,8 @@ const en = {
+     "This account has been disabled. Please contact the administration.",
+   "errors.ACCOUNT_PENDING":
+     "Your account is awaiting activation by the administration.",
++  "errors.ACCOUNT_DELETION_PENDING":
++    "This account is scheduled for deletion. To keep it, open the mobile app and choose \"Cancel deletion\" on the sign-in screen.",
+   "errors.FORBIDDEN": "You don't have permission to view this.",
+   "errors.COURSE_ARCHIVED": "This course has been archived.",
+   "errors.ACCESS_EXPIRED": "Your access to this content has expired.",
+@@ -957,6 +959,8 @@ const ar: Record<keyof typeof en, string> = {
+   "errors.UNAUTHORIZED": "يجب تسجيل الدخول للقيام بذلك.",
+   "errors.ACCOUNT_DISABLED": "تم تعطيل هذا الحساب. يرجى التواصل مع الإدارة.",
+   "errors.ACCOUNT_PENDING": "حسابك بانتظار التفعيل من الإدارة.",
++  "errors.ACCOUNT_DELETION_PENDING":
++    "هذا الحساب مجدول للحذف. للاحتفاظ به، افتح تطبيق الموبايل واختر \"إلغاء الحذف\" في شاشة تسجيل الدخول.",
+   "errors.FORBIDDEN": "ليس لديك صلاحية لعرض هذا المحتوى.",
+   "errors.COURSE_ARCHIVED": "تمت أرشفة هذا الكورس.",
+   "errors.ACCESS_EXPIRED": "انتهت صلاحية وصولك إلى هذا المحتوى.",
+diff --git a/src/lib/client-ip-forwarding.test.ts b/src/lib/client-ip-forwarding.test.ts
+new file mode 100644
+index 0000000..c613fac
+--- /dev/null
++++ b/src/lib/client-ip-forwarding.test.ts
+@@ -0,0 +1,80 @@
++import assert from 'node:assert/strict';
++import { readFileSync, readdirSync, statSync } from 'node:fs';
++import { join } from 'node:path';
++import { describe, it } from 'node:test';
++
++import {
++  CLIENT_IP_HEADER,
++  PROXY_SECRET_HEADER,
++  browserAddress,
++  clientIpForwardingHeaders,
++  readProxySecret,
++} from './client-ip-forwarding.ts';
++
++/** Owner decision D6. */
++const SECRET = 'k'.repeat(40);
++const env = { WEB_PROXY_SHARED_SECRET: SECRET };
++
++describe('forwarding the browser address to the API', () => {
++  it('forwards the Vercel-reported address together with the secret', () => {
++    const out = clientIpForwardingHeaders(new Headers({ 'x-real-ip': '197.34.10.20' }), env);
++    assert.deepEqual(out, { [CLIENT_IP_HEADER]: '197.34.10.20', [PROXY_SECRET_HEADER]: SECRET });
++  });
++
++  it('prefers x-vercel-forwarded-for, which a proxy in front of Vercel cannot overwrite', () => {
++    const out = clientIpForwardingHeaders(
++      new Headers({ 'x-vercel-forwarded-for': '41.33.1.2', 'x-real-ip': '10.0.0.1' }),
++      env,
++    );
++    assert.equal(out[CLIENT_IP_HEADER], '41.33.1.2');
++  });
++
++  it('sends nothing at all without a secret (feature off, behaviour as before)', () => {
++    assert.deepEqual(clientIpForwardingHeaders(new Headers({ 'x-real-ip': '197.34.10.20' }), {}), {});
++  });
++
++  it('ignores a secret too short to be one', () => {
++    assert.equal(readProxySecret({ WEB_PROXY_SHARED_SECRET: 'short' }), null);
++    assert.deepEqual(
++      clientIpForwardingHeaders(new Headers({ 'x-real-ip': '197.34.10.20' }), { WEB_PROXY_SHARED_SECRET: 'short' }),
++      {},
++    );
++  });
++
++  it('never takes X-Forwarded-For, or a client-sent x-edu-client-ip, as the address', () => {
++    const incoming = new Headers({ 'x-forwarded-for': '6.6.6.6', [CLIENT_IP_HEADER]: '7.7.7.7' });
++    assert.equal(browserAddress(incoming), null);
++    assert.deepEqual(clientIpForwardingHeaders(incoming, env), {});
++  });
++
++  it('refuses something that is not an address', () => {
++    assert.equal(browserAddress(new Headers({ 'x-real-ip': 'evil' })), null);
++    assert.equal(browserAddress(new Headers({ 'x-real-ip': '2001:db8::1' })), '2001:db8::1');
++  });
++});
++
++describe('the secret stays on the server', () => {
++  const SRC = join(import.meta.dirname, '..');
++  const walk = (dir: string): string[] =>
++    readdirSync(dir).flatMap((entry) => {
++      const full = join(dir, entry);
++      if (statSync(full).isDirectory()) return walk(full);
++      return /\.(ts|tsx)$/.test(full) ? [full] : [];
++    });
++  const files = walk(SRC).filter((f) => !f.endsWith('.test.ts'));
++
++  it('is never a NEXT_PUBLIC_ variable', () => {
++    for (const file of files) {
++      assert.doesNotMatch(readFileSync(file, 'utf8'), /NEXT_PUBLIC_WEB_PROXY|NEXT_PUBLIC_[A-Z_]*SECRET/, file);
++    }
++  });
++
++  it('is read only by server modules, never by a client component', () => {
++    const readers = files.filter((f) => /WEB_PROXY_SHARED_SECRET|client-ip-forwarding/.test(readFileSync(f, 'utf8')));
++    assert.ok(readers.length > 0);
++    for (const file of readers) {
++      const text = readFileSync(file, 'utf8');
++      assert.doesNotMatch(text, /^\s*['"]use client['"]/m, `${file} is a client module`);
++    }
++  });
++});
+diff --git a/src/lib/client-ip-forwarding.ts b/src/lib/client-ip-forwarding.ts
+new file mode 100644
+index 0000000..14e046b
+--- /dev/null
++++ b/src/lib/client-ip-forwarding.ts
+@@ -0,0 +1,78 @@
++import { isIP } from 'node:net';
++
++/**
++ * Owner decision D6 - telling the API which browser a request is for.
++ *
++ * Every call this server makes to the API comes from a Vercel egress address
++ * that all web students share, so per-address limits, session records and
++ * security events would otherwise lump them together. Vercel overwrites
++ * `X-Forwarded-For` / `X-Real-IP` / `X-Vercel-Forwarded-For` with the real
++ * client address (it does not forward client-supplied values), so the server
++ * can read the browser's address and pass it on.
++ *
++ * The API believes the forwarded address ONLY when it arrives with the shared
++ * secret, `WEB_PROXY_SHARED_SECRET`. That secret is a server-side variable: it
++ * must never be named NEXT_PUBLIC_*, never be sent to the browser, and never be
++ * logged. This module is imported only by server code (lib/session.ts), and the
++ * headers are added to the outgoing API request, which the browser never sees.
++ *
++ * Without the secret, nothing is forwarded and the API falls back to its own
++ * view of the caller, exactly as before.
++ */
++
++export const CLIENT_IP_HEADER = 'x-edu-client-ip';
++export const PROXY_SECRET_HEADER = 'x-edu-proxy-secret';
++export const MIN_PROXY_SECRET_LENGTH = 32;
++
++/** Headers that carry the client address on Vercel, most specific first.
++ *  `X-Forwarded-For` is deliberately absent: on any host that APPENDS to it
++ *  instead of overwriting it, its first entry is client-controlled. */
++const CLIENT_ADDRESS_HEADERS = ['x-vercel-forwarded-for', 'x-real-ip'] as const;
++
++interface HeaderReader {
++  get(name: string): string | null;
++}
++
++let warnedShortSecret = false;
++
++export function readProxySecret(env: Record<string, string | undefined> = process.env): string | null {
++  const value = env.WEB_PROXY_SHARED_SECRET?.trim();
++  if (!value) return null;
++  if (value.length < MIN_PROXY_SECRET_LENGTH) {
++    if (!warnedShortSecret) {
++      warnedShortSecret = true;
++      // The value itself is never printed.
++      console.warn(
++        `[config] WEB_PROXY_SHARED_SECRET is shorter than ${MIN_PROXY_SECRET_LENGTH} characters and is ignored.`,
++      );
++    }
++    return null;
++  }
++  return value;
++}
++
++/** The browser's address as the hosting edge reported it, or null. */
++export function browserAddress(incoming: HeaderReader): string | null {
++  for (const name of CLIENT_ADDRESS_HEADERS) {
++    const raw = incoming.get(name);
++    if (!raw) continue;
++    const first = raw.split(',')[0]?.trim() ?? '';
++    if (first.length > 0 && first.length <= 45 && isIP(first)) return first;
++  }
++  return null;
++}
++
++/**
++ * The headers to add to an outgoing API call. Empty unless both a valid secret
++ * and a valid browser address are available.
++ */
++export function clientIpForwardingHeaders(
++  incoming: HeaderReader,
++  env: Record<string, string | undefined> = process.env,
++): Record<string, string> {
++  const secret = readProxySecret(env);
++  if (!secret) return {};
++  const ip = browserAddress(incoming);
++  if (!ip) return {};
++  return { [CLIENT_IP_HEADER]: ip, [PROXY_SECRET_HEADER]: secret };
++}
+diff --git a/src/lib/session.ts b/src/lib/session.ts
+index 8fd2782..c1ff660 100755
+--- a/src/lib/session.ts
++++ b/src/lib/session.ts
+@@ -1,6 +1,7 @@
+-import { cookies } from 'next/headers';
++import { cookies, headers as incomingHeaders } from 'next/headers';
+ import { cache } from 'react';
+ 
++import { clientIpForwardingHeaders } from './client-ip-forwarding';
+ import { serverConfig, cookieNames } from './config';
+ import { ApiError, asApiError, toApiError } from './errors';
+ 
+@@ -51,6 +52,12 @@ export async function backendRequest<T>(params: {
+     if (device?.name) headers['x-device-name'] = encodeURIComponent(device.name);
+   }
+ 
++  // Owner decision D6: the browser's address and the shared secret, so the
++  // API attributes this call to the student rather than to Vercel. Empty when
++  // the secret is not configured. Built from the edge-reported address only;
++  // nothing the browser sent under these names is passed on.
++  Object.assign(headers, await forwardedClientHeaders());
++
+   const controller = new AbortController();
+   const timeout = setTimeout(() => controller.abort(), serverConfig.apiTimeoutMs);
+ 
+@@ -94,6 +101,15 @@ export async function backendRequest<T>(params: {
+   }
+ }
+ 
++async function forwardedClientHeaders(): Promise<Record<string, string>> {
++  try {
++    return clientIpForwardingHeaders(await incomingHeaders());
++  } catch {
++    // Outside a request scope (build time, tests) there is no browser.
++    return {};
++  }
++}
++
+ export async function getAccessToken(): Promise<string | null> {
+   const store = await cookies();
+   return store.get(cookieNames.accessToken)?.value ?? null;
+diff --git a/src/types/api.ts b/src/types/api.ts
+index 9c8aa82..34180dc 100755
+--- a/src/types/api.ts
++++ b/src/types/api.ts
+@@ -43,6 +43,8 @@ export type ApiErrorCode =
+   | 'SESSION_REFRESH_UNAVAILABLE'
+   | 'ACCOUNT_DISABLED'
+   | 'ACCOUNT_PENDING'
++  // Owner decision D5: sign-in is refused while a deletion request is pending.
++  | 'ACCOUNT_DELETION_PENDING'
+   | 'PHONE_ALREADY_REGISTERED'
+   | 'DEVICE_NOT_AUTHORIZED'
+   | 'DEVICE_LIMIT_REACHED'

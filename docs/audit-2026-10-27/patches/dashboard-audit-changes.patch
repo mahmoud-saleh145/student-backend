@@ -1,0 +1,178 @@
+diff --git a/src/components/ui/tabs.tsx b/src/components/ui/tabs.tsx
+index 30dfbd1..8bdc214 100755
+--- a/src/components/ui/tabs.tsx
++++ b/src/components/ui/tabs.tsx
+@@ -122,8 +122,13 @@ export function useTabParam(defaultTab: string): [string, (id: string) => void]
+       if (id === defaultTab) next.delete('tab');
+       else next.set('tab', id);
+ 
+-      // Changing tab resets any list paging that belonged to the old tab.
++      // Changing tab resets any list paging AND sorting that belonged to the old
++      // tab. A sort key is a column of the old tab's table; carried over, it is
++      // sent to the new tab's endpoint, which rejects unknown values with 422
++      // (sorting the Student wallets tab broke the other wallet tabs).
+       next.delete('page');
++      next.delete('sort');
++      next.delete('order');
+ 
+       const query = next.toString();
+       router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false });
+diff --git a/src/features/courses/hooks.ts b/src/features/courses/hooks.ts
+index de447aa..6f2420f 100755
+--- a/src/features/courses/hooks.ts
++++ b/src/features/courses/hooks.ts
+@@ -71,10 +71,24 @@ export interface CourseDetail extends Omit<CourseSummary, 'teachers'> {
+   sections?: SectionRow[];
+ }
+ 
++/**
++ * The table's "Created" column sorts by its key, `createdAt`, but the API's
++ * sort vocabulary is `newest | oldest | title | students | price` and an
++ * unknown value is refused with 422 - which emptied the whole list. Translated
++ * here so the URL keeps the column's own key.
++ */
++export function toCourseListQuery(
++  query: Record<string, string | number>,
++): Record<string, string | number> {
++  if (query.sort !== 'createdAt') return query;
++  const { order, ...rest } = query;
++  return { ...rest, sort: order === 'asc' ? 'oldest' : 'newest' };
++}
++
+ export function useCourses(query: Record<string, string | number>) {
+   return useQuery({
+     queryKey: queryKeys.courses.list(query),
+-    queryFn: () => api.page<CourseSummary>('admin/courses', { query }),
++    queryFn: () => api.page<CourseSummary>('admin/courses', { query: toCourseListQuery(query) }),
+     // Keeps the previous page visible while the next one loads, so paging
+     // does not flash an empty table.
+     placeholderData: (previous) => previous,
+@@ -566,7 +580,11 @@ export function useDeleteCourse() {
+       queryClient.removeQueries({ queryKey: queryKeys.courses.sections(courseId) });
+       queryClient.removeQueries({ queryKey: queryKeys.courseParts.forCourse(courseId) });
+ 
+-      await queryClient.invalidateQueries({ queryKey: queryKeys.courses.list(undefined) });
++      // Every cached list page, whatever its filters. `courses.list(undefined)`
++      // is ['courses','list',undefined], and a partial key match compares that
++      // `undefined` against each page's params object - so it matched nothing
++      // and the deleted course stayed on screen.
++      await queryClient.invalidateQueries({ queryKey: ['courses', 'list'] });
+       await queryClient.invalidateQueries({ queryKey: queryKeys.codes.all });
+       await queryClient.invalidateQueries({ queryKey: queryKeys.students.all });
+       await queryClient.invalidateQueries({ queryKey: queryKeys.teachers.all });
+diff --git a/src/features/videos/hooks.ts b/src/features/videos/hooks.ts
+index 1a13cb6..1ce12c6 100755
+--- a/src/features/videos/hooks.ts
++++ b/src/features/videos/hooks.ts
+@@ -240,20 +240,31 @@ export function useCompleteVideoUpload(courseId?: string) {
+   });
+ }
+ 
++export interface RemoveVideoResult {
++  ok: boolean;
++  /** True when the asset is shared and was only detached from this lecture. */
++  detached?: boolean;
++  /** Other lectures that still use the asset after this removal. */
++  remainingAttachments?: number;
++}
++
+ /**
+- * Deletes a lecture's video (`DELETE /videos/:id`).
++ * Removes a video from THIS lecture (`DELETE /videos/:id?lessonId=`).
+  *
+- * Soft on the metadata — watch events reference the row — and hard on the
+- * bytes: the HLS output and the uploaded source are purged from storage. Any
+- * live playback grant for it is revoked. A new video can be uploaded to the
+- * lecture afterwards.
++ * The lecture is always sent: a shared asset is attached to several lectures,
++ * and the backend refuses to guess which one to remove it from. While other
++ * lectures still use it the asset is only detached here; otherwise the
++ * metadata is archived (watch events reference the row) and the HLS output and
++ * the uploaded source are purged. Live playback grants through this lecture are
++ * revoked. A new video can be uploaded to the lecture afterwards.
+  */
+ export function useDeleteVideo(courseId?: string) {
+   const queryClient = useQueryClient();
+ 
+   return useMutation({
+-    mutationFn: (videoId: string) => api.delete<{ ok: boolean }>(`videos/${videoId}`),
+-    onSuccess: async (_result, videoId) => {
++    mutationFn: ({ videoId, lessonId }: { videoId: string; lessonId: string }) =>
++      api.delete<RemoveVideoResult>(`videos/${videoId}`, undefined, { query: { lessonId } }),
++    onSuccess: async (_result, { videoId }) => {
+       queryClient.removeQueries({ queryKey: queryKeys.videos.status(videoId) });
+       await queryClient.invalidateQueries({ queryKey: queryKeys.courses.all });
+       if (courseId) {
+diff --git a/src/features/videos/lesson-video-panel.tsx b/src/features/videos/lesson-video-panel.tsx
+index 1434c8a..cf32203 100755
+--- a/src/features/videos/lesson-video-panel.tsx
++++ b/src/features/videos/lesson-video-panel.tsx
+@@ -156,15 +156,25 @@ export function LessonVideoPanel({
+   async function runDelete() {
+     if (!videoId) return;
+     try {
+-      await removeVideo.mutateAsync(videoId);
++      // Always name THIS lecture: for a shared asset the backend detaches it
++      // here only, and it refuses to guess which lecture was meant.
++      const result = await removeVideo.mutateAsync({ videoId, lessonId });
+       setDeletedVideoId(videoId);
+       setStartedVideoId(null);
+       setHandedOffStatus(null);
+       upload.reset();
+-      toast.success(
+-        'Video deleted',
+-        'Its stored files were removed. The lecture now has no video.',
+-      );
++      if (result?.detached) {
++        const others = result.remainingAttachments ?? 0;
++        toast.success(
++          'Video removed from this lecture',
++          `The stored file was kept: ${others} other lecture${others === 1 ? '' : 's'} still use${others === 1 ? 's' : ''} it.`,
++        );
++      } else {
++        toast.success(
++          'Video deleted',
++          'Its stored files were removed. The lecture now has no video.',
++        );
++      }
+     } catch (error) {
+       toast.error(error, 'The video could not be deleted');
+     } finally {
+diff --git a/src/lib/session.ts b/src/lib/session.ts
+index fb48470..d9dcbae 100755
+--- a/src/lib/session.ts
++++ b/src/lib/session.ts
+@@ -168,12 +168,27 @@ export async function signOut(): Promise<void> {
+   const jar = await cookies();
+   const accessToken = jar.get(COOKIE.access)?.value;
+ 
+-  if (accessToken) {
+-    // A failure here (an already-expired token, the API being down) must not
+-    // stop the browser being signed out; the cookies are cleared regardless.
+-    await backendRequest({ method: 'POST', path: '/auth/logout', accessToken }).catch(
+-      () => undefined,
+-    );
++  // A failure here (the API being down) must not stop the browser being
++  // signed out; the cookies are cleared regardless.
++  const revoke = async (token: string): Promise<'ok' | 'unauthorized' | 'failed'> => {
++    try {
++      await backendRequest({ method: 'POST', path: '/auth/logout', accessToken: token });
++      return 'ok';
++    } catch (error) {
++      return error instanceof ApiError && error.status === 401 ? 'unauthorized' : 'failed';
++    }
++  };
++
++  const outcome = accessToken ? await revoke(accessToken) : 'unauthorized';
++
++  // The access cookie outlives the token inside it (12h vs 15 min), so the
++  // common case is a sign-out that presents an EXPIRED token. The backend can
++  // only revoke the session behind a valid one; ignoring that 401 left the
++  // server session - and its 30-day refresh token - alive after "sign out".
++  // Exchange the refresh token once and revoke with the fresh access token.
++  if (outcome === 'unauthorized' && jar.get(COOKIE.refresh)?.value) {
++    const attempt = await attemptRefresh().catch(() => null);
++    if (attempt?.token) await revoke(attempt.token);
+   }
+ 
+   tryDeleteCookie(jar, COOKIE.access);

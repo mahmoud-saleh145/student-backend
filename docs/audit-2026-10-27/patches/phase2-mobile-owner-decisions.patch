@@ -1,0 +1,1428 @@
+diff --git a/DATA-SAFETY.md b/DATA-SAFETY.md
+index 9a30d3a..78caad8 100755
+--- a/DATA-SAFETY.md
++++ b/DATA-SAFETY.md
+@@ -6,8 +6,13 @@ entry says why, so the form can be filled in without re-deriving it.
+ **Is data encrypted in transit?** Yes. The app refuses cleartext HTTP entirely
+ (`usesCleartextTraffic=false` plus a network security config).
+ 
+-**Can users request deletion?** Yes — by writing to the support address in the
+-privacy policy.
++**Can users request deletion?** Yes — in the app (Settings → Delete account),
++with the current password. Deletion is carried out 30 days later unless the
++user cancels it by signing in; personal data is then erased, and payment,
++wallet and enrolment records are kept without it. The web URL Play asks for is
++`EXPO_PUBLIC_ACCOUNT_DELETION_URL` (it must point at a real page that explains
++these steps before the listing is submitted). Writing to the support address in
++the privacy policy also still works.
+ 
+ ## Collected and linked to the user
+ 
+diff --git a/PRIVACY.md b/PRIVACY.md
+index 1a6de81..03a31bc 100755
+--- a/PRIVACY.md
++++ b/PRIVACY.md
+@@ -75,10 +75,22 @@ for a limited period and then deleted.
+ ## Your choices
+ 
+ You can edit your profile and change your password in the app. Notifications can
+-be turned off in the app or in your phone's settings. To request a copy of your
+-data or ask us to delete your account, write to the address at the top of this
+-policy; we will confirm your identity first, since a deletion request from the
+-wrong person would cost you access you paid for.
++be turned off in the app or in your phone's settings.
++
++You can delete your account in the app under Settings → Delete account. You
++confirm with your password, you are signed out on every device straight away,
++and the deletion is carried out 30 days later. Until then you can cancel it by
++signing in with your phone number and password and choosing "Cancel deletion".
++When the deletion is carried out we erase your name, phone number, email,
++photo, devices, notifications and the messages you wrote to support. We keep
++payment, wallet and enrolment records without those details, because the law
++and our accounting require them. Your wallet balance is shown before you
++confirm. It stays on record but cannot be used while the deletion is pending or
++afterwards; contact us before deleting if you want to ask about it.
++
++To request a copy of your data, or if you cannot use the app, write to the
++address at the top of this policy; we will confirm your identity first, since a
++deletion request from the wrong person would cost you access you paid for.
+ 
+ ## Children
+ 
+diff --git a/__tests__/account-deletion.test.ts b/__tests__/account-deletion.test.ts
+new file mode 100644
+index 0000000..8928d1f
+--- /dev/null
++++ b/__tests__/account-deletion.test.ts
+@@ -0,0 +1,60 @@
++import { readFileSync } from 'node:fs';
++import { join } from 'node:path';
++
++import { Endpoints } from '@/api/endpoints';
++import { toApiError } from '@/api/errors';
++import ar from '@/i18n/locales/ar.json';
++import en from '@/i18n/locales/en.json';
++
++/**
++ * Owner decision D5: in-app account deletion with a 30-day cancellation
++ * period. The paths are read off `AccountDeletionController` in edu-backend.
++ */
++describe('account deletion contract', () => {
++  it('requests and cancels on the routes the API serves', () => {
++    expect(Endpoints.auth.accountDeletion).toBe('/auth/account-deletion');
++    expect(Endpoints.auth.cancelAccountDeletion).toBe('/auth/account-deletion/cancel');
++  });
++
++  it('keeps the pending-deletion refusal precise instead of a flat FORBIDDEN', () => {
++    // 403 would otherwise fall back to FORBIDDEN and the login screen could not
++    // offer "Cancel deletion".
++    const error = toApiError(403, { code: 'ACCOUNT_DELETION_PENDING', message: 'scheduled' });
++    expect(error.code).toBe('ACCOUNT_DELETION_PENDING');
++    expect(error.retryable).toBe(false);
++  });
++
++  it('explains the refusal and the way back in both languages', () => {
++    expect(en.errors.ACCOUNT_DELETION_PENDING).toMatch(/cancel/i);
++    expect(ar.errors.ACCOUNT_DELETION_PENDING).toBeTruthy();
++    for (const bundle of [en, ar]) {
++      expect(bundle.deleteAccount.cancelAction).toBeTruthy();
++      expect(bundle.deleteAccount.scheduledBody).toContain('{{date}}');
++      expect(bundle.deleteAccount.processNote).toMatch(/30/);
++    }
++  });
++
++  it('shows the wallet balance before confirming, without settling a refund policy', () => {
++    for (const bundle of [en, ar]) {
++      expect(bundle.deleteAccount.walletBalance).toContain('{{amount}}');
++      expect(bundle.deleteAccount.confirmBalance).toContain('{{amount}}');
++    }
++    // What happens to a remaining balance is an open owner decision: the app
++    // must neither promise nor rule out a refund.
++    expect(JSON.stringify(en.deleteAccount)).not.toMatch(/refund/i);
++    expect(JSON.stringify(ar.deleteAccount)).not.toMatch(/يُسترد|استرداد/);
++  });
++
++  it('the screen waits for the balance before the delete button works', () => {
++    const source = readFileSync(join(__dirname, '..', 'src', 'app', 'settings', 'delete-account.tsx'), 'utf8');
++    expect(source).toMatch(/useWallet\(\)/);
++    expect(source).toMatch(/disabled=\{busy \|\| !wallet\.data\}/);
++    expect(source).toMatch(/deleteAccount\.confirmBalance/);
++  });
++
++  it('no longer describes deletion as a support ticket', () => {
++    expect(JSON.stringify(en.deleteAccount)).not.toMatch(/ticket/i);
++    expect(en.deleteAccount).not.toHaveProperty('ticketBody');
++    expect(ar.deleteAccount).not.toHaveProperty('ticketBody');
++  });
++});
+diff --git a/__tests__/no-external-checkout.test.ts b/__tests__/no-external-checkout.test.ts
+new file mode 100644
+index 0000000..f874825
+--- /dev/null
++++ b/__tests__/no-external-checkout.test.ts
+@@ -0,0 +1,35 @@
++import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
++import { join } from 'node:path';
++
++/**
++ * Owner decision D4 (Android first, iOS later; no StoreKit, no price hiding).
++ *
++ * The store builds must not sell digital content outside the store's billing.
++ * The one screen that could - `EnrollSheet.tsx`, which opened
++ * `payment.checkoutUrl` in the browser - was never imported and was removed.
++ * This keeps a checkout from coming back unnoticed. The mock API (`src/api/mock`)
++ * is development-only and excluded.
++ */
++
++const SRC = join(__dirname, '..', 'src');
++
++const walk = (dir: string): string[] =>
++  readdirSync(dir).flatMap((entry) => {
++    const full = join(dir, entry);
++    if (statSync(full).isDirectory()) return full.includes(join('src', 'api', 'mock')) ? [] : walk(full);
++    return /\.(ts|tsx)$/.test(full) ? [full] : [];
++  });
++
++describe('no external checkout in the app', () => {
++  it('the removed EnrollSheet stays removed', () => {
++    expect(existsSync(join(SRC, 'features', 'enrollment', 'EnrollSheet.tsx'))).toBe(false);
++  });
++
++  it('no screen opens a payment checkout URL', () => {
++    const offenders = walk(SRC).filter((file) => {
++      if (file.endsWith(join('types', 'domain.ts'))) return false; // the wire type only
++      return /checkoutUrl/.test(readFileSync(file, 'utf8'));
++    });
++    expect(offenders).toEqual([]);
++  });
++});
+diff --git a/__tests__/production-config.test.ts b/__tests__/production-config.test.ts
+index bb793eb..c09788c 100755
+--- a/__tests__/production-config.test.ts
++++ b/__tests__/production-config.test.ts
+@@ -124,8 +124,18 @@ describe('production build guard', () => {
+   });
+ 
+   it('does not apply to non-production variants', () => {
+-    expect(() =>
+-      loadConfig({ EXPO_PUBLIC_ENV: 'staging', APP_VARIANT: 'staging', EXPO_PUBLIC_TERMS_URL: undefined })
+-    ).not.toThrow();
++    // Staging has its own guard (owner decision D7, __tests__/staging-guard.test.ts):
++    // against the production API it needs the acknowledgement its eas.json
++    // profile carries. The production-only requirements below still never apply.
++    const prev = process.env.STAGING_USES_PRODUCTION_API;
++    process.env.STAGING_USES_PRODUCTION_API = 'acknowledged';
++    try {
++      expect(() =>
++        loadConfig({ EXPO_PUBLIC_ENV: 'staging', APP_VARIANT: 'staging', EXPO_PUBLIC_TERMS_URL: undefined })
++      ).not.toThrow();
++    } finally {
++      if (prev === undefined) delete process.env.STAGING_USES_PRODUCTION_API;
++      else process.env.STAGING_USES_PRODUCTION_API = prev;
++    }
+   });
+ });
+diff --git a/__tests__/registration-no-study-type.test.ts b/__tests__/registration-no-study-type.test.ts
+new file mode 100644
+index 0000000..18e8dac
+--- /dev/null
++++ b/__tests__/registration-no-study-type.test.ts
+@@ -0,0 +1,39 @@
++import { registerAcademicSchema, registerSchema } from '@/features/auth/schemas';
++
++/**
++ * Owner decision D1: the registration wizard does not ask the student to pick
++ * GENERAL / PROGRAMS. The academic system is the college's configuration,
++ * resolved by the API from the chosen department (`/catalog/academic-selection`).
++ *
++ * Upstream commits on origin/main (c30964d, 2d6a890, d31f51e) add a required
++ * `studyType` to these schemas. This test is what fails if that is merged in
++ * without a new product decision.
++ */
++describe('registration has no student-chosen study type', () => {
++  it('is absent from both the academic step and the full payload schema', () => {
++    expect(Object.keys(registerAcademicSchema.shape)).not.toContain('studyType');
++    expect(Object.keys(registerSchema.shape)).not.toContain('studyType');
++  });
++
++  it('accepts a complete academic step without one', () => {
++    const parsed = registerAcademicSchema.safeParse({
++      universityId: 'uni_1',
++      facultyId: 'fac_1',
++      departmentId: 'dep_1',
++      academicYearId: 'yr_1',
++      gender: 'FEMALE',
++    });
++    expect(parsed.success).toBe(true);
++  });
++
++  it('still requires every unit the server uses to resolve the system', () => {
++    const parsed = registerAcademicSchema.safeParse({ gender: 'MALE' });
++    expect(parsed.success).toBe(false);
++    if (!parsed.success) {
++      const paths = parsed.error.issues.map((issue) => issue.path[0]);
++      expect(paths).toEqual(
++        expect.arrayContaining(['universityId', 'facultyId', 'departmentId', 'academicYearId']),
++      );
++    }
++  });
++});
+diff --git a/__tests__/staging-guard.test.ts b/__tests__/staging-guard.test.ts
+new file mode 100644
+index 0000000..6d0bdbf
+--- /dev/null
++++ b/__tests__/staging-guard.test.ts
+@@ -0,0 +1,156 @@
++/**
++ * Owner decision D7: there is no staging backend, so the staging profile uses
++ * the production API. That is allowed only when acknowledged, is shown in the
++ * app, and never affects production builds. No staging hostname is invented.
++ */
++import { readFileSync } from 'node:fs';
++import { join } from 'node:path';
++
++import ar from '../src/i18n/locales/ar.json';
++import en from '../src/i18n/locales/en.json';
++import {
++  PRODUCTION_API_HOSTS,
++  STAGING_ACK_VALUE,
++  STAGING_ACK_VARIABLE,
++  stagingBuildProblems,
++  stagingTargetsProduction,
++} from '../src/config/staging-guard';
++
++const PROD_API = 'https://student-backend-814y.onrender.com/api/v1';
++
++type Profile = { extends?: string; env?: Record<string, string> };
++const eas = JSON.parse(readFileSync(join(__dirname, '..', 'eas.json'), 'utf8')) as {
++  build: Record<string, Profile>;
++};
++
++/** A profile's env with `extends` applied, as EAS resolves it. */
++function profileEnv(name: string): Record<string, string> {
++  const profile = eas.build[name];
++  if (!profile) throw new Error(`eas.json has no "${name}" profile`);
++  const parent = profile.extends ? profileEnv(profile.extends) : {};
++  return { ...parent, ...(profile.env ?? {}) };
++}
++
++describe('environment selection per build profile', () => {
++  it('staging is a staging build of its own app id, using the production API', () => {
++    const env = profileEnv('staging');
++    expect(env.APP_VARIANT).toBe('staging');
++    expect(env.EXPO_PUBLIC_ENV).toBe('staging');
++    expect(env.EXPO_PUBLIC_API_URL).toBe(PROD_API);
++    expect(env.EXPO_PUBLIC_USE_MOCKS).toBe('false');
++  });
++
++  it('staging carries the explicit acknowledgement that it uses production data', () => {
++    expect(profileEnv('staging')[STAGING_ACK_VARIABLE]).toBe(STAGING_ACK_VALUE);
++  });
++
++  it('production does not need, and does not carry, the staging acknowledgement', () => {
++    for (const name of ['production', 'production:apk']) {
++      const env = profileEnv(name);
++      expect(env.EXPO_PUBLIC_ENV).toBe('production');
++      expect(env.EXPO_PUBLIC_API_URL).toBe(PROD_API);
++      expect(env[STAGING_ACK_VARIABLE]).toBeUndefined();
++    }
++  });
++
++  it('points every release profile at a real host: production, never an invented staging one', () => {
++    for (const [name] of Object.entries(eas.build)) {
++      const url = profileEnv(name).EXPO_PUBLIC_API_URL;
++      if (!url) continue;
++      const host = new URL(url).hostname;
++      // Development builds use the emulator's view of a laptop.
++      expect([...PRODUCTION_API_HOSTS, '10.0.2.2']).toContain(host);
++      expect(host).not.toMatch(/staging|stg/i);
++    }
++  });
++});
++
++describe('the staging build guard', () => {
++  const staging = (overrides: Record<string, string | undefined> = {}) => ({
++    EXPO_PUBLIC_ENV: 'staging',
++    EXPO_PUBLIC_API_URL: PROD_API,
++    EXPO_PUBLIC_USE_MOCKS: 'false',
++    [STAGING_ACK_VARIABLE]: STAGING_ACK_VALUE,
++    ...overrides,
++  });
++
++  it('passes the real staging profile', () => {
++    expect(stagingBuildProblems(profileEnv('staging'))).toEqual([]);
++  });
++
++  it('refuses production data without the acknowledgement', () => {
++    const problems = stagingBuildProblems(staging({ [STAGING_ACK_VARIABLE]: undefined }));
++    expect(problems.join('\n')).toMatch(/PRODUCTION API/);
++  });
++
++  it.each([
++    ['plain http', 'http://student-backend-814y.onrender.com/api/v1'],
++    ['a laptop', 'http://10.0.2.2:3000/api/v1'],
++    ['a placeholder', 'https://api.example.com/api/v1'],
++    ['nothing', undefined],
++  ])('refuses %s as the staging API', (_name, url) => {
++    expect(stagingBuildProblems(staging({ EXPO_PUBLIC_API_URL: url }))).not.toEqual([]);
++  });
++
++  it('accepts a future real staging API without any acknowledgement', () => {
++    // Illustrative only: no such host is configured anywhere.
++    expect(
++      stagingBuildProblems(staging({ EXPO_PUBLIC_API_URL: 'https://api.staging.invalid/api/v1', [STAGING_ACK_VARIABLE]: undefined })),
++    ).toEqual([]);
++  });
++
++  it('never applies to production or development builds', () => {
++    expect(stagingBuildProblems({ ...profileEnv('production') })).toEqual([]);
++    expect(stagingBuildProblems({ ...profileEnv('development') })).toEqual([]);
++  });
++});
++
++describe('app.config.ts enforces the same rule on the build worker', () => {
++  const KEYS = ['EXPO_PUBLIC_ENV', 'APP_VARIANT', 'EAS_BUILD', 'EXPO_PUBLIC_API_URL', 'EXPO_PUBLIC_USE_MOCKS', STAGING_ACK_VARIABLE];
++  const saved: Record<string, string | undefined> = {};
++  beforeEach(() => KEYS.forEach((k) => (saved[k] = process.env[k])));
++  afterEach(() =>
++    KEYS.forEach((k) => (saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]))),
++  );
++
++  function load(env: Record<string, string | undefined>) {
++    for (const k of KEYS) {
++      if (env[k] === undefined) delete process.env[k];
++      else process.env[k] = env[k];
++    }
++    let mod: { default: (ctx: { config: object }) => { name: string } } | undefined;
++    jest.isolateModules(() => {
++      // eslint-disable-next-line @typescript-eslint/no-require-imports
++      mod = require('../app.config');
++    });
++    return mod!.default({ config: {} });
++  }
++
++  it('builds the acknowledged staging profile', () => {
++    expect(load({ ...profileEnv('staging'), EAS_BUILD: 'true' }).name).toBe('EduPlatform (Stg)');
++  });
++
++  it('refuses a staging build on the worker without the acknowledgement', () => {
++    expect(() => load({ ...profileEnv('staging'), EAS_BUILD: 'true', [STAGING_ACK_VARIABLE]: undefined })).toThrow(
++      /Staging build refused[\s\S]*PRODUCTION API/,
++    );
++  });
++
++  it('does not block local tooling that only reads the config', () => {
++    expect(() => load({ ...profileEnv('staging'), EAS_BUILD: undefined, [STAGING_ACK_VARIABLE]: undefined })).not.toThrow();
++  });
++});
++
++describe('the running staging app says it is on production data', () => {
++  it('flags only a staging build that targets the production API', () => {
++    expect(stagingTargetsProduction('staging', PROD_API)).toBe(true);
++    expect(stagingTargetsProduction('production', PROD_API)).toBe(false);
++    expect(stagingTargetsProduction('development', 'http://10.0.2.2:3000/api/v1')).toBe(false);
++    expect(stagingTargetsProduction('staging', 'https://api.staging.invalid/api/v1')).toBe(false);
++  });
++
++  it('has the badge text in both languages', () => {
++    expect(en.staging.productionApiBadge).toMatch(/PRODUCTION/);
++    expect(ar.staging.productionApiBadge).toBeTruthy();
++  });
++});
+diff --git a/__tests__/wallet-scope.test.ts b/__tests__/wallet-scope.test.ts
+index 6aa7ce3..60904ed 100755
+--- a/__tests__/wallet-scope.test.ts
++++ b/__tests__/wallet-scope.test.ts
+@@ -27,7 +27,9 @@ const COURSE_SIDE = [
+   'features/course-parts/api.ts',
+   'features/course-parts/hooks.ts',
+   'features/course-parts/PartsPanel.tsx',
+-  'features/enrollment/EnrollSheet.tsx',
++  // EnrollSheet.tsx (external checkout, never imported) was removed under
++  // owner decision D4; JoinSheet is the course-joining surface.
++  'features/enrollment/JoinSheet.tsx',
+ ];
+ 
+ const read = (rel: string) => readFileSync(join(SRC, rel), 'utf8');
+diff --git a/app.config.ts b/app.config.ts
+index 00c9ff0..5065485 100755
+--- a/app.config.ts
++++ b/app.config.ts
+@@ -122,6 +122,63 @@ function assertProductionEnv() {
+ 
+ assertProductionEnv();
+ 
++/**
++ * Owner decision D7: no staging backend exists, so the staging profile uses
++ * the production API. A staging build is refused unless that is acknowledged
++ * in its profile, and is refused outright against a local or placeholder host.
++ * Same scope as the production check: only on the EAS build worker, so local
++ * tooling that merely reads the config is never blocked.
++ */
++function assertStagingEnv() {
++  if (process.env.EXPO_PUBLIC_ENV !== 'staging') return;
++  if (process.env.EAS_BUILD !== 'true') return;
++  const problems = stagingBuildProblems(process.env);
++  if (problems.length > 0) {
++    throw new Error(
++      'Staging build refused:\n' + problems.map((p) => `  • ${p}`).join('\n')
++    );
++  }
++}
++
++/**
++ * Kept in this file on purpose: Expo evaluates app.config.ts on its own, and a
++ * TypeScript import from here is not guaranteed to load on every build worker.
++ * `src/config/staging-guard.ts` holds the same rule for the running app, and
++ * __tests__/staging-guard.test.ts checks that the two agree.
++ */
++const PRODUCTION_API_HOSTS = ['student-backend-814y.onrender.com'];
++
++function stagingBuildProblems(env: NodeJS.ProcessEnv): string[] {
++  const problems: string[] = [];
++  const apiUrl = env.EXPO_PUBLIC_API_URL ?? '';
++  let host = '';
++  try {
++    host = new URL(apiUrl).hostname.toLowerCase();
++  } catch {
++    return ['EXPO_PUBLIC_API_URL is missing or not a valid URL'];
++  }
++  if (!/^https:/i.test(apiUrl)) problems.push('EXPO_PUBLIC_API_URL must use https://');
++  if (
++    /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|0\.0\.0\.0)/.test(host) ||
++    /(^|\.)example\.(com|org|net)$/.test(host)
++  ) {
++    problems.push(`EXPO_PUBLIC_API_URL points at a local or placeholder host (${host})`);
++  }
++  if (env.EXPO_PUBLIC_USE_MOCKS === 'true') {
++    problems.push('EXPO_PUBLIC_USE_MOCKS must not be true in a staging build');
++  }
++  if (PRODUCTION_API_HOSTS.includes(host) && env.STAGING_USES_PRODUCTION_API !== 'acknowledged') {
++    problems.push(
++      `this staging build would use the PRODUCTION API (${host}) and real student data. ` +
++        'Set STAGING_USES_PRODUCTION_API=acknowledged in the staging profile to accept that ' +
++        '(no staging backend exists yet - see OWNER_DECISIONS D7).'
++    );
++  }
++  return problems;
++}
++
++assertStagingEnv();
++
+ const NAME: Record<Variant, string> = {
+   development: 'EduPlatform (Dev)',
+   staging: 'EduPlatform (Stg)',
+diff --git a/docs/MANUAL_STEPS.md b/docs/MANUAL_STEPS.md
+index 88f78b5..ecb3216 100755
+--- a/docs/MANUAL_STEPS.md
++++ b/docs/MANUAL_STEPS.md
+@@ -454,10 +454,11 @@ eas submit -p ios --latest
+ 
+ These are product decisions, not missing code:
+ 
+-1. **Payment provider.** `EnrollSheet` opens `payment.checkoutUrl` in the
+-   external browser (so card data never touches the app and the student sees
+-   the provider's TLS indicator). Wire Paymob / Fawry / Stripe on the backend
+-   and return the URL.
++1. **Payment provider.** The app has no in-app checkout. The unused
++   `EnrollSheet` (which opened `payment.checkoutUrl` in the external browser)
++   was removed under owner decision D4: selling digital content inside a store
++   build needs the store's billing (Google Play Billing / StoreKit), which is a
++   separate product decision. Courses are unlocked with access cards.
+ 2. **Terms / privacy / content-policy URLs.** Currently the About screen routes
+    these to email. Replace with real URLs once they exist.
+ 3. **Course thumbnails.** The domain model has `thumbnailUrl`; the mock data
+diff --git a/eas.json b/eas.json
+index 4ff20d5..9bb64b5 100755
+--- a/eas.json
++++ b/eas.json
+@@ -43,7 +43,8 @@
+         "APP_VARIANT": "staging",
+         "EXPO_PUBLIC_ENV": "staging",
+         "EXPO_PUBLIC_USE_MOCKS": "false",
+-        "EXPO_PUBLIC_API_URL": "https://student-backend-814y.onrender.com/api/v1"
++        "EXPO_PUBLIC_API_URL": "https://student-backend-814y.onrender.com/api/v1",
++        "STAGING_USES_PRODUCTION_API": "acknowledged"
+       },
+       "android": {
+         "buildType": "apk"
+diff --git a/release/GOOGLE_PLAY.md b/release/GOOGLE_PLAY.md
+index e3953b4..3e54034 100755
+--- a/release/GOOGLE_PLAY.md
++++ b/release/GOOGLE_PLAY.md
+@@ -92,9 +92,12 @@ Play's Payments policy requires Google Play Billing for digital content sold
+ **inside** the app. Keep the app from selling or linking to payment:
+ 
+ - `PAYMENT_PROVIDER` on Render must stay `none`.
+-- No published course may list `PAYMENT` in `enrollmentMethods` (it opens an
+-  external checkout from `EnrollSheet.tsx`). Read-only check, run where the
+-  database is reachable:
++- No published course should list `PAYMENT` in `enrollmentMethods`. The app no
++  longer contains any checkout UI (the unused `EnrollSheet.tsx`, which opened an
++  external checkout, was removed under owner decision D4, and
++  `__tests__/no-external-checkout.test.ts` keeps it that way), so such a course
++  would only show as not joinable. Read-only check, run where the database is
++  reachable:
+   ```sql
+   SELECT id, title, status FROM courses
+   WHERE 'PAYMENT' = ANY("enrollmentMethods") AND "deletedAt" IS NULL;
+diff --git a/src/api/endpoints.ts b/src/api/endpoints.ts
+index 263616b..b32abeb 100755
+--- a/src/api/endpoints.ts
++++ b/src/api/endpoints.ts
+@@ -18,6 +18,10 @@ export const Endpoints = {
+      * category. /profile is profile data only.
+      */
+     changePassword: '/auth/password',
++    /** In-app account deletion (30-day cancellation period). */
++    accountDeletion: '/auth/account-deletion',
++    /** Public: the sessions are revoked once deletion is requested. */
++    cancelAccountDeletion: '/auth/account-deletion/cancel',
+   },
+ 
+   catalog: {
+diff --git a/src/api/errors.ts b/src/api/errors.ts
+index be3bdba..b265404 100755
+--- a/src/api/errors.ts
++++ b/src/api/errors.ts
+@@ -99,7 +99,7 @@ const STATUS_FALLBACK: Record<number, ApiErrorCode> = {
+ const KNOWN_CODES = new Set<string>([
+   'NETWORK_OFFLINE','NETWORK_TIMEOUT','SERVER_ERROR','UNKNOWN','VALIDATION_ERROR',
+   'RATE_LIMITED','MAINTENANCE','APP_UPDATE_REQUIRED','INVALID_CREDENTIALS',
+-  'UNAUTHORIZED','SESSION_EXPIRED','ACCOUNT_DISABLED','ACCOUNT_PENDING',
++  'UNAUTHORIZED','SESSION_EXPIRED','ACCOUNT_DISABLED','ACCOUNT_PENDING','ACCOUNT_DELETION_PENDING',
+   'PHONE_ALREADY_REGISTERED','DEVICE_NOT_AUTHORIZED','DEVICE_LIMIT_REACHED',
+   'DEVICE_CHANGE_PENDING','DEVICE_INTEGRITY_FAILED','FORBIDDEN','NOT_FOUND',
+   'COURSE_NOT_AVAILABLE','COURSE_ARCHIVED','ACCESS_EXPIRED','NOT_ENROLLED','COURSE_NOT_TARGETED',
+diff --git a/src/app/(auth)/login.tsx b/src/app/(auth)/login.tsx
+index 55375ea..0b4ae3c 100755
+--- a/src/app/(auth)/login.tsx
++++ b/src/app/(auth)/login.tsx
+@@ -10,6 +10,7 @@ import { InlineError } from '@/components/ui/ErrorState';
+ import { Input, PasswordInput } from '@/components/ui/Input';
+ import { Screen } from '@/components/ui/Screen';
+ import { Text } from '@/components/ui/Text';
++import { authApi } from '@/features/auth/api';
+ import { useAuth } from '@/features/auth/AuthProvider';
+ import { type LoginInput, loginSchema } from '@/features/auth/schemas';
+ import { useFormErrors, messageParams } from '@/hooks/use-form-errors';
+@@ -27,10 +28,14 @@ export default function LoginScreen() {
+     lastSessionError ?? null
+   );
+ 
++  const [cancelling, setCancelling] = React.useState(false);
++  const [notice, setNotice] = React.useState<string | null>(null);
++
+   const {
+     control,
+     handleSubmit,
+     setError,
++    getValues,
+     formState: { errors, isSubmitting },
+   } = useForm<LoginInput>({
+     resolver: zodResolver(loginSchema),
+@@ -40,6 +45,7 @@ export default function LoginScreen() {
+ 
+   const onSubmit = handleSubmit(async (values) => {
+     setFormError(null);
++    setNotice(null);
+     clearSessionError();
+ 
+     try {
+@@ -53,6 +59,29 @@ export default function LoginScreen() {
+     }
+   });
+ 
++  /**
++   * Owner decision D5: an account with a pending deletion cannot sign in, but
++   * the same phone + password can cancel the deletion, and then sign in.
++   */
++  const cancelDeletion = async () => {
++    setCancelling(true);
++    try {
++      const credentials = loginSchema.parse(getValues());
++      await authApi.cancelAccountDeletion(credentials);
++      setFormError(null);
++      setNotice(t('deleteAccount.cancelled'));
++      await login(credentials);
++      router.replace('/(tabs)');
++    } catch (e) {
++      const apiError = asApiError(e);
++      // Past its 30 days (or being erased): only support can help now.
++      if (apiError.code === 'INVALID_STATE') setNotice(t('deleteAccount.cancelTooLate'));
++      else setFormError(apiError);
++    } finally {
++      setCancelling(false);
++    }
++  };
++
+   return (
+     /*
+      * The front door sits on the mark's own plate, in both themes — it
+@@ -84,11 +113,27 @@ export default function LoginScreen() {
+       </View>
+ 
+       {formError ? (
+-        <View className="mb-4">
++        <View className="mb-4 gap-3">
+           <InlineError error={formError} onPlate />
++          {formError.code === 'ACCOUNT_DELETION_PENDING' ? (
++            <Button
++              label={t('deleteAccount.cancelAction')}
++              onPress={() => void cancelDeletion()}
++              loading={cancelling}
++              disabled={cancelling || isSubmitting}
++              variant="onPlate"
++              fullWidth
++            />
++          ) : null}
+         </View>
+       ) : null}
+ 
++      {notice ? (
++        <Text variant="label" className="mb-4 text-center text-brand-900">
++          {notice}
++        </Text>
++      ) : null}
++
+       <View className="gap-4">
+         <Controller
+           control={control}
+diff --git a/src/app/_layout.tsx b/src/app/_layout.tsx
+index 4f21f15..02a2729 100755
+--- a/src/app/_layout.tsx
++++ b/src/app/_layout.tsx
+@@ -14,6 +14,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
+ import { bootstrapQueryManagers, persistOptions, queryClient } from '@/api/query-client';
+ import { ErrorBoundary } from '@/components/feedback/ErrorBoundary';
+ import { PrivacyShield } from '@/components/feedback/PrivacyShield';
++import { StagingBanner } from '@/components/feedback/StagingBanner';
+ import { ToastHost } from '@/components/feedback/ToastHost';
+ import { env } from '@/config/env';
+ import { AuthProvider, useAuth } from '@/features/auth/AuthProvider';
+@@ -86,6 +87,8 @@ export default function RootLayout() {
+                 <NotificationRouter />
+                 <RootNavigator />
+                 <ToastHost />
++                {/* D7: staging builds use the production API; always say so. */}
++                <StagingBanner />
+                 {/* Rendered last so it paints above every navigator layer. */}
+                 <PrivacyShield />
+               </AuthProvider>
+diff --git a/src/app/settings/delete-account.tsx b/src/app/settings/delete-account.tsx
+index 484418b..fdc2835 100755
+--- a/src/app/settings/delete-account.tsx
++++ b/src/app/settings/delete-account.tsx
+@@ -2,62 +2,100 @@ import { useRouter } from 'expo-router';
+ import * as React from 'react';
+ import { Alert, View } from 'react-native';
+ 
++import { asApiError, type ApiError } from '@/api/errors';
+ import { AppBar } from '@/components/layout/AppBar';
+ import { Button } from '@/components/ui/Button';
+ import { Card, CardBody } from '@/components/ui/Card';
+ import { InlineError } from '@/components/ui/ErrorState';
++import { PasswordInput } from '@/components/ui/Input';
+ import { Screen } from '@/components/ui/Screen';
+ import { Text } from '@/components/ui/Text';
+ import { env } from '@/config/env';
++import { authApi } from '@/features/auth/api';
+ import { useAuth } from '@/features/auth/AuthProvider';
+-import { useCreateTicket } from '@/features/support/hooks';
++import { useWallet } from '@/features/wallet/hooks';
+ import { useTranslation } from '@/hooks/use-translation';
+ import { support } from '@/services/support';
++import { formatDate, formatMoney } from '@/utils/format';
+ 
+ /**
+- * Account deletion request.
++ * In-app account deletion (owner decision D5; Google Play's account-deletion
++ * requirement).
+  *
+- * Both stores require that an app which lets people create an account also
+- * lets them start deleting it from inside the app. The backend has no
+- * self-service deletion endpoint (deletion is an admin action on
+- * `DELETE /admin/users/:id`), so the request is filed through the existing,
+- * authenticated support-ticket API — the same channel admins already work
+- * from — and the student gets a tracked reference instead of an email
+- * address. Nothing is deleted on the device beyond what logout already does.
++ * `POST /auth/account-deletion` with the current password schedules the
++ * deletion 30 days out and revokes every session server-side in the same call.
++ * The student is then told the date and signed out locally. Signing in during
++ * the 30 days is refused with ACCOUNT_DELETION_PENDING, and the login screen
++ * offers "Cancel deletion" (`POST /auth/account-deletion/cancel`).
++ *
++ * After 30 days the server erases the personal data and keeps the payment,
++ * wallet and enrolment records without it - the "What we keep" card says so.
++ *
++ * The current wallet balance is shown, and repeated in the confirmation,
++ * before anything is sent. What happens to a remaining balance is an owner
++ * policy that has not been decided, so the text states only facts: the
++ * balance stays on record and cannot be used while deletion is pending or
++ * afterwards, and the student is pointed to support. The button stays
++ * disabled until the balance has loaded.
+  */
+ export default function DeleteAccountScreen() {
+-  const { t } = useTranslation();
++  const { t, language } = useTranslation();
+   const router = useRouter();
+-  const { user } = useAuth();
+-  const create = useCreateTicket();
++  const { logout } = useAuth();
++  const wallet = useWallet();
++  const balance = wallet.data
++    ? formatMoney({ amount: wallet.data.balance, currency: wallet.data.currency }, language)
++    : null;
++  const hasBalance = (wallet.data?.balance ?? 0) > 0;
++
++  const [password, setPassword] = React.useState('');
++  const [fieldError, setFieldError] = React.useState<string | undefined>();
++  const [error, setError] = React.useState<ApiError | null>(null);
++  const [busy, setBusy] = React.useState(false);
++
++  const send = async () => {
++    setBusy(true);
++    setError(null);
++    try {
++      const request = await authApi.requestAccountDeletion(password);
++      setPassword('');
++      // The server has already ended every session; this clears the device.
++      await logout();
++      Alert.alert(
++        t('deleteAccount.scheduledTitle'),
++        t('deleteAccount.scheduledBody', { date: formatDate(request.scheduledFor, language) })
++      );
++      router.replace('/(auth)/login');
++    } catch (e) {
++      const apiError = asApiError(e);
++      if (apiError.code === 'INVALID_CREDENTIALS') {
++        setFieldError(t('errors.INVALID_CREDENTIALS'));
++      } else {
++        setError(apiError);
++      }
++    } finally {
++      setBusy(false);
++    }
++  };
+ 
+   const submit = () => {
+-    Alert.alert(t('deleteAccount.confirmTitle'), t('deleteAccount.confirmBody'), [
++    setFieldError(undefined);
++    if (!password) {
++      setFieldError(t('deleteAccount.passwordRequired'));
++      return;
++    }
++    if (!wallet.data) return;
++    const confirmBody = hasBalance
++      ? `${t('deleteAccount.confirmBody')}\n\n${t('deleteAccount.confirmBalance', { amount: balance ?? '' })}`
++      : t('deleteAccount.confirmBody');
++    Alert.alert(t('deleteAccount.confirmTitle'), confirmBody, [
+       { text: t('common.cancel'), style: 'cancel' },
+-      {
+-        text: t('deleteAccount.confirm'),
+-        style: 'destructive',
+-        onPress: async () => {
+-          try {
+-            const ticket = await create.mutateAsync({
+-              subject: t('deleteAccount.ticketSubject'),
+-              body: t('deleteAccount.ticketBody', {
+-                name: user?.fullName ?? '',
+-                phone: user?.phone ?? '',
+-              }),
+-              category: 'GENERAL',
+-            });
+-            router.replace(`/support/${ticket.id}`);
+-          } catch {
+-            // Rendered from the mutation state below.
+-          }
+-        },
+-      },
++      { text: t('deleteAccount.confirm'), style: 'destructive', onPress: () => void send() },
+     ]);
+   };
+ 
+   return (
+-    <Screen edges={['top']} padded={false} scroll>
++    <Screen edges={['top']} padded={false} scroll keyboardAvoiding>
+       <AppBar title={t('deleteAccount.title')} showBack />
+ 
+       <View className="gap-4 px-4 pb-10 pt-3">
+@@ -70,18 +108,65 @@ export default function DeleteAccountScreen() {
+           </CardBody>
+         </Card>
+ 
++        <Card>
++          <CardBody className="gap-2">
++            <Text variant="label">{t('deleteAccount.keptTitle')}</Text>
++            <Text variant="caption" tone="muted">
++              {t('deleteAccount.keptBody')}
++            </Text>
++          </CardBody>
++        </Card>
++
++        <Card>
++          <CardBody className="gap-2">
++            <Text variant="label">{t('deleteAccount.walletTitle')}</Text>
++            {wallet.isPending ? (
++              <Text variant="caption" tone="muted">
++                {t('deleteAccount.walletLoading')}
++              </Text>
++            ) : wallet.isError ? (
++              <>
++                <Text variant="caption" tone="muted">
++                  {t('deleteAccount.walletLoadFailed')}
++                </Text>
++                <Button label={t('common.retry')} variant="link" onPress={() => void wallet.refetch()} />
++              </>
++            ) : (
++              <>
++                <Text variant="body">{t('deleteAccount.walletBalance', { amount: balance ?? '' })}</Text>
++                <Text variant="caption" tone="muted">
++                  {hasBalance ? t('deleteAccount.walletNote') : t('deleteAccount.walletZero')}
++                </Text>
++              </>
++            )}
++          </CardBody>
++        </Card>
++
+         <Text variant="caption" tone="muted">
+           {t('deleteAccount.processNote')}
+         </Text>
+ 
+-        {create.isError ? <InlineError error={create.error} /> : null}
++        <PasswordInput
++          label={t('deleteAccount.passwordLabel')}
++          value={password}
++          onChangeText={(value) => {
++            setPassword(value);
++            if (fieldError) setFieldError(undefined);
++          }}
++          error={fieldError}
++          required
++          returnKeyType="done"
++          onSubmitEditing={submit}
++        />
++
++        {error ? <InlineError error={error} /> : null}
+ 
+         <Button
+           label={t('deleteAccount.submit')}
+           variant="danger"
+           iconStart="trash"
+-          loading={create.isPending}
+-          disabled={create.isPending}
++          loading={busy}
++          disabled={busy || !wallet.data}
+           onPress={submit}
+           fullWidth
+         />
+diff --git a/src/components/feedback/StagingBanner.tsx b/src/components/feedback/StagingBanner.tsx
+new file mode 100644
+index 0000000..0fc9bbe
+--- /dev/null
++++ b/src/components/feedback/StagingBanner.tsx
+@@ -0,0 +1,34 @@
++import * as React from 'react';
++import { View } from 'react-native';
++import { useSafeAreaInsets } from 'react-native-safe-area-context';
++
++import { stagingUsesProductionApi } from '@/config/env';
++import { useTranslation } from '@/hooks/use-translation';
++
++import { Text } from '../ui/Text';
++
++/**
++ * Owner decision D7: a staging build uses the PRODUCTION API, because no
++ * staging backend exists. Anyone testing it is working with real students'
++ * data, so the build says so on every screen. It never renders in a
++ * production or development build, and it does not take touches.
++ */
++export function StagingBanner() {
++  const insets = useSafeAreaInsets();
++  const { t } = useTranslation();
++  if (!stagingUsesProductionApi) return null;
++
++  return (
++    <View
++      pointerEvents="none"
++      accessibilityRole="text"
++      style={{ position: 'absolute', top: insets.top, left: 0, right: 0, alignItems: 'center', zIndex: 1000 }}
++    >
++      <View className="rounded-b-md bg-danger-600 px-3 py-0.5">
++        <Text variant="caption" className="text-white">
++          {t('staging.productionApiBadge')}
++        </Text>
++      </View>
++    </View>
++  );
++}
+diff --git a/src/config/env.ts b/src/config/env.ts
+index 7324bb3..7c94944 100755
+--- a/src/config/env.ts
++++ b/src/config/env.ts
+@@ -1,6 +1,8 @@
+ import Constants from 'expo-constants';
+ import { z } from 'zod';
+ 
++import { stagingTargetsProduction } from './staging-guard';
++
+ /**
+  * Environment configuration.
+  *
+@@ -138,6 +140,12 @@ export const env = read();
+ export const isDev = env.env === 'development';
+ export const isProd = env.env === 'production';
+ 
++/**
++ * Owner decision D7: a staging build talking to the production API (there is
++ * no staging backend). Drives the permanent badge in the root layout.
++ */
++export const stagingUsesProductionApi = stagingTargetsProduction(env.env, env.apiUrl);
++
+ /**
+  * Mocks are only ever allowed outside production, no matter what the env
+  * variable says — this prevents a misconfigured store build from silently
+diff --git a/src/config/staging-guard.ts b/src/config/staging-guard.ts
+new file mode 100644
+index 0000000..b8ed993
+--- /dev/null
++++ b/src/config/staging-guard.ts
+@@ -0,0 +1,75 @@
++/**
++ * Owner decision D7: there is no staging backend. The `staging` build profile
++ * points at the PRODUCTION API, so a staging build reads and writes real
++ * students' data.
++ *
++ * Until a real staging API exists this is allowed, but never silently:
++ *  - an EAS staging build is refused unless its profile carries the explicit
++ *    acknowledgement (`STAGING_USES_PRODUCTION_API=acknowledged`, eas.json);
++ *  - the running staging app shows a permanent "production data" badge.
++ *
++ * Production builds are not affected by anything here.
++ *
++ * The production host is listed, not guessed: it is the API every store build
++ * uses (eas.json `production`). No staging hostname is invented - when a real
++ * staging API exists, point the staging profile at it and this guard goes
++ * quiet on its own.
++ */
++
++/** API hosts that serve real students. */
++export const PRODUCTION_API_HOSTS: readonly string[] = ['student-backend-814y.onrender.com'];
++
++export const STAGING_ACK_VARIABLE = 'STAGING_USES_PRODUCTION_API';
++export const STAGING_ACK_VALUE = 'acknowledged';
++
++export function apiHost(apiUrl: string | undefined): string | null {
++  if (!apiUrl) return null;
++  try {
++    return new URL(apiUrl).hostname.toLowerCase();
++  } catch {
++    return null;
++  }
++}
++
++export function isProductionApi(apiUrl: string | undefined): boolean {
++  const host = apiHost(apiUrl);
++  return host !== null && PRODUCTION_API_HOSTS.includes(host);
++}
++
++/** True for a staging build that talks to the production API. */
++export function stagingTargetsProduction(envName: string | undefined, apiUrl: string | undefined): boolean {
++  return envName === 'staging' && isProductionApi(apiUrl);
++}
++
++/**
++ * Problems that must stop a staging build. Empty for every non-staging build.
++ */
++export function stagingBuildProblems(env: Record<string, string | undefined>): string[] {
++  if (env.EXPO_PUBLIC_ENV !== 'staging') return [];
++  const problems: string[] = [];
++  const apiUrl = env.EXPO_PUBLIC_API_URL;
++  const host = apiHost(apiUrl);
++
++  if (!host) {
++    problems.push('EXPO_PUBLIC_API_URL is missing or not a valid URL');
++    return problems;
++  }
++  if (!/^https:/i.test(apiUrl ?? '')) problems.push('EXPO_PUBLIC_API_URL must use https://');
++  if (
++    /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|0\.0\.0\.0)/.test(host) ||
++    /(^|\.)example\.(com|org|net)$/.test(host)
++  ) {
++    problems.push(`EXPO_PUBLIC_API_URL points at a local or placeholder host (${host})`);
++  }
++  if (env.EXPO_PUBLIC_USE_MOCKS === 'true') {
++    problems.push('EXPO_PUBLIC_USE_MOCKS must not be true in a staging build');
++  }
++  if (isProductionApi(apiUrl) && env[STAGING_ACK_VARIABLE] !== STAGING_ACK_VALUE) {
++    problems.push(
++      `this staging build would use the PRODUCTION API (${host}) and real student data. ` +
++        `Set ${STAGING_ACK_VARIABLE}=${STAGING_ACK_VALUE} in the staging profile to accept that ` +
++        '(no staging backend exists yet - see OWNER_DECISIONS D7).',
++    );
++  }
++  return problems;
++}
+diff --git a/src/features/auth/api.ts b/src/features/auth/api.ts
+index e68cdfc..ea413f2 100755
+--- a/src/features/auth/api.ts
++++ b/src/features/auth/api.ts
+@@ -76,6 +76,15 @@ export interface RegisterPayload {
+   gender: 'MALE' | 'FEMALE';
+ }
+ 
++/** The server's view of a deletion request (`POST /auth/account-deletion`). */
++export interface AccountDeletionRequest {
++  id: string;
++  status: 'PENDING' | 'PROCESSING' | 'CANCELLED' | 'COMPLETED';
++  requestedAt: string;
++  scheduledFor: string;
++  cancellable: boolean;
++}
++
+ export const authApi = {
+   login: (payload: LoginPayload) =>
+     api.post<AuthResponse>(Endpoints.auth.login, payload, { anonymous: true }),
+@@ -88,6 +97,21 @@ export const authApi = {
+     api.post<{ ok: boolean }>(Endpoints.auth.logout, {}, { retries: 0 }),
+ 
+   me: () => api.get<User>(Endpoints.auth.me),
++
++  /**
++   * Schedules deletion of the signed-in account. The server revokes every
++   * session in the same call, so the caller tears the local session down next.
++   */
++  requestAccountDeletion: (password: string) =>
++    api.post<AccountDeletionRequest>(Endpoints.auth.accountDeletion, { password }, { retries: 0 }),
++
++  /** Phone + password, exactly like sign-in; no session exists at this point. */
++  cancelAccountDeletion: (payload: LoginPayload) =>
++    api.post<{ cancelled: true; requestId: string }>(
++      Endpoints.auth.cancelAccountDeletion,
++      payload,
++      { anonymous: true, retries: 0 }
++    ),
+ };
+ 
+ export const catalogApi = {
+diff --git a/src/features/enrollment/EnrollSheet.tsx b/src/features/enrollment/EnrollSheet.tsx
+deleted file mode 100755
+index e77c45f..0000000
+--- a/src/features/enrollment/EnrollSheet.tsx
++++ /dev/null
+@@ -1,233 +0,0 @@
+-import { zodResolver } from '@hookform/resolvers/zod';
+-import * as Linking from 'expo-linking';
+-import * as React from 'react';
+-import { Controller, useForm } from 'react-hook-form';
+-import { Pressable, View } from 'react-native';
+-
+-import { asApiError } from '@/api/errors';
+-import { Button } from '@/components/ui/Button';
+-import { InlineError } from '@/components/ui/ErrorState';
+-import { Icon, type IconName } from '@/components/ui/Icon';
+-import { Input } from '@/components/ui/Input';
+-import { Sheet } from '@/components/ui/Sheet';
+-import { Text } from '@/components/ui/Text';
+-import { accessCodeSchema } from '@/features/auth/schemas';
+-import { useEnroll, useRedeemCode } from '@/features/courses/hooks';
+-import { useFormErrors } from '@/hooks/use-form-errors';
+-import { useTheme } from '@/hooks/use-theme';
+-import { useTranslation } from '@/hooks/use-translation';
+-import { MIN_TOUCH_TARGET } from '@/theme/tokens';
+-import type { CourseDetail, EnrollmentMethod } from '@/types/domain';
+-import { formatMoney } from '@/utils/format';
+-import { cn } from '@/utils/cn';
+-
+-const METHOD_META: Record<
+-  EnrollmentMethod,
+-  { icon: IconName; titleKey: string; bodyKey: string }
+-> = {
+-  FREE: { icon: 'checkCircle', titleKey: 'access.methodFree', bodyKey: 'access.methodFreeBody' },
+-  PAYMENT: { icon: 'price', titleKey: 'access.methodPayment', bodyKey: 'access.methodPaymentBody' },
+-  CODE: { icon: 'code', titleKey: 'access.methodCode', bodyKey: 'access.methodCodeBody' },
+-  ADMIN_APPROVAL: {
+-    icon: 'shield',
+-    titleKey: 'access.methodApproval',
+-    bodyKey: 'access.methodApprovalBody',
+-  },
+-};
+-
+-export interface EnrollSheetProps {
+-  course: CourseDetail;
+-  visible: boolean;
+-  onClose: () => void;
+-}
+-
+-/**
+- * Join / enroll flow.
+- *
+- * Browsing and joining are separate states by design (spec §23): opening a
+- * course never grants access. This sheet is the only path from
+- * NOT_ENROLLED to anything else, and it renders exactly the methods the
+- * backend says are available for this course — it never invents a payment
+- * option or assumes a course is free.
+- */
+-export function EnrollSheet({ course, visible, onClose }: EnrollSheetProps) {
+-  const { t, language } = useTranslation();
+-  const { colors } = useTheme();
+-
+-  const methods = course.access.availableMethods;
+-  const [selected, setSelected] = React.useState<EnrollmentMethod | null>(
+-    methods.length === 1 ? (methods[0] ?? null) : null
+-  );
+-
+-  const enroll = useEnroll(course.id);
+-  const redeem = useRedeemCode(course.id);
+-  const { translate, applyServerErrors } = useFormErrors<{ code: string }>();
+-
+-  const codeForm = useForm<{ code: string }>({
+-    resolver: zodResolver(accessCodeSchema),
+-    defaultValues: { code: '' },
+-  });
+-
+-  React.useEffect(() => {
+-    if (!visible) {
+-      setSelected(methods.length === 1 ? (methods[0] ?? null) : null);
+-      codeForm.reset();
+-      enroll.reset();
+-      redeem.reset();
+-    }
+-    // eslint-disable-next-line react-hooks/exhaustive-deps
+-  }, [visible]);
+-
+-  const price = formatMoney(course.price, language);
+-  const busy = enroll.isPending || redeem.isPending;
+-
+-  const submitCode = codeForm.handleSubmit(async ({ code }) => {
+-    try {
+-      await redeem.mutateAsync(code.trim().toUpperCase());
+-      onClose();
+-    } catch (e) {
+-      const remaining = applyServerErrors(e, codeForm.setError);
+-      if (remaining) {
+-        codeForm.setError('code', { message: remaining.i18nKey });
+-      }
+-    }
+-  });
+-
+-  const submitMethod = async () => {
+-    if (!selected) return;
+-
+-    if (selected === 'CODE') {
+-      await submitCode();
+-      return;
+-    }
+-
+-    try {
+-      const result = await enroll.mutateAsync(selected);
+-
+-      // A payment provider returns an external checkout URL. We hand off to
+-      // the browser rather than embedding a WebView so the student sees the
+-      // provider's own TLS indicator — and so no card data ever touches
+-      // this app.
+-      if (result.payment?.checkoutUrl) {
+-        await Linking.openURL(result.payment.checkoutUrl);
+-      }
+-      onClose();
+-    } catch {
+-      // Error is rendered from the mutation state below.
+-    }
+-  };
+-
+-  const activeError = redeem.error ?? enroll.error;
+-
+-  return (
+-    <Sheet
+-      visible={visible}
+-      onClose={onClose}
+-      title={t('access.chooseMethod')}
+-      subtitle={course.title}
+-    >
+-      <View className="gap-2 pb-2">
+-        {methods.length === 0 ? (
+-          <Text variant="caption" tone="muted" className="py-6 text-center">
+-            {t('errors.COURSE_NOT_AVAILABLE')}
+-          </Text>
+-        ) : null}
+-
+-        {methods.map((method) => {
+-          const meta = METHOD_META[method];
+-          const active = selected === method;
+-
+-          return (
+-            <Pressable
+-              key={method}
+-              accessibilityRole="radio"
+-              accessibilityState={{ selected: active }}
+-              accessibilityLabel={t(meta.titleKey)}
+-              onPress={() => setSelected(method)}
+-              className={cn(
+-                'flex-row items-center gap-3 rounded-md border p-3.5',
+-                active
+-                  ? 'border-primary bg-primary-soft'
+-                  : 'border-border bg-surface active:bg-surface-alt'
+-              )}
+-              style={{ minHeight: MIN_TOUCH_TARGET }}
+-            >
+-              <View
+-                className={cn(
+-                  'h-10 w-10 items-center justify-center rounded-md',
+-                  active ? 'bg-primary' : 'bg-surface-alt'
+-                )}
+-              >
+-                <Icon
+-                  name={meta.icon}
+-                  size={18}
+-                  color={active ? colors.primaryFg : colors.muted}
+-                />
+-              </View>
+-
+-              <View className="flex-1">
+-                <Text variant="label" tone={active ? 'primary' : 'default'}>
+-                  {t(meta.titleKey)}
+-                  {method === 'PAYMENT' && price ? ` · ${price}` : ''}
+-                </Text>
+-                <Text variant="caption" tone="muted" className="mt-0.5">
+-                  {t(meta.bodyKey)}
+-                </Text>
+-              </View>
+-
+-              {active ? <Icon name="check" size={20} color={colors.primary} /> : null}
+-            </Pressable>
+-          );
+-        })}
+-
+-        {selected === 'CODE' ? (
+-          <View className="mt-2">
+-            <Controller
+-              control={codeForm.control}
+-              name="code"
+-              render={({ field }) => (
+-                <Input
+-                  label={t('access.codeLabel')}
+-                  placeholder={t('access.codePlaceholder')}
+-                  value={field.value}
+-                  onChangeText={(v) => field.onChange(v.toUpperCase())}
+-                  error={translate(codeForm.formState.errors.code?.message)}
+-                  autoCapitalize="characters"
+-                  autoCorrect={false}
+-                  iconStart="code"
+-                  forceLTR
+-                  returnKeyType="go"
+-                  onSubmitEditing={submitCode}
+-                />
+-              )}
+-            />
+-          </View>
+-        ) : null}
+-
+-        {activeError ? (
+-          <View className="mt-2">
+-            <InlineError error={asApiError(activeError)} />
+-          </View>
+-        ) : null}
+-
+-        <Button
+-          label={
+-            busy
+-              ? selected === 'CODE'
+-                ? t('access.redeeming')
+-                : t('access.joining')
+-              : selected === 'CODE'
+-                ? t('access.redeem')
+-                : t('access.joinNow')
+-          }
+-          onPress={submitMethod}
+-          loading={busy}
+-          disabled={!selected}
+-          size="lg"
+-          fullWidth
+-          className="mt-3"
+-        />
+-      </View>
+-    </Sheet>
+-  );
+-}
+diff --git a/src/i18n/locales/ar.json b/src/i18n/locales/ar.json
+index c23ae18..a0e5779 100755
+--- a/src/i18n/locales/ar.json
++++ b/src/i18n/locales/ar.json
+@@ -527,6 +527,7 @@
+     "SESSION_EXPIRED": "انتهت جلستك. يرجى تسجيل الدخول مرة أخرى.",
+     "ACCOUNT_DISABLED": "تم تعطيل هذا الحساب. يرجى التواصل مع الإدارة.",
+     "ACCOUNT_PENDING": "حسابك بانتظار التفعيل من الإدارة.",
++    "ACCOUNT_DELETION_PENDING": "هذا الحساب مجدول للحذف. يمكنك إلغاء الحذف من الأسفل للاحتفاظ به.",
+     "PHONE_ALREADY_REGISTERED": "يوجد حساب مسجّل بهذا الرقم بالفعل.",
+     "DEVICE_NOT_AUTHORIZED": "هذا الجهاز غير مصرّح به لحسابك. تواصل مع الإدارة.",
+     "DEVICE_LIMIT_REACHED": "وصلت إلى الحد الأقصى للأجهزة المسموح بها.",
+@@ -731,16 +732,33 @@
+   },
+   "deleteAccount": {
+     "title": "حذف الحساب",
+-    "settingsSubtitle": "اطلب حذف حسابك وبياناته",
++    "settingsSubtitle": "احذف حسابك وبياناتك الشخصية",
+     "whatHappensTitle": "ماذا يحدث عند حذف حسابك",
+-    "whatHappensBody": "عند حذف حسابك تفقد الوصول إلى كورساتك وتقدّمك ورصيد محفظتك ومشترياتك من المكتبة، ولا يمكن التراجع عن ذلك. ولا يمكن إعادة استخدام الكروت التي سبق شحنها. قد نحتفظ ببعض السجلات إذا كان القانون يتطلب ذلك.",
+-    "processNote": "يُرسَل طلبك إلى إدارة المنصة كتذكرة دعم يمكنك متابعتها من قسم الدعم، وسيتواصل معك الفريق على رقم هاتفك المسجّل للتأكيد قبل إتمام الحذف.",
+-    "submit": "طلب حذف الحساب",
++    "whatHappensBody": "عند حذف حسابك تفقد الوصول إلى كورساتك وتقدّمك ورصيد محفظتك ومشترياتك من المكتبة، ولا يمكن التراجع عن ذلك. ولا يمكن إعادة استخدام الكروت التي سبق شحنها.",
++    "keptTitle": "ما الذي نحتفظ به",
++    "keptBody": "يُمسح اسمك ورقم هاتفك وبريدك الإلكتروني وصورتك وأجهزتك وإشعاراتك ورسائل الدعم الخاصة بك. ونحتفظ بسجلات الدفع والمحفظة والاشتراكات بدون بياناتك الشخصية، لأن القانون والمحاسبة يتطلبان ذلك.",
++    "processNote": "يُجدول الحذف بعد 30 يومًا من طلبك، ويتم تسجيل خروجك من كل الأجهزة فورًا. للاحتفاظ بحسابك، سجّل الدخول برقم هاتفك وكلمة المرور في أي وقت خلال هذه الأيام الثلاثين واختر \"إلغاء الحذف\".",
++    "passwordLabel": "كلمة المرور الحالية",
++    "passwordRequired": "أدخل كلمة المرور للتأكيد.",
++    "submit": "احذف حسابي",
+     "confirmTitle": "هل تريد حذف حسابك؟",
+-    "confirmBody": "سيتم إرسال طلب لحذف حسابك. بعد إتمام الحذف لا يمكن التراجع عنه.",
+-    "confirm": "إرسال الطلب",
+-    "webLink": "اطلب الحذف من الموقع بدلًا من ذلك",
+-    "ticketSubject": "طلب حذف الحساب",
+-    "ticketBody": "أطلب حذف حسابي والبيانات المرتبطة به.\nالاسم: {{name}}\nالهاتف: {{phone}}\n(مُرسَل من تطبيق الموبايل.)"
++    "confirmBody": "سيُحذف حسابك بعد 30 يومًا وسيتم تسجيل خروجك الآن. يمكنك الإلغاء خلال هذه المدة بتسجيل الدخول.",
++    "confirm": "حذف الحساب",
++    "scheduledTitle": "تمت جدولة الحذف",
++    "scheduledBody": "سيُحذف حسابك يوم {{date}}. سجّل الدخول قبل ذلك للإلغاء.",
++    "webLink": "مساعدة حذف الحساب على الموقع",
++    "cancelAction": "إلغاء الحذف وتسجيل الدخول",
++    "cancelled": "تم إلغاء الحذف. مرحبًا بعودتك.",
++    "walletTitle": "محفظتك",
++    "walletLoading": "جارٍ التحقق من رصيد محفظتك…",
++    "walletLoadFailed": "تعذّر تحميل رصيد محفظتك. يمكنك المتابعة بعد تحميله.",
++    "walletBalance": "الرصيد الحالي: {{amount}}",
++    "walletNote": "يبقى هذا الرصيد مسجّلًا لدينا، لكن لا يمكنك استخدامه أثناء انتظار الحذف أو بعد حذف حسابك. إذا أردت الاستفسار عنه، تواصل مع الدعم قبل المتابعة.",
++    "walletZero": "لا يوجد رصيد في محفظتك.",
++    "confirmBalance": "لا يمكن استخدام رصيد محفظتك البالغ {{amount}} أثناء انتظار الحذف أو بعد حذف حسابك.",
++    "cancelTooLate": "لم يعد من الممكن إلغاء هذا الحذف من التطبيق. يرجى التواصل مع الدعم."
++  },
++  "staging": {
++    "productionApiBadge": "نسخة تجريبية · بيانات حقيقية"
+   }
+ }
+diff --git a/src/i18n/locales/en.json b/src/i18n/locales/en.json
+index 35dc3df..916da9b 100755
+--- a/src/i18n/locales/en.json
++++ b/src/i18n/locales/en.json
+@@ -512,6 +512,7 @@
+     "SESSION_EXPIRED": "Your session expired. Please sign in again.",
+     "ACCOUNT_DISABLED": "This account has been disabled. Please contact the administration.",
+     "ACCOUNT_PENDING": "Your account is awaiting activation by the administration.",
++    "ACCOUNT_DELETION_PENDING": "This account is scheduled for deletion. You can cancel the deletion below to keep it.",
+     "PHONE_ALREADY_REGISTERED": "An account already exists with this phone number.",
+     "DEVICE_NOT_AUTHORIZED": "This device isn't authorized for your account. Contact the administration.",
+     "DEVICE_LIMIT_REACHED": "You've reached the device limit for this account.",
+@@ -700,16 +701,33 @@
+   },
+   "deleteAccount": {
+     "title": "Delete account",
+-    "settingsSubtitle": "Ask for your account and its data to be deleted",
++    "settingsSubtitle": "Delete your account and its personal data",
+     "whatHappensTitle": "What happens when your account is deleted",
+-    "whatHappensBody": "When your account is deleted you lose access to your courses, progress, wallet credit and library purchases, and this cannot be undone. Access cards you already redeemed cannot be reused. Some records may be kept where the law requires it.",
+-    "processNote": "Your request is sent to the platform administration as a support ticket. You can follow it under Support, and the team will contact you on your registered phone number to confirm before the deletion is completed.",
+-    "submit": "Request account deletion",
++    "whatHappensBody": "When your account is deleted you lose access to your courses, progress, wallet credit and library purchases, and this cannot be undone. Access cards you already redeemed cannot be reused.",
++    "keptTitle": "What we keep",
++    "keptBody": "Your name, phone number, email, photo, devices, notifications and support messages are erased. Payment, wallet and enrolment records are kept without your personal details, because the law and our accounting require them.",
++    "processNote": "Deletion is scheduled 30 days after you ask. You are signed out on every device straight away. To keep your account, sign in with your phone number and password at any time in those 30 days and choose \"Cancel deletion\".",
++    "passwordLabel": "Your current password",
++    "passwordRequired": "Enter your password to confirm.",
++    "submit": "Delete my account",
+     "confirmTitle": "Delete your account?",
+-    "confirmBody": "This sends a deletion request for your account. Once it is completed it cannot be undone.",
+-    "confirm": "Send request",
+-    "webLink": "Request deletion on the web instead",
+-    "ticketSubject": "Account deletion request",
+-    "ticketBody": "I am asking for my account and its associated data to be deleted.\nName: {{name}}\nPhone: {{phone}}\n(Sent from the mobile app.)"
++    "confirmBody": "Your account will be deleted in 30 days and you will be signed out now. You can cancel during those 30 days by signing in.",
++    "confirm": "Delete account",
++    "scheduledTitle": "Deletion scheduled",
++    "scheduledBody": "Your account will be deleted on {{date}}. Sign in before then to cancel.",
++    "webLink": "Account deletion help on the web",
++    "cancelAction": "Cancel deletion and sign in",
++    "cancelled": "The deletion was cancelled. Welcome back.",
++    "walletTitle": "Your wallet",
++    "walletLoading": "Checking your wallet balance…",
++    "walletLoadFailed": "We couldn't load your wallet balance. You can continue once it has loaded.",
++    "walletBalance": "Current balance: {{amount}}",
++    "walletNote": "This balance stays on our records, but you can't use it while the deletion is pending or after your account is deleted. If you want to ask about it, contact support before you continue.",
++    "walletZero": "You have no wallet balance.",
++    "confirmBalance": "Your wallet balance of {{amount}} can't be used while the deletion is pending or after your account is deleted.",
++    "cancelTooLate": "This deletion can no longer be cancelled in the app. Please contact support."
++  },
++  "staging": {
++    "productionApiBadge": "STAGING build · PRODUCTION data"
+   }
+ }
+diff --git a/src/types/api.ts b/src/types/api.ts
+index 7362ce3..c8ab924 100755
+--- a/src/types/api.ts
++++ b/src/types/api.ts
+@@ -47,6 +47,7 @@ export type ApiErrorCode =
+   | 'SESSION_EXPIRED'
+   | 'ACCOUNT_DISABLED'
+   | 'ACCOUNT_PENDING'
++  | 'ACCOUNT_DELETION_PENDING'
+   | 'PHONE_ALREADY_REGISTERED'
+   // device binding
+   | 'DEVICE_NOT_AUTHORIZED'

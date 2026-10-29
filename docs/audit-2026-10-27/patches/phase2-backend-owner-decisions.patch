@@ -1,0 +1,3644 @@
+diff --git a/.env.example b/.env.example
+index 142d412..0ce60fb 100755
+--- a/.env.example
++++ b/.env.example
+@@ -22,6 +22,24 @@ CORS_ORIGINS=http://localhost:3001,http://localhost:5173
+ 
+ # Trust the X-Forwarded-* headers (set to true behind a load balancer / nginx).
+ TRUST_PROXY=false
++# How many proxies in front of the API append to X-Forwarded-For (Express
++# `trust proxy` hop count). Read only when TRUST_PROXY=true. Confirm the real
++# value for your host before relying on per-IP limits (see
++# docs/audit-2026-10-27/OWNER_DECISIONS.md, D6).
++TRUST_PROXY_HOPS=1
++
++# Owner decision D6: shared secret between the student web SERVER and this API.
++# When the web server sends it (X-Edu-Proxy-Secret), the browser address it
++# forwards (X-Edu-Client-Ip) is used for rate limits, sessions and security
++# events. Without it, those headers are ignored. At least 32 characters; set the
++# SAME value as WEB_PROXY_SHARED_SECRET in the web app's server environment.
++# Never expose it as NEXT_PUBLIC_*. Generate with: openssl rand -base64 48
++# WEB_PROXY_SHARED_SECRET=
++
++# Owner decision D5: in-process sweep that erases accounts whose 30-day
++# cancellation period has ended (Redis-locked, one sweeper across replicas).
++# 0 disables it on this process. Default hourly.
++ACCOUNT_DELETION_SWEEP_INTERVAL_SECONDS=3600
+ 
+ # --- database ----------------------------------------------------------------
+ DATABASE_URL=postgresql://edu:edu_dev_password@localhost:5432/edu_platform?schema=public
+diff --git a/prisma/migrations/20261027120000_account_deletion_requests/migration.sql b/prisma/migrations/20261027120000_account_deletion_requests/migration.sql
+new file mode 100644
+index 0000000..d630d94
+--- /dev/null
++++ b/prisma/migrations/20261027120000_account_deletion_requests/migration.sql
+@@ -0,0 +1,60 @@
++-- Student-initiated account deletion with a 30-day cancellation period
++-- (owner decision D5).
++--
++-- PREPARED ONLY. NOT APPLIED to Production. Apply only after review, with
++-- `npm run prisma:deploy` from a release build, BEFORE the API code that
++-- reads this table is deployed (the API's login path queries it).
++--
++-- ADDITIVE AND BACKWARDS COMPATIBLE:
++--   * one new enum and one new table; no existing table, column or row is
++--     changed, so the running API is unaffected until the new code ships
++--   * no backfill
++--
++-- WHY A PARTIAL UNIQUE INDEX
++--   A student may have many historical requests (cancelled, completed) but at
++--   most ONE pending one. A plain unique index on "userId" would forbid a new
++--   request after a cancellation; a unique index restricted to the PENDING
++--   state is exactly the rule. Prisma cannot express it in schema.prisma, so
++--   it is created here, the same way as the other partial indexes in this
++--   repository. Do not let `prisma migrate dev` drop it: generate future
++--   migrations with --create-only and remove any DROP INDEX for it.
++--
++-- REVISED 2026-10-28, still unapplied: added "failedAt" (erasure stopped
++-- after repeated failures; see AccountDeletionService). Before this revision
++-- the file had only been applied to a throwaway local test database.
++--
++-- ROLLBACK (only if no request has been created yet):
++--   DROP TABLE "account_deletion_requests";
++--   DROP TYPE "AccountDeletionStatus";
++
++-- CreateEnum
++CREATE TYPE "AccountDeletionStatus" AS ENUM ('PENDING', 'PROCESSING', 'CANCELLED', 'COMPLETED');
++
++-- CreateTable
++CREATE TABLE "account_deletion_requests" (
++    "id" TEXT NOT NULL,
++    "userId" TEXT NOT NULL,
++    "status" "AccountDeletionStatus" NOT NULL DEFAULT 'PENDING',
++    "requestedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    "scheduledFor" TIMESTAMP(3) NOT NULL,
++    "cancelledAt" TIMESTAMP(3),
++    "completedAt" TIMESTAMP(3),
++    "source" TEXT NOT NULL DEFAULT 'app',
++    "lastError" TEXT,
++    "attempts" INTEGER NOT NULL DEFAULT 0,
++    "failedAt" TIMESTAMP(3),
++
++    CONSTRAINT "account_deletion_requests_pkey" PRIMARY KEY ("id")
++);
++
++-- CreateIndex
++CREATE INDEX "account_deletion_requests_status_scheduledFor_idx" ON "account_deletion_requests"("status", "scheduledFor");
++
++-- CreateIndex
++CREATE INDEX "account_deletion_requests_userId_status_idx" ON "account_deletion_requests"("userId", "status");
++
++-- AddForeignKey
++ALTER TABLE "account_deletion_requests" ADD CONSTRAINT "account_deletion_requests_userId_fkey" FOREIGN KEY ("userId") REFERENCES "users"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- One pending request per student (see header).
++CREATE UNIQUE INDEX "account_deletion_requests_one_pending_per_user" ON "account_deletion_requests"("userId") WHERE "status" = 'PENDING';
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 4b00a42..ce4cf13 100755
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -62,6 +62,23 @@ enum AccountStatus {
+   DISABLED
+ }
+ 
++/// Lifecycle of a student-initiated account deletion (owner decision D5).
++///
++///   PENDING    - requested in-app; the account cannot be used and every
++///                session is revoked. Cancellable until `scheduledFor`.
++///   PROCESSING - claimed by the deletion sweep. A short-lived state that makes
++///                the claim atomic: cancel and a second sweep both require
++///                PENDING, so neither can race the erasure.
++///   CANCELLED  - the student signed in to the cancel flow before the deadline.
++///   COMPLETED  - personal data erased; financial and audit records retained
++///                under the anonymised user id.
++enum AccountDeletionStatus {
++  PENDING
++  PROCESSING
++  CANCELLED
++  COMPLETED
++}
++
+ enum Gender {
+   MALE
+   FEMALE
+@@ -980,6 +997,8 @@ model User {
+   revenueShares    RevenueLedger[]       @relation("RevenueTeacher")
+ 
+   // --- wallet ---------------------------------------------------------------
++  deletionRequests AccountDeletionRequest[]
++
+   wallet             Wallet?
+   walletTransactions WalletTransaction[]   @relation("WalletTxUser")
+   walletAdjustments  WalletTransaction[]   @relation("WalletTxAdmin")
+@@ -2947,3 +2966,37 @@ model IdempotencyRecord {
+   @@index([expiresAt])
+   @@map("idempotency_records")
+ }
++
++/// A student's request to delete their own account (owner decision D5).
++///
++/// At most one PENDING request per user is enforced by a partial unique index
++/// created in the migration (`account_deletion_requests_one_pending_per_user`).
++/// Like the other partial indexes in this schema it cannot be expressed here,
++/// so `prisma migrate dev` must be run with --create-only and reviewed.
++///
++/// `onDelete: Restrict`: the row is the evidence that the erasure was asked for
++/// and when it ran, so it outlives the personal data it describes.
++model AccountDeletionRequest {
++  id           String                @id @default(cuid())
++  userId       String
++  status       AccountDeletionStatus @default(PENDING)
++  requestedAt  DateTime              @default(now())
++  /// The end of the cancellation period. Deletion runs at or after this.
++  scheduledFor DateTime
++  cancelledAt  DateTime?
++  completedAt  DateTime?
++  /// Where it was initiated. 'app' today.
++  source       String                @default("app")
++  /// Set when a sweep attempt failed; the request stays PENDING and is retried.
++  lastError    String?
++  attempts     Int                   @default(0)
++  /// Set when erasure stopped after DELETION_MAX_ATTEMPTS failures. The sweep
++  /// then skips the request until an administrator retries or cancels it.
++  failedAt     DateTime?
++
++  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
++
++  @@index([status, scheduledFor])
++  @@index([userId, status])
++  @@map("account_deletion_requests")
++}
+diff --git a/src/app.module.ts b/src/app.module.ts
+index ed3afe4..a884a9b 100755
+--- a/src/app.module.ts
++++ b/src/app.module.ts
+@@ -12,6 +12,7 @@ import { ConfigModule } from './config/config.module';
+ import type { RedisConfig, ThrottleConfig } from './config/configuration';
+ import { DatabaseModule } from './database/database.module';
+ import { JobsModule } from './jobs/jobs.module';
++import { AccountDeletionModule } from './modules/account-deletion/account-deletion.module';
+ import { AnalyticsModule } from './modules/analytics/analytics.module';
+ import { AttachmentsModule } from './modules/attachments/attachments.module';
+ import { AuditInterceptor } from './modules/audit/audit.interceptor';
+@@ -22,6 +23,7 @@ import { CodesModule } from './modules/codes/codes.module';
+ import { CoursePartsModule } from './modules/course-parts/course-parts.module';
+ import { CoursesModule } from './modules/courses/courses.module';
+ import { DevicesModule } from './modules/devices/devices.module';
++import { DiagnosticsModule } from './modules/diagnostics/diagnostics.module';
+ import { EnrollmentsModule } from './modules/enrollments/enrollments.module';
+ import { HomeModule } from './modules/home/home.module';
+ import { LessonsModule } from './modules/lessons/lessons.module';
+@@ -144,6 +146,7 @@ import { RedisModule } from './redis/redis.module';
+ 
+     // --- identity ------------------------------------------------------------
+     AuthModule,
++    AccountDeletionModule,
+     UsersModule,
+     DevicesModule,
+     SessionsModule,
+@@ -186,6 +189,7 @@ import { RedisModule } from './redis/redis.module';
+     AnalyticsModule,
+     MasterModule,
+     MetaModule,
++    DiagnosticsModule,
+ 
+     // --- async work -----------------------------------------------------------
+     JobsModule,
+diff --git a/src/common/errors/error-codes.ts b/src/common/errors/error-codes.ts
+index 4b6d824..b9e3a80 100755
+--- a/src/common/errors/error-codes.ts
++++ b/src/common/errors/error-codes.ts
+@@ -26,6 +26,12 @@ export enum ErrorCode {
+   SESSION_EXPIRED = 'SESSION_EXPIRED',
+   ACCOUNT_DISABLED = 'ACCOUNT_DISABLED',
+   ACCOUNT_PENDING = 'ACCOUNT_PENDING',
++  /**
++   * The student asked for their account to be deleted (owner decision D5).
++   * Sign-in is refused until the request is cancelled; `details` carries
++   * `scheduledFor` and `cancellable`.
++   */
++  ACCOUNT_DELETION_PENDING = 'ACCOUNT_DELETION_PENDING',
+   PHONE_ALREADY_REGISTERED = 'PHONE_ALREADY_REGISTERED',
+ 
+   // --- device binding --------------------------------------------------------
+@@ -114,6 +120,7 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
+   [ErrorCode.SESSION_EXPIRED]: 401,
+   [ErrorCode.ACCOUNT_DISABLED]: 403,
+   [ErrorCode.ACCOUNT_PENDING]: 403,
++  [ErrorCode.ACCOUNT_DELETION_PENDING]: 403,
+   [ErrorCode.PHONE_ALREADY_REGISTERED]: 409,
+ 
+   [ErrorCode.DEVICE_NOT_AUTHORIZED]: 403,
+@@ -184,6 +191,7 @@ export const ERROR_MESSAGE: Record<ErrorCode, string> = {
+   [ErrorCode.SESSION_EXPIRED]: 'Session is no longer valid',
+   [ErrorCode.ACCOUNT_DISABLED]: 'Account has been disabled',
+   [ErrorCode.ACCOUNT_PENDING]: 'Account is awaiting activation',
++  [ErrorCode.ACCOUNT_DELETION_PENDING]: 'This account is scheduled for deletion',
+   [ErrorCode.PHONE_ALREADY_REGISTERED]: 'An account with this phone already exists',
+ 
+   [ErrorCode.DEVICE_NOT_AUTHORIZED]: 'This device is not authorized for the account',
+diff --git a/src/common/guards/throttler-proxy.guard.ts b/src/common/guards/throttler-proxy.guard.ts
+index 6f87513..fdd55c0 100755
+--- a/src/common/guards/throttler-proxy.guard.ts
++++ b/src/common/guards/throttler-proxy.guard.ts
+@@ -8,27 +8,30 @@ import type { Request } from 'express';
+  * Runs AFTER JwtAuthGuard (see AppModule), which is what makes the user-id
+  * branch reachable.
+  *
+- * Behind a load balancer `req.ip` is the balancer, so every user shares one
+- * bucket. Authenticated requests are therefore keyed by user id, and
+- * anonymous ones by the leftmost X-Forwarded-For entry (only trustworthy when
+- * TRUST_PROXY is on and the balancer overwrites the header).
++ * Authenticated requests are keyed by user id, credential requests by the
++ * submitted phone, and other anonymous requests by `req.ip`.
++ *
++ * `req.ip` is the attribution decided once in RequestContextMiddleware (owner
++ * decision D6, common/net/client-ip.ts): the browser address forwarded by the
++ * student web server when it presents the shared secret, otherwise the address
++ * Express derives from the trusted proxy hops. The raw X-Forwarded-For header
++ * is NOT read here: its leftmost entry is whatever the client wrote.
+  */
+ @Injectable()
+ export class ThrottlerProxyGuard extends ThrottlerGuard {
+   protected override async getTracker(req: Request): Promise<string> {
+     if (req.user?.id) return `user:${req.user.id}`;
+ 
+-    const forwarded = req.header('x-forwarded-for');
+-    const ip = forwarded ? (forwarded.split(',')[0]?.trim() ?? req.ip) : req.ip;
++    const ip = req.ip;
+ 
+     // Credential endpoints bucket by the submitted phone ALONE.
+     //
+-    // The leftmost X-Forwarded-For entry is whatever the client wrote, so an
+-    // `ip|phone` key let an attacker rotate that header and get a fresh bucket
+-    // for the same account on every request - unlimited guesses against one
+-    // phone. Keyed by phone, the attempts against one account share one bucket
+-    // whatever address they claim, and one attacker still cannot exhaust the
+-    // limit for an entire NAT range. (Formatting is stripped so "010 1234" and
++    // An `ip|phone` key let an attacker who could vary the address (the
++    // leftmost X-Forwarded-For entry, which this guard used to read) get a
++    // fresh bucket for the same account on every request. Keyed by phone, the
++    // attempts against one account share one bucket whatever address they
++    // claim, and one attacker still cannot exhaust the limit for an entire NAT
++    // range. (Formatting is stripped so "010 1234" and
+     // "0101234" are the same account.)
+     const phone =
+       typeof req.body === 'object' && req.body && 'phone' in req.body
+diff --git a/src/common/middleware/request-context.middleware.ts b/src/common/middleware/request-context.middleware.ts
+index 668ef38..d449ee6 100755
+--- a/src/common/middleware/request-context.middleware.ts
++++ b/src/common/middleware/request-context.middleware.ts
+@@ -1,7 +1,9 @@
+-import { Injectable, type NestMiddleware } from '@nestjs/common';
++import { Injectable, Optional, type NestMiddleware } from '@nestjs/common';
++import { ConfigService } from '@nestjs/config';
+ import type { NextFunction, Request, Response } from 'express';
+ import { randomUUID } from 'node:crypto';
+ 
++import { applyClientIp } from '../net/client-ip';
+ import type { DeviceContext } from '../types/request-context';
+ 
+ const SUPPORTED_LOCALES = new Set(['en', 'ar']);
+@@ -14,7 +16,19 @@ const SUPPORTED_LOCALES = new Set(['en', 'ar']);
+  */
+ @Injectable()
+ export class RequestContextMiddleware implements NestMiddleware {
++  private readonly webProxySecret: string | null;
++
++  constructor(@Optional() config?: ConfigService) {
++    this.webProxySecret =
++      config?.get<{ webProxySharedSecret?: string | null }>('app')?.webProxySharedSecret ?? null;
++  }
++
+   use(req: Request, res: Response, next: NextFunction): void {
++    // First, so every later reader of `req.ip` (throttler, sessions, security
++    // events, audit) sees the same attribution, and so the proxy secret is
++    // gone from the request before anything else can see it (D6).
++    applyClientIp(req, this.webProxySecret);
++
+     const incoming = req.header('x-request-id');
+     req.requestId = incoming && incoming.length <= 64 ? incoming : randomUUID();
+     res.setHeader('X-Request-Id', req.requestId);
+diff --git a/src/common/net/client-ip.ts b/src/common/net/client-ip.ts
+new file mode 100644
+index 0000000..014923e
+--- /dev/null
++++ b/src/common/net/client-ip.ts
+@@ -0,0 +1,165 @@
++import { createHash, timingSafeEqual } from 'node:crypto';
++import { isIP } from 'node:net';
++
++import type { Request } from 'express';
++
++/**
++ * Which address a request is attributed to (owner decision D6).
++ *
++ * Two kinds of caller reach this API:
++ *
++ *  - The mobile app, directly. Its address is `req.ip`, which Express derives
++ *    from the socket and - when `TRUST_PROXY` is on - from the hops the hosting
++ *    balancer appended (`TRUST_PROXY_HOPS`). The client can write anything into
++ *    `X-Forwarded-For`, so the header itself is never read here.
++ *
++ *  - The student web app's server (Next.js on Vercel), on behalf of a browser.
++ *    `req.ip` is then a Vercel egress address shared by every web student. The
++ *    web server knows the browser's address (Vercel overwrites
++ *    `X-Forwarded-For` / `X-Real-IP` with it) and forwards it in
++ *    `X-Edu-Client-Ip`, together with a shared secret in `X-Edu-Proxy-Secret`.
++ *    The forwarded address is believed ONLY when that secret matches
++ *    `WEB_PROXY_SHARED_SECRET`; otherwise both headers are ignored and the
++ *    request is attributed to `req.ip` like any other direct caller.
++ *
++ * The secret is compared in constant time, removed from the request before any
++ * other code runs, and never logged or echoed.
++ */
++
++export const WEB_CLIENT_IP_HEADER = 'x-edu-client-ip';
++export const WEB_PROXY_SECRET_HEADER = 'x-edu-proxy-secret';
++/** A shorter secret is refused at boot by env validation. */
++export const MIN_WEB_PROXY_SECRET_LENGTH = 32;
++
++export type ClientIpSource = 'web-proxy' | 'direct';
++
++export interface ResolvedClientIp {
++  ip: string | null;
++  source: ClientIpSource;
++}
++
++/** Constant-time comparison that also hides the expected length. */
++export function proxySecretMatches(provided: string | undefined, expected: string | null): boolean {
++  if (!expected || expected.length < MIN_WEB_PROXY_SECRET_LENGTH || !provided) return false;
++  const a = createHash('sha256').update(provided, 'utf8').digest();
++  const b = createHash('sha256').update(expected, 'utf8').digest();
++  return timingSafeEqual(a, b);
++}
++
++/** A single, syntactically valid IPv4/IPv6 address, or null. Never a list. */
++export function parseForwardedClientIp(raw: string | undefined): string | null {
++  if (!raw) return null;
++  const value = raw.trim();
++  if (value.length === 0 || value.length > 45 || value.includes(',')) return null;
++  return isIP(value) ? value : null;
++}
++
++function header(req: Request, name: string): string | undefined {
++  const value = req.headers[name];
++  return Array.isArray(value) ? value[0] : value;
++}
++
++export function resolveClientIp(req: Request, secret: string | null): ResolvedClientIp {
++  const direct = req.ip ?? req.socket?.remoteAddress ?? null;
++  if (proxySecretMatches(header(req, WEB_PROXY_SECRET_HEADER), secret)) {
++    const forwarded = parseForwardedClientIp(header(req, WEB_CLIENT_IP_HEADER));
++    if (forwarded) return { ip: forwarded, source: 'web-proxy' };
++  }
++  return { ip: direct, source: 'direct' };
++}
++
++/**
++ * Applies the resolution to the request so every existing `req.ip` reader -
++ * the throttler, sessions, security events, the audit log - gets the same
++ * answer without each one re-implementing it. Strips both headers so nothing
++ * downstream can read the secret or a forwarded address of unknown standing.
++ */
++export function applyClientIp(req: Request, secret: string | null): ResolvedClientIp {
++  const resolved = resolveClientIp(req, secret);
++  delete req.headers[WEB_PROXY_SECRET_HEADER];
++  delete req.headers[WEB_CLIENT_IP_HEADER];
++  if (resolved.source === 'web-proxy') {
++    Object.defineProperty(req, 'ip', {
++      value: resolved.ip,
++      configurable: true,
++      enumerable: true,
++      writable: false,
++    });
++  }
++  req.clientIpSource = resolved.source;
++  return resolved;
++}
++
++// ---------------------------------------------------------------------------
++// Diagnostics: how the hosting platform actually builds the forwarding chain
++// ---------------------------------------------------------------------------
++
++/** Headers some platforms use to carry the client address. Read for display only. */
++export const DIAGNOSTIC_ADDRESS_HEADERS = [
++  'x-real-ip',
++  'true-client-ip',
++  'cf-connecting-ip',
++  'x-client-ip',
++  'fly-client-ip',
++] as const;
++
++export interface ClientIpChainReport {
++  trustProxy: boolean;
++  trustProxyHops: number;
++  socketAddress: string | null;
++  /** X-Forwarded-For as received, left to right (at most 20 entries). */
++  forwardedFor: string[];
++  /** What `req.ip` would be for each `trust proxy` hop count, 1..5. */
++  ipByHopCount: Record<string, string | null>;
++  resolvedIp: string | null;
++  resolvedSource: ClientIpSource | null;
++  otherAddressHeaders: Record<string, string | null>;
++}
++
++/**
++ * The address Express returns for `trust proxy = hops`: the socket peer and
++ * the forwarding entries are read from the right, and the first untrusted one
++ * wins; with more hops than entries it is the leftmost entry.
++ */
++export function expressIpForHops(socketAddress: string | null, forwardedFor: string[], hops: number): string | null {
++  const chain = [socketAddress, ...[...forwardedFor].reverse()];
++  return chain[Math.min(hops, chain.length - 1)] ?? null;
++}
++
++/**
++ * A description of the caller's OWN request, for an operator checking the
++ * platform's proxy behaviour (OWNER_DECISIONS D6). It never influences
++ * attribution, and it reads only the forwarding and address headers above:
++ * the proxy secret was already stripped by the middleware and is never read.
++ */
++export function describeClientIpChain(
++  req: Request,
++  cfg: { trustProxy: boolean; trustProxyHops: number },
++): ClientIpChainReport {
++  const rawForwarded = header(req, 'x-forwarded-for') ?? '';
++  const forwardedFor = rawForwarded
++    .split(',')
++    .map((part) => part.trim())
++    .filter((part) => part.length > 0)
++    .slice(0, 20)
++    .map((part) => part.slice(0, 64));
++  const socketAddress = req.socket?.remoteAddress ?? null;
++  const ipByHopCount: Record<string, string | null> = {};
++  for (let hops = 1; hops <= 5; hops += 1) {
++    ipByHopCount[String(hops)] = expressIpForHops(socketAddress, forwardedFor, hops);
++  }
++  const otherAddressHeaders: Record<string, string | null> = {};
++  for (const name of DIAGNOSTIC_ADDRESS_HEADERS) {
++    otherAddressHeaders[name] = header(req, name)?.slice(0, 64) ?? null;
++  }
++  return {
++    trustProxy: cfg.trustProxy,
++    trustProxyHops: cfg.trustProxyHops,
++    socketAddress,
++    forwardedFor,
++    ipByHopCount,
++    resolvedIp: req.ip ?? null,
++    resolvedSource: req.clientIpSource ?? null,
++    otherAddressHeaders,
++  };
++}
+diff --git a/src/common/types/request-context.ts b/src/common/types/request-context.ts
+index 5041977..a0f78f1 100755
+--- a/src/common/types/request-context.ts
++++ b/src/common/types/request-context.ts
+@@ -32,6 +32,8 @@ declare module 'express' {
+     deviceContext?: DeviceContext;
+     requestId?: string;
+     locale?: 'en' | 'ar';
++    /** How `req.ip` was decided (owner decision D6, common/net/client-ip.ts). */
++    clientIpSource?: 'web-proxy' | 'direct';
+   }
+ }
+ 
+diff --git a/src/config/configuration.ts b/src/config/configuration.ts
+index a2f8322..4c0b89e 100755
+--- a/src/config/configuration.ts
++++ b/src/config/configuration.ts
+@@ -26,6 +26,9 @@ export const appConfig = registerAs('app', () => ({
+     .map((o) => o.trim())
+     .filter(Boolean),
+   trustProxy: bool(process.env.TRUST_PROXY),
++  trustProxyHops: Math.min(10, Math.max(1, Math.floor(num(process.env.TRUST_PROXY_HOPS, 1)))),
++  /** Owner decision D6. See common/net/client-ip.ts. Never logged. */
++  webProxySharedSecret: process.env.WEB_PROXY_SHARED_SECRET?.trim() || null,
+   logLevel: process.env.LOG_LEVEL ?? 'info',
+   logPretty: bool(process.env.LOG_PRETTY),
+ }));
+diff --git a/src/config/env.validation.ts b/src/config/env.validation.ts
+index 8a4b6bc..ad28f84 100755
+--- a/src/config/env.validation.ts
++++ b/src/config/env.validation.ts
+@@ -56,6 +56,18 @@ export class EnvironmentVariables {
+   @IsBoolean()
+   TRUST_PROXY = false;
+ 
++  /// How many proxy hops in front of the API append to X-Forwarded-For
++  /// (Express `trust proxy` count). Only read when TRUST_PROXY is on.
++  @Type(() => Number) @IsInt() @Min(1) @Max(10) TRUST_PROXY_HOPS = 1;
++
++  /// Owner decision D6: shared with the student web server ONLY (server-side
++  /// env there, never NEXT_PUBLIC_*). When the web server presents it, the
++  /// browser address it forwards is believed. Unset = never believed.
++  @IsOptional()
++  @IsString()
++  @MinLength(32)
++  WEB_PROXY_SHARED_SECRET?: string;
++
+   // --- database -------------------------------------------------------------
+   @IsString()
+   @MinLength(10)
+@@ -266,6 +278,14 @@ export class EnvironmentVariables {
+   @Max(86400)
+   DRM_SWEEP_INTERVAL_SECONDS = 900;
+ 
++  /// Owner decision D5: how often the API sweeps due account deletions
++  /// (0 disables it on this process; values under 300 are raised to 300).
++  @Type(() => Number)
++  @IsInt()
++  @Min(0)
++  @Max(86400)
++  ACCOUNT_DELETION_SWEEP_INTERVAL_SECONDS = 3600;
++
+   /** Per-request timeout for Gumlet's asset API and manifest reads, in milliseconds. */
+   @IsOptional()
+   @Type(() => Number)
+diff --git a/src/main.ts b/src/main.ts
+index 959d8e3..146297e 100755
+--- a/src/main.ts
++++ b/src/main.ts
+@@ -31,9 +31,12 @@ async function bootstrap(): Promise<void> {
+   // ---------------------------------------------------------------------------
+ 
+   if (cfg.trustProxy) {
+-    // Only enable behind a balancer that overwrites X-Forwarded-For, otherwise
+-    // clients can spoof their IP and defeat rate limiting.
+-    app.set('trust proxy', 1);
++    // Only enable behind a balancer that appends to X-Forwarded-For. The count
++    // is the number of hops that do (TRUST_PROXY_HOPS, default 1): Express then
++    // takes the address that many entries from the RIGHT, which the client
++    // cannot forge. Too low a count yields a balancer address (every caller
++    // shares one bucket); too high lets a client choose its own address.
++    app.set('trust proxy', cfg.trustProxyHops);
+   }
+ 
+   app.use(
+diff --git a/src/modules/account-deletion/account-deletion.controller.ts b/src/modules/account-deletion/account-deletion.controller.ts
+new file mode 100644
+index 0000000..4436081
+--- /dev/null
++++ b/src/modules/account-deletion/account-deletion.controller.ts
+@@ -0,0 +1,118 @@
++import { Body, Controller, Get, HttpCode, HttpStatus, Param, Post, Req } from '@nestjs/common';
++import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
++import type { Request } from 'express';
++
++import { CurrentUser } from '../../common/decorators/current-user.decorator';
++import { Public } from '../../common/decorators/public.decorator';
++import { AdminOnly, StudentOnly } from '../../common/decorators/roles.decorator';
++import { CredentialThrottle } from '../../common/decorators/throttle.decorator';
++import type { AuthenticatedUser, DeviceContext } from '../../common/types/request-context';
++import type { RequestMeta } from '../auth/auth.service';
++
++import {
++  CancelAccountDeletionDto,
++  RecoverAccountDeletionDto,
++  RequestAccountDeletionDto,
++} from './account-deletion.dto';
++import { AccountDeletionService } from './account-deletion.service';
++
++/**
++ * In-app account deletion (owner decision D5; Google Play's account-deletion
++ * requirement). See AccountDeletionService for the lifecycle.
++ */
++@ApiTags('auth')
++@Controller('auth/account-deletion')
++export class AccountDeletionController {
++  constructor(private readonly deletion: AccountDeletionService) {}
++
++  @Post()
++  @StudentOnly()
++  @CredentialThrottle()
++  @HttpCode(HttpStatus.OK)
++  @ApiBearerAuth()
++  @ApiOperation({
++    summary: 'Schedule deletion of the signed-in account (30-day cancellation period)',
++    description:
++      'Requires the current password. Signs the account out everywhere. Idempotent: an open request is returned unchanged.',
++  })
++  request(
++    @CurrentUser() user: AuthenticatedUser,
++    @Body() dto: RequestAccountDeletionDto,
++    @Req() req: Request,
++  ) {
++    return this.deletion.request(user, dto.password, meta(req));
++  }
++
++  @Post('cancel')
++  @Public()
++  @CredentialThrottle()
++  @HttpCode(HttpStatus.OK)
++  @ApiOperation({ summary: 'Cancel a pending account deletion with phone and password' })
++  cancel(@Body() dto: CancelAccountDeletionDto, @Req() req: Request) {
++    return this.deletion.cancel(dto.phone, dto.password, meta(req));
++  }
++}
++
++/**
++ * Administrator recovery for erasures that stopped after repeated failures.
++ * Admin-only, every change audited with a reason, and limited to those
++ * requests: a normal pending deletion cannot be touched from here. The list
++ * returns ids, timings and the error class only - no name, phone or email.
++ */
++@ApiTags('admin')
++@ApiBearerAuth()
++@Controller('admin/account-deletions')
++export class AccountDeletionAdminController {
++  constructor(private readonly deletion: AccountDeletionService) {}
++
++  @Get('attention')
++  @AdminOnly()
++  @ApiOperation({ summary: 'Deletion requests whose erasure stopped after repeated failures' })
++  attention() {
++    return this.deletion.listNeedingAttention();
++  }
++
++  @Post(':id/retry')
++  @AdminOnly()
++  @HttpCode(HttpStatus.OK)
++  @ApiOperation({ summary: 'Re-queue a failed erasure (the holder still wants deletion)' })
++  retry(
++    @Param('id') id: string,
++    @Body() dto: RecoverAccountDeletionDto,
++    @CurrentUser() actor: AuthenticatedUser,
++    @Req() req: Request,
++  ) {
++    return this.deletion.retryFailed(id, actor, dto.reason, meta(req));
++  }
++
++  @Post(':id/cancel')
++  @AdminOnly()
++  @HttpCode(HttpStatus.OK)
++  @ApiOperation({ summary: "Cancel a failed erasure at the account holder's confirmed request" })
++  cancel(
++    @Param('id') id: string,
++    @Body() dto: RecoverAccountDeletionDto,
++    @CurrentUser() actor: AuthenticatedUser,
++    @Req() req: Request,
++  ) {
++    return this.deletion.cancelFailed(id, actor, dto.reason, meta(req));
++  }
++}
++
++function meta(req: Request): RequestMeta {
++  return {
++    ip: req.ip ?? null,
++    userAgent: req.header('user-agent') ?? null,
++    requestId: req.requestId ?? null,
++    device: (req.deviceContext ?? {
++      deviceKey: null,
++      platform: null,
++      model: null,
++      name: null,
++      osVersion: null,
++      appVersion: null,
++      appBuild: null,
++      integritySuspect: false,
++    }) as DeviceContext,
++  };
++}
+diff --git a/src/modules/account-deletion/account-deletion.dto.ts b/src/modules/account-deletion/account-deletion.dto.ts
+new file mode 100644
+index 0000000..bd8a113
+--- /dev/null
++++ b/src/modules/account-deletion/account-deletion.dto.ts
+@@ -0,0 +1,29 @@
++import { ApiProperty } from '@nestjs/swagger';
++import { IsString, MaxLength, MinLength } from 'class-validator';
++
++import { LoginDto } from '../auth/dto/login.dto';
++
++/** Requesting deletion of the signed-in account: the current password only. */
++export class RequestAccountDeletionDto {
++  @ApiProperty()
++  @IsString()
++  @MinLength(1)
++  @MaxLength(128)
++  password!: string;
++}
++
++/**
++ * Cancelling a pending deletion. The sessions were revoked when deletion was
++ * requested, so the phone and password are the proof - the same shape and
++ * validation as sign-in.
++ */
++export class CancelAccountDeletionDto extends LoginDto {}
++
++/** Administrator recovery of a failed erasure: the reason is audited. */
++export class RecoverAccountDeletionDto {
++  @ApiProperty({ description: 'Why this is being done, e.g. the support ticket reference' })
++  @IsString()
++  @MinLength(10)
++  @MaxLength(500)
++  reason!: string;
++}
+diff --git a/src/modules/account-deletion/account-deletion.module.ts b/src/modules/account-deletion/account-deletion.module.ts
+new file mode 100644
+index 0000000..3780592
+--- /dev/null
++++ b/src/modules/account-deletion/account-deletion.module.ts
+@@ -0,0 +1,16 @@
++import { Module } from '@nestjs/common';
++
++import { AccountDeletionAdminController, AccountDeletionController } from './account-deletion.controller';
++import { AccountDeletionScheduler } from './account-deletion.scheduler';
++import { AccountDeletionService } from './account-deletion.service';
++
++/**
++ * Owner decision D5. AuthModule, AuditModule, StorageModule, RedisModule and
++ * DatabaseModule are global, so nothing needs importing here.
++ */
++@Module({
++  controllers: [AccountDeletionController, AccountDeletionAdminController],
++  providers: [AccountDeletionService, AccountDeletionScheduler],
++  exports: [AccountDeletionService],
++})
++export class AccountDeletionModule {}
+diff --git a/src/modules/account-deletion/account-deletion.scheduler.ts b/src/modules/account-deletion/account-deletion.scheduler.ts
+new file mode 100644
+index 0000000..4197d68
+--- /dev/null
++++ b/src/modules/account-deletion/account-deletion.scheduler.ts
+@@ -0,0 +1,80 @@
++import { Injectable, Logger, type OnApplicationBootstrap, type OnModuleDestroy } from '@nestjs/common';
++
++import { RedisService } from '../../redis/redis.service';
++
++import { AccountDeletionService, type DeletionSweepResult } from './account-deletion.service';
++
++/** Hourly by default; `ACCOUNT_DELETION_SWEEP_INTERVAL_SECONDS=0` disables it on a process. */
++export function normalizeDeletionSweepIntervalSeconds(raw: string | undefined): number {
++  if (raw === undefined || raw.trim() === '') return 3600;
++  const value = Number(raw);
++  if (!Number.isFinite(value) || value < 0) return 3600;
++  if (value === 0) return 0;
++  return Math.max(300, Math.floor(value));
++}
++
++export const DELETION_SWEEP_LOCK = 'account-deletion-sweep';
++const LOCK_SECONDS = 30 * 60;
++
++/**
++ * Runs the account-deletion sweep on the API process.
++ *
++ * Why not a timer per request: the decision (D5) rules out anything that
++ * disappears on restart. Nothing is held in memory here except "check the
++ * table again in an hour" - the due requests are re-read from Postgres on every
++ * run, so a restart or a skipped run only delays erasure to the next sweep.
++ *
++ * Why the API and not the BullMQ worker: in this deployment the worker runs on
++ * the owner's PC and is not guaranteed to be up, while the API always is (the
++ * DRM verification sweep moved here for the same reason). The Redis lock keeps
++ * it to one sweeper across replicas; if the lock ever lapsed, every transition
++ * is conditional, so a second sweeper finds nothing to claim.
++ */
++@Injectable()
++export class AccountDeletionScheduler implements OnApplicationBootstrap, OnModuleDestroy {
++  private readonly logger = new Logger(AccountDeletionScheduler.name);
++  readonly intervalSeconds = normalizeDeletionSweepIntervalSeconds(
++    process.env.ACCOUNT_DELETION_SWEEP_INTERVAL_SECONDS,
++  );
++  private timer?: NodeJS.Timeout;
++  private first?: NodeJS.Timeout;
++
++  constructor(
++    private readonly deletion: AccountDeletionService,
++    private readonly redis: RedisService,
++  ) {}
++
++  onApplicationBootstrap(): void {
++    if (this.intervalSeconds === 0 || process.env.NODE_ENV === 'test') return;
++    this.first = setTimeout(() => void this.tick(), 120_000);
++    this.first.unref();
++    this.timer = setInterval(() => void this.tick(), this.intervalSeconds * 1000);
++    this.timer.unref();
++    this.logger.log(`Account deletion sweep scheduled in-process every ${this.intervalSeconds}s`);
++  }
++
++  onModuleDestroy(): void {
++    if (this.first) clearTimeout(this.first);
++    if (this.timer) clearInterval(this.timer);
++  }
++
++  /** One locked sweep; null when another process holds the lock or Redis is down. */
++  async tick(): Promise<DeletionSweepResult | null> {
++    const release = await this.redis.acquireLock(DELETION_SWEEP_LOCK, LOCK_SECONDS);
++    if (!release) return null;
++    try {
++      const result = await this.deletion.sweep();
++      if (result.claimed > 0 || result.skipped > 0) {
++        this.logger.log(
++          `account deletion sweep: completed=${result.completed} failed=${result.failed} skipped=${result.skipped}`,
++        );
++      }
++      return result;
++    } catch (error) {
++      this.logger.error(`account deletion sweep failed: ${(error as Error).message}`);
++      return null;
++    } finally {
++      await release();
++    }
++  }
++}
+diff --git a/src/modules/account-deletion/account-deletion.service.ts b/src/modules/account-deletion/account-deletion.service.ts
+new file mode 100644
+index 0000000..5d9b179
+--- /dev/null
++++ b/src/modules/account-deletion/account-deletion.service.ts
+@@ -0,0 +1,594 @@
++import { Injectable, Logger } from '@nestjs/common';
++import {
++  AccountDeletionStatus,
++  AccountStatus,
++  AuditAction,
++  DeviceStatus,
++  PlaybackTicketStatus,
++  Prisma,
++  SessionStatus,
++  UserRole,
++} from '@prisma/client';
++
++import { AppException } from '../../common/errors/app.exception';
++import { ErrorCode } from '../../common/errors/error-codes';
++import type { AuthenticatedUser } from '../../common/types/request-context';
++import { PrismaService } from '../../database/prisma.service';
++import { RedisService } from '../../redis/redis.service';
++import { AuditService } from '../audit/audit.service';
++import { AuthService, type RequestMeta } from '../auth/auth.service';
++import { PasswordService } from '../auth/password.service';
++import { StorageService } from '../storage/storage.service';
++
++/**
++ * Owner decision D5: a student can delete their own account from the app.
++ *
++ *   request  ->  PENDING for 30 days  ->  (cancel ->  CANCELLED)
++ *                                     ->  sweep claims it: PROCESSING
++ *                                     ->  personal data erased: COMPLETED
++ *
++ * WHAT "DELETED" MEANS HERE
++ * The user row cannot be hard-deleted: payments, wallet ledger, enrollments,
++ * redemptions, revenue rows and audit entries reference it with
++ * `onDelete: Restrict`, and those are records the business must keep. So the
++ * row stays as a pseudonymous anchor and everything that identifies the person
++ * is erased or overwritten (see `erase`). What is retained, and why, is listed
++ * in docs/audit-2026-10-27/OWNER_DECISIONS.md (D5).
++ *
++ * RELIABILITY
++ * The state lives in `account_deletion_requests`, not in a timer. The hourly
++ * sweep (AccountDeletionScheduler) re-reads the table each time, so a restart,
++ * a redeploy or a missed run only delays erasure until the next sweep. Every
++ * transition is a conditional `updateMany`, and a partial unique index allows
++ * at most one PENDING request per user, so concurrent requests, a cancel racing
++ * the sweep, or two sweepers cannot double-process an account.
++ */
++
++export const DELETION_GRACE_DAYS = 30;
++/** Requests per sweep. Small: each erase is one transaction over one account. */
++export const DELETION_SWEEP_BATCH = 25;
++/**
++ * After this many failed erase attempts the request is marked `failedAt` and
++ * the sweep stops retrying it. It is then listed for an administrator
++ * (`GET /admin/account-deletions/attention`), who can retry it or, on the
++ * account holder's confirmed request, cancel it. Nothing was erased: each
++ * attempt is one transaction that rolled back.
++ */
++export const DELETION_MAX_ATTEMPTS = 10;
++
++/** Log marker an alert rule can match. Carries ids only, never personal data. */
++export const DELETION_ALERT_MARKER = 'ACCOUNT_DELETION_NEEDS_ATTENTION';
++
++/**
++ * What is stored in `lastError` and written to logs: the error's class and
++ * Prisma/Node code, never its message. Messages can echo query arguments.
++ */
++export function describeEraseError(error: unknown): string {
++  if (!error || typeof error !== 'object') return 'UnknownError';
++  const name = (error as { name?: unknown }).name;
++  const code = (error as { code?: unknown }).code;
++  const safeName = typeof name === 'string' && /^[A-Za-z0-9_]{1,60}$/.test(name) ? name : 'Error';
++  const safeCode = typeof code === 'string' && /^[A-Za-z0-9_]{1,20}$/.test(code) ? `:${code}` : '';
++  return `${safeName}${safeCode}`;
++}
++
++export const DELETED_USER_NAME = 'Deleted user';
++export const REDACTED_TEXT = '[removed at the account holder\'s request]';
++/** Not a valid argon2/bcrypt string, so no password can ever verify against it. */
++export const UNUSABLE_PASSWORD_HASH = '!account-deleted';
++
++const REVOKE_REASON = 'Account deletion requested';
++
++export interface DeletionRequestView {
++  id: string;
++  status: AccountDeletionStatus;
++  requestedAt: string;
++  scheduledFor: string;
++  cancellable: boolean;
++}
++
++export interface DeletionSweepResult {
++  claimed: number;
++  completed: number;
++  failed: number;
++  skipped: number;
++  /** Requests stopped after repeated failures, waiting for an administrator. */
++  needsAttention?: number;
++}
++
++function view(row: {
++  id: string;
++  status: AccountDeletionStatus;
++  requestedAt: Date;
++  scheduledFor: Date;
++}): DeletionRequestView {
++  return {
++    id: row.id,
++    status: row.status,
++    requestedAt: row.requestedAt.toISOString(),
++    scheduledFor: row.scheduledFor.toISOString(),
++    cancellable:
++      row.status === AccountDeletionStatus.PENDING && row.scheduledFor.getTime() > Date.now(),
++  };
++}
++
++function isUniqueViolation(error: unknown): boolean {
++  return (
++    error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002'
++  ) || (typeof error === 'object' && error !== null && (error as { code?: string }).code === 'P2002');
++}
++
++@Injectable()
++export class AccountDeletionService {
++  private readonly logger = new Logger(AccountDeletionService.name);
++
++  constructor(
++    private readonly prisma: PrismaService,
++    private readonly auth: AuthService,
++    private readonly passwords: PasswordService,
++    private readonly audit: AuditService,
++    private readonly redis: RedisService,
++    private readonly storage: StorageService,
++  ) {}
++
++  // ---------------------------------------------------------------------------
++  // Request
++  // ---------------------------------------------------------------------------
++
++  /**
++   * Schedules deletion of the CALLER's own account. Requires the current
++   * password, so an unlocked phone left on a desk is not enough.
++   *
++   * Idempotent: asking again while a request is open returns that request with
++   * its ORIGINAL date (asking twice never moves the date).
++   *
++   * Every session, refresh token, live playback grant and push token is revoked
++   * in the same transaction, so the account is unusable from this moment;
++   * signing in again is refused until the deletion is cancelled.
++   */
++  async request(actor: AuthenticatedUser, password: string, meta: RequestMeta): Promise<DeletionRequestView> {
++    if (actor.role !== UserRole.STUDENT) {
++      // Staff accounts are managed by an administrator (users.softDelete),
++      // which also protects courses from losing their only teacher.
++      throw new AppException(ErrorCode.INSUFFICIENT_ROLE, {
++        message: 'Staff accounts are deleted by an administrator.',
++      });
++    }
++
++    const user = await this.prisma.user.findFirst({
++      where: { id: actor.id, deletedAt: null },
++      select: { id: true, passwordHash: true },
++    });
++    if (!user) throw AppException.notFound('User', actor.id);
++
++    const valid = await this.passwords.verify(user.passwordHash, password);
++    if (!valid) {
++      throw new AppException(ErrorCode.INVALID_CREDENTIALS, {
++        message: 'The password is incorrect.',
++        fields: { password: ['The password is incorrect.'] },
++      });
++    }
++
++    const open = await this.findOpen(user.id);
++    if (open) return view(open);
++
++    const now = new Date();
++    const scheduledFor = new Date(now.getTime() + DELETION_GRACE_DAYS * 24 * 3600 * 1000);
++
++    let created: { id: string; status: AccountDeletionStatus; requestedAt: Date; scheduledFor: Date };
++    try {
++      created = await this.prisma.$transaction(async (tx) => {
++        const row = await tx.accountDeletionRequest.create({
++          data: { userId: user.id, requestedAt: now, scheduledFor, source: 'app' },
++          select: { id: true, status: true, requestedAt: true, scheduledFor: true },
++        });
++        await this.revokeAccessInTx(tx, user.id, now, REVOKE_REASON);
++        await this.audit.recordTx(tx, {
++          actorId: actor.id,
++          actorRole: actor.role,
++          action: AuditAction.DELETE,
++          entity: 'account_deletion_request',
++          entityId: row.id,
++          note: `Account deletion requested; scheduled for ${scheduledFor.toISOString()}`,
++          ipAddress: meta.ip,
++          userAgent: meta.userAgent,
++          requestId: meta.requestId,
++        });
++        return row;
++      });
++    } catch (error) {
++      // A concurrent request from the same account won the partial unique
++      // index. That request is the answer.
++      if (isUniqueViolation(error)) {
++        const winner = await this.findOpen(user.id);
++        if (winner) return view(winner);
++      }
++      throw error;
++    }
++
++    await this.redis.del(`pb:slots:${user.id}`);
++    return view(created);
++  }
++
++  // ---------------------------------------------------------------------------
++  // Cancel
++  // ---------------------------------------------------------------------------
++
++  /**
++   * Cancels a pending deletion. Public: the account's sessions were revoked
++   * when deletion was requested and sign-in is refused, so the phone and
++   * password are the proof. `AuthService.verifyCredentials` gives this route
++   * the same lockout, timing equalisation and failed-attempt accounting as
++   * sign-in, and the route carries the credential throttle (keyed by phone).
++   *
++   * Only a request that is still PENDING and inside its 30 days can be
++   * cancelled; the conditional update is what makes a cancel racing the sweep
++   * safe - exactly one of them changes the row.
++   */
++  async cancel(phone: string, password: string, meta: RequestMeta): Promise<{ cancelled: true; requestId: string }> {
++    const user = await this.auth.verifyCredentials(phone, password, meta);
++    const now = new Date();
++
++    const open = await this.prisma.accountDeletionRequest.findFirst({
++      where: { userId: user.id, status: AccountDeletionStatus.PENDING },
++      select: { id: true },
++    });
++
++    const { count } = open
++      ? await this.prisma.accountDeletionRequest.updateMany({
++          where: { id: open.id, status: AccountDeletionStatus.PENDING, scheduledFor: { gt: now } },
++          data: { status: AccountDeletionStatus.CANCELLED, cancelledAt: now },
++        })
++      : { count: 0 };
++
++    if (!open || count === 0) {
++      const processing = await this.prisma.accountDeletionRequest.findFirst({
++        where: { userId: user.id, status: { in: [AccountDeletionStatus.PENDING, AccountDeletionStatus.PROCESSING] } },
++        select: { id: true },
++      });
++      throw new AppException(ErrorCode.INVALID_STATE, {
++        // Past its 30 days (or being erased): the app can no longer cancel it.
++        // If erasure stopped after repeated failures, an administrator can
++        // still cancel it on the holder's confirmed request (cancelFailed).
++        message: processing
++          ? 'This deletion can no longer be cancelled in the app. Please contact support.'
++          : 'There is no pending deletion for this account.',
++      });
++    }
++
++    await this.audit.record({
++      actorId: user.id,
++      actorRole: user.role,
++      action: AuditAction.UPDATE,
++      entity: 'account_deletion_request',
++      entityId: open.id,
++      note: 'Account deletion cancelled by the account holder',
++      ipAddress: meta.ip,
++      userAgent: meta.userAgent,
++      requestId: meta.requestId,
++    });
++
++    return { cancelled: true, requestId: open.id };
++  }
++
++  // ---------------------------------------------------------------------------
++  // Sweep (called by AccountDeletionScheduler under a Redis lock)
++  // ---------------------------------------------------------------------------
++
++  async sweep(now = new Date()): Promise<DeletionSweepResult> {
++    const result: DeletionSweepResult = { claimed: 0, completed: 0, failed: 0, skipped: 0 };
++
++    const due = await this.prisma.accountDeletionRequest.findMany({
++      where: {
++        // Requests that ran out of attempts wait for an administrator.
++        failedAt: null,
++        OR: [
++          { status: AccountDeletionStatus.PENDING, scheduledFor: { lte: now } },
++          // A PROCESSING row is one whose sweep died between the claim and the
++          // erase transaction (which is atomic, so nothing half-done is left).
++          // Erasure is idempotent, so it is simply run again.
++          { status: AccountDeletionStatus.PROCESSING },
++        ],
++      },
++      orderBy: { scheduledFor: 'asc' },
++      take: DELETION_SWEEP_BATCH,
++      select: { id: true, userId: true, status: true, attempts: true },
++    });
++
++    for (const row of due) {
++      const attempt = row.attempts + 1;
++      if (row.status === AccountDeletionStatus.PENDING) {
++        const claim = await this.prisma.accountDeletionRequest.updateMany({
++          where: { id: row.id, status: AccountDeletionStatus.PENDING, scheduledFor: { lte: now } },
++          data: { status: AccountDeletionStatus.PROCESSING, attempts: { increment: 1 } },
++        });
++        if (claim.count === 0) {
++          // Cancelled (or claimed elsewhere) since it was read.
++          result.skipped += 1;
++          continue;
++        }
++      } else {
++        await this.prisma.accountDeletionRequest.update({
++          where: { id: row.id },
++          data: { attempts: { increment: 1 } },
++        });
++      }
++      result.claimed += 1;
++
++      try {
++        await this.erase(row.id, row.userId);
++        result.completed += 1;
++      } catch (error) {
++        result.failed += 1;
++        const reason = describeEraseError(error);
++        const exhausted = attempt >= DELETION_MAX_ATTEMPTS;
++        this.logger.error(
++          `account erase failed: request=${row.id} attempt=${attempt}/${DELETION_MAX_ATTEMPTS} error=${reason}` +
++            (exhausted ? ` ${DELETION_ALERT_MARKER} (retries stopped; administrator action required)` : ''),
++        );
++        // Back to PENDING. The account stays blocked from sign-in (a pending
++        // deletion), nothing was erased, and the date has passed, so the next
++        // sweep retries - unless the attempts are used up.
++        await this.prisma.accountDeletionRequest
++          .updateMany({
++            where: { id: row.id, status: AccountDeletionStatus.PROCESSING },
++            data: {
++              status: AccountDeletionStatus.PENDING,
++              lastError: reason,
++              ...(exhausted ? { failedAt: new Date() } : {}),
++            },
++          })
++          .catch(() => undefined);
++      }
++    }
++
++    // A standing signal while anything waits for an administrator, so an alert
++    // on the marker keeps firing until someone acts.
++    const waiting = await this.prisma.accountDeletionRequest
++      .count({ where: { failedAt: { not: null }, status: AccountDeletionStatus.PENDING } })
++      .catch(() => 0);
++    if (waiting > 0) {
++      this.logger.error(`${DELETION_ALERT_MARKER}: ${waiting} account deletion request(s) stopped after repeated failures`);
++    }
++    result.needsAttention = waiting;
++
++    return result;
++  }
++
++  // ---------------------------------------------------------------------------
++  // Administrator recovery (failed erasures only)
++  // ---------------------------------------------------------------------------
++
++  /** Requests whose erasure stopped after repeated failures. Ids and timings only. */
++  async listNeedingAttention() {
++    const rows = await this.prisma.accountDeletionRequest.findMany({
++      where: { failedAt: { not: null }, status: AccountDeletionStatus.PENDING },
++      orderBy: { failedAt: 'asc' },
++      take: 100,
++      select: {
++        id: true,
++        userId: true,
++        status: true,
++        requestedAt: true,
++        scheduledFor: true,
++        attempts: true,
++        failedAt: true,
++        lastError: true,
++      },
++    });
++    return rows.map((r) => ({
++      ...r,
++      requestedAt: r.requestedAt.toISOString(),
++      scheduledFor: r.scheduledFor.toISOString(),
++      failedAt: r.failedAt?.toISOString() ?? null,
++    }));
++  }
++
++  /**
++   * Re-queues a failed erasure: the account holder still wants deletion and
++   * the cause has been fixed. Only a request that stopped after repeated
++   * failures qualifies; a normal pending request is untouched.
++   */
++  async retryFailed(requestId: string, actor: AuthenticatedUser, reason: string, meta: RequestMeta) {
++    const { count } = await this.prisma.accountDeletionRequest.updateMany({
++      where: { id: requestId, status: AccountDeletionStatus.PENDING, failedAt: { not: null } },
++      data: { failedAt: null, attempts: 0, lastError: null },
++    });
++    if (count === 0) throw this.notRecoverable();
++    await this.audit.record({
++      actorId: actor.id,
++      actorRole: actor.role,
++      action: AuditAction.UPDATE,
++      entity: 'account_deletion_request',
++      entityId: requestId,
++      note: `Failed account erasure re-queued by an administrator: ${reason}`,
++      ipAddress: meta.ip,
++      userAgent: meta.userAgent,
++      requestId: meta.requestId,
++    });
++    return { id: requestId, requeued: true as const };
++  }
++
++  /**
++   * Cancels a failed erasure on the account holder's confirmed request. The
++   * account was never erased (every attempt rolled back), so cancelling makes
++   * it usable again; the holder signs in normally. Explicit, reasoned and
++   * audited - never automatic.
++   */
++  async cancelFailed(requestId: string, actor: AuthenticatedUser, reason: string, meta: RequestMeta) {
++    const now = new Date();
++    const { count } = await this.prisma.accountDeletionRequest.updateMany({
++      where: { id: requestId, status: AccountDeletionStatus.PENDING, failedAt: { not: null } },
++      data: { status: AccountDeletionStatus.CANCELLED, cancelledAt: now },
++    });
++    if (count === 0) throw this.notRecoverable();
++    await this.audit.record({
++      actorId: actor.id,
++      actorRole: actor.role,
++      action: AuditAction.UPDATE,
++      entity: 'account_deletion_request',
++      entityId: requestId,
++      note: `Failed account erasure cancelled by an administrator at the holder's request: ${reason}`,
++      ipAddress: meta.ip,
++      userAgent: meta.userAgent,
++      requestId: meta.requestId,
++    });
++    return { id: requestId, cancelled: true as const };
++  }
++
++  private notRecoverable() {
++    return new AppException(ErrorCode.INVALID_STATE, {
++      message: 'Only a deletion request whose erasure stopped after repeated failures can be recovered here.',
++    });
++  }
++
++  /**
++   * Erases the person and keeps the records. One transaction: either every
++   * step happens and the request is COMPLETED, or none does and the request is
++   * retried.
++   */
++  async erase(requestId: string, userId: string): Promise<void> {
++    const now = new Date();
++
++    await this.prisma.$transaction(
++      async (tx) => {
++        // Re-read inside the transaction: the request must still be claimed
++        // for exactly this account, and the account must be a student. A stale
++        // or mismatched call can therefore never erase anyone else.
++        const current = await tx.accountDeletionRequest.findUnique({
++          where: { id: requestId },
++          select: { userId: true, status: true },
++        });
++        if (!current || current.userId !== userId || current.status !== AccountDeletionStatus.PROCESSING) {
++          throw Object.assign(new Error('deletion request is not claimed for this account'), {
++            name: 'DeletionRequestMismatch',
++          });
++        }
++        const target = await tx.user.findUnique({ where: { id: userId }, select: { role: true } });
++        if (!target || target.role !== UserRole.STUDENT) {
++          throw Object.assign(new Error('deletion target is not a student account'), {
++            name: 'DeletionTargetNotStudent',
++          });
++        }
++
++        // Identity. The phone becomes a value that can never collide with a
++        // real number, which also frees the number for a fresh registration.
++        await tx.user.update({
++          where: { id: userId },
++          data: {
++            fullName: DELETED_USER_NAME,
++            phone: `deleted:${userId}`,
++            email: null,
++            avatarUrl: null,
++            gender: null,
++            passwordHash: UNUSABLE_PASSWORD_HASH,
++            credentialsChangedAt: now,
++            failedLoginCount: 0,
++            lockedUntil: null,
++            status: AccountStatus.DISABLED,
++            deletedAt: now,
++          },
++        });
++        await tx.studentProfile.updateMany({
++          where: { userId },
++          data: { studentNumber: null, notes: null },
++        });
++
++        // Access: anything a request-time revocation could have missed.
++        await this.revokeAccessInTx(tx, userId, now, 'Account deleted');
++
++        // Network and device identifiers.
++        await tx.session.updateMany({ where: { userId }, data: { ipAddress: null, userAgent: null } });
++        await tx.playbackTicket.updateMany({ where: { userId }, data: { ipAddress: null, userAgent: null } });
++        await tx.securityEvent.updateMany({
++          where: { userId },
++          data: { ipAddress: null, userAgent: null, deviceKey: null, metadata: Prisma.DbNull },
++        });
++        await tx.accessCodeRedemption.updateMany({ where: { userId }, data: { ipAddress: null, deviceKey: null } });
++        const devices = await tx.device.findMany({ where: { userId }, select: { id: true } });
++        for (const device of devices) {
++          // deviceKey is unique per user, so each row gets its own placeholder.
++          await tx.device.update({
++            where: { id: device.id },
++            data: {
++              deviceKey: `deleted:${device.id}`,
++              name: 'Deleted device',
++              model: null,
++              osVersion: null,
++              appVersion: null,
++              status: DeviceStatus.REVOKED,
++              revokedAt: now,
++              revokedReason: 'Account deleted',
++            },
++          });
++        }
++
++        // Rows that exist only for the person and carry nothing to keep.
++        await tx.deviceChangeRequest.deleteMany({ where: { userId } });
++        await tx.pushToken.deleteMany({ where: { userId } });
++        await tx.notification.deleteMany({ where: { userId } });
++        await tx.notificationPreference.deleteMany({ where: { userId } });
++
++        // Support: the ticket stays (staff workload and audit), what the
++        // student wrote does not.
++        await tx.supportTicket.updateMany({ where: { userId }, data: { subject: REDACTED_TEXT } });
++        await tx.supportMessage.updateMany({ where: { authorId: userId }, data: { body: REDACTED_TEXT } });
++
++        await tx.accountDeletionRequest.update({
++          where: { id: requestId },
++          data: { status: AccountDeletionStatus.COMPLETED, completedAt: now, lastError: null },
++        });
++
++        await this.audit.recordTx(tx, {
++          actorId: null,
++          actorRole: null,
++          action: AuditAction.DELETE,
++          entity: 'user',
++          entityId: userId,
++          note: `Personal data erased at the account holder's request (deletion request ${requestId})`,
++        });
++      },
++      { timeout: 60_000, maxWait: 10_000 },
++    );
++
++    // Outside the transaction, best effort: object storage and cache cannot
++    // roll back with Postgres, and a leftover avatar file is unreferenced.
++    await this.redis.del(`pb:slots:${userId}`);
++    if (this.storage.isConfigured) {
++      await this.storage
++        .deletePrefix('media', `avatars/${userId}/`)
++        .catch((error: Error) => this.logger.warn(`avatar cleanup failed for ${userId}: ${error.message}`));
++    }
++  }
++
++  // ---------------------------------------------------------------------------
++
++  private findOpen(userId: string) {
++    // A request that stopped after repeated failures is still PENDING, so it is
++    // still "open": asking again returns it rather than creating a second one.
++    return this.prisma.accountDeletionRequest.findFirst({
++      where: {
++        userId,
++        status: { in: [AccountDeletionStatus.PENDING, AccountDeletionStatus.PROCESSING] },
++      },
++      select: { id: true, status: true, requestedAt: true, scheduledFor: true },
++    });
++  }
++
++  private async revokeAccessInTx(tx: Prisma.TransactionClient, userId: string, now: Date, reason: string) {
++    await tx.session.updateMany({
++      where: { userId, status: SessionStatus.ACTIVE },
++      data: { status: SessionStatus.REVOKED, revokedAt: now, revokedReason: reason },
++    });
++    await tx.refreshToken.updateMany({
++      where: { userId, revokedAt: null },
++      data: { revokedAt: now, revokedReason: reason },
++    });
++    await tx.playbackTicket.updateMany({
++      where: { userId, status: PlaybackTicketStatus.ACTIVE },
++      data: { status: PlaybackTicketStatus.REVOKED, revokedAt: now, revokedReason: reason },
++    });
++    // Queued pushes check `isActive`, so nothing more reaches the devices.
++    await tx.pushToken.updateMany({ where: { userId, isActive: true }, data: { isActive: false } });
++  }
++}
+diff --git a/src/modules/auth/auth.service.ts b/src/modules/auth/auth.service.ts
+index 27f3ce3..362392f 100755
+--- a/src/modules/auth/auth.service.ts
++++ b/src/modules/auth/auth.service.ts
+@@ -1,6 +1,7 @@
+ import { Injectable, Logger } from '@nestjs/common';
+ import { ConfigService } from '@nestjs/config';
+ import {
++  AccountDeletionStatus,
+   AccountStatus,
+   AuditAction,
+   DeviceStatus,
+@@ -156,8 +157,15 @@ export class AuthService {
+   // Login
+   // ---------------------------------------------------------------------------
+ 
+-  async login(dto: LoginDto, meta: RequestMeta): Promise<AuthResult> {
+-    const phone = UsersService.normalizePhone(dto.phone);
++  /**
++   * The phone + password check, shared by sign-in and the account-deletion
++   * cancel flow so both get the same timing equalisation, lockout and
++   * failed-attempt accounting. Returns the user only when the password is
++   * correct. Account status is deliberately NOT checked here: each caller
++   * decides what a correct password on a disabled or pending account means.
++   */
++  async verifyCredentials(phoneInput: string, password: string, meta: RequestMeta) {
++    const phone = UsersService.normalizePhone(phoneInput);
+ 
+     const user = await this.prisma.user.findUnique({
+       where: { phone },
+@@ -175,7 +183,7 @@ export class AuthService {
+     if (!user || user.deletedAt) {
+       // Spend the same CPU as a real verification so response time doesn't
+       // reveal whether the number is registered.
+-      await this.passwords.burnTiming(dto.password);
++      await this.passwords.burnTiming(password);
+       await this.security.record({
+         type: SecurityEventType.LOGIN_FAILED,
+         ipAddress: meta.ip,
+@@ -196,7 +204,7 @@ export class AuthService {
+       });
+     }
+ 
+-    const valid = await this.passwords.verify(user.passwordHash, dto.password);
++    const valid = await this.passwords.verify(user.passwordHash, password);
+ 
+     if (!valid) {
+       await this.registerFailedAttempt(
+@@ -208,6 +216,12 @@ export class AuthService {
+       throw new AppException(ErrorCode.INVALID_CREDENTIALS);
+     }
+ 
++    return user;
++  }
++
++  async login(dto: LoginDto, meta: RequestMeta): Promise<AuthResult> {
++    const user = await this.verifyCredentials(dto.phone, dto.password, meta);
++
+     // Status is checked AFTER the password so a disabled-account response
+     // can't be used to enumerate valid numbers.
+     if (
+@@ -222,6 +236,34 @@ export class AuthService {
+       throw new AppException(ErrorCode.ACCOUNT_PENDING);
+     }
+ 
++    // A pending account deletion (owner decision D5) blocks ordinary use. It
++    // is checked after the password, like the status checks above, so the
++    // answer cannot be used to learn which numbers have asked for deletion.
++    // The cancel flow (`POST /auth/account-deletion/cancel`) is the way back.
++    const deletion = await this.prisma.accountDeletionRequest.findFirst({
++      where: {
++        userId: user.id,
++        status: { in: [AccountDeletionStatus.PENDING, AccountDeletionStatus.PROCESSING] },
++      },
++      select: { status: true, scheduledFor: true },
++    }).catch((error: unknown) => {
++      // P2021 = the table does not exist: the API was deployed before its
++      // migration. No request can exist then, so sign-in must not break.
++      if ((error as { code?: string })?.code === 'P2021') return null;
++      throw error;
++    });
++    if (deletion) {
++      const cancellable =
++        deletion.status === AccountDeletionStatus.PENDING &&
++        deletion.scheduledFor.getTime() > Date.now();
++      throw new AppException(ErrorCode.ACCOUNT_DELETION_PENDING, {
++        message: cancellable
++          ? 'This account is scheduled for deletion. Cancel the deletion to sign in again.'
++          : 'This account is being deleted and can no longer be restored.',
++        details: { scheduledFor: deletion.scheduledFor.toISOString(), cancellable },
++      });
++    }
++
+     // Opportunistic upgrade if the hashing parameters were raised.
+     if (this.passwords.needsRehash(user.passwordHash)) {
+       const rehashed = await this.passwords.hash(dto.password);
+diff --git a/src/modules/courses/courses.admin.service.ts b/src/modules/courses/courses.admin.service.ts
+index 343b5f1..19690ea 100755
+--- a/src/modules/courses/courses.admin.service.ts
++++ b/src/modules/courses/courses.admin.service.ts
+@@ -4,7 +4,7 @@ import {
+   AcademicStructureKind,
+   AuditAction,
+   CourseStatus,
+-  type EnrollmentMethod,
++  EnrollmentMethod,
+   EnrollmentState,
+   type Prisma,
+   UserRole,
+@@ -24,6 +24,20 @@ import { assertObjectKeyInNamespace, StorageService } from '../storage/storage.s
+ import { CourseAccessService } from './course-access.service';
+ import { CoursesService } from './courses.service';
+ 
++/**
++ * Key in `archive_records.snapshot` listing the enrollments that were still
++ * PENDING_APPROVAL when the course was archived, so `restore` can put them
++ * back as requests instead of granting access.
++ */
++export const PENDING_APPROVAL_SNAPSHOT_KEY = 'pendingApprovalEnrollmentIds';
++
++/** The recorded pending-approval ids, or [] for archives made before the record existed. */
++export function pendingApprovalIdsFrom(snapshot: unknown): string[] {
++  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return [];
++  const value = (snapshot as Record<string, unknown>)[PENDING_APPROVAL_SNAPSHOT_KEY];
++  return Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string') : [];
++}
++
+ export interface CreateCourseInput {
+   title: string;
+   titleAr?: string;
+@@ -1056,6 +1070,15 @@ export class CoursesAdminService {
+         data: { status: CourseStatus.ARCHIVED, archivedAt: now },
+       });
+ 
++      // Which requests were still awaiting approval. ARCHIVED alone does not
++      // say what a row was before, and `restore` must put an unapproved
++      // request back as unapproved - never ACTIVE. Recorded in the archive
++      // record only (not in the audit row or the response).
++      const pendingApproval = await tx.enrollment.findMany({
++        where: { courseId, state: EnrollmentState.PENDING_APPROVAL },
++        select: { id: true },
++      });
++
+       // Enrollments move to ARCHIVED so the student sees the right state, but
+       // the rows — and their payment links — remain.
+       await tx.enrollment.updateMany({
+@@ -1078,7 +1101,10 @@ export class CoursesAdminService {
+           entityId: courseId,
+           courseId,
+           reason,
+-          snapshot: frozen as Prisma.InputJsonValue,
++          snapshot: {
++            ...frozen,
++            [PENDING_APPROVAL_SNAPSHOT_KEY]: pendingApproval.map((e) => e.id),
++          } as Prisma.InputJsonValue,
+           archivedById: actor.id,
+         },
+       });
+@@ -1121,8 +1147,35 @@ export class CoursesAdminService {
+         data: { status: CourseStatus.DRAFT, archivedAt: null },
+       });
+ 
+-      // Enrollments come back to ACTIVE only if their access window still
+-      // holds; the rest become EXPIRED, which is the honest state.
++      // Requests that were awaiting approval when the course was archived go
++      // back to PENDING_APPROVAL. Restoring a course must never approve
++      // anyone. Two sources, combined:
++      //  - the ids recorded at archive time (archives made after this fix);
++      //  - for older archives with no record, rows that can only have been an
++      //    unapproved request: ADMIN_APPROVAL with no approval stamp. Every
++      //    real grant of that method stamps `approvedAt` (grantByAdmin always
++      //    passes the approver), so this cannot catch an approved student.
++      const archiveRecord = await tx.archiveRecord.findFirst({
++        where: { entity: 'course', entityId: courseId, restoredAt: null },
++        orderBy: { archivedAt: 'desc' },
++        select: { snapshot: true },
++      });
++      const recordedPending = pendingApprovalIdsFrom(archiveRecord?.snapshot);
++      await tx.enrollment.updateMany({
++        where: {
++          courseId,
++          state: EnrollmentState.ARCHIVED,
++          OR: [
++            ...(recordedPending.length > 0 ? [{ id: { in: recordedPending } }] : []),
++            { method: EnrollmentMethod.ADMIN_APPROVAL, approvedAt: null },
++          ],
++        },
++        data: { state: EnrollmentState.PENDING_APPROVAL },
++      });
++
++      // Everything else archived was ACTIVE. It comes back to ACTIVE only if
++      // its access window still holds; the rest become EXPIRED, which is the
++      // honest state.
+       const now = new Date();
+       await tx.enrollment.updateMany({
+         where: {
+diff --git a/src/modules/diagnostics/client-ip-diagnostics.controller.ts b/src/modules/diagnostics/client-ip-diagnostics.controller.ts
+new file mode 100644
+index 0000000..f68c798
+--- /dev/null
++++ b/src/modules/diagnostics/client-ip-diagnostics.controller.ts
+@@ -0,0 +1,36 @@
++import { Controller, Get, Req } from '@nestjs/common';
++import { ConfigService } from '@nestjs/config';
++import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
++import type { Request } from 'express';
++
++import { MasterOnly } from '../../common/decorators/roles.decorator';
++import { describeClientIpChain } from '../../common/net/client-ip';
++
++/**
++ * Owner decision D6 follow-up: the number of proxies Render puts in front of
++ * the API (`TRUST_PROXY_HOPS`) is not documented, and guessing it wrong either
++ * lumps all anonymous mobile traffic into one rate-limit bucket (too few hops)
++ * or lets a client choose its own address (too many).
++ *
++ * This read-only, MASTER-only endpoint shows how the platform delivered the
++ * CALLER'S OWN request, so the hop count can be read off real evidence. It
++ * changes nothing and is not used for attribution. Procedure:
++ * docs/audit-2026-10-27/OWNER_DECISIONS.md, D6.
++ */
++@ApiTags('admin')
++@ApiBearerAuth()
++@Controller('admin/diagnostics')
++export class ClientIpDiagnosticsController {
++  constructor(private readonly config: ConfigService) {}
++
++  @Get('client-ip')
++  @MasterOnly()
++  @ApiOperation({ summary: "How this request's client address reached the API (proxy-hop check)" })
++  clientIp(@Req() req: Request) {
++    const app = this.config.get<{ trustProxy?: boolean; trustProxyHops?: number }>('app') ?? {};
++    return describeClientIpChain(req, {
++      trustProxy: app.trustProxy ?? false,
++      trustProxyHops: app.trustProxyHops ?? 1,
++    });
++  }
++}
+diff --git a/src/modules/diagnostics/diagnostics.module.ts b/src/modules/diagnostics/diagnostics.module.ts
+new file mode 100644
+index 0000000..e2c393b
+--- /dev/null
++++ b/src/modules/diagnostics/diagnostics.module.ts
+@@ -0,0 +1,7 @@
++import { Module } from '@nestjs/common';
++
++import { ClientIpDiagnosticsController } from './client-ip-diagnostics.controller';
++
++/** Read-only operator diagnostics (MASTER only). */
++@Module({ controllers: [ClientIpDiagnosticsController] })
++export class DiagnosticsModule {}
+diff --git a/src/modules/enrollments/enrollments.controller.ts b/src/modules/enrollments/enrollments.controller.ts
+index 7454681..c350ddb 100755
+--- a/src/modules/enrollments/enrollments.controller.ts
++++ b/src/modules/enrollments/enrollments.controller.ts
+@@ -161,12 +161,16 @@ export class EnrollmentsController {
+     });
+   }
+ 
++  // Owner decision D3: granting access (including approving a pending request,
++  // which turns PENDING_PAYMENT / PENDING_APPROVAL into ACTIVE without a
++  // payment) and extending an access window are ADMINISTRATION ONLY. Teachers
++  // keep viewing students, rejecting requests and managing content.
+   @Post('admin/enrollments/grant')
+-  @StaffOnly()
++  @AdminOnly()
+   @ApiOperation({
+-    summary: 'Grant access directly',
++    summary: 'Grant access directly (admin only)',
+     description:
+-      'Approves a pending request or enrolls a student outright — the administrative override for offline payments and approvals.',
++      'Approves a pending request or enrolls a student outright — the administrative override for offline payments and approvals. Teachers receive 403.',
+   })
+   grant(@Body() dto: GrantAccessDto, @CurrentUser() actor: AuthenticatedUser) {
+     return this.enrollments.grantByAdmin(dto, actor);
+@@ -202,9 +206,9 @@ export class EnrollmentsController {
+   }
+ 
+   @Post('admin/enrollments/:id/extend')
+-  @StaffOnly()
++  @AdminOnly()
+   @ApiOperation({
+-    summary: 'Extend an access window',
++    summary: 'Extend an access window (admin only)',
+     description:
+       'Extends from the later of the current end date or now, so extending an already-lapsed enrollment actually grants time.',
+   })
+diff --git a/src/modules/enrollments/enrollments.service.ts b/src/modules/enrollments/enrollments.service.ts
+index 3f9490d..903cf93 100755
+--- a/src/modules/enrollments/enrollments.service.ts
++++ b/src/modules/enrollments/enrollments.service.ts
+@@ -30,6 +30,21 @@ import { PaymentsService } from '../payments/payments.service';
+ 
+ import { revokeEnrollmentInTx } from './revoke-enrollment';
+ 
++/**
++ * Refuses anyone but an administrator (ADMIN or MASTER).
++ *
++ * Used for the operations owner decision D3 reserves for administration:
++ * granting access without payment and extending an access window. Thrown as
++ * INSUFFICIENT_ROLE (403), the same answer RolesGuard gives at the route.
++ */
++export function assertAdministrator(role: UserRole, action: string): void {
++  if (role !== UserRole.ADMIN && role !== UserRole.MASTER) {
++    throw new AppException(ErrorCode.INSUFFICIENT_ROLE, {
++      message: `Only an administrator can ${action}.`,
++    });
++  }
++}
++
+ /** Matches the mobile app's `EnrollmentResult` exactly. */
+ export interface EnrollmentResult {
+   state: string;
+@@ -856,6 +871,10 @@ export class EnrollmentsService {
+     },
+     actor: { id: string; role: UserRole },
+   ) {
++    // Defence in depth behind @AdminOnly() on the route: free access is an
++    // administrative decision (owner decision D3), whatever capabilities a
++    // teacher's course assignment carries.
++    assertAdministrator(actor.role, 'grant access');
+     await this.access.assertCanManageCourse(actor.id, actor.role, params.courseId, 'students');
+ 
+     const course = await this.prisma.course.findFirst({
+@@ -1044,6 +1063,10 @@ export class EnrollmentsService {
+     actor: { id: string; role: UserRole },
+     note?: string,
+   ) {
++    // Administration only (owner decision D3), checked before anything is read
++    // so a teacher learns nothing about the enrollment either.
++    assertAdministrator(actor.role, 'extend access');
++
+     const enrollment = await this.prisma.enrollment.findUnique({
+       where: { id: enrollmentId },
+     });
+diff --git a/src/modules/notifications/notifications.controller.ts b/src/modules/notifications/notifications.controller.ts
+index 255e654..5ce0677 100755
+--- a/src/modules/notifications/notifications.controller.ts
++++ b/src/modules/notifications/notifications.controller.ts
+@@ -12,6 +12,7 @@ import {
+   Req,
+ } from '@nestjs/common';
+ import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
++import { AuditAction } from '@prisma/client';
+ import { Transform } from 'class-transformer';
+ import {
+   IsBoolean,
+@@ -23,11 +24,14 @@ import {
+ } from 'class-validator';
+ import type { Request } from 'express';
+ 
++import { Audit } from '../../common/decorators/audit.decorator';
+ import { CurrentUser, Locale } from '../../common/decorators/current-user.decorator';
+-import { AdminOnly } from '../../common/decorators/roles.decorator';
++import { AdminOnly, StaffOnly } from '../../common/decorators/roles.decorator';
+ import { PaginationDto } from '../../common/dto/pagination.dto';
+ import type { AuthenticatedUser } from '../../common/types/request-context';
+ 
++import { CourseAccessService } from '../courses/course-access.service';
++
+ import { AnnouncementsService } from './announcements.service';
+ import { NotificationsService } from './notifications.service';
+ 
+@@ -69,6 +73,24 @@ class CreateAnnouncementDto {
+   @IsOptional() @IsBoolean() publishNow?: boolean;
+ }
+ 
++/**
++ * A notification to the students of ONE course.
++ *
++ * Deliberately narrower than `CreateAnnouncementDto`: no audience fields, no
++ * `userId`, no `route`. The course comes from the URL, the audience is derived
++ * on the server from that course's ACTIVE enrollments, and the deep link is
++ * fixed to the course page. A teacher therefore cannot widen the audience, name
++ * individual users, or point the notification somewhere else - the DTO has no
++ * field to do it with, and `forbidNonWhitelisted` rejects any extra one.
++ */
++export class CourseAnnouncementDto {
++  @IsString() @MinLength(3) @MaxLength(200) title!: string;
++  @IsOptional() @IsString() @MaxLength(200) titleAr?: string;
++  @IsString() @MinLength(3) @MaxLength(2000) body!: string;
++  @IsOptional() @IsString() @MaxLength(2000) bodyAr?: string;
++  @IsOptional() @IsBoolean() sendPush?: boolean;
++}
++
+ /**
+  * Notifications.
+  *
+@@ -82,6 +104,7 @@ export class NotificationsController {
+   constructor(
+     private readonly notifications: NotificationsService,
+     private readonly announcements: AnnouncementsService,
++    private readonly courseAccess: CourseAccessService,
+   ) {}
+ 
+   @Get()
+@@ -196,6 +219,56 @@ export class NotificationsController {
+     return this.announcements.createLegacy(dto, actor);
+   }
+ 
++  /**
++   * Teachers (and admins) notifying the students of one course.
++   *
++   * Authorised by the course assignment, not by the role alone: the teacher
++   * must be assigned to THIS course with the student-management capability
++   * (`canViewStudents`), checked by the same authority every course route uses.
++   * Admins pass that check for any existing course.
++   *
++   * The audience is the course's ACTIVE enrollments of ACTIVE student accounts
++   * (`compileAudience` with `courseIds`), resolved server-side at send time -
++   * pending, expired, revoked and archived enrollments, and suspended or
++   * deleted accounts, are not reached. Broadcasts to everyone, to a
++   * university or a year, and direct messages stay on the admin-only route
++   * above.
++   */
++  @Post('courses/:courseId/announcements')
++  @StaffOnly()
++  @Audit({ action: AuditAction.CREATE, entity: 'course_announcement' })
++  @ApiOperation({
++    summary: "Notify the active students of one course",
++    description:
++      "Teachers need an assignment on the course with the student capability. The audience is the course's active enrollments, resolved on the server; no recipient list is accepted.",
++  })
++  async announceToCourse(
++    @Param('courseId') courseId: string,
++    @Body() dto: CourseAnnouncementDto,
++    @CurrentUser() actor: AuthenticatedUser,
++  ) {
++    await this.courseAccess.assertCourseExistsAndManageable(
++      actor.id,
++      actor.role,
++      courseId,
++      'students',
++    );
++
++    return this.announcements.createLegacy(
++      {
++        title: dto.title,
++        titleAr: dto.titleAr,
++        body: dto.body,
++        bodyAr: dto.bodyAr,
++        sendPush: dto.sendPush,
++        courseId,
++        route: `/course/${courseId}`,
++        publishNow: true,
++      },
++      actor,
++    );
++  }
++
+   @Post('announcements/:id/publish')
+   @AdminOnly()
+   @ApiOperation({
+diff --git a/test/unit/account-deletion.spec.ts b/test/unit/account-deletion.spec.ts
+new file mode 100644
+index 0000000..5707f4f
+--- /dev/null
++++ b/test/unit/account-deletion.spec.ts
+@@ -0,0 +1,761 @@
++import { readFileSync } from 'node:fs';
++import { join } from 'node:path';
++
++import { Logger, ValidationPipe } from '@nestjs/common';
++import { AccountDeletionStatus, AccountStatus, UserRole } from '@prisma/client';
++
++import { IS_PUBLIC_KEY } from '../../src/common/decorators/public.decorator';
++import { ROLES_KEY } from '../../src/common/decorators/roles.decorator';
++import {
++  AccountDeletionAdminController,
++  AccountDeletionController,
++} from '../../src/modules/account-deletion/account-deletion.controller';
++import {
++  CancelAccountDeletionDto,
++  RecoverAccountDeletionDto,
++  RequestAccountDeletionDto,
++} from '../../src/modules/account-deletion/account-deletion.dto';
++import {
++  AccountDeletionScheduler,
++  normalizeDeletionSweepIntervalSeconds,
++} from '../../src/modules/account-deletion/account-deletion.scheduler';
++import {
++  AccountDeletionService,
++  DELETED_USER_NAME,
++  DELETION_ALERT_MARKER,
++  DELETION_MAX_ATTEMPTS,
++  describeEraseError,
++  DELETION_GRACE_DAYS,
++  REDACTED_TEXT,
++  UNUSABLE_PASSWORD_HASH,
++} from '../../src/modules/account-deletion/account-deletion.service';
++import { AuthService } from '../../src/modules/auth/auth.service';
++
++/**
++ * Owner decision D5: in-app account deletion with a 30-day cancellation
++ * period, a durable scheduled erase, use blocked while pending (but never the
++ * cancellation), personal data erased and financial/audit records retained.
++ */
++
++const DAY = 24 * 3600 * 1000;
++const STUDENT = { id: 'usr_s', role: UserRole.STUDENT, sessionId: 'ses_1' } as never;
++const META = { ip: '203.0.113.7', userAgent: 'jest', requestId: 'req_1', device: {} } as never;
++
++type Row = {
++  id: string;
++  userId: string;
++  status: AccountDeletionStatus;
++  requestedAt: Date;
++  scheduledFor: Date;
++  attempts?: number;
++};
++
++function build(opts: { password?: boolean; open?: Row | null } = {}) {
++  const calls: string[] = [];
++  const track = (name: string, impl: (...a: never[]) => unknown = async () => ({ count: 1 })) =>
++    jest.fn(async (...a: never[]) => {
++      calls.push(name);
++      return impl(...a);
++    });
++
++  // Every model the erase may touch. Payments, wallet, ledger, enrollments,
++  // redemption amounts, revenue and audit history are deliberately ABSENT
++  // except where named: touching them would throw here.
++  const tx = {
++    accountDeletionRequest: {
++      create: track('deletion.create', async () => ({
++        id: 'del_1',
++        status: AccountDeletionStatus.PENDING,
++        requestedAt: new Date(),
++        scheduledFor: new Date(Date.now() + DELETION_GRACE_DAYS * DAY),
++      })),
++      update: track('deletion.update'),
++      // erase() re-reads its own request inside the transaction.
++      findUnique: jest.fn(async () => ({ userId: 'usr_s', status: AccountDeletionStatus.PROCESSING })),
++    },
++    user: {
++      update: track('user.update'),
++      findUnique: jest.fn(async () => ({ role: UserRole.STUDENT })),
++    },
++    studentProfile: { updateMany: track('studentProfile.updateMany') },
++    session: { updateMany: track('session.updateMany') },
++    refreshToken: { updateMany: track('refreshToken.updateMany') },
++    playbackTicket: { updateMany: track('playbackTicket.updateMany') },
++    pushToken: { updateMany: track('pushToken.updateMany'), deleteMany: track('pushToken.deleteMany') },
++    securityEvent: { updateMany: track('securityEvent.updateMany') },
++    accessCodeRedemption: { updateMany: track('accessCodeRedemption.updateMany') },
++    device: {
++      findMany: track('device.findMany', async () => [{ id: 'dev_1' }, { id: 'dev_2' }]),
++      update: track('device.update'),
++    },
++    deviceChangeRequest: { deleteMany: track('deviceChangeRequest.deleteMany') },
++    notification: { deleteMany: track('notification.deleteMany') },
++    notificationPreference: { deleteMany: track('notificationPreference.deleteMany') },
++    supportTicket: { updateMany: track('supportTicket.updateMany') },
++    supportMessage: { updateMany: track('supportMessage.updateMany') },
++  };
++
++  const prisma = {
++    user: {
++      findFirst: jest.fn(async () => ({ id: 'usr_s', passwordHash: 'hash' })),
++    },
++    accountDeletionRequest: {
++      findFirst: jest.fn(async () => opts.open ?? null),
++      findMany: jest.fn(async () => [] as Row[]),
++      updateMany: jest.fn(async () => ({ count: 1 })),
++      update: jest.fn(async () => ({})),
++      count: jest.fn(async () => 0),
++    },
++    $transaction: jest.fn(async (fn: (t: typeof tx) => unknown) => fn(tx)),
++  };
++  const passwords = { verify: jest.fn(async () => opts.password ?? true) };
++  const auth = {
++    verifyCredentials: jest.fn(async () => ({ id: 'usr_s', role: UserRole.STUDENT })),
++  };
++  const audit = { record: jest.fn(async () => undefined), recordTx: jest.fn(async () => undefined) };
++  const redis = { del: jest.fn(async () => undefined) };
++  const storage = { isConfigured: true, deletePrefix: jest.fn(async () => 1) };
++
++  const service = new AccountDeletionService(
++    prisma as never,
++    auth as never,
++    passwords as never,
++    audit as never,
++    redis as never,
++    storage as never,
++  );
++  return { service, prisma, tx, passwords, auth, audit, redis, storage, calls };
++}
++
++describe('requesting deletion', () => {
++  it('needs the current password and creates nothing without it', async () => {
++    const { service, tx } = build({ password: false });
++    await expect(service.request(STUDENT, 'wrong', META)).rejects.toMatchObject({ code: 'INVALID_CREDENTIALS' });
++    expect(tx.accountDeletionRequest.create).not.toHaveBeenCalled();
++  });
++
++  it('schedules the erase 30 days out and cuts off every way back in, in one transaction', async () => {
++    const { service, tx, audit, redis, calls } = build();
++
++    const before = Date.now();
++    const result = await service.request(STUDENT, 'Str0ngPass', META);
++
++    expect(result.status).toBe(AccountDeletionStatus.PENDING);
++    expect(result.cancellable).toBe(true);
++    const created = (tx.accountDeletionRequest.create.mock.calls[0] as unknown as [{ data: { scheduledFor: Date } }])[0];
++    const days = (created.data.scheduledFor.getTime() - before) / DAY;
++    expect(days).toBeGreaterThan(29.99);
++    expect(days).toBeLessThan(30.01);
++
++    expect(calls).toEqual(
++      expect.arrayContaining([
++        'deletion.create',
++        'session.updateMany',
++        'refreshToken.updateMany',
++        'playbackTicket.updateMany',
++        'pushToken.updateMany',
++      ]),
++    );
++    expect(audit.recordTx).toHaveBeenCalledTimes(1);
++    expect(redis.del).toHaveBeenCalledWith('pb:slots:usr_s');
++    // Nothing is erased at request time - that is what the 30 days are for.
++    expect(tx.user.update).not.toHaveBeenCalled();
++  });
++
++  it('is idempotent: asking again returns the open request with its original date', async () => {
++    const original = {
++      id: 'del_0',
++      userId: 'usr_s',
++      status: AccountDeletionStatus.PENDING,
++      requestedAt: new Date(Date.now() - 5 * DAY),
++      scheduledFor: new Date(Date.now() + 25 * DAY),
++    };
++    const { service, tx } = build({ open: original });
++
++    const result = await service.request(STUDENT, 'Str0ngPass', META);
++
++    expect(result.id).toBe('del_0');
++    expect(result.scheduledFor).toBe(original.scheduledFor.toISOString());
++    expect(tx.accountDeletionRequest.create).not.toHaveBeenCalled();
++  });
++
++  it('answers a concurrent duplicate with the request that won the unique index', async () => {
++    const { service, prisma } = build();
++    const winner = {
++      id: 'del_w',
++      userId: 'usr_s',
++      status: AccountDeletionStatus.PENDING,
++      requestedAt: new Date(),
++      scheduledFor: new Date(Date.now() + 30 * DAY),
++    };
++    prisma.accountDeletionRequest.findFirst
++      .mockResolvedValueOnce(null as never) // the pre-check saw nothing
++      .mockResolvedValueOnce(winner as never); // after the P2002
++    prisma.$transaction.mockRejectedValueOnce(Object.assign(new Error('Unique constraint'), { code: 'P2002' }) as never);
++
++    await expect(service.request(STUDENT, 'Str0ngPass', META)).resolves.toMatchObject({ id: 'del_w' });
++  });
++
++  it('is for students; staff accounts stay with the administrators', async () => {
++    const { service, passwords } = build();
++    await expect(
++      service.request({ id: 'usr_t', role: UserRole.TEACHER } as never, 'x', META),
++    ).rejects.toMatchObject({ code: 'INSUFFICIENT_ROLE' });
++    expect(passwords.verify).not.toHaveBeenCalled();
++  });
++});
++
++describe('cancelling', () => {
++  it('checks phone + password through the sign-in path and only moves a PENDING, not-yet-due request', async () => {
++    const { service, prisma, auth, audit } = build({
++      open: { id: 'del_1' } as never,
++    });
++
++    await expect(service.cancel('01001234567', 'Str0ngPass', META)).resolves.toEqual({
++      cancelled: true,
++      requestId: 'del_1',
++    });
++
++    expect(auth.verifyCredentials).toHaveBeenCalledWith('01001234567', 'Str0ngPass', META);
++    const where = (prisma.accountDeletionRequest.updateMany.mock.calls[0] as unknown as [{ where: Record<string, unknown> }])[0].where;
++    expect(where).toMatchObject({ id: 'del_1', status: AccountDeletionStatus.PENDING });
++    expect((where.scheduledFor as { gt: Date }).gt).toBeInstanceOf(Date);
++    expect(audit.record).toHaveBeenCalledTimes(1);
++  });
++
++  it('refuses once the sweep has claimed the request (the race is decided by the conditional update)', async () => {
++    const { service, prisma } = build({ open: { id: 'del_1' } as never });
++    prisma.accountDeletionRequest.updateMany.mockResolvedValueOnce({ count: 0 } as never);
++
++    await expect(service.cancel('01001234567', 'Str0ngPass', META)).rejects.toMatchObject({
++      code: 'INVALID_STATE',
++      message: expect.stringContaining('can no longer be cancelled in the app'),
++    });
++  });
++
++  it('never cancels on a wrong password', async () => {
++    const { service, prisma, auth } = build({ open: { id: 'del_1' } as never });
++    auth.verifyCredentials.mockRejectedValueOnce(Object.assign(new Error('bad'), { code: 'INVALID_CREDENTIALS' }) as never);
++
++    await expect(service.cancel('01001234567', 'nope', META)).rejects.toMatchObject({ code: 'INVALID_CREDENTIALS' });
++    expect(prisma.accountDeletionRequest.updateMany).not.toHaveBeenCalled();
++  });
++});
++
++describe('the scheduled sweep', () => {
++  const due = (status: AccountDeletionStatus): Row => ({
++    id: 'del_1',
++    userId: 'usr_s',
++    status,
++    requestedAt: new Date(Date.now() - 31 * DAY),
++    scheduledFor: new Date(Date.now() - DAY),
++    attempts: 0,
++  });
++
++  it('claims a due request atomically before erasing it', async () => {
++    const { service, prisma, tx } = build();
++    prisma.accountDeletionRequest.findMany.mockResolvedValueOnce([due(AccountDeletionStatus.PENDING)]);
++
++    const result = await service.sweep();
++
++    expect(result).toEqual({ claimed: 1, completed: 1, failed: 0, skipped: 0, needsAttention: 0 });
++    const claim = (prisma.accountDeletionRequest.updateMany.mock.calls[0] as unknown as [{ where: Record<string, unknown>; data: Record<string, unknown> }])[0];
++    expect(claim.where).toMatchObject({ id: 'del_1', status: AccountDeletionStatus.PENDING });
++    expect(claim.data).toMatchObject({ status: AccountDeletionStatus.PROCESSING });
++    expect(tx.user.update).toHaveBeenCalledTimes(1);
++  });
++
++  it('skips a request that was cancelled between the read and the claim', async () => {
++    const { service, prisma, tx } = build();
++    prisma.accountDeletionRequest.findMany.mockResolvedValueOnce([due(AccountDeletionStatus.PENDING)]);
++    prisma.accountDeletionRequest.updateMany.mockResolvedValueOnce({ count: 0 } as never);
++
++    await expect(service.sweep()).resolves.toMatchObject({ claimed: 0, skipped: 1 });
++    expect(tx.user.update).not.toHaveBeenCalled();
++  });
++
++  it('picks up a request a crashed sweep left PROCESSING (erase is idempotent)', async () => {
++    const { service, prisma, tx } = build();
++    prisma.accountDeletionRequest.findMany.mockResolvedValueOnce([due(AccountDeletionStatus.PROCESSING)]);
++
++    await expect(service.sweep()).resolves.toMatchObject({ completed: 1 });
++    expect(tx.user.update).toHaveBeenCalledTimes(1);
++  });
++
++  it('puts a failed erase back to PENDING with the error, for the next sweep', async () => {
++    const { service, prisma } = build();
++    prisma.accountDeletionRequest.findMany.mockResolvedValueOnce([due(AccountDeletionStatus.PENDING)]);
++    prisma.$transaction.mockRejectedValueOnce(new Error('deadlock detected') as never);
++
++    await expect(service.sweep()).resolves.toMatchObject({ failed: 1, completed: 0 });
++    const revert = (prisma.accountDeletionRequest.updateMany.mock.calls[1] as unknown as [{ where: Record<string, unknown>; data: Record<string, unknown> }])[0];
++    expect(revert.where).toMatchObject({ status: AccountDeletionStatus.PROCESSING });
++    // The error class is stored, never the message (messages can echo data).
++    expect(revert.data).toEqual({ status: AccountDeletionStatus.PENDING, lastError: 'Error' });
++  });
++
++  it('only ever asks for due PENDING rows or stranded PROCESSING rows, skipping requests that ran out of attempts', async () => {
++    const { service, prisma } = build();
++    await service.sweep();
++    const where = (prisma.accountDeletionRequest.findMany.mock.calls[0] as unknown as [{ where: { OR: unknown[]; failedAt: unknown } }])[0].where;
++    expect(where.failedAt).toBeNull();
++    expect(where.OR).toEqual([
++      { status: AccountDeletionStatus.PENDING, scheduledFor: { lte: expect.any(Date) } },
++      { status: AccountDeletionStatus.PROCESSING },
++    ]);
++  });
++});
++
++describe('what the erase removes and what it keeps', () => {
++  it('overwrites identity, strips identifiers, deletes personal-only rows, and completes the request', async () => {
++    const { service, tx, storage, redis } = build();
++
++    await service.erase('del_1', 'usr_s');
++
++    const userData = (tx.user.update.mock.calls[0] as unknown as [{ data: Record<string, unknown> }])[0].data;
++    expect(userData).toMatchObject({
++      fullName: DELETED_USER_NAME,
++      phone: 'deleted:usr_s',
++      email: null,
++      avatarUrl: null,
++      gender: null,
++      passwordHash: UNUSABLE_PASSWORD_HASH,
++      status: AccountStatus.DISABLED,
++    });
++    expect(userData.deletedAt).toBeInstanceOf(Date);
++
++    expect(tx.device.update).toHaveBeenCalledTimes(2);
++    for (const name of ['deviceChangeRequest', 'pushToken', 'notification', 'notificationPreference'] as const) {
++      expect(tx[name].deleteMany).toHaveBeenCalledWith({ where: { userId: 'usr_s' } });
++    }
++    expect(tx.supportMessage.updateMany).toHaveBeenCalledWith({
++      where: { authorId: 'usr_s' },
++      data: { body: REDACTED_TEXT },
++    });
++    expect(tx.accountDeletionRequest.update).toHaveBeenCalledWith(
++      expect.objectContaining({ data: expect.objectContaining({ status: AccountDeletionStatus.COMPLETED }) }),
++    );
++    expect(storage.deletePrefix).toHaveBeenCalledWith('media', 'avatars/usr_s/');
++    expect(redis.del).toHaveBeenCalledWith('pb:slots:usr_s');
++  });
++
++  it('never touches payments, wallet, ledger, enrollments, purchases, revenue or audit history', async () => {
++    const { service, tx } = build();
++    await service.erase('del_1', 'usr_s');
++    for (const kept of [
++      'payment',
++      'wallet',
++      'walletTransaction',
++      'enrollment',
++      'coursePartPurchase',
++      'libraryPurchase',
++      'rechargeRevenue',
++      'auditLog',
++      'watchProgress',
++    ]) {
++      // The transaction double has no such delegate; the erase would have thrown.
++      expect(tx).not.toHaveProperty(kept);
++    }
++  });
++});
++
++describe('sign-in while a deletion is pending', () => {
++  function auth(deletion: { status: AccountDeletionStatus; scheduledFor: Date } | null) {
++    const prisma = {
++      user: {
++        findUnique: jest.fn(async () => ({
++          id: 'usr_s',
++          passwordHash: 'hash',
++          role: UserRole.STUDENT,
++          status: AccountStatus.ACTIVE,
++          deletedAt: null,
++          failedLoginCount: 0,
++          lockedUntil: null,
++        })),
++      },
++      accountDeletionRequest: { findFirst: jest.fn(async () => deletion) },
++    };
++    const passwords = { verify: jest.fn(async () => true), needsRehash: jest.fn(() => false) };
++    const config = { getOrThrow: () => ({}) };
++    return new AuthService(
++      prisma as never,
++      {} as never,
++      passwords as never,
++      {} as never,
++      {} as never,
++      { record: jest.fn() } as never,
++      {} as never,
++      config as never,
++    );
++  }
++
++  it('is refused with ACCOUNT_DELETION_PENDING, saying it can still be cancelled', async () => {
++    const scheduledFor = new Date(Date.now() + 10 * DAY);
++    await expect(
++      auth({ status: AccountDeletionStatus.PENDING, scheduledFor }).login(
++        { phone: '01001234567', password: 'Str0ngPass' },
++        META,
++      ),
++    ).rejects.toMatchObject({
++      code: 'ACCOUNT_DELETION_PENDING',
++      details: { cancellable: true, scheduledFor: scheduledFor.toISOString() },
++    });
++  });
++
++  it('says it cannot be cancelled once processing has started', async () => {
++    await expect(
++      auth({ status: AccountDeletionStatus.PROCESSING, scheduledFor: new Date(Date.now() - DAY) }).login(
++        { phone: '01001234567', password: 'Str0ngPass' },
++        META,
++      ),
++    ).rejects.toMatchObject({ code: 'ACCOUNT_DELETION_PENDING', details: { cancellable: false } });
++  });
++
++  it('stays refused while a failed erasure waits for an administrator (never silently reactivated)', async () => {
++    // A request that ran out of attempts is still PENDING with its date past.
++    await expect(
++      auth({ status: AccountDeletionStatus.PENDING, scheduledFor: new Date(Date.now() - 5 * DAY) }).login(
++        { phone: '01001234567', password: 'Str0ngPass' },
++        META,
++      ),
++    ).rejects.toMatchObject({ code: 'ACCOUNT_DELETION_PENDING', details: { cancellable: false } });
++  });
++});
++
++describe('routes and validation', () => {
++  it('requesting is a signed-in student action; cancelling is public (the sessions are gone)', () => {
++    expect(Reflect.getMetadata(ROLES_KEY, AccountDeletionController.prototype.request)).toEqual([UserRole.STUDENT]);
++    expect(Reflect.getMetadata(IS_PUBLIC_KEY, AccountDeletionController.prototype.request)).toBeUndefined();
++    expect(Reflect.getMetadata(IS_PUBLIC_KEY, AccountDeletionController.prototype.cancel)).toBe(true);
++  });
++
++  const pipe = new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true });
++
++  it('the request body is the password and nothing else (no userId to delete someone else)', async () => {
++    await expect(
++      pipe.transform({ password: 'x', userId: 'usr_other' }, { type: 'body', metatype: RequestAccountDeletionDto }),
++    ).rejects.toBeDefined();
++    await expect(pipe.transform({ password: 'x' }, { type: 'body', metatype: RequestAccountDeletionDto })).resolves.toBeDefined();
++  });
++
++  it('the cancel body is exactly the sign-in body', async () => {
++    await expect(
++      pipe.transform({ phone: '01001234567', password: 'x' }, { type: 'body', metatype: CancelAccountDeletionDto }),
++    ).resolves.toBeDefined();
++    await expect(
++      pipe.transform({ phone: 'not-a-phone', password: 'x' }, { type: 'body', metatype: CancelAccountDeletionDto }),
++    ).rejects.toBeDefined();
++  });
++});
++
++describe('the scheduler', () => {
++  it('does nothing when another process holds the lock', async () => {
++    const sweep = jest.fn();
++    const scheduler = new AccountDeletionScheduler({ sweep } as never, { acquireLock: jest.fn(async () => null) } as never);
++    await expect(scheduler.tick()).resolves.toBeNull();
++    expect(sweep).not.toHaveBeenCalled();
++  });
++
++  it('sweeps under the lock and always releases it', async () => {
++    const release = jest.fn(async () => undefined);
++    const sweep = jest.fn(async () => {
++      throw new Error('db down');
++    });
++    const scheduler = new AccountDeletionScheduler({ sweep } as never, { acquireLock: jest.fn(async () => release) } as never);
++    await expect(scheduler.tick()).resolves.toBeNull();
++    expect(release).toHaveBeenCalledTimes(1);
++  });
++
++  it.each([
++    [undefined, 3600],
++    ['', 3600],
++    ['0', 0],
++    ['60', 300],
++    ['7200', 7200],
++    ['nonsense', 3600],
++  ])('interval %p -> %p seconds', (raw, expected) => {
++    expect(normalizeDeletionSweepIntervalSeconds(raw)).toBe(expected);
++  });
++});
++
++describe('the prepared migration', () => {
++  const root = join(__dirname, '..', '..');
++  const sql = readFileSync(
++    join(root, 'prisma/migrations/20261027120000_account_deletion_requests/migration.sql'),
++    'utf8',
++  );
++
++  it('allows at most one PENDING request per user at the database level', () => {
++    expect(sql).toMatch(
++      /CREATE UNIQUE INDEX "account_deletion_requests_one_pending_per_user"\s+ON "account_deletion_requests"\("userId"\)\s+WHERE "status" = 'PENDING'/,
++    );
++  });
++
++  it('cannot cascade-delete a user (the row is the anchor for retained records)', () => {
++    expect(sql).toMatch(/REFERENCES "users"\("id"\) ON DELETE RESTRICT/);
++    const statements = sql
++      .split('\n')
++      .filter((line) => !line.trimStart().startsWith('--'))
++      .join('\n');
++    expect(statements).not.toMatch(/DROP|TRUNCATE|DELETE FROM|ALTER TABLE "users"/i);
++  });
++});
++
++
++// ---------------------------------------------------------------------------
++// Stuck erasures: ten failures, retries, recovery (Phase 2 remediation)
++// ---------------------------------------------------------------------------
++
++/**
++ * A stateful stand-in for the request table: one row, with the conditional
++ * updates the service relies on applied for real, so repeated sweeps behave
++ * like repeated sweeps.
++ */
++function stateful(failErase: () => boolean) {
++  const harness = build();
++  const row = {
++    id: 'del_1',
++    userId: 'usr_s',
++    status: AccountDeletionStatus.PENDING as AccountDeletionStatus,
++    requestedAt: new Date(Date.now() - 31 * DAY),
++    scheduledFor: new Date(Date.now() - DAY),
++    attempts: 0,
++    failedAt: null as Date | null,
++    lastError: null as string | null,
++    cancelledAt: null as Date | null,
++  };
++  const r = harness.prisma.accountDeletionRequest;
++  const fits = (where: Record<string, unknown>) =>
++    (where.id === undefined || where.id === row.id) &&
++    (where.status === undefined || where.status === row.status) &&
++    (where.failedAt === undefined ||
++      (where.failedAt === null ? row.failedAt === null : row.failedAt !== null)) &&
++    (where.scheduledFor === undefined ||
++      ((where.scheduledFor as { gt?: Date; lte?: Date }).gt
++        ? row.scheduledFor > (where.scheduledFor as { gt: Date }).gt
++        : row.scheduledFor <= (where.scheduledFor as { lte: Date }).lte));
++  r.findMany.mockImplementation((async ({ where }: { where: Record<string, unknown> }) => {
++    if (where.failedAt === null && row.failedAt !== null) return [];
++    const pendingDue = row.status === AccountDeletionStatus.PENDING && row.scheduledFor <= new Date();
++    return pendingDue || row.status === AccountDeletionStatus.PROCESSING ? [{ ...row }] : [];
++  }) as never);
++  r.updateMany.mockImplementation((async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
++    if (!fits(where)) return { count: 0 };
++    for (const [k, v] of Object.entries(data)) {
++      if (k === 'attempts' && typeof v === 'object' && v) row.attempts += (v as { increment: number }).increment;
++      else (row as Record<string, unknown>)[k] = v;
++    }
++    return { count: 1 };
++  }) as never);
++  r.update.mockImplementation((async ({ data }: { data: { attempts?: { increment: number } } }) => {
++    if (data.attempts) row.attempts += data.attempts.increment;
++    return {};
++  }) as never);
++  r.count.mockImplementation((async () =>
++    row.failedAt !== null && row.status === AccountDeletionStatus.PENDING ? 1 : 0) as never);
++  harness.prisma.$transaction.mockImplementation((async (fn: (t: typeof harness.tx) => unknown) => {
++    if (failErase()) {
++      // A message that echoes personal data, which must never be stored or logged.
++      throw Object.assign(new Error('could not update user 01001234567 Ahmed Mohamed'), { code: 'P2034' });
++    }
++    harness.tx.accountDeletionRequest.update.mockImplementation((async ({ data }: { data: Record<string, unknown> }) => {
++      Object.assign(row, data);
++      return {};
++    }) as never);
++    return fn(harness.tx);
++  }) as never);
++  return { ...harness, row };
++}
++
++const ADMIN_ACTOR = { id: 'usr_admin', role: UserRole.ADMIN } as never;
++
++describe('an erasure that keeps failing', () => {
++  let errors: jest.SpyInstance;
++  beforeEach(() => {
++    errors = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
++  });
++  afterEach(() => errors.mockRestore());
++
++  it(`stops after ${DELETION_MAX_ATTEMPTS} failures, marks the request, raises the alert, and erases nothing`, async () => {
++    const { service, row, tx } = stateful(() => true);
++
++    for (let i = 0; i < DELETION_MAX_ATTEMPTS; i += 1) {
++      await service.sweep();
++      if (i < DELETION_MAX_ATTEMPTS - 1) expect(row.failedAt).toBeNull();
++    }
++
++    expect(row.attempts).toBe(DELETION_MAX_ATTEMPTS);
++    expect(row.failedAt).toBeInstanceOf(Date);
++    expect(row.status).toBe(AccountDeletionStatus.PENDING);
++    expect(row.lastError).toBe('Error:P2034');
++    expect(tx.user.update).not.toHaveBeenCalled();
++
++    const logged = JSON.stringify(errors.mock.calls);
++    expect(logged).toContain(DELETION_ALERT_MARKER);
++    expect(logged).not.toMatch(/01001234567|Ahmed/);
++  });
++
++  it('is not retried again automatically, but keeps signalling until someone acts', async () => {
++    const { service, row } = stateful(() => true);
++    for (let i = 0; i < DELETION_MAX_ATTEMPTS; i += 1) await service.sweep();
++    errors.mockClear();
++
++    const result = await service.sweep();
++
++    expect(result).toMatchObject({ claimed: 0, needsAttention: 1 });
++    expect(row.attempts).toBe(DELETION_MAX_ATTEMPTS);
++    expect(JSON.stringify(errors.mock.calls)).toContain(DELETION_ALERT_MARKER);
++  });
++
++  it('retries normally below the limit and completes once the cause is gone', async () => {
++    let failures = 3;
++    const { service, row } = stateful(() => failures-- > 0);
++    for (let i = 0; i < 4; i += 1) await service.sweep();
++    expect(row.status).toBe(AccountDeletionStatus.COMPLETED);
++    expect(row.failedAt).toBeNull();
++    expect(row.attempts).toBe(4);
++  });
++
++  it('cannot be cancelled from the app once its 30 days are over', async () => {
++    const { service, row, prisma } = stateful(() => true);
++    for (let i = 0; i < DELETION_MAX_ATTEMPTS; i += 1) await service.sweep();
++    prisma.accountDeletionRequest.findFirst.mockResolvedValue({ id: row.id } as never);
++
++    await expect(service.cancel('01001234567', 'Str0ngPass', META)).rejects.toMatchObject({
++      code: 'INVALID_STATE',
++      message: expect.stringContaining('contact support'),
++    });
++    expect(row.status).toBe(AccountDeletionStatus.PENDING);
++  });
++});
++
++describe('administrator recovery of a failed erasure', () => {
++  beforeEach(() => jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined));
++  afterEach(() => jest.restoreAllMocks());
++
++  async function failed() {
++    let failing = true;
++    const harness = stateful(() => failing);
++    for (let i = 0; i < DELETION_MAX_ATTEMPTS; i += 1) await harness.service.sweep();
++    return { ...harness, fix: () => (failing = false) };
++  }
++
++  it('retry re-queues it with fresh attempts, audited, and the next sweep erases', async () => {
++    const { service, row, audit, fix } = await failed();
++    fix();
++
++    await expect(service.retryFailed(row.id, ADMIN_ACTOR, 'Support ticket SC-1042, cause fixed', META)).resolves.toEqual({
++      id: row.id,
++      requeued: true,
++    });
++    expect(row).toMatchObject({ failedAt: null, attempts: 0, lastError: null, status: AccountDeletionStatus.PENDING });
++    expect(audit.record).toHaveBeenCalledWith(
++      expect.objectContaining({ actorId: 'usr_admin', entityId: row.id, note: expect.stringContaining('SC-1042') }),
++    );
++
++    await service.sweep();
++    expect(row.status).toBe(AccountDeletionStatus.COMPLETED);
++  });
++
++  it("cancel ends the request at the holder's confirmed request, audited; nothing was erased", async () => {
++    const { service, row, audit, tx } = await failed();
++
++    await expect(service.cancelFailed(row.id, ADMIN_ACTOR, 'Holder confirmed by phone, ticket SC-7', META)).resolves.toEqual({
++      id: row.id,
++      cancelled: true,
++    });
++    expect(row.status).toBe(AccountDeletionStatus.CANCELLED);
++    expect(row.cancelledAt).toBeInstanceOf(Date);
++    expect(tx.user.update).not.toHaveBeenCalled();
++    expect(audit.record).toHaveBeenCalledWith(expect.objectContaining({ note: expect.stringContaining('SC-7') }));
++  });
++
++  it('cannot touch a normal pending deletion (only failed ones)', async () => {
++    const { service, row, audit } = stateful(() => false);
++    row.scheduledFor = new Date(Date.now() + 10 * DAY);
++
++    await expect(service.retryFailed(row.id, ADMIN_ACTOR, 'should not be possible', META)).rejects.toMatchObject({
++      code: 'INVALID_STATE',
++    });
++    await expect(service.cancelFailed(row.id, ADMIN_ACTOR, 'should not be possible', META)).rejects.toMatchObject({
++      code: 'INVALID_STATE',
++    });
++    expect(row.status).toBe(AccountDeletionStatus.PENDING);
++    expect(audit.record).not.toHaveBeenCalled();
++  });
++
++  it('lists ids, timings and the error class only - no name, phone or email', async () => {
++    const { service, prisma } = await failed();
++    prisma.accountDeletionRequest.findMany.mockResolvedValueOnce([
++      {
++        id: 'del_1',
++        userId: 'usr_s',
++        status: AccountDeletionStatus.PENDING,
++        requestedAt: new Date(),
++        scheduledFor: new Date(),
++        attempts: 10,
++        failedAt: new Date(),
++        lastError: 'Error:P2034',
++      },
++    ] as never);
++
++    const [item] = await service.listNeedingAttention();
++    expect(Object.keys(item).sort()).toEqual(
++      ['attempts', 'failedAt', 'id', 'lastError', 'requestedAt', 'scheduledFor', 'status', 'userId'].sort(),
++    );
++    const select = (prisma.accountDeletionRequest.findMany.mock.calls.at(-1) as unknown as [{ select: Record<string, unknown> }])[0].select;
++    expect(select).not.toHaveProperty('user');
++  });
++
++  it('is administrator-only and needs a written reason', async () => {
++    const roles = (h: object) => (Reflect.getMetadata(ROLES_KEY, h) as string[]).slice().sort();
++    for (const h of [
++      AccountDeletionAdminController.prototype.attention,
++      AccountDeletionAdminController.prototype.retry,
++      AccountDeletionAdminController.prototype.cancel,
++    ]) {
++      expect(roles(h)).toEqual(['ADMIN', 'MASTER']);
++      expect(Reflect.getMetadata(IS_PUBLIC_KEY, h)).toBeUndefined();
++    }
++    const pipe = new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true });
++    await expect(pipe.transform({ reason: 'short' }, { type: 'body', metatype: RecoverAccountDeletionDto })).rejects.toBeDefined();
++    await expect(
++      pipe.transform({ reason: 'Support ticket SC-1042', userId: 'x' }, { type: 'body', metatype: RecoverAccountDeletionDto }),
++    ).rejects.toBeDefined();
++  });
++});
++
++describe('erasure can never hit the wrong account', () => {
++  it('refuses when the request is not claimed for exactly this account', async () => {
++    const { service, tx } = build();
++    tx.accountDeletionRequest.findUnique.mockResolvedValueOnce({ userId: 'usr_other', status: AccountDeletionStatus.PROCESSING } as never);
++    await expect(service.erase('del_1', 'usr_s')).rejects.toMatchObject({ name: 'DeletionRequestMismatch' });
++    expect(tx.user.update).not.toHaveBeenCalled();
++  });
++
++  it('refuses a request that is no longer PROCESSING (cancelled or completed meanwhile)', async () => {
++    const { service, tx } = build();
++    tx.accountDeletionRequest.findUnique.mockResolvedValueOnce({ userId: 'usr_s', status: AccountDeletionStatus.CANCELLED } as never);
++    await expect(service.erase('del_1', 'usr_s')).rejects.toMatchObject({ name: 'DeletionRequestMismatch' });
++    expect(tx.user.update).not.toHaveBeenCalled();
++  });
++
++  it('refuses a target that is not a student account', async () => {
++    const { service, tx } = build();
++    tx.user.findUnique.mockResolvedValueOnce({ role: UserRole.TEACHER } as never);
++    await expect(service.erase('del_1', 'usr_s')).rejects.toMatchObject({ name: 'DeletionTargetNotStudent' });
++    expect(tx.user.update).not.toHaveBeenCalled();
++  });
++});
++
++describe('describeEraseError', () => {
++  it.each([
++    [Object.assign(new Error('phone 01001234567'), { code: 'P2002' }), 'Error:P2002'],
++    [Object.assign(new Error('x'), { name: 'PrismaClientKnownRequestError', code: 'P2034' }), 'PrismaClientKnownRequestError:P2034'],
++    [Object.assign(new Error('x'), { name: 'evil name with spaces 0100' }), 'Error'],
++    ['a string', 'UnknownError'],
++    [null, 'UnknownError'],
++  ])('%p -> %p', (input, expected) => {
++    expect(describeEraseError(input)).toBe(expected);
++  });
++});
+diff --git a/test/unit/client-ip-attribution.spec.ts b/test/unit/client-ip-attribution.spec.ts
+new file mode 100644
+index 0000000..22278d4
+--- /dev/null
++++ b/test/unit/client-ip-attribution.spec.ts
+@@ -0,0 +1,210 @@
++import express, { type Request } from 'express';
++import request from 'supertest';
++
++import { ThrottlerProxyGuard } from '../../src/common/guards/throttler-proxy.guard';
++import { RequestContextMiddleware } from '../../src/common/middleware/request-context.middleware';
++import {
++  WEB_CLIENT_IP_HEADER,
++  WEB_PROXY_SECRET_HEADER,
++  describeClientIpChain,
++  expressIpForHops,
++} from '../../src/common/net/client-ip';
++
++/**
++ * D6 end to end on a real Express stack: `trust proxy` as main.ts sets it,
++ * the request middleware, then the throttler's bucket key. What matters is
++ * which bucket a request lands in, for every kind of caller:
++ *
++ *  - anonymous, direct (mobile)       -> ip:<address Express trusts>
++ *  - anonymous, via the web server     -> ip:<browser address>, only with the secret
++ *  - credential attempt                -> phone:<number>
++ *  - signed in                         -> user:<id>
++ *
++ * and that nothing a client writes into a header moves it to a fresh bucket.
++ * These tests pin our model of Express; they say nothing about how many
++ * proxies Render really runs (that needs the diagnostic endpoint, D6).
++ */
++
++const SECRET = 's'.repeat(48);
++
++function app(hops: number, opts: { secret?: string | null; user?: string } = {}) {
++  const a = express();
++  a.set('trust proxy', hops);
++  a.use(express.json());
++  const middleware = new RequestContextMiddleware({
++    get: () => ({ webProxySharedSecret: opts.secret === undefined ? SECRET : opts.secret }),
++  } as never);
++  a.use((req, res, next) => middleware.use(req, res, next));
++  const userId = opts.user;
++  if (userId) {
++    a.use((req, _res, next) => {
++      (req as unknown as { user?: unknown }).user = { id: userId };
++      next();
++    });
++  }
++  const guard = Object.create(ThrottlerProxyGuard.prototype) as { getTracker(r: Request): Promise<string> };
++  a.all('/t', async (req, res) => {
++    res.json({ tracker: await guard.getTracker(req), ip: req.ip, chain: describeClientIpChain(req, { trustProxy: true, trustProxyHops: hops }) });
++  });
++  return a;
++}
++
++const tracker = async (a: express.Express, headers: Record<string, string>, body?: unknown) => {
++  const r = request(a).post('/t');
++  for (const [k, v] of Object.entries(headers)) r.set(k, v);
++  const res = await (body ? r.send(body) : r.send());
++  return res.body as { tracker: string; ip: string; chain: { ipByHopCount: Record<string, string> } };
++};
++
++// A platform with ONE proxy that appends the real client address:
++//   client -> proxy (appends client) -> API
++// The rightmost entry is the client; anything to its left was written by the client.
++const PROXY_ADDED = '197.34.10.20';
++
++describe('anonymous direct traffic (mobile), hop count matching the platform', () => {
++  const a = app(1);
++
++  it('is bucketed by the address the trusted proxy added', async () => {
++    await expect(tracker(a, { 'x-forwarded-for': PROXY_ADDED })).resolves.toMatchObject({
++      tracker: `ip:${PROXY_ADDED}`,
++    });
++  });
++
++  it('cannot escape its bucket by writing its own X-Forwarded-For entries', async () => {
++    const seen = new Set<string>();
++    for (const spoof of ['1.1.1.1', '2.2.2.2, 3.3.3.3', '10.0.0.1']) {
++      seen.add((await tracker(a, { 'x-forwarded-for': `${spoof}, ${PROXY_ADDED}` })).tracker);
++    }
++    expect([...seen]).toEqual([`ip:${PROXY_ADDED}`]);
++  });
++
++  it('cannot claim a web-proxy address without the secret', async () => {
++    const r = await tracker(a, {
++      'x-forwarded-for': PROXY_ADDED,
++      [WEB_CLIENT_IP_HEADER]: '8.8.8.8',
++      [WEB_PROXY_SECRET_HEADER]: 'guess-'.repeat(8),
++    });
++    expect(r.tracker).toBe(`ip:${PROXY_ADDED}`);
++  });
++});
++
++describe('what a WRONG hop count does (why D6 needs live evidence)', () => {
++  // Platform with TWO proxies: client -> edge (appends client) -> balancer (appends edge) -> API.
++  const EDGE = '172.71.0.5';
++
++  it('too few hops: every client lands in the edge proxy bucket (shared, availability risk)', async () => {
++    const a = app(1);
++    const one = await tracker(a, { 'x-forwarded-for': `${PROXY_ADDED}, ${EDGE}` });
++    const two = await tracker(a, { 'x-forwarded-for': `41.0.0.9, ${EDGE}` });
++    expect(one.tracker).toBe(`ip:${EDGE}`);
++    expect(two.tracker).toBe(one.tracker);
++  });
++
++  it('the right count separates clients and still ignores client-written entries', async () => {
++    const a = app(2);
++    expect((await tracker(a, { 'x-forwarded-for': `${PROXY_ADDED}, ${EDGE}` })).tracker).toBe(`ip:${PROXY_ADDED}`);
++    expect((await tracker(a, { 'x-forwarded-for': `6.6.6.6, ${PROXY_ADDED}, ${EDGE}` })).tracker).toBe(`ip:${PROXY_ADDED}`);
++  });
++
++  it('too many hops: a client can choose its own bucket (evasion risk)', async () => {
++    const a = app(3);
++    const r1 = await tracker(a, { 'x-forwarded-for': `6.6.6.6, ${PROXY_ADDED}, ${EDGE}` });
++    const r2 = await tracker(a, { 'x-forwarded-for': `7.7.7.7, ${PROXY_ADDED}, ${EDGE}` });
++    expect(r1.tracker).toBe('ip:6.6.6.6');
++    expect(r2.tracker).not.toBe(r1.tracker);
++  });
++});
++
++describe('the trusted web server (student web on Vercel)', () => {
++  const VERCEL = '18.200.0.1';
++
++  it('with the secret: anonymous browsers are bucketed by their own address', async () => {
++    const a = app(1);
++    const r1 = await tracker(a, { 'x-forwarded-for': VERCEL, [WEB_CLIENT_IP_HEADER]: '41.33.1.2', [WEB_PROXY_SECRET_HEADER]: SECRET });
++    const r2 = await tracker(a, { 'x-forwarded-for': VERCEL, [WEB_CLIENT_IP_HEADER]: '41.33.1.3', [WEB_PROXY_SECRET_HEADER]: SECRET });
++    expect(r1.tracker).toBe('ip:41.33.1.2');
++    expect(r2.tracker).toBe('ip:41.33.1.3');
++  });
++
++  it('without a configured secret: everything from the web server shares its address, as before', async () => {
++    const a = app(1, { secret: null });
++    const r = await tracker(a, { 'x-forwarded-for': VERCEL, [WEB_CLIENT_IP_HEADER]: '41.33.1.2', [WEB_PROXY_SECRET_HEADER]: SECRET });
++    expect(r.tracker).toBe(`ip:${VERCEL}`);
++  });
++
++  it('never reveals the secret to the handler', async () => {
++    const a = express();
++    a.set('trust proxy', 1);
++    const middleware = new RequestContextMiddleware({ get: () => ({ webProxySharedSecret: SECRET }) } as never);
++    a.use((req, res, next) => middleware.use(req, res, next));
++    a.get('/h', (req, res) => res.json(req.headers));
++    const res = await request(a).get('/h').set(WEB_PROXY_SECRET_HEADER, SECRET).set(WEB_CLIENT_IP_HEADER, '41.33.1.2');
++    expect(JSON.stringify(res.body)).not.toContain(SECRET);
++  });
++});
++
++describe('credential and signed-in traffic keep their own keys', () => {
++  it('credential attempts are keyed by phone whatever address is claimed', async () => {
++    const a = app(1);
++    const r1 = await tracker(a, { 'x-forwarded-for': `1.1.1.1, ${PROXY_ADDED}` }, { phone: '010 0123 4567', password: 'x' });
++    const r2 = await tracker(a, { 'x-forwarded-for': `9.9.9.9, 41.0.0.1` }, { phone: '01001234567', password: 'y' });
++    expect(r1.tracker).toBe('phone:01001234567');
++    expect(r2.tracker).toBe(r1.tracker);
++  });
++
++  it('signed-in requests are keyed by user, whatever headers they carry', async () => {
++    const a = app(1, { user: 'usr_42' });
++    const r = await tracker(a, {
++      'x-forwarded-for': '6.6.6.6',
++      [WEB_CLIENT_IP_HEADER]: '8.8.8.8',
++      [WEB_PROXY_SECRET_HEADER]: SECRET,
++    });
++    expect(r.tracker).toBe('user:usr_42');
++  });
++});
++
++describe('the proxy-hop diagnostic agrees with Express', () => {
++  it.each([1, 2, 3, 4, 5])('hop count %i', async (hops) => {
++    const a = app(hops);
++    const r = await tracker(a, { 'x-forwarded-for': '10.1.1.1, 10.2.2.2, 10.3.3.3' });
++    expect(r.chain.ipByHopCount[String(hops)]).toBe(r.ip);
++  });
++
++  it('expressIpForHops reads from the right and stops at the leftmost entry', () => {
++    expect(expressIpForHops('127.0.0.1', ['a', 'b', 'c'], 1)).toBe('c');
++    expect(expressIpForHops('127.0.0.1', ['a', 'b', 'c'], 3)).toBe('a');
++    expect(expressIpForHops('127.0.0.1', ['a', 'b', 'c'], 9)).toBe('a');
++    expect(expressIpForHops('127.0.0.1', [], 1)).toBe('127.0.0.1');
++  });
++});
++
++describe('the diagnostic endpoint', () => {
++  it('is MASTER-only and read-only', () => {
++    // eslint-disable-next-line @typescript-eslint/no-require-imports
++    const { ClientIpDiagnosticsController } = require('../../src/modules/diagnostics/client-ip-diagnostics.controller');
++    // eslint-disable-next-line @typescript-eslint/no-require-imports
++    const { ROLES_KEY } = require('../../src/common/decorators/roles.decorator');
++    expect(Reflect.getMetadata(ROLES_KEY, ClientIpDiagnosticsController.prototype.clientIp)).toEqual(['MASTER']);
++    expect(Reflect.getMetadata('method', ClientIpDiagnosticsController.prototype.clientIp)).toBe(0); // GET
++  });
++
++  it('reports only address headers, never the proxy secret', () => {
++    const req = {
++      headers: {
++        'x-forwarded-for': '41.33.1.2, 10.0.0.1',
++        [WEB_PROXY_SECRET_HEADER]: SECRET,
++        authorization: 'Bearer abc',
++        'true-client-ip': '41.33.1.2',
++      },
++      ip: '10.0.0.1',
++      socket: { remoteAddress: '10.9.9.9' },
++    } as unknown as Request;
++    const report = describeClientIpChain(req, { trustProxy: true, trustProxyHops: 1 });
++    const text = JSON.stringify(report);
++    expect(text).not.toContain(SECRET);
++    expect(text).not.toContain('Bearer');
++    expect(report.forwardedFor).toEqual(['41.33.1.2', '10.0.0.1']);
++    expect(report.ipByHopCount).toMatchObject({ '1': '10.0.0.1', '2': '41.33.1.2', '3': '41.33.1.2' });
++    expect(report.otherAddressHeaders['true-client-ip']).toBe('41.33.1.2');
++  });
++});
+diff --git a/test/unit/course-archive-restore-states.spec.ts b/test/unit/course-archive-restore-states.spec.ts
+new file mode 100644
+index 0000000..d98998e
+--- /dev/null
++++ b/test/unit/course-archive-restore-states.spec.ts
+@@ -0,0 +1,255 @@
++import { CourseStatus, EnrollmentMethod, EnrollmentState, UserRole } from '@prisma/client';
++
++import {
++  CoursesAdminService,
++  PENDING_APPROVAL_SNAPSHOT_KEY,
++  pendingApprovalIdsFrom,
++} from '../../src/modules/courses/courses.admin.service';
++
++/**
++ * Archive -> restore must not approve anyone.
++ *
++ * Archiving moves ACTIVE and PENDING_APPROVAL rows to ARCHIVED. Restore used
++ * to turn every ARCHIVED row with a live (or no) window into ACTIVE, so a
++ * request nobody had approved came back as full access. These cases run the
++ * real archive/restore code against a small in-memory enrollment table.
++ */
++
++const DAY = 24 * 3600 * 1000;
++const ADMIN = { id: 'usr_admin', role: UserRole.ADMIN };
++
++type Row = {
++  id: string;
++  courseId: string;
++  state: EnrollmentState;
++  method: EnrollmentMethod;
++  approvedAt: Date | null;
++  accessEndsAt: Date | null;
++};
++
++/** Just enough of Prisma's `where` for the queries archive/restore issue. */
++function matches(row: Row, where: Record<string, unknown>): boolean {
++  return Object.entries(where).every(([key, cond]) => {
++    if (key === 'OR') return (cond as Record<string, unknown>[]).some((w) => matches(row, w));
++    const value = (row as unknown as Record<string, unknown>)[key];
++    if (cond === null) return value === null;
++    if (cond instanceof Date || typeof cond !== 'object') return value === cond;
++    const c = cond as { in?: unknown[]; gt?: Date; lte?: Date };
++    if (c.in) return c.in.includes(value);
++    if (c.gt) return value instanceof Date && value > c.gt;
++    if (c.lte) return value instanceof Date && value <= c.lte;
++    throw new Error(`unsupported condition on ${key}`);
++  });
++}
++
++function build(rows: Row[], legacySnapshot?: Record<string, unknown>) {
++  let courseStatus: CourseStatus = CourseStatus.PUBLISHED;
++  const archiveRecords: { snapshot: unknown; restoredAt: Date | null; archivedAt: Date }[] = legacySnapshot
++    ? [{ snapshot: legacySnapshot, restoredAt: null, archivedAt: new Date() }]
++    : [];
++  if (legacySnapshot) {
++    courseStatus = CourseStatus.ARCHIVED;
++  }
++
++  const enrollment = {
++    count: jest.fn(async () => rows.length),
++    findMany: jest.fn(async ({ where }: { where: Record<string, unknown> }) =>
++      rows.filter((r) => matches(r, where)).map((r) => ({ id: r.id })),
++    ),
++    updateMany: jest.fn(async ({ where, data }: { where: Record<string, unknown>; data: Partial<Row> }) => {
++      const hit = rows.filter((r) => matches(r, where));
++      hit.forEach((r) => Object.assign(r, data));
++      return { count: hit.length };
++    }),
++  };
++
++  const tx = {
++    enrollment,
++    payment: { aggregate: jest.fn(async () => ({ _sum: { amount: 0 }, _count: { _all: 0 } })) },
++    watchEvent: { count: jest.fn(async () => 0) },
++    course: {
++      update: jest.fn(async ({ data }: { data: { status: CourseStatus } }) => {
++        courseStatus = data.status;
++        return {};
++      }),
++    },
++    playbackTicket: { updateMany: jest.fn(async () => ({ count: 0 })) },
++    archiveRecord: {
++      create: jest.fn(async ({ data }: { data: { snapshot: unknown } }) => {
++        archiveRecords.push({ snapshot: data.snapshot, restoredAt: null, archivedAt: new Date() });
++        return {};
++      }),
++      findFirst: jest.fn(async () => {
++        const open = archiveRecords.filter((a) => a.restoredAt === null);
++        return open.length ? { snapshot: open[open.length - 1].snapshot } : null;
++      }),
++      updateMany: jest.fn(async () => {
++        archiveRecords.forEach((a) => (a.restoredAt = a.restoredAt ?? new Date()));
++        return { count: 1 };
++      }),
++    },
++  };
++
++  const prisma = {
++    course: {
++      findFirst: jest.fn(async () => ({
++        id: 'crs_1',
++        status: courseStatus,
++        lessonCount: 3,
++        studentCount: rows.length,
++        deletedAt: null,
++      })),
++    },
++    $transaction: jest.fn(async (fn: (t: typeof tx) => unknown) => fn(tx)),
++  };
++  const audit = { record: jest.fn(async () => undefined) };
++
++  const service = new CoursesAdminService(
++    prisma as never,
++    {} as never,
++    {} as never,
++    audit as never,
++    {} as never,
++    {} as never,
++    {} as never,
++  );
++  return { service, rows, audit, archiveRecords };
++}
++
++const now = Date.now();
++const row = (id: string, state: EnrollmentState, extra: Partial<Row> = {}): Row => ({
++  id,
++  courseId: 'crs_1',
++  state,
++  method: EnrollmentMethod.CODE,
++  approvedAt: null,
++  accessEndsAt: null,
++  ...extra,
++});
++
++function fixture(): Row[] {
++  return [
++    row('active_lifetime', EnrollmentState.ACTIVE),
++    row('active_window', EnrollmentState.ACTIVE, { accessEndsAt: new Date(now + 30 * DAY) }),
++    row('active_lapsed', EnrollmentState.ACTIVE, { accessEndsAt: new Date(now - DAY) }),
++    row('active_admin_granted', EnrollmentState.ACTIVE, {
++      method: EnrollmentMethod.ADMIN_APPROVAL,
++      approvedAt: new Date(now - 10 * DAY),
++    }),
++    row('pending_fresh', EnrollmentState.PENDING_APPROVAL, { method: EnrollmentMethod.ADMIN_APPROVAL }),
++    // A student who was approved once, lost access, and asked again: the row
++    // keeps the old approval stamp. Only the archive-time record can tell.
++    row('pending_rerequest', EnrollmentState.PENDING_APPROVAL, {
++      method: EnrollmentMethod.ADMIN_APPROVAL,
++      approvedAt: new Date(now - 100 * DAY),
++    }),
++    row('pending_payment', EnrollmentState.PENDING_PAYMENT, { method: EnrollmentMethod.PAYMENT }),
++    row('expired', EnrollmentState.EXPIRED, { accessEndsAt: new Date(now - 5 * DAY) }),
++    row('revoked', EnrollmentState.REVOKED),
++  ];
++}
++
++const stateOf = (rows: Row[]) => Object.fromEntries(rows.map((r) => [r.id, r.state]));
++
++describe('archive -> restore keeps every enrollment state honest', () => {
++  it('puts unapproved requests back as requests and approved students back as active', async () => {
++    const { service, rows } = build(fixture());
++
++    await service.archive('crs_1', ADMIN, 'term ended');
++    expect(stateOf(rows)).toMatchObject({
++      active_lifetime: EnrollmentState.ARCHIVED,
++      pending_fresh: EnrollmentState.ARCHIVED,
++      pending_rerequest: EnrollmentState.ARCHIVED,
++      pending_payment: EnrollmentState.PENDING_PAYMENT,
++    });
++
++    await service.restore('crs_1', ADMIN);
++
++    expect(stateOf(rows)).toEqual({
++      active_lifetime: EnrollmentState.ACTIVE,
++      active_window: EnrollmentState.ACTIVE,
++      active_lapsed: EnrollmentState.EXPIRED,
++      active_admin_granted: EnrollmentState.ACTIVE,
++      pending_fresh: EnrollmentState.PENDING_APPROVAL,
++      pending_rerequest: EnrollmentState.PENDING_APPROVAL,
++      pending_payment: EnrollmentState.PENDING_PAYMENT,
++      expired: EnrollmentState.EXPIRED,
++      revoked: EnrollmentState.REVOKED,
++    });
++  });
++
++  it('records the pending ids in the archive record only, not in the audit row or the response', async () => {
++    const { service, audit, archiveRecords } = build(fixture());
++
++    const result = await service.archive('crs_1', ADMIN, 'term ended');
++
++    expect(pendingApprovalIdsFrom(archiveRecords[0].snapshot).sort()).toEqual(['pending_fresh', 'pending_rerequest']);
++    expect(result.snapshot).not.toHaveProperty(PENDING_APPROVAL_SNAPSHOT_KEY);
++    expect(JSON.stringify(audit.record.mock.calls)).not.toContain('pending_fresh');
++  });
++
++  it('never approves anyone across repeated archive/restore cycles', async () => {
++    const { service, rows } = build(fixture());
++    for (let i = 0; i < 3; i += 1) {
++      await service.archive('crs_1', ADMIN, `cycle ${i}`);
++      await service.restore('crs_1', ADMIN);
++    }
++    expect(stateOf(rows).pending_fresh).toBe(EnrollmentState.PENDING_APPROVAL);
++    expect(stateOf(rows).pending_rerequest).toBe(EnrollmentState.PENDING_APPROVAL);
++    expect(stateOf(rows).active_lifetime).toBe(EnrollmentState.ACTIVE);
++  });
++
++  it('is admin-only on both sides', async () => {
++    const { service } = build(fixture());
++    const teacher = { id: 'usr_t', role: UserRole.TEACHER };
++    await expect(service.archive('crs_1', teacher, 'x')).rejects.toMatchObject({ code: 'INSUFFICIENT_ROLE' });
++    await expect(service.restore('crs_1', teacher)).rejects.toMatchObject({ code: 'INSUFFICIENT_ROLE' });
++  });
++});
++
++describe('courses archived before the fix (no recorded ids)', () => {
++  function legacy(): Row[] {
++    // What such an archive left behind: both kinds of row already ARCHIVED.
++    return fixture().map((r) =>
++      r.state === EnrollmentState.ACTIVE || r.state === EnrollmentState.PENDING_APPROVAL
++        ? { ...r, state: EnrollmentState.ARCHIVED }
++        : r,
++    );
++  }
++
++  it('never activates a request that was never approved', async () => {
++    const { service, rows } = build(legacy(), { enrollments: 9 });
++    await service.restore('crs_1', ADMIN);
++    expect(stateOf(rows).pending_fresh).toBe(EnrollmentState.PENDING_APPROVAL);
++  });
++
++  it('keeps approved students active', async () => {
++    const { service, rows } = build(legacy(), { enrollments: 9 });
++    await service.restore('crs_1', ADMIN);
++    expect(stateOf(rows)).toMatchObject({
++      active_lifetime: EnrollmentState.ACTIVE,
++      active_window: EnrollmentState.ACTIVE,
++      active_admin_granted: EnrollmentState.ACTIVE,
++      active_lapsed: EnrollmentState.EXPIRED,
++    });
++  });
++
++  it('KNOWN LIMIT: a re-request that kept an old approval stamp cannot be told apart and comes back ACTIVE', async () => {
++    // Documented in OWNER_DECISIONS (restore defect). Only archives made
++    // before the fix are affected; a read-only SQL check is provided there.
++    const { service, rows } = build(legacy(), { enrollments: 9 });
++    await service.restore('crs_1', ADMIN);
++    expect(stateOf(rows).pending_rerequest).toBe(EnrollmentState.ACTIVE);
++  });
++});
++
++describe('pendingApprovalIdsFrom', () => {
++  it.each([
++    [null, []],
++    [[], []],
++    [{ enrollments: 3 }, []],
++    [{ [PENDING_APPROVAL_SNAPSHOT_KEY]: ['a', 2, 'b'] }, ['a', 'b']],
++  ])('%p -> %p', (input, expected) => {
++    expect(pendingApprovalIdsFrom(input)).toEqual(expected);
++  });
++});
+diff --git a/test/unit/enrollment-admin-only-grants.spec.ts b/test/unit/enrollment-admin-only-grants.spec.ts
+new file mode 100644
+index 0000000..ea39703
+--- /dev/null
++++ b/test/unit/enrollment-admin-only-grants.spec.ts
+@@ -0,0 +1,110 @@
++import { EnrollmentState, UserRole } from '@prisma/client';
++
++import { ROLES_KEY } from '../../src/common/decorators/roles.decorator';
++import { EnrollmentsController } from '../../src/modules/enrollments/enrollments.controller';
++import { EnrollmentsService } from '../../src/modules/enrollments/enrollments.service';
++
++/**
++ * Owner decision D3: granting free access (including approving a pending
++ * request) and extending an access window are ADMINISTRATION ONLY.
++ *
++ * Both are checked twice: the route is @AdminOnly(), and the service refuses a
++ * non-admin before reading anything. A teacher whose course assignment carries
++ * the student capability - which used to be enough - must still get 403.
++ */
++
++const TEACHER_WITH_STUDENT_CAPABILITY = { id: 'usr_t', role: UserRole.TEACHER };
++const ADMIN = { id: 'usr_a', role: UserRole.ADMIN };
++const MASTER = { id: 'usr_m', role: UserRole.MASTER };
++
++function build() {
++  const enrollmentRow = {
++    id: 'enr_1',
++    courseId: 'crs_1',
++    userId: 'usr_s',
++    state: EnrollmentState.PENDING_PAYMENT,
++    accessEndsAt: null,
++  };
++  const prisma = {
++    enrollment: {
++      findUnique: jest.fn(async () => enrollmentRow),
++      update: jest.fn(async (a: { data: Record<string, unknown> }) => ({ ...enrollmentRow, ...a.data })),
++    },
++    course: { findFirst: jest.fn(async () => null) },
++  };
++  // The capability check a teacher with canViewStudents would PASS.
++  const access = { assertCanManageCourse: jest.fn(async () => undefined) };
++  const audit = { record: jest.fn(async () => undefined) };
++  const service = new EnrollmentsService(
++    prisma as never,
++    {} as never,
++    access as never,
++    {} as never,
++    {} as never,
++    {} as never,
++    audit as never,
++  );
++  return { service, prisma, access, audit };
++}
++
++describe('extend access window', () => {
++  it('refuses a teacher with 403 before reading or writing anything', async () => {
++    const { service, prisma } = build();
++
++    await expect(
++      service.extend('enr_1', 30, TEACHER_WITH_STUDENT_CAPABILITY),
++    ).rejects.toMatchObject({ code: 'INSUFFICIENT_ROLE' });
++
++    expect(prisma.enrollment.findUnique).not.toHaveBeenCalled();
++    expect(prisma.enrollment.update).not.toHaveBeenCalled();
++  });
++
++  it.each([ADMIN, MASTER])('still works for %o', async (actor) => {
++    const { service, prisma, audit } = build();
++
++    const updated = await service.extend('enr_1', 30, actor);
++
++    expect(prisma.enrollment.update).toHaveBeenCalledTimes(1);
++    expect(updated.state).toBe(EnrollmentState.ACTIVE);
++    expect(audit.record).toHaveBeenCalledTimes(1);
++  });
++});
++
++describe('grant access directly', () => {
++  it('refuses a teacher with 403 before any course lookup or grant', async () => {
++    const { service, prisma, access } = build();
++
++    await expect(
++      service.grantByAdmin({ userId: 'usr_s', courseId: 'crs_1' }, TEACHER_WITH_STUDENT_CAPABILITY),
++    ).rejects.toMatchObject({ code: 'INSUFFICIENT_ROLE' });
++
++    expect(access.assertCanManageCourse).not.toHaveBeenCalled();
++    expect(prisma.course.findFirst).not.toHaveBeenCalled();
++  });
++
++  it('lets an administrator through to the course check', async () => {
++    const { service, prisma } = build();
++
++    // The course does not exist in this double, so an admin gets past the role
++    // check and is answered NOT_FOUND by the real lookup.
++    await expect(
++      service.grantByAdmin({ userId: 'usr_s', courseId: 'crs_1' }, ADMIN),
++    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
++    expect(prisma.course.findFirst).toHaveBeenCalledTimes(1);
++  });
++});
++
++describe('route roles', () => {
++  const roles = (handler: object) => (Reflect.getMetadata(ROLES_KEY, handler) as string[]).slice().sort();
++
++  it('makes grant and extend admin-only', () => {
++    expect(roles(EnrollmentsController.prototype.grant)).toEqual(['ADMIN', 'MASTER']);
++    expect(roles(EnrollmentsController.prototype.extend)).toEqual(['ADMIN', 'MASTER']);
++  });
++
++  it('leaves listing and rejecting requests to staff, and revoke admin-only as before', () => {
++    expect(roles(EnrollmentsController.prototype.list)).toContain('TEACHER');
++    expect(roles(EnrollmentsController.prototype.reject)).toContain('TEACHER');
++    expect(roles(EnrollmentsController.prototype.revoke)).toEqual(['ADMIN', 'MASTER']);
++  });
++});
+diff --git a/test/unit/login-lockout.spec.ts b/test/unit/login-lockout.spec.ts
+index c545911..fd0e2bd 100755
+--- a/test/unit/login-lockout.spec.ts
++++ b/test/unit/login-lockout.spec.ts
+@@ -84,6 +84,8 @@ function build() {
+         return { ...row };
+       }),
+     },
++    // Sign-in also checks for a pending account deletion (owner decision D5).
++    accountDeletionRequest: { findFirst: jest.fn(async () => null) },
+   };
+ 
+   const passwords = {
+diff --git a/test/unit/registration-contract-no-study-type.spec.ts b/test/unit/registration-contract-no-study-type.spec.ts
+new file mode 100644
+index 0000000..15dbbd7
+--- /dev/null
++++ b/test/unit/registration-contract-no-study-type.spec.ts
+@@ -0,0 +1,55 @@
++import { ValidationPipe } from '@nestjs/common';
++
++import { RegisterDto } from '../../src/modules/auth/dto/register.dto';
++
++/**
++ * Owner decision D1: students do NOT choose GENERAL / PROGRAMS at registration.
++ * The academic system is the college's configuration; `studyType` survives only
++ * as an optional legacy field for older app builds.
++ *
++ * The payload below is exactly what the mobile app's `RegisterPayload`
++ * (`mobile-app-student/src/features/auth/api.ts`) sends. The pipe options are
++ * the API's own (`main.ts`): whitelist + forbidNonWhitelisted + transform.
++ */
++const pipe = new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true });
++const validate = (value: Record<string, unknown>) =>
++  pipe.transform(value, { type: 'body', metatype: RegisterDto });
++
++const mobilePayload = {
++  fullName: 'Ahmed Mohamed Ali',
++  phone: '01001234567',
++  password: 'Str0ngPass',
++  universityId: 'uni_1',
++  facultyId: 'fac_1',
++  departmentId: 'dep_1',
++  academicYearId: 'yr_1',
++  gender: 'MALE',
++};
++
++describe('RegisterDto contract (D1)', () => {
++  it('accepts the current mobile payload, which carries no study type', async () => {
++    const dto = (await validate(mobilePayload)) as RegisterDto;
++    expect(dto.studyType).toBeUndefined();
++    expect(dto.departmentId).toBe('dep_1');
++  });
++
++  it('still accepts an older client that sends a study type (backward compatibility)', async () => {
++    await expect(validate({ ...mobilePayload, studyType: 'PROGRAMS' })).resolves.toBeDefined();
++  });
++
++  it('rejects a study type outside the legacy vocabulary', async () => {
++    await expect(validate({ ...mobilePayload, studyType: 'ANYTHING' })).rejects.toBeDefined();
++  });
++
++  it.each(['universityId', 'facultyId', 'departmentId', 'academicYearId'])(
++    'requires %s - the server, not the client, decides the academic system from it',
++    async (field) => {
++      const { [field]: _omitted, ...rest } = mobilePayload as Record<string, unknown>;
++      await expect(validate(rest)).rejects.toBeDefined();
++    },
++  );
++
++  it('rejects a client-declared academic system', async () => {
++    await expect(validate({ ...mobilePayload, academicSystem: 'LEVEL' })).rejects.toBeDefined();
++  });
++});
+diff --git a/test/unit/teacher-course-announcements.spec.ts b/test/unit/teacher-course-announcements.spec.ts
+new file mode 100644
+index 0000000..630392b
+--- /dev/null
++++ b/test/unit/teacher-course-announcements.spec.ts
+@@ -0,0 +1,124 @@
++import { ValidationPipe } from '@nestjs/common';
++import { AccountStatus, EnrollmentState, UserRole } from '@prisma/client';
++
++import { ROLES_KEY } from '../../src/common/decorators/roles.decorator';
++import { compileAudience, ruleFromLegacyColumns } from '../../src/modules/notifications/audience';
++import {
++  CourseAnnouncementDto,
++  NotificationsController,
++} from '../../src/modules/notifications/notifications.controller';
++
++/**
++ * Owner decision D2: teachers may notify the ACTIVE students of their OWN
++ * assigned courses, and nothing wider. Broadcasts and direct messages stay
++ * admin-only.
++ */
++
++const TEACHER = { id: 'usr_t', role: UserRole.TEACHER } as never;
++const ADMIN = { id: 'usr_a', role: UserRole.ADMIN } as never;
++
++function build(opts: { allowed: boolean }) {
++  const createLegacy = jest.fn(async () => ({ id: 'ann_1', status: 'SENT' }));
++  const assertCourseExistsAndManageable = jest.fn(async () => {
++    if (!opts.allowed) {
++      throw Object.assign(new Error('NOT_COURSE_TEACHER'), { code: 'NOT_COURSE_TEACHER' });
++    }
++  });
++  const controller = new NotificationsController(
++    {} as never,
++    { createLegacy } as never,
++    { assertCourseExistsAndManageable } as never,
++  );
++  return { controller, createLegacy, assertCourseExistsAndManageable };
++}
++
++const body = { title: 'Lecture moved', body: 'Tomorrow at 10:00 instead of 12:00.' };
++
++describe('POST /notifications/courses/:courseId/announcements', () => {
++  it('lets an assigned teacher notify their own course, checked with the student capability', async () => {
++    const { controller, createLegacy, assertCourseExistsAndManageable } = build({ allowed: true });
++
++    await controller.announceToCourse('crs_1', body as CourseAnnouncementDto, TEACHER);
++
++    expect(assertCourseExistsAndManageable).toHaveBeenCalledWith('usr_t', UserRole.TEACHER, 'crs_1', 'students');
++    expect(createLegacy).toHaveBeenCalledWith(
++      expect.objectContaining({
++        courseId: 'crs_1',
++        route: '/course/crs_1',
++        publishNow: true,
++        title: body.title,
++        body: body.body,
++      }),
++      TEACHER,
++    );
++    // Nothing that widens the audience reaches the send.
++    const sent = (createLegacy.mock.calls[0] as unknown as [Record<string, unknown>])[0];
++    expect(sent).not.toHaveProperty('universityId');
++    expect(sent).not.toHaveProperty('academicYearId');
++    expect(sent).not.toHaveProperty('userId');
++  });
++
++  it("refuses a teacher who is not assigned to the course (another teacher's course)", async () => {
++    const { controller, createLegacy } = build({ allowed: false });
++
++    await expect(
++      controller.announceToCourse('crs_other', body as CourseAnnouncementDto, TEACHER),
++    ).rejects.toMatchObject({ code: 'NOT_COURSE_TEACHER' });
++    expect(createLegacy).not.toHaveBeenCalled();
++  });
++
++  it('lets an admin notify any existing course through the same route', async () => {
++    const { controller, createLegacy } = build({ allowed: true });
++    await controller.announceToCourse('crs_1', body as CourseAnnouncementDto, ADMIN);
++    expect(createLegacy).toHaveBeenCalledTimes(1);
++  });
++});
++
++describe('the course announcement body cannot carry an audience', () => {
++  const pipe = new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true });
++  const validate = (value: Record<string, unknown>) =>
++    pipe.transform(value, { type: 'body', metatype: CourseAnnouncementDto });
++
++  it.each([
++    ['userId', { userId: 'usr_someone' }],
++    ['universityId', { universityId: 'uni_1' }],
++    ['academicYearId', { academicYearId: 'yr_1' }],
++    ['courseId', { courseId: 'crs_other' }],
++    ['route', { route: '/wallet' }],
++    ['audience', { audience: { roles: ['TEACHER'] } }],
++  ])('rejects an extra %s field', async (_name, extra) => {
++    await expect(validate({ ...body, ...extra })).rejects.toBeDefined();
++  });
++
++  it('accepts the plain message', async () => {
++    await expect(validate({ ...body, titleAr: 'تم نقل المحاضرة', sendPush: true })).resolves.toMatchObject(body);
++  });
++});
++
++describe('the audience is the course\'s ACTIVE students only', () => {
++  it('compiles to active student accounts with an ACTIVE enrollment in that course', () => {
++    const where = compileAudience(ruleFromLegacyColumns({ courseId: 'crs_1', universityId: null, academicYearId: null }));
++
++    expect(where).toMatchObject({
++      deletedAt: null,
++      role: { in: [UserRole.STUDENT] },
++      status: AccountStatus.ACTIVE,
++      enrollments: { some: { courseId: { in: ['crs_1'] }, state: { in: [EnrollmentState.ACTIVE] } } },
++    });
++  });
++});
++
++describe('route roles', () => {
++  const roles = (handler: object) => Reflect.getMetadata(ROLES_KEY, handler) as string[];
++
++  it('keeps broadcasts and direct messages admin-only', () => {
++    expect(roles(NotificationsController.prototype.announce).sort()).toEqual(['ADMIN', 'MASTER']);
++  });
++
++  it('opens the course route to staff, with the course check doing the scoping', () => {
++    expect(roles(NotificationsController.prototype.announceToCourse)).toEqual(
++      expect.arrayContaining(['TEACHER', 'ADMIN', 'MASTER']),
++    );
++    expect(roles(NotificationsController.prototype.announceToCourse)).not.toContain('STUDENT');
++  });
++});
+diff --git a/test/unit/throttler-tracker.spec.ts b/test/unit/throttler-tracker.spec.ts
+index 577d0fb..22d58a8 100755
+--- a/test/unit/throttler-tracker.spec.ts
++++ b/test/unit/throttler-tracker.spec.ts
+@@ -27,10 +27,15 @@ describe('ThrottlerProxyGuard.getTracker', () => {
+     expect(b).toBe(a);
+   });
+ 
+-  it('keys other anonymous requests by client address', async () => {
++  it('keys other anonymous requests by req.ip and never by the client-written X-Forwarded-For (D6)', async () => {
++    // req.ip is what RequestContextMiddleware decided: the trusted-hop address,
++    // or the browser address the web server forwarded with the shared secret.
+     await expect(tracker({ headers: { 'x-forwarded-for': '3.3.3.3, 10.0.0.1' }, ip: '10.0.0.1' })).resolves.toBe(
+-      'ip:3.3.3.3',
++      'ip:10.0.0.1',
+     );
++    const a = await tracker({ headers: { 'x-forwarded-for': '4.4.4.4' }, ip: '198.51.100.9' });
++    const b = await tracker({ headers: { 'x-forwarded-for': '5.5.5.5' }, ip: '198.51.100.9' });
++    expect(b).toBe(a);
+   });
+ });
+ 
+diff --git a/test/unit/web-proxy-client-ip.spec.ts b/test/unit/web-proxy-client-ip.spec.ts
+new file mode 100644
+index 0000000..d0ed72a
+--- /dev/null
++++ b/test/unit/web-proxy-client-ip.spec.ts
+@@ -0,0 +1,142 @@
++import type { Request } from 'express';
++
++import { RequestContextMiddleware } from '../../src/common/middleware/request-context.middleware';
++import {
++  WEB_CLIENT_IP_HEADER,
++  WEB_PROXY_SECRET_HEADER,
++  applyClientIp,
++  parseForwardedClientIp,
++  proxySecretMatches,
++  resolveClientIp,
++} from '../../src/common/net/client-ip';
++import { validateEnv } from '../../src/config/env.validation';
++
++/**
++ * Owner decision D6: the student web server forwards the browser's address
++ * with a shared secret; the API believes it only with that secret, and never
++ * believes X-Forwarded-For as written by a client.
++ */
++
++const SECRET = 'a'.repeat(24) + 'Zx9!long-enough-secret';
++const VERCEL_EGRESS = '18.200.0.1';
++
++function request(headers: Record<string, string>, ip = VERCEL_EGRESS): Request {
++  return { headers: { ...headers }, ip, socket: { remoteAddress: ip } } as unknown as Request;
++}
++
++describe('the forwarded address is believed only with the shared secret', () => {
++  it('uses the forwarded browser address when the web server presents the secret', () => {
++    const req = request({ [WEB_PROXY_SECRET_HEADER]: SECRET, [WEB_CLIENT_IP_HEADER]: '197.34.10.20' });
++    expect(resolveClientIp(req, SECRET)).toEqual({ ip: '197.34.10.20', source: 'web-proxy' });
++  });
++
++  it.each([
++    ['no secret header', {}],
++    ['a wrong secret', { [WEB_PROXY_SECRET_HEADER]: SECRET.slice(0, -1) + '?' }],
++    ['a prefix of the secret', { [WEB_PROXY_SECRET_HEADER]: SECRET.slice(0, 32) }],
++    ['an empty secret', { [WEB_PROXY_SECRET_HEADER]: '' }],
++  ])('ignores the forwarded address with %s (direct API traffic)', (_name, extra) => {
++    const req = request({ ...extra, [WEB_CLIENT_IP_HEADER]: '1.2.3.4' });
++    expect(resolveClientIp(req, SECRET)).toEqual({ ip: VERCEL_EGRESS, source: 'direct' });
++  });
++
++  it('believes nothing when the API has no secret configured, even if a caller sends one', () => {
++    const req = request({ [WEB_PROXY_SECRET_HEADER]: SECRET, [WEB_CLIENT_IP_HEADER]: '1.2.3.4' });
++    expect(resolveClientIp(req, null).source).toBe('direct');
++  });
++
++  it('refuses a configured secret that is too short to be one', () => {
++    expect(proxySecretMatches('short', 'short')).toBe(false);
++  });
++
++  it('never reads X-Forwarded-For itself', () => {
++    const req = request({ 'x-forwarded-for': '6.6.6.6, 18.200.0.1' });
++    expect(resolveClientIp(req, SECRET)).toEqual({ ip: VERCEL_EGRESS, source: 'direct' });
++  });
++});
++
++describe('the forwarded value must be one real address', () => {
++  it.each([
++    ['197.34.10.20', '197.34.10.20'],
++    ['2001:db8::1', '2001:db8::1'],
++    [' 197.34.10.20 ', '197.34.10.20'],
++    ['1.1.1.1, 2.2.2.2', null],
++    ['not-an-ip', null],
++    ['999.1.1.1', null],
++    ['', null],
++    [undefined, null],
++  ])('%p -> %p', (raw, expected) => {
++    expect(parseForwardedClientIp(raw as string | undefined)).toBe(expected);
++  });
++
++  it('falls back to the direct address when the secret is right but the value is junk', () => {
++    const req = request({ [WEB_PROXY_SECRET_HEADER]: SECRET, [WEB_CLIENT_IP_HEADER]: 'evil, 1.1.1.1' });
++    expect(resolveClientIp(req, SECRET)).toEqual({ ip: VERCEL_EGRESS, source: 'direct' });
++  });
++});
++
++describe('applying the attribution', () => {
++  it('sets req.ip for every later reader and strips both headers', () => {
++    const req = request({ [WEB_PROXY_SECRET_HEADER]: SECRET, [WEB_CLIENT_IP_HEADER]: '197.34.10.20' });
++    applyClientIp(req, SECRET);
++    expect(req.ip).toBe('197.34.10.20');
++    expect(req.clientIpSource).toBe('web-proxy');
++    expect(req.headers).not.toHaveProperty(WEB_PROXY_SECRET_HEADER);
++    expect(req.headers).not.toHaveProperty(WEB_CLIENT_IP_HEADER);
++  });
++
++  it('strips the headers from a direct caller too, and leaves req.ip alone', () => {
++    const req = request({ [WEB_PROXY_SECRET_HEADER]: 'guess', [WEB_CLIENT_IP_HEADER]: '1.2.3.4' });
++    applyClientIp(req, SECRET);
++    expect(req.ip).toBe(VERCEL_EGRESS);
++    expect(req.clientIpSource).toBe('direct');
++    expect(req.headers).not.toHaveProperty(WEB_PROXY_SECRET_HEADER);
++  });
++
++  it('runs in the request middleware, before guards, with the configured secret', () => {
++    const config = { get: () => ({ webProxySharedSecret: SECRET }) };
++    const middleware = new RequestContextMiddleware(config as never);
++    const req = Object.assign(
++      request({ [WEB_PROXY_SECRET_HEADER]: SECRET, [WEB_CLIENT_IP_HEADER]: '197.34.10.20' }),
++      { header: (name: string) => (req.headers as Record<string, string>)[name] },
++    ) as Request;
++    const res = { setHeader: jest.fn() };
++    const next = jest.fn();
++
++    middleware.use(req, res as never, next);
++
++    expect(next).toHaveBeenCalledTimes(1);
++    expect(req.ip).toBe('197.34.10.20');
++    // The secret is never echoed back.
++    expect(JSON.stringify(res.setHeader.mock.calls)).not.toContain(SECRET);
++  });
++});
++
++describe('environment validation', () => {
++  // Same minimal environment as env-validation.spec.ts.
++  const base = {
++    NODE_ENV: 'development',
++    DATABASE_URL: 'postgresql://u:p@localhost:5432/edu',
++    JWT_ACCESS_SECRET: 'a'.repeat(48),
++    JWT_REFRESH_SECRET: 'b'.repeat(48),
++    JWT_PLAYBACK_SECRET: 'c'.repeat(48),
++    MEDIA_SIGNING_KEY: 'd'.repeat(48),
++    HLS_KEY_ROOT: 'e'.repeat(48),
++  };
++
++  it('accepts no secret (feature off) and a long one', () => {
++    expect(() => validateEnv(base)).not.toThrow();
++    expect(() => validateEnv({ ...base, WEB_PROXY_SHARED_SECRET: SECRET })).not.toThrow();
++  });
++
++  it('refuses a short secret at boot rather than running with a guessable one', () => {
++    expect(() => validateEnv({ ...base, WEB_PROXY_SHARED_SECRET: 'short-secret' })).toThrow(
++      /WEB_PROXY_SHARED_SECRET/,
++    );
++  });
++
++  it('accepts a proxy hop count and refuses a silly one', () => {
++    expect(validateEnv({ ...base, TRUST_PROXY_HOPS: '2' }).TRUST_PROXY_HOPS).toBe(2);
++    expect(() => validateEnv({ ...base, TRUST_PROXY_HOPS: '0' })).toThrow(/TRUST_PROXY_HOPS/);
++  });
++});
+diff --git a/tools/offline-verify/stubs/@nestjs/common/index.js b/tools/offline-verify/stubs/@nestjs/common/index.js
+index 93ad5be..050c599 100755
+--- a/tools/offline-verify/stubs/@nestjs/common/index.js
++++ b/tools/offline-verify/stubs/@nestjs/common/index.js
+@@ -5,7 +5,7 @@ exports.Inject = noopDecorator;
+ exports.Global = () => (t) => t;
+ exports.Module = () => (t) => t;
+ exports.Controller = () => (t) => t;
+-for (const v of ['Get','Post','Put','Patch','Delete','Body','Param','Query','Req','Res','Headers','HttpCode','SetMetadata','UseGuards','UseInterceptors']) {
++for (const v of ['Get','Post','Put','Patch','Delete','Body','Param','Query','Req','Res','Headers','HttpCode','SetMetadata','UseGuards','UseInterceptors','Optional']) {
+   exports[v] = noopDecorator;
+ }
+ exports.Logger = class Logger {

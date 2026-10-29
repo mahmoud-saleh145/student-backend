@@ -5,27 +5,41 @@ import type { Request } from 'express';
 /**
  * Rate-limit key resolution.
  *
- * Behind a load balancer `req.ip` is the balancer, so every user shares one
- * bucket. Authenticated requests are therefore keyed by user id, and
- * anonymous ones by the leftmost X-Forwarded-For entry (only trustworthy when
- * TRUST_PROXY is on and the balancer overwrites the header).
+ * Runs AFTER JwtAuthGuard (see AppModule), which is what makes the user-id
+ * branch reachable.
+ *
+ * Authenticated requests are keyed by user id, credential requests by the
+ * submitted phone, and other anonymous requests by `req.ip`.
+ *
+ * `req.ip` is the attribution decided once in RequestContextMiddleware (owner
+ * decision D6, common/net/client-ip.ts): the browser address forwarded by the
+ * student web server when it presents the shared secret, otherwise the address
+ * Express derives from the trusted proxy hops. The raw X-Forwarded-For header
+ * is NOT read here: its leftmost entry is whatever the client wrote.
  */
 @Injectable()
 export class ThrottlerProxyGuard extends ThrottlerGuard {
   protected override async getTracker(req: Request): Promise<string> {
     if (req.user?.id) return `user:${req.user.id}`;
 
-    const forwarded = req.header('x-forwarded-for');
-    const ip = forwarded ? (forwarded.split(',')[0]?.trim() ?? req.ip) : req.ip;
+    const ip = req.ip;
 
-    // Credential endpoints additionally bucket by the submitted phone so one
-    // attacker cannot exhaust the limit for an entire NAT range, and so
-    // password spraying against many accounts still trips the limit.
+    // Credential endpoints bucket by the submitted phone ALONE.
+    //
+    // An `ip|phone` key let an attacker who could vary the address (the
+    // leftmost X-Forwarded-For entry, which this guard used to read) get a
+    // fresh bucket for the same account on every request. Keyed by phone, the
+    // attempts against one account share one bucket whatever address they
+    // claim, and one attacker still cannot exhaust the limit for an entire NAT
+    // range. (Formatting is stripped so "010 1234" and
+    // "0101234" are the same account.)
     const phone =
       typeof req.body === 'object' && req.body && 'phone' in req.body
-        ? String((req.body as { phone?: unknown }).phone ?? '').slice(0, 20)
+        ? String((req.body as { phone?: unknown }).phone ?? '')
+            .replace(/[\s()-]/g, '')
+            .slice(0, 20)
         : '';
 
-    return phone ? `ip:${ip}|phone:${phone}` : `ip:${ip ?? 'unknown'}`;
+    return phone ? `phone:${phone}` : `ip:${ip ?? 'unknown'}`;
   }
 }

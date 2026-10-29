@@ -1,10 +1,10 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import {
   AuditAction,
-  CourseStatus,
   EnrollmentMethod,
   EnrollmentState,
   NotificationKind,
+  PartEntitlementSource,
   type Prisma,
   SectionGrantSource,
   UserRole,
@@ -20,6 +20,7 @@ import { paginated } from '../../common/types/api-response';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { withSerializableRetry } from '../../database/serializable-retry';
 import { AuditService } from '../audit/audit.service';
+import { CatalogService } from '../catalog/catalog.service';
 import { CodesService } from '../codes/codes.service';
 import { grantPartFromCode } from '../course-parts/grant-part-from-code';
 import { CourseAccessService } from '../courses/course-access.service';
@@ -29,6 +30,21 @@ import { REFUND_TX_INCLUDE, refundStateOf } from '../payments/refund-state';
 import { PaymentsService } from '../payments/payments.service';
 
 import { revokeEnrollmentInTx } from './revoke-enrollment';
+
+/**
+ * Refuses anyone but an administrator (ADMIN or MASTER).
+ *
+ * Used for the operations owner decision D3 reserves for administration:
+ * granting access without payment and extending an access window. Thrown as
+ * INSUFFICIENT_ROLE (403), the same answer RolesGuard gives at the route.
+ */
+export function assertAdministrator(role: UserRole, action: string): void {
+  if (role !== UserRole.ADMIN && role !== UserRole.MASTER) {
+    throw new AppException(ErrorCode.INSUFFICIENT_ROLE, {
+      message: `Only an administrator can ${action}.`,
+    });
+  }
+}
 
 /** Matches the mobile app's `EnrollmentResult` exactly. */
 export interface EnrollmentResult {
@@ -64,6 +80,12 @@ export class EnrollmentsService {
     private readonly codes: CodesService,
     private readonly notifications: NotificationsService,
     private readonly audit: AuditService,
+    // Optional only so unit tests that build this service positionally keep
+    // compiling; the application module always provides it (see
+    // EnrollmentsModule's CatalogModule import). `transfer` refuses to run
+    // without it, because "which ladder governs this department" must be
+    // answered by the catalog, never re-derived here.
+    @Optional() private readonly catalog?: CatalogService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -517,14 +539,24 @@ export class EnrollmentsService {
 
     const existing = await tx.enrollment.findUnique({
       where: { userId_courseId: { userId: params.userId, courseId: params.course.id } },
-      select: { id: true, coversAllSections: true },
+      select: { id: true, coversAllSections: true, state: true, accessEndsAt: true },
     });
 
     // Access is only ever widened here, never narrowed: a student who already
     // holds the whole course keeps it even if the grant being applied is
     // section-scoped. The only way to reduce access is an explicit revoke.
-    const coversAllSections =
-      scope === null || (existing?.coversAllSections ?? false) ? true : false;
+    //
+    // "Already holds the whole course" means a LIVE whole-course enrollment.
+    // `coversAllSections` defaults to true on every row, including the
+    // PENDING_APPROVAL / PENDING_PAYMENT rows written by a join request and
+    // EXPIRED rows whose access has lapsed. Inheriting the flag from those let
+    // a student request approval (or start a payment) and then redeem the
+    // cheapest section card to unlock every section of the course.
+    const holdsLiveWholeCourse =
+      existing?.coversAllSections === true &&
+      existing.state === EnrollmentState.ACTIVE &&
+      (existing.accessEndsAt === null || existing.accessEndsAt > now);
+    const coversAllSections = scope === null || holdsLiveWholeCourse;
 
     const enrollment = await tx.enrollment.upsert({
       where: { userId_courseId: { userId: params.userId, courseId: params.course.id } },
@@ -846,6 +878,10 @@ export class EnrollmentsService {
     },
     actor: { id: string; role: UserRole },
   ) {
+    // Defence in depth behind @AdminOnly() on the route: free access is an
+    // administrative decision (owner decision D3), whatever capabilities a
+    // teacher's course assignment carries.
+    assertAdministrator(actor.role, 'grant access');
     await this.access.assertCanManageCourse(actor.id, actor.role, params.courseId, 'students');
 
     const course = await this.prisma.course.findFirst({
@@ -1027,6 +1063,531 @@ export class EnrollmentsService {
     };
   }
 
+  /**
+   * Moves a student's course entitlement to another course, together with the
+   * academic profile that decides eligibility — the "student transferred to
+   * another university/college" operation.
+   *
+   * Why a dedicated operation: academic targeting (`assertCourseTargeting`) is
+   * enforced live on every access, so pointing a profile at a new university
+   * immediately hides the old university's courses, while simply revoking and
+   * re-granting as two admin actions cannot be atomic and leaves a window in
+   * which the student holds access to neither course. And re-issuing a code
+   * would record a second purchase for access already paid for.
+   *
+   * What it does, in ONE Serializable transaction (the student is never
+   * visible between states):
+   *  1. grants access to the destination course — whole-course when the source
+   *     enrollment covered the whole course, otherwise scoped to the sections
+   *     of one destination part, mirroring the section-scoped source. The grant
+   *     uses `method: ADMIN_APPROVAL` and `SectionGrantSource.ADMIN`: an
+   *     administrative move, not a code or a payment;
+   *  2. revokes the source enrollment through the same `revokeEnrollmentInTx`
+   *     that "Remove from course" and refunds use — payments, code
+   *     redemptions, part purchases and watch history are preserved; live
+   *     playback tickets for the source course die; source part entitlements
+   *     are additively revoked (rows stay);
+   *  3. points the student's profile at the destination course's university and
+   *     faculty (and the chosen department), so targeting keeps passing for the
+   *     destination course. The academic year/rung is re-validated against the
+   *     destination department's ladder by the catalog service;
+   *  4. records the destination part entitlement (when part-scoped) with
+   *     `PartEntitlementSource.MIGRATION` and no purchase — an honest
+   *     provenance the schema already provides for exactly this.
+   *
+   * What it deliberately does NOT do:
+   *  - create a Payment, PaymentTransaction, RevenueLedger,
+   *    AccessCodeRedemption or CoursePartPurchase row. A transfer is not a
+   *    purchase and recognises no revenue;
+   *  - issue, revoke or touch any access code;
+   *  - touch watch progress, counted plays, the wallet, the library, the
+   *    source course's content, or any other enrollment;
+   *  - narrow an existing destination enrollment: a student who already holds
+   *    the whole destination course is refused, not downgraded.
+   *
+   * Idempotent: a repeat of a completed transfer answers
+   * `alreadyTransferred: true` from current state and changes nothing. A
+   * source enrollment revoked by some other operation (e.g. "Remove from
+   * course") is answered as INVALID_STATE rather than guessed at.
+   */
+  async transfer(
+    params: {
+      enrollmentId: string;
+      destinationCourseId: string;
+      /** Required iff the source enrollment is scoped to specific sections. */
+      destinationPartId?: string;
+      /** Required iff the destination course targets more than one department. */
+      departmentId?: string;
+      /** Defaults to the student's current rung, revalidated for the destination. */
+      academicYearId?: string;
+      reason: string;
+    },
+    actor: { id: string; role: UserRole },
+  ) {
+    // Moving access AND an academic profile is administration only (owner
+    // decision D3), checked before anything is read.
+    assertAdministrator(actor.role, 'transfer course access');
+    if (!this.catalog) {
+      throw new Error('CatalogService is not wired into EnrollmentsService');
+    }
+
+    const source = await this.prisma.enrollment.findUnique({
+      where: { id: params.enrollmentId },
+      select: {
+        id: true,
+        userId: true,
+        courseId: true,
+        state: true,
+        coversAllSections: true,
+        course: { select: { id: true, title: true } },
+      },
+    });
+    if (!source) throw AppException.notFound('Enrollment', params.enrollmentId);
+
+    // The operation moves a student between two catalog units; the actor must
+    // be allowed to manage students in BOTH.
+    await Promise.all([
+      this.access.assertCanManageCourse(actor.id, actor.role, source.courseId, 'students'),
+      this.access.assertCanManageCourse(actor.id, actor.role, params.destinationCourseId, 'students'),
+    ]);
+
+    if (params.destinationCourseId === source.courseId) {
+      throw AppException.validation({
+        destinationCourseId: ['must differ from the enrollment’s current course'],
+      });
+    }
+
+    // The destination course must be filed under a university and faculty:
+    // the student's profile is about to be pointed at them, and a transfer
+    // into a globally-open course has no academic home to point at.
+    const destination = await this.prisma.course.findFirst({
+      where: { id: params.destinationCourseId, ...notDeleted },
+      select: {
+        id: true,
+        title: true,
+        universityId: true,
+        facultyId: true,
+        accessDurationType: true,
+        accessDurationDays: true,
+        accessEndsAt: true,
+        departments: { select: { departmentId: true } },
+      },
+    });
+    if (!destination) throw AppException.notFound('Course', params.destinationCourseId);
+    if (!destination.universityId || !destination.facultyId) {
+      throw AppException.validation({
+        destinationCourseId: [
+          'a transfer needs a destination course filed under a university and faculty — the student’s academic profile follows the course',
+        ],
+      });
+    }
+
+    // A repeat of an already-completed transfer is answered from current
+    // state instead of failing or applying anything twice. The response has
+    // the same shape as a fresh transfer; its counters describe this call
+    // (which changed nothing).
+    const profile = await this.prisma.studentProfile.findUnique({
+      where: { userId: source.userId },
+    });
+    if (!profile) throw AppException.notFound('StudentProfile', source.userId);
+
+    if (source.state === EnrollmentState.REVOKED) {
+      const destinationEnrollment = await this.prisma.enrollment.findUnique({
+        where: {
+          userId_courseId: { userId: source.userId, courseId: params.destinationCourseId },
+        },
+        select: { id: true, state: true, coversAllSections: true },
+      });
+      if (destinationEnrollment?.state === EnrollmentState.ACTIVE) {
+        return {
+          ok: true,
+          alreadyTransferred: true,
+          userId: source.userId,
+          from: {
+            enrollmentId: source.id,
+            courseId: source.courseId,
+            courseTitle: source.course.title,
+            state: EnrollmentState.REVOKED,
+            removedSectionGrants: 0,
+            revokedPartEntitlements: 0,
+            revokedPlaybackTickets: 0,
+            retained: { paidPayments: 0, codeRedemptions: 0 },
+          },
+          to: {
+            enrollmentId: destinationEnrollment.id,
+            courseId: destination.id,
+            courseTitle: destination.title,
+            state: EnrollmentState.ACTIVE,
+            coversAllSections: destinationEnrollment.coversAllSections,
+            grantedSectionIds: [] as string[],
+            partId: null,
+            partEntitlementCreated: false,
+            partEntitlementReinstated: false,
+          },
+          profile: {
+            universityId: profile.universityId,
+            facultyId: profile.facultyId,
+            departmentId: profile.departmentId,
+            academicYearId: profile.academicYearId,
+          },
+        };
+      }
+      throw new AppException(ErrorCode.INVALID_STATE, {
+        message:
+          'The source enrollment is revoked but the destination access is not active. Inspect the student’s history before retrying.',
+        details: { enrollmentId: source.id, state: source.state },
+      });
+    }
+
+    // --- destination department ---------------------------------------------
+    const targetedDepartmentIds = destination.departments.map((d) => d.departmentId);
+    let departmentId: string | null = params.departmentId ?? null;
+    if (targetedDepartmentIds.length > 0) {
+      if (!departmentId) {
+        if (targetedDepartmentIds.length === 1) {
+          [departmentId] = targetedDepartmentIds;
+        } else {
+          throw AppException.validation({
+            departmentId: [
+              'is required: the destination course targets several departments, so the student must be filed under exactly one of them',
+            ],
+          });
+        }
+      } else if (!targetedDepartmentIds.includes(departmentId)) {
+        throw AppException.validation({
+          departmentId: ['is not one of the destination course’s targeted departments'],
+        });
+      }
+    } else if (departmentId) {
+      throw AppException.validation({
+        departmentId: ['was sent, but the destination course is not filed under any department'],
+      });
+    }
+
+    // --- destination section scope ------------------------------------------
+    let sectionScope: string[] | null = null;
+    let destinationPartId: string | null = null;
+    if (params.destinationPartId) {
+      const part = await this.prisma.coursePart.findFirst({
+        where: { id: params.destinationPartId, courseId: destination.id, deletedAt: null },
+        select: {
+          id: true,
+          // The same freeze rule a PART code gets at generation: every
+          // non-deleted section of the part, whatever its status.
+          sections: {
+            where: { deletedAt: null },
+            orderBy: { sortOrder: 'asc' },
+            select: { id: true },
+          },
+        },
+      });
+      if (!part) throw AppException.notFound('Course part', params.destinationPartId);
+      if (part.sections.length === 0) {
+        throw AppException.validation({
+          destinationPartId: [
+            'has no sections yet, so transferring into it would unlock nothing',
+          ],
+        });
+      }
+      destinationPartId = part.id;
+      sectionScope = part.sections.map((s) => s.id);
+    } else if (!source.coversAllSections) {
+      throw AppException.validation({
+        destinationPartId: [
+          'is required: the source enrollment is scoped to specific sections, so the destination scope must be named too',
+        ],
+      });
+    }
+
+    // --- academic chain validation ------------------------------------------
+    // Mirrors the integrity rule `UsersService.assertAcademicSelectionIsCoherent`
+    // enforces on profile edits: a client never decides the chain, the database
+    // does. Done here rather than through UsersService to keep this service
+    // free of a dependency that would cycle.
+    const academicYearId = params.academicYearId ?? profile.academicYearId;
+    const academicFields: Record<string, string[]> = {};
+    if (departmentId) {
+      const [university, faculty, department] = await Promise.all([
+        this.prisma.university.findFirst({
+          where: { id: destination.universityId, isActive: true, ...notDeleted },
+          select: { id: true },
+        }),
+        this.prisma.faculty.findFirst({
+          where: { id: destination.facultyId, isActive: true, ...notDeleted },
+          select: { id: true, universityId: true },
+        }),
+        this.prisma.department.findFirst({
+          where: { id: departmentId, isActive: true, ...notDeleted },
+          select: { id: true, facultyId: true },
+        }),
+      ]);
+      if (!university) academicFields.universityId = ['unknown or inactive university'];
+      if (!faculty) academicFields.facultyId = ['unknown or inactive faculty'];
+      if (!department) academicFields.departmentId = ['unknown or inactive department'];
+      if (faculty && university && faculty.universityId !== university.id) {
+        academicFields.facultyId = ['does not belong to the destination university'];
+      }
+      if (department && faculty && department.facultyId !== faculty.id) {
+        academicFields.departmentId = ['does not belong to the destination faculty'];
+      }
+    }
+    if (academicYearId) {
+      const structure = await this.catalog.resolveAcademicStructure(
+        departmentId
+          ? { departmentId }
+          : { facultyId: destination.facultyId },
+      );
+      if (!structure) {
+        academicFields.academicYearId = [
+          'no academic structure covers the destination college',
+        ];
+      } else {
+        const rung = await this.prisma.academicYear.findFirst({
+          where: { id: academicYearId, structureId: structure.id, isActive: true },
+          select: { id: true },
+        });
+        if (!rung) {
+          academicFields.academicYearId = [
+            'does not belong to the destination college’s ladder — send an explicit academicYearId',
+          ];
+        }
+      }
+    } else {
+      academicFields.academicYearId = [
+        'is required: the student has no rung and none was sent',
+      ];
+    }
+    if (Object.keys(academicFields).length > 0) {
+      throw AppException.validation(academicFields, 'Academic selection is not coherent');
+    }
+
+    // Refuse to make the destination narrower-then-wider: a student who
+    // already holds the whole destination course keeps it (grantAccess only
+    // widens), so proceeding would silently transfer a part-scoped source
+    // into whole-course access. That decision belongs to a human, not here.
+    if (sectionScope !== null) {
+      const existingDestination = await this.prisma.enrollment.findUnique({
+        where: {
+          userId_courseId: { userId: source.userId, courseId: destination.id },
+        },
+        select: { id: true, state: true, coversAllSections: true, accessEndsAt: true },
+      });
+      const holdsLiveWholeCourse =
+        existingDestination?.coversAllSections === true &&
+        existingDestination.state === EnrollmentState.ACTIVE &&
+        (existingDestination.accessEndsAt === null ||
+          existingDestination.accessEndsAt > new Date());
+      if (holdsLiveWholeCourse) {
+        throw new AppException(ErrorCode.INVALID_STATE, {
+          message:
+            'The student already holds the whole destination course. A part-scoped transfer would not narrow it; revoke first if that is really wanted.',
+          details: { enrollmentId: existingDestination?.id, courseId: destination.id },
+        });
+      }
+    }
+
+    // --- the transaction ------------------------------------------------------
+    const result = await withSerializableRetry(this.prisma, async (tx) => {
+      // Re-read inside the transaction: a grant or revocation that landed
+      // while the checks above ran must abort this attempt, not be overwritten
+      // by decisions made from a stale snapshot.
+      const sourceNow = await tx.enrollment.findUnique({
+        where: { id: source.id },
+        select: { id: true, state: true },
+      });
+      if (!sourceNow || sourceNow.state !== EnrollmentState.ACTIVE) {
+        throw new AppException(ErrorCode.CONFLICT, {
+          message:
+            'The source enrollment changed while the transfer was being prepared. Re-check the student and retry.',
+          details: { enrollmentId: source.id, state: sourceNow?.state ?? 'MISSING' },
+        });
+      }
+
+      // 1. Destination access first, so the student is never recorded as
+      //    holding nothing — and if anything below throws, all of it rolls
+      //    back together.
+      const destinationEnrollment = await this.grantAccess(tx, {
+        userId: source.userId,
+        course: destination,
+        method: EnrollmentMethod.ADMIN_APPROVAL,
+        approvedById: actor.id,
+        sectionScope,
+        grantSource: SectionGrantSource.ADMIN,
+        ...(destinationPartId ? { partId: destinationPartId } : {}),
+      });
+
+      // 1b. Part-ownership bookkeeping for the destination part, so the
+      //     student app's "owned parts" view agrees with the section grants.
+      //     `MIGRATION` is the schema's own provenance for this: no purchase
+      //     row is created and no revenue is recognised.
+      let partEntitlementCreated = false;
+      let partEntitlementReinstated = false;
+      if (destinationPartId) {
+        const existing = await tx.coursePartEntitlement.findUnique({
+          where: {
+            userId_coursePartId: {
+              userId: source.userId,
+              coursePartId: destinationPartId,
+            },
+          },
+        });
+        if (!existing) {
+          await tx.coursePartEntitlement.create({
+            data: {
+              userId: source.userId,
+              courseId: destination.id,
+              coursePartId: destinationPartId,
+              source: PartEntitlementSource.MIGRATION,
+              purchaseId: null,
+              revokedAt: null,
+            },
+          });
+          partEntitlementCreated = true;
+        } else if (existing.revokedAt) {
+          await tx.coursePartEntitlement.update({
+            where: { id: existing.id },
+            data: { revokedAt: null, revokedById: null, revokedReason: null },
+          });
+          partEntitlementReinstated = true;
+        }
+      }
+
+      // 2. The source enrollment goes through the exact same revocation the
+      //    dashboard's "Remove from course" uses, so history, redemptions,
+      //    purchases and watch progress survive untouched.
+      const revocation = await revokeEnrollmentInTx(tx, this.audit, {
+        enrollmentId: source.id,
+        actor,
+        reason: params.reason,
+        expectedCourseId: source.courseId,
+        ticketReason: 'Course access transferred',
+        auditContext: {
+          transfer: {
+            destinationCourseId: destination.id,
+            destinationEnrollmentId: destinationEnrollment.id,
+            destinationPartId,
+          },
+        },
+      });
+      if (revocation.alreadyRevoked) {
+        // Only reachable if a concurrent operation revoked the source between
+        // the re-read above and here. Abort so the grant and profile change
+        // made from a stale premise roll back with it.
+        throw new AppException(ErrorCode.CONFLICT, {
+          message:
+            'The source enrollment was revoked concurrently. Re-check the student and retry.',
+          details: { enrollmentId: source.id },
+        });
+      }
+
+      // 3. Profile follows the destination course, so the live targeting
+      //    checks keep passing for it. Run inside the transaction: the
+      //    eligibility change and the access change are one fact.
+      await tx.studentProfile.update({
+        where: { userId: source.userId },
+        data: {
+          universityId: destination.universityId,
+          facultyId: destination.facultyId,
+          departmentId,
+          academicYearId,
+        },
+      });
+
+      await this.audit.recordTx(tx, {
+        actorId: actor.id,
+        actorRole: actor.role,
+        action: AuditAction.ACCESS_GRANT,
+        entity: 'enrollment',
+        entityId: destinationEnrollment.id,
+        after: {
+          userId: source.userId,
+          courseId: destination.id,
+          method: EnrollmentMethod.ADMIN_APPROVAL,
+          coversAllSections: sectionScope === null,
+          grantedSectionIds: sectionScope ?? [],
+          transferFromCourseId: source.courseId,
+          transferFromEnrollmentId: source.id,
+        },
+        note: params.reason,
+      });
+
+      await this.audit.recordTx(tx, {
+        actorId: actor.id,
+        actorRole: actor.role,
+        action: AuditAction.UPDATE,
+        entity: 'user',
+        entityId: source.userId,
+        before: {
+          universityId: profile.universityId,
+          facultyId: profile.facultyId,
+          departmentId: profile.departmentId,
+          academicYearId: profile.academicYearId,
+        },
+        after: {
+          universityId: destination.universityId,
+          facultyId: destination.facultyId,
+          departmentId,
+          academicYearId,
+        },
+        note: params.reason,
+      });
+
+      return {
+        destinationEnrollment,
+        revocation,
+        partEntitlementCreated,
+        partEntitlementReinstated,
+      };
+    });
+
+    // Outside the transaction: a notification failing must not roll back a
+    // completed transfer.
+    await Promise.allSettled([
+      this.notifications.createForUser({
+        userId: source.userId,
+        kind: NotificationKind.ENROLLMENT,
+        title: 'Your course access was transferred',
+        titleAr: 'تم نقل وصولك إلى كورس آخر',
+        body: `Your access to ${source.course.title} was moved to ${destination.title}.`,
+        bodyAr: `تم نقل وصولك من ${source.course.title} إلى ${destination.title}.`,
+        route: `/course/${destination.id}`,
+      }),
+    ]);
+
+    return {
+      ok: true,
+      alreadyTransferred: false,
+      userId: source.userId,
+      from: {
+        enrollmentId: source.id,
+        courseId: source.courseId,
+        courseTitle: source.course.title,
+        state: EnrollmentState.REVOKED,
+        removedSectionGrants: result.revocation.removedSectionGrants,
+        revokedPartEntitlements: result.revocation.revokedPartEntitlements,
+        revokedPlaybackTickets: result.revocation.revokedPlaybackTickets,
+        retained: result.revocation.retained,
+      },
+      to: {
+        enrollmentId: result.destinationEnrollment.id,
+        courseId: destination.id,
+        courseTitle: destination.title,
+        state: EnrollmentState.ACTIVE,
+        coversAllSections: sectionScope === null,
+        grantedSectionIds: sectionScope ?? [],
+        partId: destinationPartId,
+        partEntitlementCreated: result.partEntitlementCreated,
+        partEntitlementReinstated: result.partEntitlementReinstated,
+      },
+      profile: {
+        universityId: destination.universityId,
+        facultyId: destination.facultyId,
+        departmentId,
+        academicYearId,
+      },
+    };
+  }
+
   /** Extends an access window without creating a new payment. */
   async extend(
     enrollmentId: string,
@@ -1034,6 +1595,10 @@ export class EnrollmentsService {
     actor: { id: string; role: UserRole },
     note?: string,
   ) {
+    // Administration only (owner decision D3), checked before anything is read
+    // so a teacher learns nothing about the enrollment either.
+    assertAdministrator(actor.role, 'extend access');
+
     const enrollment = await this.prisma.enrollment.findUnique({
       where: { id: enrollmentId },
     });

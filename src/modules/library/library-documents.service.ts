@@ -160,6 +160,7 @@ export class LibraryDocumentsService {
         userId: params.user.id,
         role: params.user.role,
         deviceKey: params.user.deviceKey,
+        sessionDeviceId: params.user.deviceId,
         integritySuspect: params.integritySuspect,
         ip: params.ip,
       });

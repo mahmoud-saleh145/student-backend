@@ -62,6 +62,23 @@ enum AccountStatus {
   DISABLED
 }
 
+/// Lifecycle of a student-initiated account deletion (owner decision D5).
+///
+///   PENDING    - requested in-app; the account cannot be used and every
+///                session is revoked. Cancellable until `scheduledFor`.
+///   PROCESSING - claimed by the deletion sweep. A short-lived state that makes
+///                the claim atomic: cancel and a second sweep both require
+///                PENDING, so neither can race the erasure.
+///   CANCELLED  - the student signed in to the cancel flow before the deadline.
+///   COMPLETED  - personal data erased; financial and audit records retained
+///                under the anonymised user id.
+enum AccountDeletionStatus {
+  PENDING
+  PROCESSING
+  CANCELLED
+  COMPLETED
+}
+
 enum Gender {
   MALE
   FEMALE
@@ -980,6 +997,8 @@ model User {
   revenueShares    RevenueLedger[]       @relation("RevenueTeacher")
 
   // --- wallet ---------------------------------------------------------------
+  deletionRequests AccountDeletionRequest[]
+
   wallet             Wallet?
   walletTransactions WalletTransaction[]   @relation("WalletTxUser")
   walletAdjustments  WalletTransaction[]   @relation("WalletTxAdmin")
@@ -1535,6 +1554,10 @@ model Video {
 
   @@index([courseId, status])
   @@index([status, createdAt])
+  /// Created by 20261012090000_strict_drm_playback for the DRM reconciliation
+  /// sweep. Declared here so the next `migrate dev` does not DROP them.
+  @@index([drmVerifiedAt])
+  @@index([drmProvider, drmVerifiedAt])
   @@map("videos")
 }
 
@@ -2942,4 +2965,38 @@ model IdempotencyRecord {
 
   @@index([expiresAt])
   @@map("idempotency_records")
+}
+
+/// A student's request to delete their own account (owner decision D5).
+///
+/// At most one PENDING request per user is enforced by a partial unique index
+/// created in the migration (`account_deletion_requests_one_pending_per_user`).
+/// Like the other partial indexes in this schema it cannot be expressed here,
+/// so `prisma migrate dev` must be run with --create-only and reviewed.
+///
+/// `onDelete: Restrict`: the row is the evidence that the erasure was asked for
+/// and when it ran, so it outlives the personal data it describes.
+model AccountDeletionRequest {
+  id           String                @id @default(cuid())
+  userId       String
+  status       AccountDeletionStatus @default(PENDING)
+  requestedAt  DateTime              @default(now())
+  /// The end of the cancellation period. Deletion runs at or after this.
+  scheduledFor DateTime
+  cancelledAt  DateTime?
+  completedAt  DateTime?
+  /// Where it was initiated. 'app' today.
+  source       String                @default("app")
+  /// Set when a sweep attempt failed; the request stays PENDING and is retried.
+  lastError    String?
+  attempts     Int                   @default(0)
+  /// Set when erasure stopped after DELETION_MAX_ATTEMPTS failures. The sweep
+  /// then skips the request until an administrator retries or cancels it.
+  failedAt     DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([status, scheduledFor])
+  @@index([userId, status])
+  @@map("account_deletion_requests")
 }

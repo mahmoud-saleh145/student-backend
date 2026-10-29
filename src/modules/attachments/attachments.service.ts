@@ -167,6 +167,7 @@ export class AttachmentsService {
         userId: params.user.id,
         role: params.user.role,
         deviceKey: params.user.deviceKey,
+        sessionDeviceId: params.user.deviceId,
         integritySuspect: params.integritySuspect,
         ip: params.ip,
       });
@@ -437,6 +438,15 @@ export class AttachmentsService {
     await this.storage
       .deleteObject('uploads', attachment.objectKey)
       .catch(() => undefined);
+    // Materials uploaded since the bucket fix (see attachment-storage-bucket
+    // spec) live in MEDIA, which is where every reader looks; deleting only
+    // from uploads left their bytes behind forever. Scoped to the attachments
+    // namespace, so this can never reach an HLS rendition or a thumbnail.
+    if (attachment.objectKey.startsWith('attachments/')) {
+      await this.storage
+        .deleteObject('media', attachment.objectKey)
+        .catch(() => undefined);
+    }
 
     await this.audit.record({
       actorId: actor.id,

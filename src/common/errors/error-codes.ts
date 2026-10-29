@@ -26,6 +26,12 @@ export enum ErrorCode {
   SESSION_EXPIRED = 'SESSION_EXPIRED',
   ACCOUNT_DISABLED = 'ACCOUNT_DISABLED',
   ACCOUNT_PENDING = 'ACCOUNT_PENDING',
+  /**
+   * The student asked for their account to be deleted (owner decision D5).
+   * Sign-in is refused until the request is cancelled; `details` carries
+   * `scheduledFor` and `cancellable`.
+   */
+  ACCOUNT_DELETION_PENDING = 'ACCOUNT_DELETION_PENDING',
   PHONE_ALREADY_REGISTERED = 'PHONE_ALREADY_REGISTERED',
 
   // --- device binding --------------------------------------------------------
@@ -114,6 +120,7 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   [ErrorCode.SESSION_EXPIRED]: 401,
   [ErrorCode.ACCOUNT_DISABLED]: 403,
   [ErrorCode.ACCOUNT_PENDING]: 403,
+  [ErrorCode.ACCOUNT_DELETION_PENDING]: 403,
   [ErrorCode.PHONE_ALREADY_REGISTERED]: 409,
 
   [ErrorCode.DEVICE_NOT_AUTHORIZED]: 403,
@@ -184,6 +191,7 @@ export const ERROR_MESSAGE: Record<ErrorCode, string> = {
   [ErrorCode.SESSION_EXPIRED]: 'Session is no longer valid',
   [ErrorCode.ACCOUNT_DISABLED]: 'Account has been disabled',
   [ErrorCode.ACCOUNT_PENDING]: 'Account is awaiting activation',
+  [ErrorCode.ACCOUNT_DELETION_PENDING]: 'This account is scheduled for deletion',
   [ErrorCode.PHONE_ALREADY_REGISTERED]: 'An account with this phone already exists',
 
   [ErrorCode.DEVICE_NOT_AUTHORIZED]: 'This device is not authorized for the account',

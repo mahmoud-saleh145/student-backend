@@ -71,6 +71,22 @@ class ExtendDto {
   @IsOptional() @IsString() @MaxLength(500) note?: string;
 }
 
+class TransferEnrollmentDto {
+  /** The course the student’s access moves to. Must be a different course. */
+  @IsString() @MaxLength(32) destinationCourseId!: string;
+  /**
+   * Required iff the source enrollment is section-scoped: names the part of
+   * the destination course whose sections become the new scope. Omit for a
+   * whole-course transfer.
+   */
+  @IsOptional() @IsString() @MaxLength(32) destinationPartId?: string;
+  /** Required iff the destination course targets several departments. */
+  @IsOptional() @IsString() @MaxLength(32) departmentId?: string;
+  /** Defaults to the student’s current rung, revalidated for the destination. */
+  @IsOptional() @IsString() @MaxLength(32) academicYearId?: string;
+  @IsString() @MinLength(3) @MaxLength(500) reason!: string;
+}
+
 /**
  * Join Course and enrollment administration.
  *
@@ -161,12 +177,16 @@ export class EnrollmentsController {
     });
   }
 
+  // Owner decision D3: granting access (including approving a pending request,
+  // which turns PENDING_PAYMENT / PENDING_APPROVAL into ACTIVE without a
+  // payment) and extending an access window are ADMINISTRATION ONLY. Teachers
+  // keep viewing students, rejecting requests and managing content.
   @Post('admin/enrollments/grant')
-  @StaffOnly()
+  @AdminOnly()
   @ApiOperation({
-    summary: 'Grant access directly',
+    summary: 'Grant access directly (admin only)',
     description:
-      'Approves a pending request or enrolls a student outright — the administrative override for offline payments and approvals.',
+      'Approves a pending request or enrolls a student outright — the administrative override for offline payments and approvals. Teachers receive 403.',
   })
   grant(@Body() dto: GrantAccessDto, @CurrentUser() actor: AuthenticatedUser) {
     return this.enrollments.grantByAdmin(dto, actor);
@@ -201,10 +221,42 @@ export class EnrollmentsController {
     return this.enrollments.revoke(id, actor, dto.reason, dto.courseId);
   }
 
-  @Post('admin/enrollments/:id/extend')
-  @StaffOnly()
+  @Post('admin/enrollments/:id/transfer')
+  @AdminOnly()
+  @HttpCode(HttpStatus.OK)
   @ApiOperation({
-    summary: 'Extend an access window',
+    summary: 'Transfer a student’s course access to another course (admin only)',
+    description:
+      'Moves one enrollment to a destination course and points the student’s academic profile at the destination course’s university and faculty, in one Serializable transaction. When the source enrollment is section-scoped, destinationPartId names the part whose sections become the new scope. Creates no payment, redemption or purchase and recognises no revenue; the source enrollment is revoked through the same path as “Remove from course”, so payments, code redemptions and watch history survive. Idempotent: a repeat returns alreadyTransferred=true.',
+  })
+  @ApiResponse({ status: 404, description: 'NOT_FOUND — no such enrollment or destination course' })
+  @ApiResponse({
+    status: 409,
+    description: 'CONFLICT — the source enrollment changed concurrently | INVALID_STATE — source revoked outside a transfer, or the student already holds the whole destination course',
+  })
+  @ApiResponse({ status: 422, description: 'VALIDATION_ERROR — incoherent academic selection or missing destination scope' })
+  transfer(
+    @Param('id') id: string,
+    @Body() dto: TransferEnrollmentDto,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    return this.enrollments.transfer(
+      {
+        enrollmentId: id,
+        destinationCourseId: dto.destinationCourseId,
+        destinationPartId: dto.destinationPartId,
+        departmentId: dto.departmentId,
+        academicYearId: dto.academicYearId,
+        reason: dto.reason,
+      },
+      actor,
+    );
+  }
+
+  @Post('admin/enrollments/:id/extend')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Extend an access window (admin only)',
     description:
       'Extends from the later of the current end date or now, so extending an already-lapsed enrollment actually grants time.',
   })

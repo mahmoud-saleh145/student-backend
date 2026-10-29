@@ -4,6 +4,7 @@ import {
   AuditAction,
   ContentStatus,
   CourseStatus,
+  EnrollmentState,
   PartPricingModel,
   type Prisma,
   UserRole,
@@ -235,7 +236,7 @@ export class CoursePartsService {
       }),
       this.prisma.enrollment.findUnique({
         where: { userId_courseId: { userId, courseId } },
-        select: { coversAllSections: true },
+        select: { coversAllSections: true, state: true },
       }),
     ]);
 
@@ -290,7 +291,12 @@ export class CoursePartsService {
     // A whole-course enrollment predates parts, or came from a course-wide
     // code. Either way the student already has everything, and every part must
     // read as owned or they would be invited to buy what they already hold.
-    const coversEverything = enrollment?.coversAllSections === true;
+    // Only a LIVE enrollment counts. `coversAllSections` defaults to true on
+    // pending-approval / pending-payment rows too, and treating those as
+    // ownership told a student who had merely asked to join that they already
+    // owned every part, so no part was offered for purchase.
+    const coversEverything =
+      enrollment?.coversAllSections === true && enrollment.state === EnrollmentState.ACTIVE;
 
     return {
       courseId,
@@ -385,7 +391,9 @@ export class CoursePartsService {
     const paymentProvider = this.config.get<string>('payment.provider') ?? 'none';
     const courseEnrollmentMethods = course.enrollmentMethods;
 
-    const ownsWholeCourse = enrollment?.coversAllSections === true;
+    // Same rule as the parts list: only a LIVE whole-course enrollment owns it.
+    const ownsWholeCourse =
+      enrollment?.coversAllSections === true && enrollment.state === EnrollmentState.ACTIVE;
     const coursePrice = partsView.coursePrice;
 
     return {

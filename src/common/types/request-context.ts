@@ -32,6 +32,8 @@ declare module 'express' {
     deviceContext?: DeviceContext;
     requestId?: string;
     locale?: 'en' | 'ar';
+    /** How `req.ip` was decided (owner decision D6, common/net/client-ip.ts). */
+    clientIpSource?: 'web-proxy' | 'direct';
   }
 }
 

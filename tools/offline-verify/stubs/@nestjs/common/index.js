@@ -5,7 +5,7 @@ exports.Inject = noopDecorator;
 exports.Global = () => (t) => t;
 exports.Module = () => (t) => t;
 exports.Controller = () => (t) => t;
-for (const v of ['Get','Post','Put','Patch','Delete','Body','Param','Query','Req','Res','Headers','HttpCode','SetMetadata','UseGuards','UseInterceptors']) {
+for (const v of ['Get','Post','Put','Patch','Delete','Body','Param','Query','Req','Res','Headers','HttpCode','SetMetadata','UseGuards','UseInterceptors','Optional']) {
   exports[v] = noopDecorator;
 }
 exports.Logger = class Logger {

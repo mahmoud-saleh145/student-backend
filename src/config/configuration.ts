@@ -26,6 +26,9 @@ export const appConfig = registerAs('app', () => ({
     .map((o) => o.trim())
     .filter(Boolean),
   trustProxy: bool(process.env.TRUST_PROXY),
+  trustProxyHops: Math.min(10, Math.max(1, Math.floor(num(process.env.TRUST_PROXY_HOPS, 1)))),
+  /** Owner decision D6. See common/net/client-ip.ts. Never logged. */
+  webProxySharedSecret: process.env.WEB_PROXY_SHARED_SECRET?.trim() || null,
   logLevel: process.env.LOG_LEVEL ?? 'info',
   logPretty: bool(process.env.LOG_PRETTY),
 }));

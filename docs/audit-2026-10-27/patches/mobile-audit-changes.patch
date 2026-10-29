@@ -1,0 +1,309 @@
+diff --git a/__tests__/player-source-drm.test.ts b/__tests__/player-source-drm.test.ts
+index d697665..1a28d42 100755
+--- a/__tests__/player-source-drm.test.ts
++++ b/__tests__/player-source-drm.test.ts
+@@ -88,7 +88,7 @@ function buildSource(
+   return {
+     uri: url,
+     headers: ticket.playbackHeaders,
+-    contentType: isDrm ? 'dash' : 'hls',
++    contentType: !isDrm || drmConfig?.type === 'fairplay' ? 'hls' : 'dash',
+     drm: drmConfig,
+   };
+ }
+@@ -186,6 +186,8 @@ describe('Gumlet DRM tickets', () => {
+     expect(s.drm!.type).toBe('fairplay');
+     expect(s.drm!.licenseServer).toContain('fairplay.gumlet.com');
+     expect(s.drm!.certificateUrl).toContain('certificate');
++    // FairPlay is delivered over HLS; typing it as DASH makes AVPlayer refuse it.
++    expect(s.contentType).toBe('hls');
+   });
+ });
+ 
+diff --git a/__tests__/release-api-url.test.ts b/__tests__/release-api-url.test.ts
+new file mode 100644
+index 0000000..2a364e1
+--- /dev/null
++++ b/__tests__/release-api-url.test.ts
+@@ -0,0 +1,30 @@
++import { assertReleaseApiUrl } from '@/config/env';
++
++/**
++ * A release bundle (store build, staging build or OTA update) must never start
++ * against a local or plain-HTTP API. The build-time guard does not cover
++ * `eas update`, so this runtime check is the backstop.
++ */
++describe('assertReleaseApiUrl', () => {
++  it.each([
++    'http://10.0.2.2:3000/api/v1',
++    'http://localhost:3000/api/v1',
++    'https://127.0.0.1/api/v1',
++    'https://192.168.1.20/api/v1',
++    'https://10.1.2.3/api/v1',
++    'https://172.20.0.5/api/v1',
++    'http://student-backend-814y.onrender.com/api/v1',
++  ])('refuses %s in a release bundle', (url) => {
++    expect(() => assertReleaseApiUrl(url, true)).toThrow(/Refusing to start a release build/);
++  });
++
++  it('accepts the real HTTPS API in a release bundle', () => {
++    expect(() =>
++      assertReleaseApiUrl('https://student-backend-814y.onrender.com/api/v1', true)
++    ).not.toThrow();
++  });
++
++  it('allows local URLs in development bundles', () => {
++    expect(() => assertReleaseApiUrl('http://10.0.2.2:3000/api/v1', false)).not.toThrow();
++  });
++});
+diff --git a/src/api/errors.ts b/src/api/errors.ts
+index 52bb92d..be3bdba 100755
+--- a/src/api/errors.ts
++++ b/src/api/errors.ts
+@@ -102,7 +102,7 @@ const KNOWN_CODES = new Set<string>([
+   'UNAUTHORIZED','SESSION_EXPIRED','ACCOUNT_DISABLED','ACCOUNT_PENDING',
+   'PHONE_ALREADY_REGISTERED','DEVICE_NOT_AUTHORIZED','DEVICE_LIMIT_REACHED',
+   'DEVICE_CHANGE_PENDING','DEVICE_INTEGRITY_FAILED','FORBIDDEN','NOT_FOUND',
+-  'COURSE_NOT_AVAILABLE','COURSE_ARCHIVED','ACCESS_EXPIRED','NOT_ENROLLED',
++  'COURSE_NOT_AVAILABLE','COURSE_ARCHIVED','ACCESS_EXPIRED','NOT_ENROLLED','COURSE_NOT_TARGETED',
+   'ENROLLMENT_PENDING','PAYMENT_REQUIRED','PAYMENT_FAILED','INVALID_CODE',
+   'CODE_ALREADY_USED','ALREADY_ENROLLED','PLAYBACK_DENIED','PLAYBACK_TICKET_EXPIRED',
+   'CONCURRENT_STREAM_LIMIT','VIDEO_NOT_READY','VIDEO_UNAVAILABLE','CAPTURE_DETECTED',
+diff --git a/src/config/env.ts b/src/config/env.ts
+index 0bb035d..7324bb3 100755
+--- a/src/config/env.ts
++++ b/src/config/env.ts
+@@ -88,9 +88,51 @@ function read(): Env {
+     );
+   }
+ 
++  assertReleaseApiUrl(parsed.data.apiUrl);
++
+   return parsed.data;
+ }
+ 
++/**
++ * A RELEASE bundle (`__DEV__` false: store builds, staging builds and every OTA
++ * update) must talk to a real HTTPS API.
++ *
++ * The build-time guard in app.config.ts runs only on EAS *builds*. An
++ * `eas update` published without the production environment inlines no
++ * EXPO_PUBLIC_API_URL, so the default below (`http://10.0.2.2:3000`, the
++ * Android emulator's view of a laptop) would ship to every installed app and
++ * every request would fail. Throwing at startup instead means the update
++ * crashes on launch, which expo-updates treats as a bad update and rolls back
++ * to the embedded bundle - the safe outcome.
++ */
++export function assertReleaseApiUrl(apiUrl: string, release: boolean = !__DEV__): void {
++  if (!release) return;
++  let host = '';
++  let protocol = '';
++  try {
++    const parsed = new URL(apiUrl);
++    host = parsed.hostname;
++    protocol = parsed.protocol;
++  } catch {
++    // Already rejected by the schema; keep the message below consistent.
++  }
++  const local =
++    host === 'localhost' ||
++    host === '10.0.2.2' ||
++    host.endsWith('.local') ||
++    /^127\./.test(host) ||
++    /^10\./.test(host) ||
++    /^192\.168\./.test(host) ||
++    /^172\.(1[6-9]|2\d|3[01])\./.test(host);
++  if (protocol !== 'https:' || local) {
++    throw new Error(
++      `Refusing to start a release build against ${apiUrl}: EXPO_PUBLIC_API_URL ` +
++        'must be an https URL of the real API. Publish updates with the EAS ' +
++        'environment for the channel (eas update --environment production).'
++    );
++  }
++}
++
+ export const env = read();
+ 
+ export const isDev = env.env === 'development';
+diff --git a/src/features/profile/avatar.ts b/src/features/profile/avatar.ts
+index cbdc02e..f055523 100755
+--- a/src/features/profile/avatar.ts
++++ b/src/features/profile/avatar.ts
+@@ -111,14 +111,27 @@ export function validateAvatar(image: PickedImage): string | null {
+  * `TypeError` that no error boundary in the app knows how to render.
+  */
+ export async function uploadAvatar(image: PickedImage): Promise<User> {
+-  const signed = await api.post<SignedUpload>(Endpoints.storage.avatarUpload, {
+-    contentType: image.mimeType,
+-    sizeBytes: image.sizeBytes,
+-  });
+-
+   // `fetch` on a file:// URI yields the real bytes; this is the one supported
+   // way to get a body for a raw PUT in React Native.
++  //
++  // Read BEFORE presigning: the picker does not always report `fileSize`
++  // (it is optional in expo-image-picker), and a missing size used to be sent
++  // as `sizeBytes: 0`, which the API refuses (minimum 1) - so the upload
++  // failed for exactly those devices. The blob's own size is the truth.
+   const body = await fetch(image.uri).then((r) => r.blob());
++  const sizeBytes = image.sizeBytes > 0 ? image.sizeBytes : body.size;
++  if (sizeBytes > AVATAR_MAX_BYTES) {
++    throw new ApiError({
++      code: 'VALIDATION_ERROR',
++      status: 422,
++      message: 'The picture is larger than the allowed size',
++    });
++  }
++
++  const signed = await api.post<SignedUpload>(Endpoints.storage.avatarUpload, {
++    contentType: image.mimeType,
++    sizeBytes,
++  });
+ 
+   const response = await fetch(signed.uploadUrl, {
+     method: 'PUT',
+diff --git a/src/features/video/ProtectedVideoPlayer.tsx b/src/features/video/ProtectedVideoPlayer.tsx
+index 06d207f..402327f 100755
+--- a/src/features/video/ProtectedVideoPlayer.tsx
++++ b/src/features/video/ProtectedVideoPlayer.tsx
+@@ -210,7 +210,12 @@ export function ProtectedVideoPlayer({
+       // Required on iOS for HLS, and for DASH on both platforms: without an
+       // explicit content type expo-video falls back to `progressive`, which
+       // cannot play a segmented manifest.
+-      contentType: isDrm ? 'dash' : 'hls',
++      //
++      // DRM content follows the key system: the backend hands iOS (FairPlay)
++      // Gumlet's HLS playlist - Gumlet offers FairPlay for HLS only - and
++      // everything else (Widevine) the DASH manifest. Labelling the FairPlay
++      // HLS playlist as `dash` made AVPlayer refuse it.
++      contentType: !isDrm || drmConfig?.type === 'fairplay' ? 'hls' : 'dash',
+       // Omitted entirely for legacy AES-128 HLS; populated only when the
+       // backend actually issued a licence.
+       drm: drmConfig,
+@@ -239,6 +244,19 @@ export function ProtectedVideoPlayer({
+   const playerRef = React.useRef(player);
+   playerRef.current = player;
+ 
++  // A denied, terminated or expired grant replaces the video surface with an
++  // error screen, but the native player outlives the surface: without an
++  // explicit pause the audio (and the decode) carried on behind the message.
++  React.useEffect(() => {
++    if (phase === 'denied' || phase === 'terminated' || phase === 'expired') {
++      try {
++        playerRef.current?.pause();
++      } catch {
++        // The player may already be released; nothing left to stop.
++      }
++    }
++  }, [phase]);
++
+   // ---- continuity across source swaps -------------------------------------
+   //
+   // `useVideoPlayer` builds a NEW native player whenever the source changes,
+diff --git a/src/features/video/usePlaybackTicket.ts b/src/features/video/usePlaybackTicket.ts
+index e5a6ff9..1e70f18 100755
+--- a/src/features/video/usePlaybackTicket.ts
++++ b/src/features/video/usePlaybackTicket.ts
+@@ -6,12 +6,24 @@ import { TICKET_REFRESH_LEAD_SECONDS } from '@/constants';
+ import { useOnForeground } from '@/hooks/use-app-state';
+ import { contentProtection } from '@/services/content-protection';
+ import { createLogger } from '@/services/logger';
++import type { ApiErrorCode } from '@/types/api';
+ import type { PlaybackTicket } from '@/types/domain';
+ 
+ import { videoApi } from './api';
+ 
+ const log = createLogger('playback-ticket');
+ 
++/**
++ * Heartbeat termination reasons that mean "this grant is over, ask for a new
++ * one" rather than "you may not watch this". They land in the `expired` phase,
++ * whose screen re-issues the ticket and shows the specific reason.
++ */
++const REISSUABLE_TERMINATIONS = new Set<string>([
++  'PLAYBACK_TICKET_EXPIRED',
++  'DEVICE_NOT_AUTHORIZED',
++  'CONCURRENT_STREAM_LIMIT',
++]);
++
+ export type TicketPhase =
+   | 'idle'
+   | 'authorizing'
+@@ -164,12 +176,24 @@ export function usePlaybackTicket(
+ 
+         if (res.terminate) {
+           log.warn('playback terminated by server', res.terminate);
++          const reason = res.terminate.reason;
++          // The server sends a machine code for the reasons the student can
++          // act on. Those keep their meaning (an expired grant is re-issued by
++          // "reload"; a device problem says so) instead of collapsing into a
++          // generic "not allowed".
++          if (REISSUABLE_TERMINATIONS.has(reason)) {
++            setError(
++              new ApiError({ code: reason as ApiErrorCode, status: 403, message: reason })
++            );
++            setPhase('expired');
++            return;
++          }
+           setPhase('terminated');
+           setError(
+             new ApiError({
+-              code: 'PLAYBACK_DENIED',
++              code: reason === 'NOT_ENROLLED' ? 'NOT_ENROLLED' : 'PLAYBACK_DENIED',
+               status: 403,
+-              message: res.terminate.reason,
++              message: reason,
+             })
+           );
+           return;
+@@ -213,7 +237,12 @@ export function usePlaybackTicket(
+     );
+     const rotateId = setTimeout(() => {
+       setPhase('refreshing');
+-      void beat().finally(() => setPhase('ready'));
++      // Back to `ready` only if the beat did not end playback. Setting it
++      // unconditionally overwrote a server termination (or an expiry) that the
++      // beat had just recorded, and the player carried on as if authorised.
++      void beat().finally(() =>
++        setPhase((current) => (current === 'refreshing' ? 'ready' : current))
++      );
+     }, msUntilRefresh);
+ 
+     return () => {
+diff --git a/src/i18n/locales/ar.json b/src/i18n/locales/ar.json
+index a6ba0f7..c23ae18 100755
+--- a/src/i18n/locales/ar.json
++++ b/src/i18n/locales/ar.json
+@@ -538,6 +538,7 @@
+     "COURSE_ARCHIVED": "تمت أرشفة هذا الكورس.",
+     "ACCESS_EXPIRED": "انتهت صلاحية وصولك إلى هذا المحتوى.",
+     "NOT_ENROLLED": "انضم إلى الكورس للوصول إلى هذا المحتوى.",
++    "COURSE_NOT_TARGETED": "هذا الكورس غير متاح لقسمك أو فرقتك الدراسية.",
+     "ENROLLMENT_PENDING": "لا يزال اشتراكك قيد المعالجة.",
+     "PAYMENT_REQUIRED": "يلزم الدفع للوصول إلى هذا الكورس.",
+     "PAYMENT_FAILED": "تعذّر إتمام عملية الدفع. حاول مرة أخرى.",
+diff --git a/src/i18n/locales/en.json b/src/i18n/locales/en.json
+index 7e0e5a8..35dc3df 100755
+--- a/src/i18n/locales/en.json
++++ b/src/i18n/locales/en.json
+@@ -523,6 +523,7 @@
+     "COURSE_ARCHIVED": "This course has been archived.",
+     "ACCESS_EXPIRED": "Your access to this content has expired.",
+     "NOT_ENROLLED": "Join the course to access this content.",
++    "COURSE_NOT_TARGETED": "This course isn't offered to your department or year.",
+     "ENROLLMENT_PENDING": "Your enrollment is still being processed.",
+     "PAYMENT_REQUIRED": "Payment is required to access this course.",
+     "PAYMENT_FAILED": "The payment couldn't be completed. Please try again.",
+diff --git a/src/types/api.ts b/src/types/api.ts
+index 99ff4e4..7362ce3 100755
+--- a/src/types/api.ts
++++ b/src/types/api.ts
+@@ -60,6 +60,8 @@ export type ApiErrorCode =
+   | 'COURSE_ARCHIVED'
+   | 'ACCESS_EXPIRED'
+   | 'NOT_ENROLLED'
++  /** The course is not offered to the student's department/year. */
++  | 'COURSE_NOT_TARGETED'
+   | 'ENROLLMENT_PENDING'
+   | 'PAYMENT_REQUIRED'
+   | 'PAYMENT_FAILED'

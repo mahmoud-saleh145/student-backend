@@ -222,7 +222,13 @@ export class StorageController {
     description:
       'Returns an object key. Register it with PATCH /admin/courses/:courseId/parts/:partId to make it the part\'s thumbnail.',
   })
-  async coursePartThumbnail(@Body() dto: PresignCoursePartThumbnailDto) {
+  async coursePartThumbnail(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Body() dto: PresignCoursePartThumbnailDto,
+  ) {
+    // Same ownership check as the attachment presign: without it any staff
+    // account could write objects into another course's namespace.
+    await this.courseAccess.assertCourseExistsAndManageable(actor.id, actor.role, dto.courseId, 'content');
     const ext = extensionFor(dto.contentType);
     return this.storage.presignUpload({
       bucket: 'media',
@@ -462,9 +468,13 @@ export class StorageController {
     description: 'Raw request body. Returns the object key to set on the part.',
   })
   async coursePartThumbnailContent(
+    @CurrentUser() actor: AuthenticatedUser,
     @Query() query: UploadCoursePartThumbnailQueryDto,
     @Req() req: Request,
   ) {
+    // Same ownership check as the attachment presign: without it any staff
+    // account could write objects into another course's namespace.
+    await this.courseAccess.assertCourseExistsAndManageable(actor.id, actor.role, query.courseId, 'content');
     const declared = this.requireLength(req, MAX_THUMBNAIL_BYTES);
     const objectKey = StorageService.keys.coursePartThumbnail(
       query.courseId,
@@ -543,9 +553,13 @@ export class StorageController {
       'Raw request body. Returns the object key to register with POST /attachments, scoped there to a lecture, a section, or the whole course.',
   })
   async attachmentContent(
+    @CurrentUser() actor: AuthenticatedUser,
     @Query() query: UploadAttachmentQueryDto,
     @Req() req: Request,
   ) {
+    // Same ownership check as the attachment presign: without it any staff
+    // account could write objects into another course's namespace.
+    await this.courseAccess.assertCourseExistsAndManageable(actor.id, actor.role, query.courseId, 'content');
     if (query.filename.includes('..') || query.filename.includes('/')) {
       throw new AppException(ErrorCode.VALIDATION_ERROR, {
         fields: { filename: ['must not contain path separators'] },

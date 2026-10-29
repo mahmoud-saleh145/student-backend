@@ -18,3 +18,7 @@ tools/offline-verify/out/
 
 # scratch archives used to mirror the repo into a sandbox — never project content
 _mirror-*.tgz
+
+# one-off, local-only maintenance scripts (run by hand on a developer machine,
+# never committed and never deployed)
+/scripts/one-off/

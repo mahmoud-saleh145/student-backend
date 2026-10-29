@@ -1,0 +1,1361 @@
+diff --git a/src/common/net/client-ip.ts b/src/common/net/client-ip.ts
+index 014923e..134a9ef 100644
+--- a/src/common/net/client-ip.ts
++++ b/src/common/net/client-ip.ts
+@@ -103,14 +103,51 @@ export const DIAGNOSTIC_ADDRESS_HEADERS = [
+   'fly-client-ip',
+ ] as const;
+ 
++/**
++ * The largest `TRUST_PROXY_HOPS` the API accepts. Env validation (`@Max(10)`)
++ * and `configuration.ts` both stop at 10, and the diagnostic must cover every
++ * value an operator could actually configure.
++ */
++export const MAX_TRUST_PROXY_HOPS = 10;
++
++/** How many forwarding entries the diagnostic lists (the RIGHTMOST ones). */
++export const DIAGNOSTIC_FORWARDED_FOR_SHOWN = 20;
++
++/**
++ * Entries parsed from one X-Forwarded-For header. Far above any real chain and
++ * still bounded, so a hostile header cannot make the diagnostic expensive.
++ */
++const MAX_FORWARDED_FOR_PARSED = 200;
++
+ export interface ClientIpChainReport {
+   trustProxy: boolean;
+   trustProxyHops: number;
+   socketAddress: string | null;
+-  /** X-Forwarded-For as received, left to right (at most 20 entries). */
++  /**
++   * The RIGHTMOST entries of X-Forwarded-For, in the order received (left to
++   * right), at most `DIAGNOSTIC_FORWARDED_FOR_SHOWN`. The right end is the part
++   * the platform wrote; the left end is whatever the client sent, so that is
++   * the end that gets dropped when the header is long.
++   */
+   forwardedFor: string[];
+-  /** What `req.ip` would be for each `trust proxy` hop count, 1..5. */
++  /** Entries in the header (up to an internal bound), shown or not. */
++  forwardedForTotal: number;
++  /** True when `forwardedFor` omits entries from the left. */
++  forwardedForTruncated: boolean;
++  /**
++   * What `req.ip` would be for each `trust proxy` hop count,
++   * 1..`MAX_TRUST_PROXY_HOPS`, computed from the FULL header (not only the
++   * entries shown).
++   */
+   ipByHopCount: Record<string, string | null>;
++  /** The address the operator says this request came from, when given and valid. */
++  expectedIp: string | null;
++  /**
++   * Hop counts whose `ipByHopCount` equals `expectedIp` (empty when none, or
++   * when no expected address was given). See OWNER_DECISIONS D6 for how two
++   * calls are combined into a decision.
++   */
++  hopCountsMatchingExpected: number[];
+   resolvedIp: string | null;
+   resolvedSource: ClientIpSource | null;
+   otherAddressHeaders: Record<string, string | null>;
+@@ -135,19 +172,29 @@ export function expressIpForHops(socketAddress: string | null, forwardedFor: str
+ export function describeClientIpChain(
+   req: Request,
+   cfg: { trustProxy: boolean; trustProxyHops: number },
++  options: { expectedIp?: string | null } = {},
+ ): ClientIpChainReport {
+   const rawForwarded = header(req, 'x-forwarded-for') ?? '';
+-  const forwardedFor = rawForwarded
++  // Every entry (up to the bound) feeds the hop computation, exactly as Express
++  // reads the whole header; only the display is shortened, from the left.
++  const allForwarded = rawForwarded
+     .split(',')
+     .map((part) => part.trim())
+     .filter((part) => part.length > 0)
+-    .slice(0, 20)
++    .slice(-MAX_FORWARDED_FOR_PARSED)
+     .map((part) => part.slice(0, 64));
++  const forwardedFor = allForwarded.slice(-DIAGNOSTIC_FORWARDED_FOR_SHOWN);
+   const socketAddress = req.socket?.remoteAddress ?? null;
+   const ipByHopCount: Record<string, string | null> = {};
+-  for (let hops = 1; hops <= 5; hops += 1) {
+-    ipByHopCount[String(hops)] = expressIpForHops(socketAddress, forwardedFor, hops);
++  for (let hops = 1; hops <= MAX_TRUST_PROXY_HOPS; hops += 1) {
++    ipByHopCount[String(hops)] = expressIpForHops(socketAddress, allForwarded, hops);
+   }
++  const expectedIp = parseForwardedClientIp(options.expectedIp ?? undefined);
++  const hopCountsMatchingExpected = expectedIp
++    ? Object.entries(ipByHopCount)
++        .filter(([, ip]) => ip === expectedIp)
++        .map(([hops]) => Number(hops))
++    : [];
+   const otherAddressHeaders: Record<string, string | null> = {};
+   for (const name of DIAGNOSTIC_ADDRESS_HEADERS) {
+     otherAddressHeaders[name] = header(req, name)?.slice(0, 64) ?? null;
+@@ -157,7 +204,11 @@ export function describeClientIpChain(
+     trustProxyHops: cfg.trustProxyHops,
+     socketAddress,
+     forwardedFor,
++    forwardedForTotal: allForwarded.length,
++    forwardedForTruncated: allForwarded.length > forwardedFor.length,
+     ipByHopCount,
++    expectedIp,
++    hopCountsMatchingExpected,
+     resolvedIp: req.ip ?? null,
+     resolvedSource: req.clientIpSource ?? null,
+     otherAddressHeaders,
+diff --git a/src/modules/attachments/attachments.service.ts b/src/modules/attachments/attachments.service.ts
+index 95c3a26..6e3bcbc 100755
+--- a/src/modules/attachments/attachments.service.ts
++++ b/src/modules/attachments/attachments.service.ts
+@@ -167,6 +167,7 @@ export class AttachmentsService {
+         userId: params.user.id,
+         role: params.user.role,
+         deviceKey: params.user.deviceKey,
++        sessionDeviceId: params.user.deviceId,
+         integritySuspect: params.integritySuspect,
+         ip: params.ip,
+       });
+diff --git a/src/modules/auth/auth.service.ts b/src/modules/auth/auth.service.ts
+index 0f6a94b..37373b2 100644
+--- a/src/modules/auth/auth.service.ts
++++ b/src/modules/auth/auth.service.ts
+@@ -399,6 +399,14 @@ export class AuthService {
+    * again.
+    */
+   async refresh(refreshToken: string, meta: RequestMeta): Promise<AuthResult> {
++    return this.rotateRefresh(refreshToken, meta, false);
++  }
++
++  private async rotateRefresh(
++    refreshToken: string,
++    meta: RequestMeta,
++    isRetry: boolean,
++  ): Promise<AuthResult> {
+     let claims;
+     try {
+       claims = await this.tokens.verifyRefresh(refreshToken);
+@@ -513,7 +521,21 @@ export class AuthService {
+       familyId: stored.familyId,
+     });
+ 
+-    await this.prisma.$transaction(async (tx) => {
++    const rotated = await this.prisma.$transaction(async (tx) => {
++      // Compare-and-set (audit F-12). `stored` was read outside this
++      // transaction, so two refreshes presenting the same token at the same
++      // instant could both pass the `usedAt` check above, both create a
++      // successor and both commit: two live chains in one family, the second
++      // `replacedById` silently overwriting the first. Claiming the row only
++      // while it is still unused makes exactly one of them the rotation; under
++      // READ COMMITTED the loser's UPDATE waits for the winner's commit,
++      // re-evaluates `usedAt IS NULL`, and matches nothing.
++      const claimed = await tx.refreshToken.updateMany({
++        where: { id: stored.id, usedAt: null, revokedAt: null },
++        data: { usedAt: new Date() },
++      });
++      if (claimed.count !== 1) return false;
++
+       const next = await tx.refreshToken.create({
+         data: {
+           userId: user.id,
+@@ -526,7 +548,7 @@ export class AuthService {
+ 
+       await tx.refreshToken.update({
+         where: { id: stored.id },
+-        data: { usedAt: new Date(), replacedById: next.id },
++        data: { replacedById: next.id },
+       });
+ 
+       // The session expiry slides with the refresh token.
+@@ -550,8 +572,22 @@ export class AuthService {
+           expiresAt: issued.refreshExpiresAt,
+         },
+       });
++      return true;
+     });
+ 
++    if (!rotated) {
++      // The other request rotated this token a moment ago. Re-reading it now
++      // finds `usedAt` set and takes the ordinary path for that case: the
++      // grace-window reissue, or family revocation beyond the window. One
++      // retry only; losing twice means something else is going on.
++      if (isRetry) {
++        throw new AppException(ErrorCode.SESSION_EXPIRED, {
++          message: 'Refresh token rotation conflict',
++        });
++      }
++      return this.rotateRefresh(refreshToken, meta, true);
++    }
++
+     // Re-evaluate the device on refresh too: an admin may have revoked it
+     // mid-session, and the client should learn that at the next refresh
+     // rather than at the next playback attempt.
+diff --git a/src/modules/courses/courses.admin.service.ts b/src/modules/courses/courses.admin.service.ts
+index 19690ea..51192a6 100644
+--- a/src/modules/courses/courses.admin.service.ts
++++ b/src/modules/courses/courses.admin.service.ts
+@@ -38,6 +38,45 @@ export function pendingApprovalIdsFrom(snapshot: unknown): string[] {
+   return Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string') : [];
+ }
+ 
++/**
++ * Whether a course PATCH changes its commercial terms - how students may join
++ * and how long access lasts. Those are pricing decisions, so a teacher who may
++ * only edit content must not make them (audit F-16). Only an actual change
++ * counts: the dashboard sends the whole form on every save, and resending the
++ * current values must keep working for a content-only teacher.
++ */
++export function changesCommercialTerms(
++  before: {
++    enrollmentMethods: EnrollmentMethod[];
++    accessDurationType: string;
++    accessDurationDays: number | null;
++    accessEndsAt: Date | null;
++  },
++  input: {
++    enrollmentMethods?: EnrollmentMethod[];
++    accessDurationType?: string;
++    accessDurationDays?: number;
++    accessEndsAt?: string;
++  },
++): boolean {
++  if (input.enrollmentMethods !== undefined) {
++    const was = new Set(before.enrollmentMethods);
++    const now = new Set(input.enrollmentMethods);
++    if (was.size !== now.size || [...now].some((m) => !was.has(m))) return true;
++  }
++  if (input.accessDurationType !== undefined && input.accessDurationType !== before.accessDurationType) {
++    return true;
++  }
++  if (input.accessDurationDays !== undefined && input.accessDurationDays !== before.accessDurationDays) {
++    return true;
++  }
++  if (input.accessEndsAt) {
++    const next = new Date(input.accessEndsAt).getTime();
++    if (before.accessEndsAt === null || next !== before.accessEndsAt.getTime()) return true;
++  }
++  return false;
++}
++
+ export interface CreateCourseInput {
+   title: string;
+   titleAr?: string;
+@@ -542,6 +581,11 @@ export class CoursesAdminService {
+       });
+     }
+ 
++    // Joining methods and access duration are commercial terms (F-16).
++    if (changesCommercialTerms(before, input)) {
++      await this.access.assertCanManageCourse(actor.id, actor.role, courseId, 'pricing');
++    }
++
+     const data: Prisma.CourseUpdateInput = {
+       title: input.title?.trim(),
+       titleAr: input.titleAr?.trim(),
+diff --git a/src/modules/courses/courses.service.ts b/src/modules/courses/courses.service.ts
+index 06ff160..7e0b1cd 100755
+--- a/src/modules/courses/courses.service.ts
++++ b/src/modules/courses/courses.service.ts
+@@ -54,6 +54,46 @@ const COURSE_INCLUDE = {
+   academicYear: { select: { id: true, name: true, nameAr: true } },
+ } satisfies Prisma.CourseInclude;
+ 
++/**
++ * A course a student (or an anonymous visitor) may read: published, or
++ * archived for those who already hold it. Shared by `detail`, `sections` and
++ * `attachments`; the last two used to have no status check at all, so a guessed
++ * id listed the outline and documents of a DRAFT or HIDDEN course (audit F-14).
++ */
++function assertReadableByStudents(status: CourseStatus, isStaff: boolean): void {
++  if (!isStaff && status !== CourseStatus.PUBLISHED && status !== CourseStatus.ARCHIVED) {
++    throw new AppException(ErrorCode.COURSE_NOT_AVAILABLE);
++  }
++}
++
++/**
++ * Documents a student may see listed: none that belongs to an unpublished
++ * lecture or section.
++ *
++ * A lecture-scoped row carries `lessonId` and a NULL `sectionId` - the two are
++ * mutually exclusive - so its section has to be checked THROUGH the lesson.
++ * Testing `sectionId: null` alone would wave every lecture document through
++ * regardless of the section it hangs off.
++ */
++const STUDENT_VISIBLE_ATTACHMENTS: Prisma.AttachmentWhereInput = {
++  AND: [
++    {
++      OR: [
++        { lessonId: null },
++        {
++          lesson: {
++            status: ContentStatus.PUBLISHED,
++            section: { status: ContentStatus.PUBLISHED },
++          },
++        },
++      ],
++    },
++    {
++      OR: [{ sectionId: null }, { section: { status: ContentStatus.PUBLISHED } }],
++    },
++  ],
++};
++
+ /**
+  * Student-facing course reads.
+  *
+@@ -281,13 +321,7 @@ export class CoursesService {
+ 
+     // A draft or hidden course is invisible to students even by direct id —
+     // otherwise a guessed id leaks unpublished content.
+-    if (
+-      !isStaff &&
+-      course.status !== CourseStatus.PUBLISHED &&
+-      course.status !== CourseStatus.ARCHIVED
+-    ) {
+-      throw new AppException(ErrorCode.COURSE_NOT_AVAILABLE);
+-    }
++    assertReadableByStudents(course.status, Boolean(isStaff));
+ 
+     const decision = await this.access.resolve({
+       userId: params.userId,
+@@ -328,37 +362,13 @@ export class CoursesService {
+     // refuses their documents, so listing them here would advertise the title of
+     // a lecture the student is not allowed to open, then fail on click.
+     //
+-    // A lecture-scoped row carries `lessonId` and a NULL `sectionId` - the two
+-    // are mutually exclusive - so its section has to be checked THROUGH the
+-    // lesson. Testing `sectionId: null` alone would wave every lecture document
+-    // through regardless of the section it hangs off.
++    // See STUDENT_VISIBLE_ATTACHMENTS for why the section is checked through
++    // the lesson.
+     const attachments = await this.prisma.attachment.findMany({
+       where: {
+         courseId: course.id,
+         ...notDeleted,
+-        ...(isStaff
+-          ? {}
+-          : {
+-              AND: [
+-                {
+-                  OR: [
+-                    { lessonId: null },
+-                    {
+-                      lesson: {
+-                        status: ContentStatus.PUBLISHED,
+-                        section: { status: ContentStatus.PUBLISHED },
+-                      },
+-                    },
+-                  ],
+-                },
+-                {
+-                  OR: [
+-                    { sectionId: null },
+-                    { section: { status: ContentStatus.PUBLISHED } },
+-                  ],
+-                },
+-              ],
+-            }),
++        ...(isStaff ? {} : STUDENT_VISIBLE_ATTACHMENTS),
+       },
+       orderBy: [{ lessonId: 'asc' }, { sortOrder: 'asc' }],
+     });
+@@ -401,6 +411,9 @@ export class CoursesService {
+     });
+     if (!course) throw AppException.notFound('Course', params.courseId);
+ 
++    const isStaff = Boolean(params.role && params.role !== UserRole.STUDENT);
++    assertReadableByStudents(course.status, isStaff);
++
+     const decision = await this.access.resolve({
+       userId: params.userId,
+       role: params.role,
+@@ -408,7 +421,7 @@ export class CoursesService {
+     });
+ 
+     const sections = await this.loadSections(course.id, {
+-      includeUnpublished: Boolean(params.role && params.role !== UserRole.STUDENT),
++      includeUnpublished: isStaff,
+     });
+ 
+     const progressRows = params.userId
+@@ -499,10 +512,22 @@ export class CoursesService {
+   }
+ 
+   async attachments(courseId: string, userId: string | null, role?: UserRole) {
++    // Same visibility rules as `detail()`, which is what student-web renders
++    // from: no DRAFT/HIDDEN/SUSPENDED course, and no document of an
++    // unpublished lecture or section, for students and anonymous callers.
++    const course = await this.prisma.course.findFirst({
++      where: { id: courseId, ...notDeleted },
++      select: { id: true, status: true },
++    });
++    if (!course) throw AppException.notFound('Course', courseId);
++
++    const isStaff = Boolean(role && role !== UserRole.STUDENT);
++    assertReadableByStudents(course.status, isStaff);
++
+     const decision = await this.access.resolve({ userId, role, courseId });
+ 
+     const rows = await this.prisma.attachment.findMany({
+-      where: { courseId, ...notDeleted },
++      where: { courseId, ...notDeleted, ...(isStaff ? {} : STUDENT_VISIBLE_ATTACHMENTS) },
+       orderBy: [{ lessonId: 'asc' }, { sortOrder: 'asc' }],
+     });
+ 
+diff --git a/src/modules/devices/devices.service.ts b/src/modules/devices/devices.service.ts
+index 94d70d4..daae45a 100755
+--- a/src/modules/devices/devices.service.ts
++++ b/src/modules/devices/devices.service.ts
+@@ -266,6 +266,13 @@ export class DevicesService {
+     userId: string;
+     role: UserRole;
+     deviceKey: string | null;
++    /**
++     * The device this SESSION was bound to at sign-in (`Session.deviceId`, on
++     * the principal as `deviceId`). When the session has one, the header must
++     * name that same device (audit F-08). `null` = signed in without a device
++     * header; `undefined` = caller predates this check.
++     */
++    sessionDeviceId?: string | null;
+     integritySuspect: boolean;
+     ip?: string | null;
+     userAgent?: string | null;
+@@ -317,6 +324,24 @@ export class DevicesService {
+       throw new AppException(ErrorCode.DEVICE_NOT_AUTHORIZED);
+     }
+ 
++    // The header is client-written. Without this, any session of the account
++    // - signed in on a second phone that is still PENDING_APPROVAL, say - could
++    // present the bound phone's id string and pass. A session that was bound
++    // to a device at sign-in may only ever act as that device. (A session with
++    // no bound device keeps the header-only rule; see OWNER_DECISIONS, F-08.)
++    if (params.sessionDeviceId && params.sessionDeviceId !== device.id) {
++      await this.security.record({
++        type: SecurityEventType.DEVICE_MISMATCH,
++        severity: SecuritySeverity.MEDIUM,
++        userId: params.userId,
++        deviceKey: params.deviceKey,
++        ipAddress: params.ip,
++        userAgent: params.userAgent,
++        message: 'Protected content refused: X-Device-Id names a different device than this session was signed in on',
++      });
++      throw new AppException(ErrorCode.DEVICE_NOT_AUTHORIZED);
++    }
++
+     if (device.status === DeviceStatus.ACTIVE) {
+       return { deviceId: device.id };
+     }
+@@ -682,6 +707,13 @@ export class DevicesService {
+         where: { session: { deviceId }, revokedAt: null },
+         data: { revokedAt: new Date(), revokedReason: `Device revoked: ${reason}` },
+       }),
++      // ...and it stops receiving pushes. `PushToken.deviceKey` exists so that
++      // unbinding a device kills its pushes; this path never used it, so a
++      // revoked handset kept receiving every announcement.
++      this.prisma.pushToken.updateMany({
++        where: { userId: device.userId, deviceKey: device.deviceKey, isActive: true },
++        data: { isActive: false },
++      }),
+     ]);
+ 
+     await this.audit.record({
+@@ -774,6 +806,12 @@ export class DevicesService {
+         where: { userId, revokedAt: null },
+         data: { revokedAt: new Date(), revokedReason: 'Device binding reset' },
+       }),
++      // A lost or stolen phone must stop receiving announcements too. The
++      // student's own phone re-registers its token at the next sign-in.
++      this.prisma.pushToken.updateMany({
++        where: { userId, isActive: true },
++        data: { isActive: false },
++      }),
+     ]);
+ 
+     await this.audit.record({
+diff --git a/src/modules/diagnostics/client-ip-diagnostics.controller.ts b/src/modules/diagnostics/client-ip-diagnostics.controller.ts
+index f68c798..38b6602 100644
+--- a/src/modules/diagnostics/client-ip-diagnostics.controller.ts
++++ b/src/modules/diagnostics/client-ip-diagnostics.controller.ts
+@@ -1,6 +1,6 @@
+-import { Controller, Get, Req } from '@nestjs/common';
++import { Controller, Get, Query, Req } from '@nestjs/common';
+ import { ConfigService } from '@nestjs/config';
+-import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
++import { ApiBearerAuth, ApiOperation, ApiQuery, ApiTags } from '@nestjs/swagger';
+ import type { Request } from 'express';
+ 
+ import { MasterOnly } from '../../common/decorators/roles.decorator';
+@@ -16,6 +16,10 @@ import { describeClientIpChain } from '../../common/net/client-ip';
+  * CALLER'S OWN request, so the hop count can be read off real evidence. It
+  * changes nothing and is not used for attribution. Procedure:
+  * docs/audit-2026-10-27/OWNER_DECISIONS.md, D6.
++ *
++ * `?expectedIp=` is the operator's own public address (for example from
++ * https://api.ipify.org). It is only compared with the computed candidates; a
++ * value that is not a single valid IP address is ignored.
+  */
+ @ApiTags('admin')
+ @ApiBearerAuth()
+@@ -26,11 +30,16 @@ export class ClientIpDiagnosticsController {
+   @Get('client-ip')
+   @MasterOnly()
+   @ApiOperation({ summary: "How this request's client address reached the API (proxy-hop check)" })
+-  clientIp(@Req() req: Request) {
++  @ApiQuery({ name: 'expectedIp', required: false, description: 'Your own public IP address, to list the hop counts that resolve to it' })
++  clientIp(@Req() req: Request, @Query('expectedIp') expectedIp?: string) {
+     const app = this.config.get<{ trustProxy?: boolean; trustProxyHops?: number }>('app') ?? {};
+-    return describeClientIpChain(req, {
+-      trustProxy: app.trustProxy ?? false,
+-      trustProxyHops: app.trustProxyHops ?? 1,
+-    });
++    return describeClientIpChain(
++      req,
++      {
++        trustProxy: app.trustProxy ?? false,
++        trustProxyHops: app.trustProxyHops ?? 1,
++      },
++      { expectedIp: typeof expectedIp === 'string' ? expectedIp : null },
++    );
+   }
+ }
+diff --git a/src/modules/library/library-documents.service.ts b/src/modules/library/library-documents.service.ts
+index a051f28..7007670 100755
+--- a/src/modules/library/library-documents.service.ts
++++ b/src/modules/library/library-documents.service.ts
+@@ -160,6 +160,7 @@ export class LibraryDocumentsService {
+         userId: params.user.id,
+         role: params.user.role,
+         deviceKey: params.user.deviceKey,
++        sessionDeviceId: params.user.deviceId,
+         integritySuspect: params.integritySuspect,
+         ip: params.ip,
+       });
+diff --git a/src/modules/playback/playback.service.ts b/src/modules/playback/playback.service.ts
+index 4eb705c..85aad6d 100755
+--- a/src/modules/playback/playback.service.ts
++++ b/src/modules/playback/playback.service.ts
+@@ -363,6 +363,7 @@ export class PlaybackService {
+       userId: user.id,
+       role: user.role,
+       deviceKey: user.deviceKey,
++      sessionDeviceId: user.deviceId,
+       integritySuspect: params.integritySuspect,
+       ip: params.ip,
+       userAgent: params.userAgent,
+@@ -1303,6 +1304,7 @@ export class PlaybackService {
+             userId: params.user.id,
+             role: params.user.role,
+             deviceKey: params.user.deviceKey,
++            sessionDeviceId: params.user.deviceId,
+             integritySuspect: false,
+             ip: params.ip,
+           }));
+diff --git a/src/modules/sessions/sessions.service.ts b/src/modules/sessions/sessions.service.ts
+index 652a808..226195d 100755
+--- a/src/modules/sessions/sessions.service.ts
++++ b/src/modules/sessions/sessions.service.ts
+@@ -127,7 +127,7 @@ export class SessionsService {
+   async revoke(params: { sessionId: string; actor: AuthenticatedUser; reason: string }) {
+     const session = await this.prisma.session.findUnique({
+       where: { id: params.sessionId },
+-      select: { id: true, userId: true, status: true },
++      select: { id: true, userId: true, status: true, device: { select: { deviceKey: true } } },
+     });
+ 
+     if (!session) throw AppException.notFound('Session', params.sessionId);
+@@ -165,6 +165,16 @@ export class SessionsService {
+           revokedReason: params.reason,
+         },
+       });
++
++      // So do the pushes to that session's handset, exactly as a user logout
++      // does (`AuthService.logout`). The app re-registers at its next sign-in.
++      const deviceKey = session.device?.deviceKey;
++      if (deviceKey) {
++        await tx.pushToken.updateMany({
++          where: { userId: session.userId, deviceKey, isActive: true },
++          data: { isActive: false },
++        });
++      }
+     });
+ 
+     await this.audit.record({
+@@ -220,6 +230,13 @@ export class SessionsService {
+         },
+       });
+ 
++      // Signed out everywhere by an administrator means no more pushes
++      // anywhere either, as with the user's own `logoutAll`.
++      await tx.pushToken.updateMany({
++        where: { userId: params.userId, isActive: true },
++        data: { isActive: false },
++      });
++
+       return ids.length;
+     });
+ 
+diff --git a/test/unit/client-ip-attribution.spec.ts b/test/unit/client-ip-attribution.spec.ts
+index 22278d4..5d99fea 100644
+--- a/test/unit/client-ip-attribution.spec.ts
++++ b/test/unit/client-ip-attribution.spec.ts
+@@ -1,9 +1,16 @@
++import 'reflect-metadata';
++
+ import express, { type Request } from 'express';
+ import request from 'supertest';
+ 
++import { appConfig } from '../../src/config/configuration';
++import { NodeEnv, validateEnv } from '../../src/config/env.validation';
++
+ import { ThrottlerProxyGuard } from '../../src/common/guards/throttler-proxy.guard';
+ import { RequestContextMiddleware } from '../../src/common/middleware/request-context.middleware';
+ import {
++  DIAGNOSTIC_FORWARDED_FOR_SHOWN,
++  MAX_TRUST_PROXY_HOPS,
+   WEB_CLIENT_IP_HEADER,
+   WEB_PROXY_SECRET_HEADER,
+   describeClientIpChain,
+@@ -208,3 +215,167 @@ describe('the diagnostic endpoint', () => {
+     expect(report.otherAddressHeaders['true-client-ip']).toBe('41.33.1.2');
+   });
+ });
++
++// ---------------------------------------------------------------------------
++// 2026-10-29 diagnostic fixes: long headers, every configurable hop count, and
++// the expected-address comparison the verification procedure relies on.
++// ---------------------------------------------------------------------------
++
++/** An app that answers with the diagnostic itself, for any configured hop count. */
++function diagnosticApp(hops: number) {
++  const a = express();
++  a.set('trust proxy', hops);
++  a.get('/d', (req, res) => {
++    res.json({
++      ip: req.ip,
++      report: describeClientIpChain(
++        req,
++        { trustProxy: true, trustProxyHops: hops },
++        { expectedIp: typeof req.query.expectedIp === 'string' ? req.query.expectedIp : null },
++      ),
++    });
++  });
++  return a;
++}
++
++type Diagnosed = { ip: string; report: ReturnType<typeof describeClientIpChain> };
++const diagnose = async (hops: number, xff: string, expectedIp?: string): Promise<Diagnosed> => {
++  const r = request(diagnosticApp(hops)).get('/d');
++  if (expectedIp !== undefined) r.query({ expectedIp });
++  const res = await r.set('x-forwarded-for', xff);
++  return res.body as Diagnosed;
++};
++
++describe('diagnostic with a long X-Forwarded-For (previously kept the LEFTMOST 20)', () => {
++  // 30 client-written entries, then what a two-proxy platform appends.
++  const spoofed = Array.from({ length: 30 }, (_, i) => `6.6.${i}.1`);
++  const chain = [...spoofed, PROXY_ADDED, '172.71.0.5'];
++  const xff = chain.join(', ');
++
++  it('shows the rightmost entries - the part the platform wrote - and says it truncated', async () => {
++    const { report } = await diagnose(2, xff);
++    expect(report.forwardedFor).toEqual(chain.slice(-DIAGNOSTIC_FORWARDED_FOR_SHOWN));
++    expect(report.forwardedFor.at(-1)).toBe('172.71.0.5');
++    expect(report.forwardedFor).toContain(PROXY_ADDED);
++    expect(report.forwardedForTotal).toBe(chain.length);
++    expect(report.forwardedForTruncated).toBe(true);
++  });
++
++  it.each(Array.from({ length: MAX_TRUST_PROXY_HOPS }, (_, i) => i + 1))(
++    'agrees with real Express at hop count %i even when the header is longer than what is shown',
++    async (hops) => {
++      const { ip, report } = await diagnose(hops, xff);
++      expect(report.ipByHopCount[String(hops)]).toBe(ip);
++    },
++  );
++
++  it('does not flag a short header as truncated', async () => {
++    const { report } = await diagnose(1, `${PROXY_ADDED}, 10.0.0.1`);
++    expect(report.forwardedForTruncated).toBe(false);
++    expect(report.forwardedForTotal).toBe(2);
++  });
++});
++
++describe('diagnostic covers every hop count the API accepts', () => {
++  it('reports hop counts 1..MAX_TRUST_PROXY_HOPS', async () => {
++    const { report } = await diagnose(1, '10.1.1.1');
++    expect(Object.keys(report.ipByHopCount)).toEqual(
++      Array.from({ length: MAX_TRUST_PROXY_HOPS }, (_, i) => String(i + 1)),
++    );
++  });
++
++  it('MAX_TRUST_PROXY_HOPS is exactly what env validation and configuration allow', () => {
++    const base = {
++      DATABASE_URL: 'postgresql://u:p@localhost:5432/edu',
++      JWT_ACCESS_SECRET: 'a'.repeat(48),
++      JWT_REFRESH_SECRET: 'b'.repeat(48),
++      JWT_PLAYBACK_SECRET: 'c'.repeat(48),
++      MEDIA_SIGNING_KEY: 'd'.repeat(48),
++      HLS_KEY_ROOT: 'e'.repeat(48),
++      NODE_ENV: NodeEnv.Development,
++    };
++    expect(() => validateEnv({ ...base, TRUST_PROXY_HOPS: String(MAX_TRUST_PROXY_HOPS) })).not.toThrow();
++    expect(() => validateEnv({ ...base, TRUST_PROXY_HOPS: String(MAX_TRUST_PROXY_HOPS + 1) })).toThrow(
++      /TRUST_PROXY_HOPS/,
++    );
++
++    const saved = process.env.TRUST_PROXY_HOPS;
++    try {
++      process.env.TRUST_PROXY_HOPS = '99';
++      expect(appConfig().trustProxyHops).toBe(MAX_TRUST_PROXY_HOPS);
++    } finally {
++      if (saved === undefined) delete process.env.TRUST_PROXY_HOPS;
++      else process.env.TRUST_PROXY_HOPS = saved;
++    }
++  });
++});
++
++describe('expectedIp: the comparison the D6 procedure is built on', () => {
++  const MINE = '41.33.7.7';
++  const EDGE = '172.71.0.5';
++
++  /** One call through a platform with `platformHops` proxies, optionally with a forged entry. */
++  const throughPlatform = (platformHops: number, forged?: string) => {
++    const appended = [MINE, ...Array.from({ length: platformHops - 1 }, (_, i) => `172.71.0.${i + 5}`)];
++    return [...(forged ? [forged] : []), ...appended].join(', ');
++  };
++
++  const fromTwo = Array.from({ length: MAX_TRUST_PROXY_HOPS - 1 }, (_, i) => i + 2);
++
++  it('lists the hop counts that resolve to the expected address', async () => {
++    // One plain call cannot decide on its own: with more hops than entries
++    // Express falls back to the leftmost entry, so every count from the right
++    // one upwards resolves to the caller. That is why the procedure makes a
++    // second call with a forged entry.
++    const { report } = await diagnose(1, `${MINE}, ${EDGE}`, MINE);
++    expect(report.expectedIp).toBe(MINE);
++    expect(report.hopCountsMatchingExpected).toEqual(fromTwo);
++  });
++
++  it.each([1, 2, 3])(
++    'a plain call plus a forged-entry call identify a %i-proxy platform uniquely',
++    async (platformHops) => {
++      const plain = await diagnose(1, throughPlatform(platformHops), MINE);
++      const forged = await diagnose(1, throughPlatform(platformHops, '198.51.100.77'), MINE);
++      const both = plain.report.hopCountsMatchingExpected.filter((h) =>
++        forged.report.hopCountsMatchingExpected.includes(h),
++      );
++      expect(both).toEqual([platformHops]);
++    },
++  );
++
++  it('when the platform discards client-written entries, several counts match and the smallest is the safe one', async () => {
++    // Both calls arrive identical: the forged entry never reaches the API.
++    const plain = await diagnose(1, throughPlatform(2), MINE);
++    const forgedButStripped = await diagnose(1, throughPlatform(2), MINE);
++    const both = plain.report.hopCountsMatchingExpected.filter((h) =>
++      forgedButStripped.report.hopCountsMatchingExpected.includes(h),
++    );
++    expect(both.length).toBeGreaterThan(1);
++    expect(Math.min(...both)).toBe(2);
++  });
++
++  it('ignores an expectedIp that is not one valid address', async () => {
++    for (const bad of ['1.2.3.4, 5.6.7.8', 'not-an-ip', '']) {
++      const { report } = await diagnose(1, `${MINE}, ${EDGE}`, bad);
++      expect(report.expectedIp).toBeNull();
++      expect(report.hopCountsMatchingExpected).toEqual([]);
++    }
++  });
++
++  it('the controller passes expectedIp through and still never reads the secret', () => {
++    // eslint-disable-next-line @typescript-eslint/no-require-imports
++    const { ClientIpDiagnosticsController } = require('../../src/modules/diagnostics/client-ip-diagnostics.controller');
++    const controller = new ClientIpDiagnosticsController({
++      get: () => ({ trustProxy: true, trustProxyHops: 1, webProxySharedSecret: SECRET }),
++    });
++    const req = {
++      headers: { 'x-forwarded-for': `${MINE}, ${EDGE}`, [WEB_PROXY_SECRET_HEADER]: SECRET },
++      ip: EDGE,
++      socket: { remoteAddress: '10.9.9.9' },
++    } as unknown as Request;
++    const report = controller.clientIp(req, MINE);
++    expect(report.hopCountsMatchingExpected).toEqual(fromTwo);
++    expect(JSON.stringify(report)).not.toContain(SECRET);
++  });
++});
+diff --git a/test/unit/device-binding-flow.spec.ts b/test/unit/device-binding-flow.spec.ts
+index ef0fdea..328b1cd 100755
+--- a/test/unit/device-binding-flow.spec.ts
++++ b/test/unit/device-binding-flow.spec.ts
+@@ -103,6 +103,9 @@ function build(options: Options = {}) {
+   const refreshTokenUpdateMany = jest.fn(
+     async (_args: { where: Record<string, unknown> }) => ({ count: 2 }),
+   );
++  const pushTokenUpdateMany = jest.fn(
++    async (_args: { where: Record<string, unknown>; data: Record<string, unknown> }) => ({ count: 1 }),
++  );
+ 
+   // Only the array form is modelled. The callback form would have to hand the
+   // callback a client, which means referencing `prisma` inside its own
+@@ -125,6 +128,7 @@ function build(options: Options = {}) {
+     session: { updateMany: sessionUpdateMany },
+     playbackTicket: { updateMany: ticketUpdateMany },
+     refreshToken: { updateMany: refreshTokenUpdateMany },
++    pushToken: { updateMany: pushTokenUpdateMany },
+     $transaction: jest.fn(async (operations: readonly unknown[]) => Promise.all(operations)),
+   };
+ 
+@@ -157,6 +161,7 @@ function build(options: Options = {}) {
+     sessionUpdateMany,
+     ticketUpdateMany,
+     refreshTokenUpdateMany,
++    pushTokenUpdateMany,
+     audit,
+   };
+ }
+@@ -246,6 +251,19 @@ describe('resetting a binding frees the handset', () => {
+     expect(where.revokedAt).toBeNull();
+   });
+ 
++  it('stops pushes to the old handset (2026-10-29)', async () => {
++    // A lost or stolen phone kept receiving every announcement: the reset
++    // revoked its sessions but never touched its push token.
++    const { service, pushTokenUpdateMany } = build();
++
++    await service.resetBinding(STUDENT_ID, ADMIN, 'phone stolen');
++
++    const call = pushTokenUpdateMany.mock.calls[0];
++    if (!call) throw new Error('pushToken.updateMany was never called');
++    expect(call[0].where).toEqual({ userId: STUDENT_ID, isActive: true });
++    expect(call[0].data).toEqual({ isActive: false });
++  });
++
+   it('the next sign-in from the same handset binds it ACTIVE', async () => {
+     // The row is gone, so this is genuinely an unknown device: it takes the
+     // auto-bind path under the ordinary limit rule. This is the exact sequence
+diff --git a/test/unit/security-hardening-2026-10-29.spec.ts b/test/unit/security-hardening-2026-10-29.spec.ts
+new file mode 100644
+index 0000000..2e316f7
+--- /dev/null
++++ b/test/unit/security-hardening-2026-10-29.spec.ts
+@@ -0,0 +1,522 @@
++import { readFileSync } from 'node:fs';
++import { join } from 'node:path';
++
++import type { ConfigService } from '@nestjs/config';
++import { JwtService } from '@nestjs/jwt';
++import {
++  AccountStatus,
++  CourseStatus,
++  DeviceStatus,
++  EnrollmentMethod,
++  SessionStatus,
++  UserRole,
++} from '@prisma/client';
++
++import { ErrorCode } from '../../src/common/errors/error-codes';
++import { AuthService } from '../../src/modules/auth/auth.service';
++import { TokenService } from '../../src/modules/auth/token.service';
++import { CoursesAdminService, changesCommercialTerms } from '../../src/modules/courses/courses.admin.service';
++import { CoursesService } from '../../src/modules/courses/courses.service';
++import { DevicesService } from '../../src/modules/devices/devices.service';
++import { SessionsService } from '../../src/modules/sessions/sessions.service';
++
++import { cloudinaryDouble } from './cloudinary-double';
++
++/**
++ * Regression tests for the backend fixes of 2026-10-29 (audit items F-08,
++ * F-12, F-14, F-16 and push tokens surviving a revocation). Each block runs
++ * the real service against a small hand-written Prisma stand-in.
++ */
++
++// ---------------------------------------------------------------------------
++// F-12: refresh rotation is compare-and-set
++// ---------------------------------------------------------------------------
++
++describe('F-12 two refreshes with the same token at the same instant', () => {
++  const META = {
++    ip: '10.0.0.1',
++    userAgent: 'jest',
++    device: { deviceKey: null, platform: 'android', appVersion: '1.0.0' },
++  };
++
++  function harness(options: { raceReads?: boolean } = {}) {
++    const now = Date.now();
++    // The one stored row both requests resolve to.
++    const row: Record<string, unknown> = {
++      id: 'rt_1',
++      userId: 'usr_1',
++      sessionId: 'ses_1',
++      familyId: 'fam_1',
++      replacedById: null,
++      usedAt: null,
++      revokedAt: null,
++      expiresAt: new Date(now + 20 * 86_400_000),
++      createdAt: new Date(now - 86_400_000),
++      session: { id: 'ses_1', status: SessionStatus.ACTIVE, deviceId: null },
++      user: {
++        id: 'usr_1',
++        role: UserRole.STUDENT,
++        status: AccountStatus.ACTIVE,
++        deletedAt: null,
++        credentialsChangedAt: new Date(now - 30 * 86_400_000),
++      },
++    };
++
++    // Both requests must read the row before either rotates it - the race.
++    let reads = 0;
++    let releaseReads: () => void = () => undefined;
++    const bothRead = new Promise<void>((resolve) => (releaseReads = resolve));
++
++    const created: string[] = [];
++    const replacedByWrites: unknown[] = [];
++
++    const refreshToken = {
++      findUnique: jest.fn(async () => {
++        const snapshot = { ...row };
++        reads += 1;
++        if (options.raceReads) {
++          if (reads === 2) releaseReads();
++          if (reads <= 2) await bothRead;
++        }
++        return snapshot;
++      }),
++      create: jest.fn(async () => {
++        const id = `rt_new_${created.length + 1}`;
++        created.push(id);
++        return { id };
++      }),
++      // Atomic, like a single UPDATE ... WHERE: JavaScript runs it to completion.
++      updateMany: jest.fn(async (args: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
++        const w = args.where;
++        const matches =
++          w.id === row.id &&
++          (!('usedAt' in w) || (w.usedAt === null && row.usedAt === null)) &&
++          (!('revokedAt' in w) || (w.revokedAt === null && row.revokedAt === null));
++        if (!matches) return { count: 0 };
++        Object.assign(row, args.data);
++        return { count: 1 };
++      }),
++      update: jest.fn(async (args: { data: Record<string, unknown> }) => {
++        replacedByWrites.push(args.data.replacedById);
++        Object.assign(row, args.data);
++        return { id: row.id };
++      }),
++      findMany: jest.fn(async () => []),
++    };
++
++    const prisma = {
++      refreshToken,
++      session: { update: jest.fn(async () => ({})), updateMany: jest.fn(async () => ({ count: 0 })) },
++      $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({ refreshToken, session: prisma.session }),
++      device: { findUnique: jest.fn(async () => null) },
++    };
++
++    const authCfg = {
++      accessTtl: 900,
++      refreshTtl: 30 * 86_400,
++      refreshReuseGraceSeconds: 30,
++      issuer: 'edu-platform',
++      audience: 'edu-mobile',
++      accessSecret: 'a'.repeat(48),
++      refreshSecret: 'b'.repeat(48),
++      playbackSecret: 'c'.repeat(48),
++    };
++    const configService = { getOrThrow: () => authCfg } as unknown as ConfigService;
++    const tokens = new TokenService(
++      new JwtService({ secret: authCfg.refreshSecret, signOptions: { issuer: authCfg.issuer, audience: authCfg.audience } }),
++      configService,
++    );
++    jest.spyOn(tokens, 'verifyRefresh').mockImplementation(async () => ({
++      sub: 'usr_1',
++      sid: 'ses_1',
++      fam: 'fam_1',
++      jti: 'jti_1',
++    }) as never);
++    const security = { record: jest.fn(async () => undefined) };
++
++    const service = new AuthService(
++      prisma as never,
++      { toPublicUser: jest.fn(async () => ({ id: 'usr_1' })) } as never,
++      {} as never,
++      tokens,
++      {} as never,
++      security as never,
++      { record: jest.fn(async () => undefined) } as never,
++      configService,
++    );
++    return { service, row, created, replacedByWrites, refreshToken, security };
++  }
++
++  it('rotates exactly once; the other request is answered through the grace path', async () => {
++    const h = harness({ raceReads: true });
++
++    const [a, b] = await Promise.all([
++      h.service.refresh('same-token', META as never),
++      h.service.refresh('same-token', META as never),
++    ]);
++
++    // Both callers keep a working session...
++    expect(a.refreshToken).toBeTruthy();
++    expect(b.refreshToken).toBeTruthy();
++    // ...but the stored token was rotated once: one successor is linked, and
++    // the link was written once (before the fix: twice, the second overwriting).
++    expect(h.replacedByWrites).toHaveLength(1);
++    expect(h.row.replacedById).toBe(h.replacedByWrites[0]);
++    // The loser re-read the row and took the documented grace-window path.
++    expect(h.security.record).toHaveBeenCalledWith(
++      expect.objectContaining({ message: expect.stringContaining('within the reuse grace window') }),
++    );
++  });
++
++  it('claims the token only while it is unused and unrevoked', async () => {
++    const h = harness();
++    await h.service.refresh('same-token', META as never);
++    expect(h.refreshToken.updateMany).toHaveBeenCalledWith(
++      expect.objectContaining({ where: { id: 'rt_1', usedAt: null, revokedAt: null } }),
++    );
++  });
++
++  it('a token revoked by a concurrent logout is refused, not rotated', async () => {
++    const h = harness();
++    // The logout lands between this request's read and its rotation.
++    h.refreshToken.updateMany.mockImplementationOnce(async () => {
++      h.row.revokedAt = new Date();
++      return { count: 0 };
++    });
++    await expect(h.service.refresh('same-token', META as never)).rejects.toMatchObject({
++      code: ErrorCode.SESSION_EXPIRED,
++    });
++    expect(h.replacedByWrites).toHaveLength(0);
++  });
++});
++
++// ---------------------------------------------------------------------------
++// F-14: public sections / attachments honour course and content status
++// ---------------------------------------------------------------------------
++
++describe('F-14 public course outline and documents', () => {
++  function build(status: CourseStatus) {
++    const attachmentFindMany = jest.fn(async () => []);
++    const prisma = {
++      course: { findFirst: jest.fn(async () => ({ id: 'crs_1', status, enrollmentMethods: [] })) },
++      courseSection: { findMany: jest.fn(async () => []) },
++      watchProgress: { findMany: jest.fn(async () => []) },
++      attachment: { findMany: attachmentFindMany },
++    };
++    const access = {
++      resolve: jest.fn(async () => ({ canAccessContent: false })),
++      allowedSectionIds: jest.fn(async () => null),
++    };
++    const service = new CoursesService(prisma as never, access as never, {} as never);
++    return { service, attachmentFindMany };
++  }
++
++  it.each([CourseStatus.DRAFT, CourseStatus.HIDDEN, CourseStatus.SUSPENDED])(
++    'a %s course is not listed to anonymous callers or students',
++    async (status) => {
++      const { service } = build(status);
++      for (const role of [undefined, UserRole.STUDENT]) {
++        await expect(service.sections({ courseId: 'crs_1', userId: null, role })).rejects.toMatchObject({
++          code: ErrorCode.COURSE_NOT_AVAILABLE,
++        });
++        await expect(service.attachments('crs_1', null, role)).rejects.toMatchObject({
++          code: ErrorCode.COURSE_NOT_AVAILABLE,
++        });
++      }
++    },
++  );
++
++  it('staff still see an unpublished course', async () => {
++    const { service } = build(CourseStatus.DRAFT);
++    await expect(service.sections({ courseId: 'crs_1', userId: 't1', role: UserRole.TEACHER })).resolves.toEqual([]);
++    await expect(service.attachments('crs_1', 't1', UserRole.TEACHER)).resolves.toEqual([]);
++  });
++
++  it.each([CourseStatus.PUBLISHED, CourseStatus.ARCHIVED])('a %s course is listed as before', async (status) => {
++    const { service } = build(status);
++    await expect(service.sections({ courseId: 'crs_1', userId: null })).resolves.toEqual([]);
++    await expect(service.attachments('crs_1', null)).resolves.toEqual([]);
++  });
++
++  it('students are not shown documents of unpublished lectures or sections; staff are', async () => {
++    const student = build(CourseStatus.PUBLISHED);
++    await student.service.attachments('crs_1', 's1', UserRole.STUDENT);
++    const studentWhere = JSON.stringify((student.attachmentFindMany.mock.calls[0] as unknown[])[0]);
++    expect(studentWhere).toContain('"lesson":{"status":"PUBLISHED","section":{"status":"PUBLISHED"}}');
++    expect(studentWhere).toContain('"section":{"status":"PUBLISHED"}');
++
++    const staff = build(CourseStatus.PUBLISHED);
++    await staff.service.attachments('crs_1', 'a1', UserRole.ADMIN);
++    const staffWhere = JSON.stringify((staff.attachmentFindMany.mock.calls[0] as unknown[])[0]);
++    expect(staffWhere).not.toContain('PUBLISHED');
++  });
++});
++
++// ---------------------------------------------------------------------------
++// F-08: the device header must match the device the session signed in on
++// ---------------------------------------------------------------------------
++
++describe('F-08 device binding uses the session, not only the header', () => {
++  function gate(device: { id: string; status: DeviceStatus } | null) {
++    const record = jest.fn(async () => undefined);
++    const service = new DevicesService(
++      { device: { findUnique: jest.fn(async () => device) } } as never,
++      { record } as never,
++      {} as never,
++      {} as never,
++      { getOrThrow: () => ({ blockOnIntegrityFailure: false, autoBindFirst: true }) } as never,
++    );
++    return { service, record };
++  }
++  const BASE = { userId: 'stu_1', role: UserRole.STUDENT, deviceKey: 'key-of-phone-A', integritySuspect: false };
++
++  it('refuses a session bound to another device that presents this device id', async () => {
++    const { service, record } = gate({ id: 'dev_A', status: DeviceStatus.ACTIVE });
++    await expect(
++      service.assertAuthorizedForProtectedContent({ ...BASE, sessionDeviceId: 'dev_B_pending' }),
++    ).rejects.toMatchObject({ code: ErrorCode.DEVICE_NOT_AUTHORIZED });
++    expect(record).toHaveBeenCalledWith(
++      expect.objectContaining({ message: expect.stringContaining('different device than this session') }),
++    );
++  });
++
++  it('allows the session that signed in on this device', async () => {
++    const { service } = gate({ id: 'dev_A', status: DeviceStatus.ACTIVE });
++    await expect(
++      service.assertAuthorizedForProtectedContent({ ...BASE, sessionDeviceId: 'dev_A' }),
++    ).resolves.toEqual({ deviceId: 'dev_A' });
++  });
++
++  it('keeps the header-only rule for a session signed in without a device (documented residual)', async () => {
++    const { service } = gate({ id: 'dev_A', status: DeviceStatus.ACTIVE });
++    await expect(
++      service.assertAuthorizedForProtectedContent({ ...BASE, sessionDeviceId: null }),
++    ).resolves.toEqual({ deviceId: 'dev_A' });
++  });
++
++  it('staff are still not device-bound', async () => {
++    const { service } = gate(null);
++    await expect(
++      service.assertAuthorizedForProtectedContent({ ...BASE, role: UserRole.ADMIN, sessionDeviceId: 'x' }),
++    ).resolves.toEqual({ deviceId: null });
++  });
++
++  it('every protected-content path passes the session device', () => {
++    const root = join(__dirname, '..', '..', 'src', 'modules');
++    const sites: Array<[string, number]> = [
++      ['playback/playback.service.ts', 2],
++      ['attachments/attachments.service.ts', 1],
++      ['library/library-documents.service.ts', 1],
++    ];
++    for (const [file, expected] of sites) {
++      const source = readFileSync(join(root, file), 'utf8');
++      const calls = source.match(/assertAuthorizedForProtectedContent\(\{[\s\S]*?\}\)/g) ?? [];
++      expect(calls).toHaveLength(expected);
++      for (const call of calls) expect(call).toMatch(/sessionDeviceId: (params\.)?user\.deviceId/);
++    }
++  });
++});
++
++// ---------------------------------------------------------------------------
++// Push tokens die with an administrator's revocation
++// ---------------------------------------------------------------------------
++
++describe('push tokens are deactivated when an administrator revokes access', () => {
++  const ADMIN = { id: 'adm_1', role: UserRole.ADMIN } as never;
++
++  function sessionsService(session: Record<string, unknown> | null) {
++    const pushUpdateMany = jest.fn(async () => ({ count: 1 }));
++    const tx = {
++      session: {
++        update: jest.fn(async () => ({})),
++        updateMany: jest.fn(async () => ({ count: 2 })),
++        findMany: jest.fn(async () => [{ id: 'ses_1' }, { id: 'ses_2' }]),
++      },
++      refreshToken: { updateMany: jest.fn(async () => ({ count: 1 })) },
++      playbackTicket: { updateMany: jest.fn(async () => ({ count: 0 })) },
++      pushToken: { updateMany: pushUpdateMany },
++    };
++    const prisma = {
++      session: { findUnique: jest.fn(async () => session) },
++      $transaction: async (fn: (t: typeof tx) => Promise<unknown>) => fn(tx),
++    };
++    const service = new SessionsService(prisma as never, { record: jest.fn(async () => undefined) } as never);
++    return { service, pushUpdateMany };
++  }
++
++  it('revoking one session stops pushes to that session\'s handset', async () => {
++    const { service, pushUpdateMany } = sessionsService({
++      id: 'ses_1',
++      userId: 'stu_1',
++      status: SessionStatus.ACTIVE,
++      device: { deviceKey: 'key-A' },
++    });
++    await service.revoke({ sessionId: 'ses_1', actor: ADMIN, reason: 'support' });
++    expect(pushUpdateMany).toHaveBeenCalledWith({
++      where: { userId: 'stu_1', deviceKey: 'key-A', isActive: true },
++      data: { isActive: false },
++    });
++  });
++
++  it('a session without a bound device leaves other handsets\' pushes alone', async () => {
++    const { service, pushUpdateMany } = sessionsService({
++      id: 'ses_1',
++      userId: 'stu_1',
++      status: SessionStatus.ACTIVE,
++      device: null,
++    });
++    await service.revoke({ sessionId: 'ses_1', actor: ADMIN, reason: 'support' });
++    expect(pushUpdateMany).not.toHaveBeenCalled();
++  });
++
++  it('revoking every session stops every push of that user', async () => {
++    const { service, pushUpdateMany } = sessionsService(null);
++    await service.revokeAllForUser({ userId: 'stu_1', actor: ADMIN, reason: 'compromised' });
++    expect(pushUpdateMany).toHaveBeenCalledWith({
++      where: { userId: 'stu_1', isActive: true },
++      data: { isActive: false },
++    });
++  });
++
++  it('revoking a device stops pushes to that device', async () => {
++    const pushUpdateMany = jest.fn(async () => ({ count: 1 }));
++    const prisma = {
++      device: {
++        findUnique: jest.fn(async () => ({ id: 'dev_A', userId: 'stu_1', deviceKey: 'key-A', status: DeviceStatus.ACTIVE })),
++        update: jest.fn(async () => ({})),
++      },
++      session: { updateMany: jest.fn(async () => ({ count: 1 })) },
++      playbackTicket: { updateMany: jest.fn(async () => ({ count: 0 })) },
++      refreshToken: { updateMany: jest.fn(async () => ({ count: 1 })) },
++      pushToken: { updateMany: pushUpdateMany },
++      $transaction: jest.fn(async (ops: readonly unknown[]) => Promise.all(ops)),
++    };
++    const service = new DevicesService(
++      prisma as never,
++      { record: jest.fn(async () => undefined) } as never,
++      { record: jest.fn(async () => undefined) } as never,
++      {} as never,
++      { getOrThrow: () => ({}) } as never,
++    );
++    await service.revokeDevice('dev_A', { id: 'adm_1', role: UserRole.ADMIN }, 'lost');
++    expect(pushUpdateMany).toHaveBeenCalledWith({
++      where: { userId: 'stu_1', deviceKey: 'key-A', isActive: true },
++      data: { isActive: false },
++    });
++  });
++});
++
++// ---------------------------------------------------------------------------
++// F-16: commercial terms need the pricing capability
++// ---------------------------------------------------------------------------
++
++describe('F-16 joining methods and access duration are pricing decisions', () => {
++  const BEFORE = {
++    enrollmentMethods: [EnrollmentMethod.CODE, EnrollmentMethod.ADMIN_APPROVAL],
++    accessDurationType: 'FIXED_DAYS',
++    accessDurationDays: 120,
++    accessEndsAt: null,
++  };
++
++  it.each([
++    ['a method added', { enrollmentMethods: [EnrollmentMethod.CODE, EnrollmentMethod.ADMIN_APPROVAL, EnrollmentMethod.FREE] }],
++    ['a method removed', { enrollmentMethods: [EnrollmentMethod.CODE] }],
++    ['the duration type changed', { accessDurationType: 'LIFETIME' }],
++    ['the day count changed', { accessDurationDays: 365 }],
++    ['an end date set', { accessEndsAt: '2027-01-01T00:00:00.000Z' }],
++  ])('%s counts as a change', (_label, input) => {
++    expect(changesCommercialTerms(BEFORE, input)).toBe(true);
++  });
++
++  it.each([
++    ['nothing commercial sent', {}],
++    ['the same values resent (the dashboard sends the whole form)', {
++      enrollmentMethods: [EnrollmentMethod.ADMIN_APPROVAL, EnrollmentMethod.CODE],
++      accessDurationType: 'FIXED_DAYS',
++      accessDurationDays: 120,
++    }],
++  ])('%s is not a change', (_label, input) => {
++    expect(changesCommercialTerms(BEFORE, input)).toBe(false);
++  });
++
++  function adminService(canPrice: boolean) {
++    const before = {
++      id: 'crs_1',
++      title: 'Anatomy',
++      shortDescription: '',
++      description: '',
++      status: CourseStatus.DRAFT,
++      thumbnailKey: null,
++      universityId: null,
++      facultyId: null,
++      academicYearId: null,
++      departments: [],
++      prices: [],
++      teachers: [],
++      sections: [],
++      university: null,
++      faculty: null,
++      academicYear: null,
++      subject: null,
++      _count: { enrollments: 0, attachments: 0 },
++      sectionCount: 0,
++      lessonCount: 0,
++      ...BEFORE,
++    };
++    const courseUpdate = jest.fn(async () => before);
++    const prisma: Record<string, unknown> = {
++      course: {
++        findFirst: jest.fn(async () => before),
++        findUnique: jest.fn(async () => null),
++        update: courseUpdate,
++        findMany: jest.fn(async () => []),
++      },
++      faculty: { findFirst: jest.fn(async () => null) },
++      department: { findMany: jest.fn(async () => []) },
++      courseDepartment: { deleteMany: jest.fn(), createMany: jest.fn() },
++    };
++    prisma.$transaction = jest.fn(async (arg: unknown) =>
++      typeof arg === 'function' ? (arg as (tx: unknown) => Promise<unknown>)(prisma) : arg,
++    );
++    const assertCanManageCourse = jest.fn(async (_u: string, _r: UserRole, _c: string, capability: string) => {
++      if (capability === 'pricing' && !canPrice) {
++        throw Object.assign(new Error('no pricing'), { code: ErrorCode.INSUFFICIENT_ROLE });
++      }
++    });
++    const service = new CoursesAdminService(
++      prisma as never,
++      { recountCourse: jest.fn(async () => undefined) } as never,
++      { assertCanManageCourse } as never,
++      { record: jest.fn(async () => undefined) } as never,
++      { publicAssetUrl: jest.fn(async () => null), deleteObject: jest.fn() } as never,
++      { resolveAcademicStructure: jest.fn(async () => ({ id: 'as_1', kind: 'YEAR' })) } as never,
++      cloudinaryDouble(),
++    );
++    return { service, courseUpdate, assertCanManageCourse };
++  }
++  const TEACHER = { id: 'tch_1', role: UserRole.TEACHER };
++
++  it('a content-only teacher cannot switch a course to lifetime access', async () => {
++    const { service, courseUpdate } = adminService(false);
++    await expect(service.update('crs_1', { accessDurationType: 'LIFETIME' }, TEACHER)).rejects.toMatchObject({
++      code: ErrorCode.INSUFFICIENT_ROLE,
++    });
++    expect(courseUpdate).not.toHaveBeenCalled();
++  });
++
++  it('a content-only teacher can still save the form with the terms unchanged', async () => {
++    const { service, courseUpdate, assertCanManageCourse } = adminService(false);
++    await service
++      .update('crs_1', { title: 'Anatomy II', enrollmentMethods: BEFORE.enrollmentMethods, accessDurationDays: 120 }, TEACHER)
++      .catch(() => undefined);
++    expect(courseUpdate).toHaveBeenCalled();
++    expect(assertCanManageCourse).not.toHaveBeenCalledWith(TEACHER.id, TEACHER.role, 'crs_1', 'pricing');
++  });
++
++  it('a teacher with the pricing capability may change them', async () => {
++    const { service, courseUpdate, assertCanManageCourse } = adminService(true);
++    await service.update('crs_1', { accessDurationType: 'LIFETIME' }, TEACHER).catch(() => undefined);
++    expect(assertCanManageCourse).toHaveBeenCalledWith(TEACHER.id, TEACHER.role, 'crs_1', 'pricing');
++    expect(courseUpdate).toHaveBeenCalled();
++  });
++});

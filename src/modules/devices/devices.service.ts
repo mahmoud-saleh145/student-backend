@@ -266,6 +266,13 @@ export class DevicesService {
     userId: string;
     role: UserRole;
     deviceKey: string | null;
+    /**
+     * The device this SESSION was bound to at sign-in (`Session.deviceId`, on
+     * the principal as `deviceId`). When the session has one, the header must
+     * name that same device (audit F-08). `null` = signed in without a device
+     * header; `undefined` = caller predates this check.
+     */
+    sessionDeviceId?: string | null;
     integritySuspect: boolean;
     ip?: string | null;
     userAgent?: string | null;
@@ -313,6 +320,24 @@ export class DevicesService {
         ipAddress: params.ip,
         userAgent: params.userAgent,
         message: 'Protected content requested from an unregistered device',
+      });
+      throw new AppException(ErrorCode.DEVICE_NOT_AUTHORIZED);
+    }
+
+    // The header is client-written. Without this, any session of the account
+    // - signed in on a second phone that is still PENDING_APPROVAL, say - could
+    // present the bound phone's id string and pass. A session that was bound
+    // to a device at sign-in may only ever act as that device. (A session with
+    // no bound device keeps the header-only rule; see OWNER_DECISIONS, F-08.)
+    if (params.sessionDeviceId && params.sessionDeviceId !== device.id) {
+      await this.security.record({
+        type: SecurityEventType.DEVICE_MISMATCH,
+        severity: SecuritySeverity.MEDIUM,
+        userId: params.userId,
+        deviceKey: params.deviceKey,
+        ipAddress: params.ip,
+        userAgent: params.userAgent,
+        message: 'Protected content refused: X-Device-Id names a different device than this session was signed in on',
       });
       throw new AppException(ErrorCode.DEVICE_NOT_AUTHORIZED);
     }
@@ -682,6 +707,13 @@ export class DevicesService {
         where: { session: { deviceId }, revokedAt: null },
         data: { revokedAt: new Date(), revokedReason: `Device revoked: ${reason}` },
       }),
+      // ...and it stops receiving pushes. `PushToken.deviceKey` exists so that
+      // unbinding a device kills its pushes; this path never used it, so a
+      // revoked handset kept receiving every announcement.
+      this.prisma.pushToken.updateMany({
+        where: { userId: device.userId, deviceKey: device.deviceKey, isActive: true },
+        data: { isActive: false },
+      }),
     ]);
 
     await this.audit.record({
@@ -773,6 +805,12 @@ export class DevicesService {
       this.prisma.refreshToken.updateMany({
         where: { userId, revokedAt: null },
         data: { revokedAt: new Date(), revokedReason: 'Device binding reset' },
+      }),
+      // A lost or stolen phone must stop receiving announcements too. The
+      // student's own phone re-registers its token at the next sign-in.
+      this.prisma.pushToken.updateMany({
+        where: { userId, isActive: true },
+        data: { isActive: false },
       }),
     ]);
 

@@ -84,6 +84,8 @@ function build() {
         return { ...row };
       }),
     },
+    // Sign-in also checks for a pending account deletion (owner decision D5).
+    accountDeletionRequest: { findFirst: jest.fn(async () => null) },
   };
 
   const passwords = {

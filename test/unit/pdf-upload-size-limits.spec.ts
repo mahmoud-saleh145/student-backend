@@ -52,10 +52,14 @@ type StorageControllerLike = {
     req: unknown,
   ): Promise<{ objectKey: string; sizeBytes: number }>;
   attachmentContent(
+    actor: { id: string; role: 'ADMIN' },
     query: Record<string, unknown>,
     req: unknown,
   ): Promise<{ objectKey: string; sizeBytes: number }>;
 };
+
+/** The actor the course-material uploads are made as. */
+const ADMIN = { id: 'usr_1', role: 'ADMIN' } as const;
 
 function build() {
   const putStream = jest.fn(
@@ -82,7 +86,10 @@ function build() {
   const controller = new StorageController(
     storage as never,
     {} as never,
-    { assertCanManageCourse: jest.fn(async () => undefined) } as never,
+    {
+      assertCanManageCourse: jest.fn(async () => undefined),
+      assertCourseExistsAndManageable: jest.fn(async () => undefined),
+    } as never,
   ) as unknown as StorageControllerLike;
 
   return { controller, putStream };
@@ -176,7 +183,7 @@ describe('PDF streaming size limits — Lecture Files', () => {
   ])('accepts %s', async (_label, sizeBytes) => {
     const { controller, putStream } = build();
 
-    const result = await controller.attachmentContent(attachmentQuery, req(sizeBytes));
+    const result = await controller.attachmentContent(ADMIN, attachmentQuery, req(sizeBytes));
 
     expect(putStream).toHaveBeenCalledTimes(1);
     expect(result.sizeBytes).toBe(sizeBytes);
@@ -186,7 +193,7 @@ describe('PDF streaming size limits — Lecture Files', () => {
   it('refuses one byte over the ceiling, naming the limit', async () => {
     const { controller, putStream } = build();
 
-    const { code, body } = await refusal(controller.attachmentContent(attachmentQuery, req(MAX + 1)));
+    const { code, body } = await refusal(controller.attachmentContent(ADMIN, attachmentQuery, req(MAX + 1)));
 
     expect(code).toBe(ErrorCode.VALIDATION_ERROR);
     expect(body.join(' ')).toContain(`exceeds the ${MAX} byte limit`);
@@ -196,7 +203,7 @@ describe('PDF streaming size limits — Lecture Files', () => {
   it('refuses a request with no declared length', async () => {
     const { controller, putStream } = build();
 
-    const { code, body } = await refusal(controller.attachmentContent(attachmentQuery, req(undefined)));
+    const { code, body } = await refusal(controller.attachmentContent(ADMIN, attachmentQuery, req(undefined)));
 
     expect(code).toBe(ErrorCode.VALIDATION_ERROR);
     expect(body.join(' ')).toContain('Content-Length');
@@ -206,7 +213,7 @@ describe('PDF streaming size limits — Lecture Files', () => {
   it('streams to the bucket readers resolve, not the uploads bucket', async () => {
     const { controller, putStream } = build();
 
-    const result = await controller.attachmentContent(attachmentQuery, req(25 * MB));
+    const result = await controller.attachmentContent(ADMIN, attachmentQuery, req(25 * MB));
 
     const [args] = putStream.mock.calls[0] as [{ bucket: string; objectKey: string }];
     expect(args.bucket).toBe('media');
@@ -229,7 +236,7 @@ describe('the two flows are gated independently', () => {
     await expect(library.controller.libraryDocumentContent(libraryQuery, req(oversized))).rejects.toThrow(
       AppException,
     );
-    await expect(lecture.controller.attachmentContent(attachmentQuery, req(oversized))).rejects.toThrow(
+    await expect(lecture.controller.attachmentContent(ADMIN, attachmentQuery, req(oversized))).rejects.toThrow(
       AppException,
     );
 

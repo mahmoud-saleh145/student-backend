@@ -48,6 +48,8 @@ function world(opts: {
   entitledCourses?: string[];
   /** Gumlet unreachable: every provider request fails at the network level. */
   gumletDown?: boolean;
+  /** What device binding answers for the requesting device (default: dev_1, active). */
+  deviceResult?: () => Promise<{ deviceId: string | null }>;
 } = {}) {
   const video: Row = {
     id: 'vid_1',
@@ -160,20 +162,28 @@ function world(opts: {
     ),
   };
 
+  const redisStore = new Map<string, unknown>();
   const playback = new PlaybackService(
     prisma as never,
     {
       incrementWindow: jest.fn(async () => 1),
       key: jest.fn((k: string) => k),
+      getJson: jest.fn(async (k: string) => redisStore.get(k) ?? null),
+      setJson: jest.fn(async (k: string, v: unknown) => {
+        redisStore.set(k, v);
+      }),
       client: {
         zremrangebyscore: jest.fn(async () => 0),
         zcard: jest.fn(async () => 0),
         zadd: jest.fn(async () => 1),
         expire: jest.fn(async () => 1),
+        zrem: jest.fn(async () => 1),
       },
     } as never,
     access as never,
-    { assertAuthorizedForProtectedContent: jest.fn(async () => ({ deviceId: 'dev_1' })) } as never,
+    {
+      assertAuthorizedForProtectedContent: jest.fn(opts.deviceResult ?? (async () => ({ deviceId: 'dev_1' }))),
+    } as never,
     { signMediaUrl: jest.fn(async () => 'https://media.example/caption.vtt') } as never,
     {} as never,
     {} as never,
@@ -203,7 +213,7 @@ function world(opts: {
   };
 
   return {
-    video, tickets, drmVerification, signLicence, issue, heartbeat, access, prisma,
+    video, tickets, drmVerification, signLicence, issue, heartbeat, access, prisma, playback,
     ticketUpdates: () => ticketUpdates,
     providerCalls: () => [...providerCalls],
   };
@@ -540,5 +550,75 @@ describe('T2: one DRM verification per ticket, and none reused across requests',
     });
     await expect(w.issue('les_src')).resolves.toMatchObject({ drm: { scheme: 'widevine' } });
     expect(gate).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('heartbeat hardening: expired grants, device, section scope, key system', () => {
+  const onSource = { lessonId: 'les_src', courseId: 'crs_src', lesson: { sectionId: 'sec_les_src', isPreview: false } };
+  const verified = { drmRequested: true, drmVerifiedAt: new Date() };
+
+  it('an EXPIRED ticket is terminated, never exchanged for a fresh one', async () => {
+    const w = world({ row: verified });
+    const res = await w.heartbeat({ ...onSource, status: 'EXPIRED' }, -10 * 60 * 1000);
+    expect(res).toEqual({ ok: false, terminate: { reason: 'PLAYBACK_TICKET_EXPIRED' } });
+    expect(w.tickets).toHaveLength(0);
+  });
+
+  it('a ticket well past its expiry (status not yet swept) is terminated too', async () => {
+    const w = world({ row: verified });
+    const res = await w.heartbeat(onSource, -10 * 60 * 1000);
+    expect(res).toEqual({ ok: false, terminate: { reason: 'PLAYBACK_TICKET_EXPIRED' } });
+    expect(w.tickets).toHaveLength(0);
+  });
+
+  it('a beat that is only slightly late (inside the grace) still rotates', async () => {
+    const w = world({ row: verified });
+    const res = await w.heartbeat(onSource, -5 * 1000);
+    expect(res).toMatchObject({ ok: true, ticket: { drm: { scheme: 'widevine' } } });
+  });
+
+  it('rotation from a different device than the grant was issued to is refused', async () => {
+    const w = world({ row: verified, deviceResult: async () => ({ deviceId: 'dev_other' }) });
+    const res = await w.heartbeat(onSource, 5 * 1000);
+    expect(res).toEqual({ ok: false, terminate: { reason: 'DEVICE_NOT_AUTHORIZED' } });
+    expect(w.tickets).toHaveLength(0);
+  });
+
+  it('rotation from a device that is no longer authorised is refused', async () => {
+    const w = world({
+      row: verified,
+      deviceResult: async () => {
+        throw Object.assign(new Error('DEVICE_NOT_AUTHORIZED'), { code: 'DEVICE_NOT_AUTHORIZED' });
+      },
+    });
+    const res = await w.heartbeat(onSource, 5 * 1000);
+    expect(res).toEqual({ ok: false, terminate: { reason: 'DEVICE_NOT_AUTHORIZED' } });
+  });
+
+  it('a section revoked mid-lesson terminates playback at the next beat', async () => {
+    const w = world({ row: verified });
+    w.access.assertSectionAccessible.mockImplementationOnce(async () => {
+      throw Object.assign(new Error('NOT_ENROLLED'), { code: 'NOT_ENROLLED' });
+    });
+    const res = await w.heartbeat(onSource, 10 * 60 * 1000);
+    expect(res).toEqual({ ok: false, terminate: { reason: 'NOT_ENROLLED' } });
+    expect(w.access.assertSectionAccessible).toHaveBeenCalledWith(
+      expect.objectContaining({ courseId: 'crs_src', sectionId: 'sec_les_src' }),
+    );
+  });
+
+  it('a FairPlay (iOS) grant rotates into FairPlay, not Widevine', async () => {
+    const w = world({ row: verified });
+    const first = await w.playback.issueTicket({
+      user: STUDENT, videoId: 'vid_1', lessonId: 'les_src', platform: 'ios', integritySuspect: false,
+    });
+    expect(first.drm).toMatchObject({ scheme: expect.stringMatching(/fairplay/i) });
+
+    const res = await w.heartbeat({ ...onSource, id: first.ticketId }, 5 * 1000);
+    expect(res).toMatchObject({ ok: true });
+    const rotated = (res as { ticket: { drm: { scheme: string }; manifestUrl: string } }).ticket;
+    expect(rotated.drm.scheme).toBe(first.drm!.scheme);
+    // FairPlay is HLS-only at Gumlet, so the rotated grant must stay on HLS.
+    expect(rotated.manifestUrl).toMatch(/m3u8/);
   });
 });
