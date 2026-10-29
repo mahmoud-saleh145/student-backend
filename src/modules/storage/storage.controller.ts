@@ -53,11 +53,6 @@ class PresignAvatarDto {
   @Type(() => Number) @IsInt() @Min(1) @Max(5 * 1024 * 1024) sizeBytes!: number;
 }
 
-class PresignCourseThumbnailDto {
-  @IsString() @MaxLength(32) courseId!: string;
-  @IsIn(IMAGE_TYPES) contentType!: string;
-  @Type(() => Number) @IsInt() @Min(1) @Max(10 * 1024 * 1024) sizeBytes!: number;
-}
 class PresignCoursePartThumbnailDto {
   @IsString() @MaxLength(32) courseId!: string;
   @IsString() @MaxLength(32) partId!: string;
