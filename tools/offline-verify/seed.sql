@@ -29,14 +29,21 @@ VALUES ('fac_eng','uni_cairo','Engineering','الهندسة',true,1,now(),now())
 INSERT INTO departments (id,"facultyId","name","nameAr","isActive","sortOrder","createdAt","updatedAt")
 VALUES ('dep_cse','fac_eng','Computer Engineering','هندسة الحاسبات',true,1,now(),now());
 
+-- The platform-wide YEAR structure the years hang off. `academic_years.structureId`
+-- became NOT NULL with the academic-structure migrations (2026-09-30 ..
+-- 2026-10-09); this seed predated them and loaded nothing after that, so the
+-- whole database suite silently stopped running.
+INSERT INTO academic_structures (id,kind,"scopeKey","isActive","createdAt","updatedAt") VALUES
+  ('as_platform','YEAR','platform',true,now(),now());
+
 -- Five years on purpose: an Egyptian engineering degree is five, and nothing
 -- in the system may assume four.
-INSERT INTO academic_years (id,"order","name","nameAr","isActive","createdAt","updatedAt") VALUES
-  ('yr1',1,'First Year','الفرقة الأولى',true,now(),now()),
-  ('yr2',2,'Second Year','الفرقة الثانية',true,now(),now()),
-  ('yr3',3,'Third Year','الفرقة الثالثة',true,now(),now()),
-  ('yr4',4,'Fourth Year','الفرقة الرابعة',true,now(),now()),
-  ('yr5',5,'Fifth Year','الفرقة الخامسة',true,now(),now());
+INSERT INTO academic_years (id,"structureId","order","name","nameAr","isActive","createdAt","updatedAt") VALUES
+  ('yr1','as_platform',1,'First Year','الفرقة الأولى',true,now(),now()),
+  ('yr2','as_platform',2,'Second Year','الفرقة الثانية',true,now(),now()),
+  ('yr3','as_platform',3,'Third Year','الفرقة الثالثة',true,now(),now()),
+  ('yr4','as_platform',4,'Fourth Year','الفرقة الرابعة',true,now(),now()),
+  ('yr5','as_platform',5,'Fifth Year','الفرقة الخامسة',true,now(),now());
 
 -- --- people -------------------------------------------------------------------
 INSERT INTO users (id,phone,"passwordHash","fullName",role,status,gender,locale,"credentialsChangedAt","failedLoginCount","createdAt","updatedAt") VALUES

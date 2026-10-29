@@ -20,7 +20,11 @@ const { CourseAccessService } = require(path.join(OUT, 'modules/courses/course-a
 const ser = require(path.join(OUT, 'modules/courses/course.serializer.js'));
 const { ErrorCode } = require(path.join(OUT, 'common/errors/error-codes.js'));
 
-const access = new CourseAccessService(null);
+// prisma is unused by the methods this flow calls; the settings and config
+// doubles answer what `availableMethods` reads (device limit, payment provider).
+const access = new CourseAccessService(null, { deviceLimit: async () => 1 }, {
+  get: (key) => (key === 'payment.provider' ? 'none' : undefined),
+});
 
 function sql(query) {
   const out = execFileSync('psql', [
