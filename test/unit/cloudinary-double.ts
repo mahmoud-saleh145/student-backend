@@ -53,7 +53,7 @@ export function stubCloudinaryUploader(
     .mockImplementation(((_options: unknown, callback: any) => {
       // A minimal writable that swallows the piped bytes and calls back, which
       // is all the service asks of it.
-      // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-unsafe-call
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
       const { Writable } = require('node:stream') as typeof import('node:stream');
       return new Writable({
         write(_chunk, _encoding, done) {

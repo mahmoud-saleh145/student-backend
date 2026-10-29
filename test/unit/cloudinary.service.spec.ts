@@ -153,6 +153,7 @@ describe('uploading', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       .mockImplementation(((options: unknown, callback: any) => {
         seen.options = options as Record<string, unknown>;
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
         const { Writable } = require('node:stream') as typeof import('node:stream');
         return new Writable({
           write(_c, _e, done) {
@@ -198,6 +199,7 @@ describe('uploading', () => {
       .spyOn(cloudinarySdk.uploader, 'upload_stream')
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       .mockImplementation(((_o: unknown, callback: any) => {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
         const { Writable } = require('node:stream') as typeof import('node:stream');
         return new Writable({
           write(_c, _e, done) {

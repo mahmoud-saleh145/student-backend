@@ -22,7 +22,6 @@ function harness(opts: { liveAttachments?: number; links?: Row[] } = {}) {
   const videoUpdateMany: Row[] = [];
   const ticketUpdateMany: Row[] = [];
   const lessonUpdateMany: Row[] = [];
-  const linkFindMany: Row[] = [];
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const prisma: any = {

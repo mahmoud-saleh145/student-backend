@@ -35,7 +35,6 @@ type AnnouncementFrequency = (typeof AnnouncementFrequency)[keyof typeof Announc
 
 import { AnnouncementsService } from '../../src/modules/notifications/announcements.service';
 
-const NOW = new Date('2026-09-20T16:00:00Z');
 const ACTOR = { id: 'admin_1' };
 
 interface Stored {
@@ -112,8 +111,6 @@ function build(options: Options = {}) {
 
   const recipientCount = options.recipients ?? 4;
   const users = Array.from({ length: recipientCount }, (_, i) => ({ id: `usr_${i}` }));
-
-  const claimed = { taken: false };
 
   const create = jest.fn(async (_args: { data: unknown }) => {
     if (options.claimTaken) {

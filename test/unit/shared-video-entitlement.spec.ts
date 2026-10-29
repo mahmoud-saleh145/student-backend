@@ -17,7 +17,6 @@ const ACTOR_STUDENT = {
   sessionId: 'ses_1',
 } as never;
 
-const CONTENT_STATUS = { PUBLISHED: 'PUBLISHED' } as never;
 
 type LessonRow = {
   id: string;
@@ -176,7 +175,6 @@ describe('shared video entitlement', () => {
     const dstLesson = lesson('les_dst', 'crs_dst');
     const { service, calls } = harness({ attachments: [srcLesson, dstLesson] });
 
-    let thrown: unknown;
     try {
       await service.issueTicket({
         user: ACTOR_STUDENT,
@@ -185,8 +183,8 @@ describe('shared video entitlement', () => {
         integritySuspect: false,
         manifest: REJECTED,
       } as never);
-    } catch (e) {
-      thrown = e;
+    } catch {
+      // The refusal itself is not this test's subject; the recorded lesson is.
     }
 
     expect(calls.tickets[0]).toMatchObject({ lessonId: 'les_dst', courseId: 'crs_dst' });

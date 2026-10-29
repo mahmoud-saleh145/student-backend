@@ -110,7 +110,7 @@ export class AnnouncementsService {
     return announcement;
   }
 
-  async update(id: string, input: Partial<AnnouncementInput>, actor: { id: string }) {
+  async update(id: string, input: Partial<AnnouncementInput>, _actor: { id: string }) {
     const existing = await this.prisma.announcement.findUnique({ where: { id } });
     if (!existing) throw AppException.notFound('Announcement', id);
 

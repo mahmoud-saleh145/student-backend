@@ -216,7 +216,7 @@ describe('CourseAccessService.readableCourseIds', () => {
 
 describe('EnrollmentsService.list — teacher scoping', () => {
   it("confines the query to the teacher's own courses", async () => {
-    const { service, prisma, findMany, count } = buildEnrollments(TEACHER_A, ['crs_mine']);
+    const { service, findMany } = buildEnrollments(TEACHER_A, ['crs_mine']);
 
     await service.list({ actor: TEACHER_A, page: 1, pageSize: 20 });
 
@@ -227,7 +227,7 @@ describe('EnrollmentsService.list — teacher scoping', () => {
     // Teacher A asks for Teacher B's course by id. The scope is intersected, so
     // the query matches nothing. Deliberately not an error: telling "not yours"
     // apart from "does not exist" would itself be an existence oracle.
-    const { service, prisma, findMany, count } = buildEnrollments(TEACHER_A, ['crs_mine']);
+    const { service, findMany } = buildEnrollments(TEACHER_A, ['crs_mine']);
 
     await service.list({
       actor: TEACHER_A,
@@ -241,7 +241,7 @@ describe('EnrollmentsService.list — teacher scoping', () => {
 
   it('returns an empty page for a teacher assigned to nothing', async () => {
     // The dangerous case is `[]` being read as "no restriction".
-    const { service, prisma, findMany, count } = buildEnrollments(TEACHER_A, []);
+    const { service, prisma } = buildEnrollments(TEACHER_A, []);
 
     const result = (await service.list({
       actor: TEACHER_A,
@@ -257,7 +257,7 @@ describe('EnrollmentsService.list — teacher scoping', () => {
   it('keeps the scope when a search term narrows it further', async () => {
     // `q` matches name and phone — the PII oracle the audit flagged. It must be
     // applied *inside* the course scope, never instead of it.
-    const { service, prisma, findMany, count } = buildEnrollments(TEACHER_A, ['crs_mine']);
+    const { service, findMany } = buildEnrollments(TEACHER_A, ['crs_mine']);
 
     await service.list({ actor: TEACHER_A, page: 1, pageSize: 20, q: '0100' });
 
@@ -267,7 +267,7 @@ describe('EnrollmentsService.list — teacher scoping', () => {
   });
 
   it('keeps the scope regardless of paging', async () => {
-    const { service, prisma, findMany, count } = buildEnrollments(TEACHER_A, ['crs_mine']);
+    const { service, findMany } = buildEnrollments(TEACHER_A, ['crs_mine']);
 
     await service.list({ actor: TEACHER_A, page: 7, pageSize: 100 });
 
@@ -275,7 +275,7 @@ describe('EnrollmentsService.list — teacher scoping', () => {
   });
 
   it('keeps the scope when a section belonging to another course is named', async () => {
-    const { service, prisma, findMany, count } = buildEnrollments(TEACHER_A, ['crs_mine']);
+    const { service, findMany } = buildEnrollments(TEACHER_A, ['crs_mine']);
 
     await service.list({
       actor: TEACHER_A,
@@ -301,7 +301,7 @@ describe('EnrollmentsService.list — teacher scoping', () => {
     ['an admin', ADMIN],
     ['the master', MASTER],
   ])('leaves %s unrestricted', async (_label, actor) => {
-    const { service, prisma, findMany, count } = buildEnrollments(actor, []);
+    const { service, findMany } = buildEnrollments(actor, []);
 
     await service.list({ actor, page: 1, pageSize: 20 });
 
@@ -310,7 +310,7 @@ describe('EnrollmentsService.list — teacher scoping', () => {
   });
 
   it('still honours an admin courseId filter exactly as before', async () => {
-    const { service, prisma, findMany, count } = buildEnrollments(ADMIN, []);
+    const { service, findMany } = buildEnrollments(ADMIN, []);
 
     await service.list({ actor: ADMIN, page: 1, pageSize: 20, courseId: 'crs_x' });
 
@@ -324,7 +324,7 @@ describe('EnrollmentsService.list — teacher scoping', () => {
 
 describe('PaymentsService.listForAdmin — teacher scoping', () => {
   it("confines payments and totals to the teacher's revenue-permitted courses", async () => {
-    const { service, prisma, findMany, count, aggregate } = buildPayments(TEACHER_A, ['crs_mine']);
+    const { service, findMany, count, aggregate } = buildPayments(TEACHER_A, ['crs_mine']);
 
     await service.listForAdmin({ actor: TEACHER_A, page: 1, pageSize: 20 });
 
@@ -336,7 +336,7 @@ describe('PaymentsService.listForAdmin — teacher scoping', () => {
   });
 
   it('reports zero totals rather than platform totals for an unassigned teacher', async () => {
-    const { service, prisma, findMany, count, aggregate } = buildPayments(TEACHER_A, []);
+    const { service, prisma } = buildPayments(TEACHER_A, []);
 
     const result = (await service.listForAdmin({
       actor: TEACHER_A,
@@ -349,7 +349,7 @@ describe('PaymentsService.listForAdmin — teacher scoping', () => {
   });
 
   it('matches nothing when a teacher names a course outside their scope', async () => {
-    const { service, prisma, findMany, count, aggregate } = buildPayments(TEACHER_A, ['crs_mine']);
+    const { service, findMany, count, aggregate } = buildPayments(TEACHER_A, ['crs_mine']);
 
     await service.listForAdmin({
       actor: TEACHER_A,
@@ -364,7 +364,7 @@ describe('PaymentsService.listForAdmin — teacher scoping', () => {
   it('gives a teacher with canViewRevenue off nothing, despite canViewStudents', async () => {
     // The exact control /admin/payments used to bypass: this teacher may see
     // students on crs_mine but not its money.
-    const { service, prisma, findMany, count, aggregate } = buildPayments(TEACHER_A, []);
+    const { service, prisma } = buildPayments(TEACHER_A, []);
 
     // Rebuild with students-only permission on one course.
     const access = accessWith([
@@ -398,7 +398,7 @@ describe('PaymentsService.listForAdmin — teacher scoping', () => {
     ['an admin', ADMIN],
     ['the master', MASTER],
   ])('leaves %s unrestricted', async (_label, actor) => {
-    const { service, prisma, findMany, count, aggregate } = buildPayments(actor, []);
+    const { service, findMany, count, aggregate } = buildPayments(actor, []);
 
     await service.listForAdmin({ actor, page: 1, pageSize: 20 });
 

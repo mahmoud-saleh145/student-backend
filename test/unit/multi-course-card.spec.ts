@@ -1,4 +1,4 @@
-import { ContentStatus, CourseStatus, EnrollmentMethod, UserRole } from '@prisma/client';
+import { CourseStatus, EnrollmentMethod, UserRole } from '@prisma/client';
 
 import { EnrollmentsService } from '../../src/modules/enrollments/enrollments.service';
 

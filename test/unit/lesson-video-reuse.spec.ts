@@ -162,7 +162,7 @@ describe('LessonVideoService.attach', () => {
 
 describe('LessonVideoService.propagateDurationToAttachedLessons', () => {
   it('writes the duration to EVERY attached lecture, not just the owner', async () => {
-    const { service, prisma, courses } = harness({
+    const { service, prisma } = harness({
       links: [
         { lessonId: 'les_a', courseId: 'crs_a' },
         { lessonId: 'les_b', courseId: 'crs_b' },

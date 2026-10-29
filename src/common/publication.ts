@@ -96,7 +96,7 @@ export function isCourseAcquirable(input: {
 /** Throws unless a course may be newly acquired. */
 export function assertCourseAcquirable(
   input: { status: CourseStatus | null | undefined; deletedAt?: Date | null },
-  id?: string,
+  _id?: string,
 ): void {
   if (!isCourseAcquirable(input)) {
     throw new AppException(ErrorCode.COURSE_NOT_AVAILABLE, {

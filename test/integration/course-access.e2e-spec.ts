@@ -454,9 +454,11 @@ describe('course access', () => {
     ])('%s %s', async (method, path) => {
       const { session } = await scenario();
 
-      const response = await (http(app) as never as Record<string, Function>)[
-        method.toLowerCase()
-      ](`${API}${path}`).set(session.headers);
+      const verb = http(app) as never as Record<
+        string,
+        (url: string) => { set(headers: Record<string, string>): Promise<{ status: number }> }
+      >;
+      const response = await verb[method.toLowerCase()](`${API}${path}`).set(session.headers);
 
       expect(response.status).toBeGreaterThanOrEqual(403);
     });
