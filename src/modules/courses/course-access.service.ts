@@ -82,17 +82,23 @@ export class CourseAccessService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly settings: PlatformSettingsService,
-    private readonly config: ConfigService,
+    // Kept in the constructor signature so existing call sites and test
+    // doubles keep compiling; no payment configuration is read any more.
+    _config: ConfigService,
   ) {}
 
   /**
-   * Whether online payment is live.
+   * Whether online payment is live: permanently false.
    *
-   * `payment.provider` ships as 'none'. Nothing about the payment
-   * implementation is removed — the module, the Payment rows, the webhook
-   * handlers and the provider clients are all intact and untouched — it is
-   * simply not offered while no provider is configured. Turning it back on is
-   * setting PAYMENT_PROVIDER, not restoring code.
+   * Owner decision (2026-10-30, Phase 6 §4.1): there are no online payments
+   * in Student Center, in any application or on any platform. This is no
+   * longer a configuration read — PAYMENT_PROVIDER is locked to 'none' in
+   * env.validation.ts AND this getter is hard-coded, so neither a stray
+   * environment variable nor a config override can re-offer checkout.
+   * Historical Payment rows and the offline admin-confirmation flow are
+   * untouched. Re-enabling online payment is an owner decision requiring a
+   * code change here, in env.validation.ts, in PaymentsService.buildCheckoutUrl
+   * and in PaymentWebhookService.
    *
    * Filtering HERE rather than in the app is deliberate: the client renders
    * exactly the methods this list contains, so a single server-side answer
@@ -100,7 +106,7 @@ export class CourseAccessService {
    * disagreeing about whether a checkout exists.
    */
   private get onlinePaymentEnabled(): boolean {
-    return (this.config.get<string>('payment.provider') ?? 'none') !== 'none';
+    return false;
   }
 
   // ---------------------------------------------------------------------------

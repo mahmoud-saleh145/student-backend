@@ -162,6 +162,19 @@ describe('the boot-time environment contract', () => {
       expect(() => validate({ RUN_WORKERS: 'false' })).not.toThrow();
     });
 
+    it('refuses PAYMENT_PROVIDER=paymob — online payments are abolished (Phase 6 §4.1)', () => {
+      expect(() => validate({ PAYMENT_PROVIDER: 'paymob' })).toThrow(/PAYMENT_PROVIDER/);
+    });
+
+    it('refuses PAYMENT_PROVIDER=stripe for the same reason', () => {
+      expect(() => validate({ PAYMENT_PROVIDER: 'stripe' })).toThrow(/PAYMENT_PROVIDER/);
+    });
+
+    it('accepts only PAYMENT_PROVIDER=none, the offline flow', () => {
+      expect(() => validate({ PAYMENT_PROVIDER: 'none' })).not.toThrow();
+      expect(validate().PAYMENT_PROVIDER).toBe('none');
+    });
+
     it('does not let a truthy ENABLE_SWAGGER widen the opt-in', () => {
       // main.ts compares against the exact string 'true'.
       expect(() => validate({ ENABLE_SWAGGER: '1' })).toThrow(/ENABLE_SWAGGER/);

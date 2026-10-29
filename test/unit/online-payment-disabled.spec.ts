@@ -3,19 +3,17 @@ import { CourseStatus, EnrollmentMethod } from '@prisma/client';
 import { CourseAccessService } from '../../src/modules/courses/course-access.service';
 
 /**
- * Online payment, dormant.
+ * Online payment, permanently off.
  *
- * The requirement is precise and easy to satisfy the wrong way: hide the
- * online-payment flow for now, and keep the implementation so it can be turned
- * back on. Deleting the code would satisfy the first half and destroy the
- * second. Hiding it in the mobile app would satisfy neither properly — the app
- * renders exactly the methods this service advertises, so any other client,
- * and the enrolment endpoint itself, would still offer a checkout that cannot
- * complete.
- *
- * So the switch is one server-side read of `payment.provider`, which ships as
- * 'none'. These tests pin both directions, because a flag that cannot be
- * turned back on is just a deletion with extra steps.
+ * Owner decision (2026-10-30, Phase 6 §4.1): there are no online payments in
+ * Student Center, in any application or on any platform. This spec used to pin
+ * both directions of a `payment.provider` switch; the switch is gone. The
+ * getter is hard-coded false, PAYMENT_PROVIDER is locked to 'none' at boot
+ * (env-validation.spec.ts pins that), and these tests pin that no
+ * configuration value — not even one that names a provider — can bring the
+ * PAYMENT method back. The implementation is still not deleted: Payment rows,
+ * the offline admin-confirmation flow and the enrolment contract are intact,
+ * and no-online-payments.spec.ts covers the rest of the surface.
  */
 
 function build(provider: string) {
@@ -65,9 +63,10 @@ describe('with no payment provider configured', () => {
   });
 
   it('leaves CODE as the way to finish a part-paid enrolment', async () => {
-    // PENDING_PAYMENT used to offer PAYMENT or CODE. With no provider that
-    // must not collapse to nothing, or a student stuck mid-payment has no
-    // route forward.
+    // PENDING_PAYMENT used to offer PAYMENT or CODE. With online payment gone
+    // that must not collapse to nothing, or a student stuck mid-payment has no
+    // route forward: the admin confirms the offline payment, or the student
+    // redeems a code.
     expect(methodsFor('none', ALL, 'PENDING_PAYMENT')).toEqual([EnrollmentMethod.CODE]);
   });
 
@@ -79,20 +78,25 @@ describe('with no payment provider configured', () => {
   });
 });
 
-describe('the moment a provider is configured', () => {
-  it('PAYMENT is offered again, with no code change', async () => {
-    // The point of the whole approach. If this test needed the payment module
-    // restored to pass, the implementation had been deleted rather than
-    // hidden.
-    expect(methodsFor('paymob', ALL)).toContain(EnrollmentMethod.PAYMENT);
-    expect(methodsFor('stripe', ALL)).toContain(EnrollmentMethod.PAYMENT);
+describe('even if a provider value somehow reaches the config', () => {
+  // Inverted on 2026-10-30 (Phase 6 §4.1). This block used to prove the
+  // opposite — that setting PAYMENT_PROVIDER brought PAYMENT back with no code
+  // change. The owner's decision is that no configuration may ever do that, so
+  // the same probe now pins the refusal. env.validation.ts already rejects
+  // these values at boot; this is the second, independent barrier.
+  it('PAYMENT is still not offered', async () => {
+    expect(methodsFor('paymob', ALL)).not.toContain(EnrollmentMethod.PAYMENT);
+    expect(methodsFor('stripe', ALL)).not.toContain(EnrollmentMethod.PAYMENT);
+    expect(methodsFor('paymob', ALL)).toEqual([
+      EnrollmentMethod.FREE,
+      EnrollmentMethod.CODE,
+      EnrollmentMethod.ADMIN_APPROVAL,
+    ]);
   });
 
-  it('and a part-paid enrolment can retry the payment', async () => {
-    expect(methodsFor('paymob', ALL, 'PENDING_PAYMENT')).toEqual([
-      EnrollmentMethod.PAYMENT,
-      EnrollmentMethod.CODE,
-    ]);
+  it('a part-paid enrolment still gets CODE only, never a payment retry', async () => {
+    expect(methodsFor('paymob', ALL, 'PENDING_PAYMENT')).toEqual([EnrollmentMethod.CODE]);
+    expect(methodsFor('stripe', ALL, 'PENDING_PAYMENT')).toEqual([EnrollmentMethod.CODE]);
   });
 });
 

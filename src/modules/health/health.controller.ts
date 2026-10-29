@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 
 import { Public } from '../../common/decorators/public.decorator';
+import { MasterOnly } from '../../common/decorators/roles.decorator';
 import type { AppConfig, StorageConfig } from '../../config/configuration';
 import {
   readWorkerHeartbeat,
@@ -72,8 +73,14 @@ export class HealthController {
   }
 
   @Get('health/deep')
-  @Public()
-  @ApiOperation({ summary: 'Full dependency report' })
+  // Owner decision (2026-10-30, Phase 6 §6): the deep report names internal
+  // dependencies (Redis, storage, worker heartbeat, video-pipeline counts), so
+  // it is MASTER-only. ADMIN, TEACHER, STUDENT and anonymous callers get the
+  // standard authorization refusal. External monitors use GET meta/health,
+  // which stays public and minimal; the worker's own liveness is read from the
+  // Redis heartbeat by scripts/healthcheck.ts, not from this route.
+  @MasterOnly()
+  @ApiOperation({ summary: 'Full dependency report (MASTER only)' })
   async deep() {
     const [database, redis, storage, worker, videoCounts, lastSweep, lastSweepFailure] = await Promise.all([
       this.prisma.ping(),

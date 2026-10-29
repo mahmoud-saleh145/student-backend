@@ -40,6 +40,16 @@ export class PaymentWebhookService {
   }
 
   async handlePaymob(body: Record<string, unknown>, hmac: string, _rawBody?: Buffer) {
+    // Owner decision (2026-10-30, Phase 6 §4.1): online payments are disabled
+    // platform-wide and PAYMENT_PROVIDER is locked to 'none', so no provider
+    // webhook is ever legitimate. Refuse before reading the payload. The
+    // handler body below is preserved as documented history of the old
+    // integration and as the verification path should the owner ever reverse
+    // the decision.
+    if (this.cfg.provider !== 'paymob') {
+      this.logger.warn('Paymob webhook received while online payments are disabled');
+      throw new AppException(ErrorCode.FORBIDDEN, { message: 'Webhook not configured' });
+    }
     if (!this.cfg.paymob.hmacSecret) {
       this.logger.error('Paymob webhook received but PAYMOB_HMAC_SECRET is not set');
       throw new AppException(ErrorCode.FORBIDDEN, { message: 'Webhook not configured' });
@@ -122,6 +132,11 @@ export class PaymentWebhookService {
   }
 
   async handleStripe(body: Record<string, unknown>, signature: string, _rawBody?: Buffer) {
+    // Phase 6 §4.1: same platform-wide refusal as handlePaymob above.
+    if (this.cfg.provider !== 'stripe') {
+      this.logger.warn('Stripe webhook received while online payments are disabled');
+      throw new AppException(ErrorCode.FORBIDDEN, { message: 'Webhook not configured' });
+    }
     if (!this.cfg.stripe.webhookSecret) {
       throw new AppException(ErrorCode.FORBIDDEN, { message: 'Webhook not configured' });
     }

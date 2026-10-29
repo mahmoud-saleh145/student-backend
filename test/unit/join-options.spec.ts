@@ -239,14 +239,17 @@ describe('the enrolment methods the sheet may render', () => {
     expect(out.enrollmentMethods).toEqual([EnrollmentMethod.CODE]);
   });
 
-  it('include it again once one is', async () => {
+  it('exclude PAYMENT even if a provider value reaches the config (Phase 6 §4.1)', async () => {
+    // Inverted on 2026-10-30: this test used to prove PAYMENT came back once a
+    // provider was configured. The owner's decision is that no online payment
+    // exists on any platform, so the same setup now pins the refusal.
     const { service } = build({
       provider: 'paymob',
       enrollmentMethods: [EnrollmentMethod.CODE, EnrollmentMethod.PAYMENT],
     });
 
     const out = await service.joinOptions('crs_1', 'usr_1');
-    expect(out.enrollmentMethods).toContain(EnrollmentMethod.PAYMENT);
+    expect(out.enrollmentMethods).toEqual([EnrollmentMethod.CODE]);
   });
 
   it('carry FREE for a free course, so one tap can join it', async () => {

@@ -177,41 +177,25 @@ export class PaymentsService {
   }
 
   /**
-   * Provider hand-off.
+   * Provider hand-off: permanently disabled.
    *
-   * With PAYMENT_PROVIDER=none the platform runs a manual flow: the payment
-   * stays PENDING and an administrator confirms it after receiving the money
-   * (bank transfer, cash at the centre — how these platforms usually operate
-   * before card processing is live). Returning null tells the client there is
-   * no external page to open.
-   *
-   * The real provider call belongs here; the surrounding contract does not
-   * change when it is added.
+   * Owner decision (2026-10-30, Phase 6 §4.1): there are no online payments
+   * in Student Center. This method used to build a Paymob/Stripe checkout URL
+   * when a provider was configured; it now returns null unconditionally, so a
+   * payment created by the enrolment flow always stays PENDING with no
+   * external page to open, and an administrator confirms it after receiving
+   * the money through the approved offline process (POST
+   * admin/payments/:id/confirm). PAYMENT_PROVIDER is also locked to 'none' in
+   * env.validation.ts, so this is defence in depth, not the only barrier.
+   * Historical Payment rows, the capture/refund paths and the admin flow are
+   * untouched.
    */
   private async buildCheckoutUrl(
-    paymentId: string,
+    _paymentId: string,
     _currency: string,
     _amount: number,
   ): Promise<string | null> {
-    switch (this.cfg.provider) {
-      case 'paymob':
-        if (!this.cfg.paymob.apiKey) {
-          this.logger.warn('PAYMENT_PROVIDER=paymob but PAYMOB_API_KEY is empty');
-          return null;
-        }
-        // See docs/MANUAL_STEPS.md §Payments for the exact call sequence.
-        return `https://accept.paymob.com/api/acceptance/iframes/${this.cfg.paymob.iframeId}?payment_token=PENDING_${paymentId}`;
-
-      case 'stripe':
-        if (!this.cfg.stripe.secretKey) {
-          this.logger.warn('PAYMENT_PROVIDER=stripe but STRIPE_SECRET_KEY is empty');
-          return null;
-        }
-        return null;
-
-      default:
-        return null;
-    }
+    return null;
   }
 
   // ---------------------------------------------------------------------------

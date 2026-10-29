@@ -295,7 +295,13 @@ export class EnvironmentVariables {
   GUMLET_HTTP_TIMEOUT_MS = 5000;
 
   // --- payments -------------------------------------------------------------
-  @IsString() PAYMENT_PROVIDER = 'none';
+  // Owner decision (2026-10-30, Phase 6 §4.1): there are no online payments in
+  // Student Center, on any platform. 'none' is the only accepted value — an
+  // environment that sets paymob/stripe fails validation at boot instead of
+  // silently re-enabling checkout. Reverting this is an owner decision, not a
+  // deploy-time toggle. The PAYMOB_*/STRIPE_* variables below stay declared so
+  // historical configuration documents remain parseable; they are inert.
+  @IsIn(['none']) PAYMENT_PROVIDER = 'none';
   @IsString() PAYMENT_CURRENCY = 'EGP';
   @IsString() PAYMENT_RETURN_URL = 'eduplatform://payment/return';
   @IsOptional() @IsString() PAYMOB_API_KEY?: string;
