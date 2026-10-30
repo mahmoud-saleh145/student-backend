@@ -531,6 +531,20 @@ export class AccountDeletionService {
    * the hold), and the administrator must be able to identify the person they
    * are settling with. The LIVE wallet balance is the authoritative amount;
    * `outstandingAmount` is what the sweep saw when it placed the hold.
+   *
+   * WALLET BALANCE IS NOT AUTOMATICALLY MONEY OWED. The balance is prepaid
+   * credit, and its ledger records how each pound got in: a recharge card the
+   * student paid cash for is a real liability; an administrative or goodwill
+   * credit may not be. Eligibility is an administrative decision, so each row
+   * carries `ledger` — the lifetime credit and debit totals by type — to make
+   * that decision with. The flow for a partially eligible balance is
+   * DECOMPOSE, NOT PARTIAL-SETTLE: first remove the non-refundable portion
+   * with the audited wallet adjustment (its own ADMIN_ADJUSTMENT ledger line,
+   * with the reason), then confirm the settlement for the remaining balance
+   * (its own REFUND line, with the method and reference). Every pound of the
+   * cleared balance therefore ends in exactly one explicit, typed, reasoned
+   * ledger entry — which is why confirmSettlement refuses any amount other
+   * than the full current balance.
    */
   async listPendingSettlements() {
     const rows = await this.prisma.accountDeletionRequest.findMany({
@@ -545,9 +559,37 @@ export class AccountDeletionService {
         scheduledFor: true,
         settlementRequiredAt: true,
         outstandingAmount: true,
-        user: { select: { fullName: true, phone: true, wallet: { select: { balance: true } } } },
+        user: {
+          select: {
+            fullName: true,
+            phone: true,
+            wallet: { select: { id: true, balance: true } },
+          },
+        },
       },
     });
+
+    // Lifetime ledger totals per wallet, split by type and direction, so the
+    // administrator can see how the balance arose (recharge cards vs
+    // administrative credit) before deciding what is actually owed.
+    const walletIds = rows
+      .map((r) => r.user.wallet?.id)
+      .filter((id): id is string => typeof id === 'string');
+    const sums = walletIds.length
+      ? await this.prisma.walletTransaction.groupBy({
+          by: ['walletId', 'type', 'direction'],
+          where: { walletId: { in: walletIds } },
+          _sum: { amount: true },
+        })
+      : [];
+    const ledgerByWallet = new Map<string, { credits: Record<string, number>; debits: Record<string, number> }>();
+    for (const row of sums) {
+      const entry = ledgerByWallet.get(row.walletId) ?? { credits: {}, debits: {} };
+      const bucket = row.direction === 'CREDIT' ? entry.credits : entry.debits;
+      bucket[row.type] = Number(row._sum.amount ?? 0);
+      ledgerByWallet.set(row.walletId, entry);
+    }
+
     return rows.map((r) => ({
       id: r.id,
       userId: r.userId,
@@ -557,6 +599,7 @@ export class AccountDeletionService {
       settlementRequiredAt: r.settlementRequiredAt?.toISOString() ?? null,
       outstandingAmount: r.outstandingAmount === null ? 0 : Number(r.outstandingAmount),
       currentBalance: r.user.wallet ? Number(r.user.wallet.balance) : 0,
+      ledger: (r.user.wallet && ledgerByWallet.get(r.user.wallet.id)) ?? { credits: {}, debits: {} },
       fullName: r.user.fullName,
       phone: r.user.phone,
     }));
@@ -576,6 +619,14 @@ export class AccountDeletionService {
    * outright duplicate confirmation. A zero balance (drained through the
    * audited adjustment flow after the hold) is confirmed with amount 0 and no
    * ledger line — there is nothing to move. Erasure resumes at the next sweep.
+   *
+   * PARTIAL SETTLEMENTS ARE REJECTED ON PURPOSE. A partial would leave money
+   * in the wallet with no record of why the remainder was not owed, and the
+   * erase guard would (correctly) keep blocking. When only part of the
+   * balance is actually owed — say an administrative goodwill credit is not
+   * refundable — the administrator first removes that portion with the
+   * audited wallet adjustment (ADMIN_ADJUSTMENT, with a reason), then settles
+   * the remainder here. The decomposition is the audit trail.
    */
   async confirmSettlement(
     requestId: string,

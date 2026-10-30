@@ -78,7 +78,7 @@ export class AccountDeletionAdminController {
   @ApiOperation({
     summary: 'Deletion requests holding for physical settlement (wallet not empty)',
     description:
-      'Unlike the attention list, these rows include the holder\'s name and phone: nothing has been erased yet, and the administrator must identify the person to settle with. The live wallet balance is the authoritative amount.',
+      "Unlike the attention list, these rows include the holder's name and phone: nothing has been erased yet, and the administrator must identify the person to settle with. The live wallet balance is the authoritative amount to clear — but not automatically the amount owed: each row carries the lifetime ledger totals by type, and any non-refundable portion (e.g. an administrative goodwill credit) is removed first through the audited wallet adjustment before the remainder is settled here.",
   })
   settlements() {
     return this.deletion.listPendingSettlements();
@@ -90,7 +90,7 @@ export class AccountDeletionAdminController {
   @ApiOperation({
     summary: 'Confirm that the remaining balance was settled physically outside the app',
     description:
-      'The stated amount must equal the current wallet balance. Records a REFUND ledger transaction with the actor, method and reference; refuses a duplicate confirmation; erasure resumes at the next sweep.',
+      'The stated amount must equal the current wallet balance — partial settlements are rejected on purpose (remove any non-refundable portion first via the audited wallet adjustment, so every pound ends in one explicit ledger line). Records a REFUND/ADMIN ledger debit with the actor, offline method and reference; refuses a duplicate confirmation; no online refund is performed or implied. Erasure resumes at the next sweep.',
   })
   confirmSettlement(
     @Param('id') id: string,

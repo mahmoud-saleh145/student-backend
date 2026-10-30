@@ -114,6 +114,10 @@ function build(opts: { password?: boolean; open?: Row | null } = {}) {
       count: jest.fn(async () => 0),
     },
     wallet: { findUnique: jest.fn(async (): Promise<{ balance: unknown } | null> => null) },
+    // Lifetime ledger totals for the settlements list. Read-only.
+    walletTransaction: {
+      groupBy: jest.fn(async (): Promise<unknown[]> => []),
+    },
     $transaction: jest.fn(async (fn: (t: typeof tx) => unknown) => fn(tx)),
   };
   const passwords = { verify: jest.fn(async () => opts.password ?? true) };
@@ -976,7 +980,7 @@ describe('settlement before erasure (Phase 6 §4.2)', () => {
     expect(h.audit.recordTx).toHaveBeenCalled();
   });
 
-  it('the settlement list carries minimal identity, both amounts, and nothing else', async () => {
+  it('the settlement list carries minimal identity, both amounts, the ledger breakdown, and nothing else', async () => {
     const h = build();
     h.prisma.accountDeletionRequest.findMany.mockResolvedValueOnce([
       {
@@ -987,8 +991,19 @@ describe('settlement before erasure (Phase 6 §4.2)', () => {
         scheduledFor: new Date(),
         settlementRequiredAt: new Date(),
         outstandingAmount: '150.00',
-        user: { fullName: 'Ahmed Mohamed', phone: '01001234567', wallet: { balance: '140.00' } },
+        user: {
+          fullName: 'Ahmed Mohamed',
+          phone: '01001234567',
+          wallet: { id: 'wal_1', balance: '140.00' },
+        },
       },
+    ] as never);
+    // How the balance arose: 120 from recharge cards (real cash in), 50 from
+    // an administrative credit, 30 spent in the library.
+    h.prisma.walletTransaction.groupBy.mockResolvedValueOnce([
+      { walletId: 'wal_1', type: 'CREDIT_RECHARGE', direction: 'CREDIT', _sum: { amount: '120.00' } },
+      { walletId: 'wal_1', type: 'ADMIN_ADJUSTMENT', direction: 'CREDIT', _sum: { amount: '50.00' } },
+      { walletId: 'wal_1', type: 'PURCHASE', direction: 'DEBIT', _sum: { amount: '30.00' } },
     ] as never);
 
     const [item] = await h.service.listPendingSettlements();
@@ -997,6 +1012,7 @@ describe('settlement before erasure (Phase 6 §4.2)', () => {
         'currentBalance',
         'fullName',
         'id',
+        'ledger',
         'outstandingAmount',
         'phone',
         'requestedAt',
@@ -1006,12 +1022,39 @@ describe('settlement before erasure (Phase 6 §4.2)', () => {
         'userId',
       ].sort(),
     );
-    // The live balance is the authoritative amount; the hold amount is context.
-    expect(item).toMatchObject({ outstandingAmount: 150, currentBalance: 140, fullName: 'Ahmed Mohamed' });
+    // The live balance is the amount to CLEAR; the ledger breakdown is what
+    // tells the administrator how much of it is actually owed (a wallet
+    // balance is not automatically a refund liability).
+    expect(item).toMatchObject({
+      outstandingAmount: 150,
+      currentBalance: 140,
+      fullName: 'Ahmed Mohamed',
+      ledger: {
+        credits: { CREDIT_RECHARGE: 120, ADMIN_ADJUSTMENT: 50 },
+        debits: { PURCHASE: 30 },
+      },
+    });
     const where = (h.prisma.accountDeletionRequest.findMany.mock.calls.at(-1) as unknown as [
       { where: Record<string, unknown> },
     ])[0].where;
     expect(where).toEqual({ settlementRequiredAt: { not: null }, settledAt: null });
+    // The breakdown is a read: groupBy, never a write.
+    expect(Object.keys(h.prisma.walletTransaction)).toEqual(['groupBy']);
+  });
+
+  it('administrator recovery can never clear a settlement hold', async () => {
+    // retryFailed re-queues a FAILED erasure; it must not be a side door out
+    // of the settlement requirement. The update touches exactly the failure
+    // fields, and the due query (pinned above) excludes held requests whatever
+    // their failure state.
+    const h = build();
+    await h.service.retryFailed('del_1', ADMIN_ACTOR, 'Cause fixed, ticket SC-1', META);
+    const { where, data } = (h.prisma.accountDeletionRequest.updateMany.mock.calls[0] as unknown as [
+      { where: Record<string, unknown>; data: Record<string, unknown> },
+    ])[0];
+    expect(Object.keys(data).sort()).toEqual(['attempts', 'failedAt', 'lastError']);
+    expect(where).not.toHaveProperty('settlementRequiredAt');
+    expect(Object.keys(data)).not.toContain('settledAt');
   });
 
   it('both settlement endpoints are administrator-only, and the body is validated', async () => {
