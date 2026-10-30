@@ -22,3 +22,7 @@ _mirror-*.tgz
 # one-off, local-only maintenance scripts (run by hand on a developer machine,
 # never committed and never deployed)
 /scripts/one-off/
+
+# No trailing slash: also ignores a symlink named node_modules (a directory
+# pattern would not), which is how one was once committed by accident.
+node_modules
