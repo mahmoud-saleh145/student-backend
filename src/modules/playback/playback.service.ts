@@ -1229,7 +1229,12 @@ export class PlaybackService {
           courseId: ticket.courseId,
           sectionId: ticket.lesson.sectionId,
         });
-      } catch {
+      } catch (error) {
+        // Only an authorization decision revokes. A database or connection
+        // failure (Prisma P1001/P2024, a timeout) is not "access lost": it is
+        // rethrown unchanged so the request fails and the client retries on
+        // its next beat, with the ticket intact.
+        if (!(error instanceof AppException)) throw error;
         await this.revokeTicket(ticket.id, 'Section access lost mid-playback');
         await this.releaseStreamSlot(params.user.id, params.user.sessionId);
         return { ok: false, terminate: { reason: ErrorCode.NOT_ENROLLED } };
@@ -1308,7 +1313,12 @@ export class PlaybackService {
             integritySuspect: false,
             ip: params.ip,
           }));
-        } catch {
+        } catch (error) {
+          // Same rule as the section re-check: an authorization refusal
+          // (DEVICE_NOT_AUTHORIZED and the other device decisions) revokes
+          // below; an infrastructure failure is rethrown with the ticket
+          // intact.
+          if (!(error instanceof AppException)) throw error;
           deviceId = null;
         }
         if (!deviceId || (ticket.deviceId !== null && deviceId !== ticket.deviceId)) {

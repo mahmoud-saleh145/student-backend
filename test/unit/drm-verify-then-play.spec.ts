@@ -12,6 +12,8 @@
  * only if a successful verification genuinely produces a playable ticket.
  * Network calls (Gumlet asset API and the DASH manifest) are stubbed.
  */
+import { AppException } from '../../src/common/errors/app.exception';
+import { ErrorCode } from '../../src/common/errors/error-codes';
 import { DrmVerificationService } from '../../src/modules/playback/drm-verification.service';
 import { GumletDrmService } from '../../src/modules/playback/gumlet-drm.service';
 import { PlaybackService } from '../../src/modules/playback/playback.service';
@@ -587,8 +589,9 @@ describe('heartbeat hardening: expired grants, device, section scope, key system
   it('rotation from a device that is no longer authorised is refused', async () => {
     const w = world({
       row: verified,
+      // The real DevicesService throws AppException, never a bare Error.
       deviceResult: async () => {
-        throw Object.assign(new Error('DEVICE_NOT_AUTHORIZED'), { code: 'DEVICE_NOT_AUTHORIZED' });
+        throw new AppException(ErrorCode.DEVICE_NOT_AUTHORIZED);
       },
     });
     const res = await w.heartbeat(onSource, 5 * 1000);
@@ -598,13 +601,98 @@ describe('heartbeat hardening: expired grants, device, section scope, key system
   it('a section revoked mid-lesson terminates playback at the next beat', async () => {
     const w = world({ row: verified });
     w.access.assertSectionAccessible.mockImplementationOnce(async () => {
-      throw Object.assign(new Error('NOT_ENROLLED'), { code: 'NOT_ENROLLED' });
+      // The real CourseAccessService throws AppException, never a bare Error.
+      throw new AppException(ErrorCode.NOT_ENROLLED);
     });
     const res = await w.heartbeat(onSource, 10 * 60 * 1000);
     expect(res).toEqual({ ok: false, terminate: { reason: 'NOT_ENROLLED' } });
     expect(w.access.assertSectionAccessible).toHaveBeenCalledWith(
       expect.objectContaining({ courseId: 'crs_src', sectionId: 'sec_les_src' }),
     );
+    expect(w.ticketUpdates().some((u) => u.data.status === 'REVOKED')).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 6.6.1: an authorization DECISION revokes; an infrastructure FAILURE
+  // does not. Before this fix both re-checks caught every error, so a Prisma
+  // connection or pool-timeout error during one beat revoked an otherwise
+  // valid ticket and told the student they were not enrolled / not on an
+  // authorised device.
+  // -------------------------------------------------------------------------
+  describe('heartbeat re-checks: authorization decisions revoke, infrastructure failures do not', () => {
+    // Shapes Prisma actually throws: initialization (P1001, cannot reach the
+    // database) and a known request error (P2024, connection pool timeout).
+    const p1001 = Object.assign(new Error("Can't reach database server"), {
+      name: 'PrismaClientInitializationError',
+      code: 'P1001',
+    });
+    const p2024 = Object.assign(new Error('Timed out fetching a new connection from the pool'), {
+      name: 'PrismaClientKnownRequestError',
+      code: 'P2024',
+    });
+
+    it('section re-check: a P1001 is rethrown unchanged and the ticket is NOT revoked', async () => {
+      const w = world({ row: verified });
+      w.access.assertSectionAccessible.mockImplementationOnce(async () => {
+        throw p1001;
+      });
+      await expect(w.heartbeat(onSource, 10 * 60 * 1000)).rejects.toBe(p1001);
+      expect(w.ticketUpdates().some((u) => u.data.status === 'REVOKED')).toBe(false);
+    });
+
+    it('section re-check: a P2024 pool timeout is rethrown unchanged and the ticket is NOT revoked', async () => {
+      const w = world({ row: verified });
+      w.access.assertSectionAccessible.mockImplementationOnce(async () => {
+        throw p2024;
+      });
+      await expect(w.heartbeat(onSource, 10 * 60 * 1000)).rejects.toBe(p2024);
+      expect(w.ticketUpdates().some((u) => u.data.status === 'REVOKED')).toBe(false);
+      // Nothing was written for this beat either: no position, no watch time.
+      expect(w.prisma.watchEvent.create).not.toHaveBeenCalled();
+    });
+
+    it('section re-check: COURSE_NOT_TARGETED is still an authorization decision and revokes', async () => {
+      const w = world({ row: verified });
+      w.access.assertSectionAccessible.mockImplementationOnce(async () => {
+        throw new AppException(ErrorCode.COURSE_NOT_TARGETED);
+      });
+      const res = await w.heartbeat(onSource, 10 * 60 * 1000);
+      expect(res).toEqual({ ok: false, terminate: { reason: 'NOT_ENROLLED' } });
+      expect(w.ticketUpdates().some((u) => u.data.status === 'REVOKED')).toBe(true);
+    });
+
+    it('device re-check at rotation: a transient database error is rethrown, nothing revoked, nothing minted', async () => {
+      const w = world({
+        row: verified,
+        deviceResult: async () => {
+          throw p2024;
+        },
+      });
+      await expect(w.heartbeat(onSource, 5 * 1000)).rejects.toBe(p2024);
+      expect(w.ticketUpdates().some((u) => u.data.status === 'REVOKED')).toBe(false);
+      expect(w.tickets).toHaveLength(0);
+    });
+
+    it('device re-check at rotation: DEVICE_CHANGE_PENDING is still a decision and revokes as DEVICE_NOT_AUTHORIZED', async () => {
+      const w = world({
+        row: verified,
+        deviceResult: async () => {
+          throw new AppException(ErrorCode.DEVICE_CHANGE_PENDING);
+        },
+      });
+      const res = await w.heartbeat(onSource, 5 * 1000);
+      expect(res).toEqual({ ok: false, terminate: { reason: 'DEVICE_NOT_AUTHORIZED' } });
+      expect(w.ticketUpdates().some((u) => u.data.status === 'REVOKED')).toBe(true);
+    });
+
+    it('a healthy beat still records the position and watch time exactly as before', async () => {
+      const w = world({ row: verified });
+      const res = await w.heartbeat(onSource, 10 * 60 * 1000);
+      expect(res).toMatchObject({ ok: true });
+      expect(w.ticketUpdates().some((u) => u.data.status === 'REVOKED')).toBe(false);
+      expect(w.prisma.watchEvent.create).toHaveBeenCalledTimes(1);
+      expect(w.prisma.videoPlay.update).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('a FairPlay (iOS) grant rotates into FairPlay, not Widevine', async () => {
