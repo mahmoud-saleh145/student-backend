@@ -297,8 +297,14 @@ export class CoursePartsService {
     // pending-approval / pending-payment rows too, and treating those as
     // ownership told a student who had merely asked to join that they already
     // owned every part, so no part was offered for purchase.
+    //
+    // "Covers everything" includes the whole-course CARD buyers whose rows were
+    // written as a section snapshot before course cards granted the course
+    // live - the access engine is the one place that knows both shapes.
     const coversEverything =
-      enrollment?.coversAllSections === true && enrollment.state === EnrollmentState.ACTIVE;
+      enrollment?.state === EnrollmentState.ACTIVE &&
+      (enrollment.coversAllSections === true ||
+        (await this.access.holdsWholeCourse(userId, courseId)));
 
     return {
       courseId,
@@ -396,7 +402,9 @@ export class CoursePartsService {
 
     // Same rule as the parts list: only a LIVE whole-course enrollment owns it.
     const ownsWholeCourse =
-      enrollment?.coversAllSections === true && enrollment.state === EnrollmentState.ACTIVE;
+      enrollment?.state === EnrollmentState.ACTIVE &&
+      (enrollment.coversAllSections === true ||
+        (await this.access.holdsWholeCourse(userId, courseId)));
     const coursePrice = partsView.coursePrice;
 
     return {

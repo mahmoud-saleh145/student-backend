@@ -43,7 +43,7 @@ const expectInvalidCode = (run: () => unknown): void => {
 
 describe('resolveRedemptionScope', () => {
   describe('course codes', () => {
-    it('unlocks exactly the sections frozen at generation time', () => {
+    it('unlocks the whole course, not the section snapshot frozen at generation time', () => {
       const scope = resolveRedemptionScope(
         code({
           targetType: CodeTargetType.COURSE,
@@ -54,10 +54,13 @@ describe('resolveRedemptionScope', () => {
       );
 
       expect(scope.courseIds).toEqual(['course-1']);
-      expect(scope.sectionIds).toEqual(['sec-pre', 'sec-mid']);
+      // null is "every section": a course card buys the course, live. The
+      // snapshot used to be returned here, which froze whole-course buyers to
+      // the sections that existed when the card was printed.
+      expect(scope.sectionIds).toBeNull();
     });
 
-    it('does not unlock a section created after the code was issued', () => {
+    it('therefore also covers a section created after the code was issued', () => {
       const scope = resolveRedemptionScope(
         code({
           courseId: 'course-1',
@@ -66,8 +69,8 @@ describe('resolveRedemptionScope', () => {
         'course-1',
       );
 
-      // 'sec-post' was added later; it must not appear.
-      expect(scope.sectionIds).not.toContain('sec-post');
+      // No list at all, so a later 'sec-post' is covered along with the rest.
+      expect(scope.sectionIds).toBeNull();
     });
 
     it('refuses a course it was not issued for', () => {

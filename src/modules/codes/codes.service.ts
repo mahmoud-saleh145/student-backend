@@ -1418,11 +1418,20 @@ export function resolveRedemptionScope(
   return {
     targetType: CodeTargetType.COURSE,
     courseIds: [requestedCourseId],
-    // A course code covers the sections that existed when it was issued.
-    // No snapshot (legacy row, or a global code) means the whole course.
-    sectionIds:
-      grantedSectionIds.length > 0 && code.courseId === requestedCourseId
-        ? grantedSectionIds
-        : null,
+    // A course card buys the COURSE, live: every section it has now and every
+    // section added later. `null` is "all sections", which `grantAccess` records
+    // as `coversAllSections = true`.
+    //
+    // This used to hand back the card's `grantedSectionIds` snapshot, so a
+    // "whole course" buyer was in fact a section-scoped enrollment frozen to
+    // the sections that existed when the card was printed. A section added
+    // afterwards (a second lecturer's Pre-Mid section, say) was then invisible
+    // to every student who had bought the whole course, and the apps told them
+    // to "join the course" they already held. The snapshot stays on the card
+    // as a record of what was printed; it no longer limits what is granted.
+    // Enrollments written under the old rule are widened at read time by
+    // `CourseAccessService.allowedSectionIds`, which recognises a grant row
+    // that came from a COURSE card.
+    sectionIds: null,
   };
 }

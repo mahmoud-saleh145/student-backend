@@ -152,6 +152,17 @@ stays `false`, so a section added later **outside any part** must be bought.
 The student API reports `ownsAllParts: true` so the app can say "complete"
 without the backend giving away future content.
 
+## Whole-course cards buy the course, live
+
+A COURSE card redeems as the whole course (`coversAllSections = true`): every
+section the course has now and every section added later. Before 2026-11-04 a
+course card redeemed as the section snapshot frozen onto it at generation, so a
+whole-course buyer was really a section-scoped enrollment and never received a
+section added after the card was printed. Enrollments written under that rule
+are not rewritten: `allowedSectionIds()` treats any enrollment holding a grant
+written by a COURSE card as whole-course access on every read, and
+`holdsWholeCourse()` gives the parts view the same answer.
+
 ## Part ownership is live
 
 What a part holder may open is decided on every read by
