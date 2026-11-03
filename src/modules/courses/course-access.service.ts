@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
+  ContentStatus,
   CourseStatus,
   type Prisma,
   type Enrollment,
@@ -792,8 +793,31 @@ export class CourseAccessService {
    *
    * Returns `null` for "all of them", which is what every enrollment created
    * before section-scoped codes existed means and what every course-scoped
-   * grant still means. Only a SECTION code produces a restricted enrollment,
-   * and only then does this return an explicit list.
+   * grant still means. Only a SECTION or PART code produces a restricted
+   * enrollment, and only then does this return an explicit list.
+   *
+   * A restricted list is the union of two sources:
+   *
+   *   1. The explicit `enrollment_section_grants` rows — what a section card
+   *      or a part card unlocked at the moment it was redeemed.
+   *   2. Every live section of every part the student currently holds a live
+   *      `CoursePartEntitlement` for.
+   *
+   * The second source is what makes part ownership LIVE rather than a
+   * snapshot. The grant rows are frozen at redemption, so when an
+   * administrator later added a section to "Part 1 — Before Mid" (a second
+   * lecturer's Pre-Mid section), every student who had already bought Part 1
+   * kept seeing only the sections that existed on the day they redeemed: the
+   * dashboard showed the new section inside the part, the entitlement said
+   * they owned the part, and the lesson gate refused them. Owning a part means
+   * owning what the part contains now, so the live membership is consulted on
+   * every read. Access is only ever widened here — a grant row for a section
+   * that has since left the part still counts, as the student paid for it.
+   *
+   * Archived sections are left out, matching `sectionIdsOfPart`: withdrawn
+   * material is not sold and is not unlocked. Deactivated (`isActive: false`)
+   * parts are NOT left out: deactivation retires a part from sale without
+   * destroying what students already own.
    *
    * Callers must treat `null` and "restricted" differently rather than
    * flattening one into the other: an empty array is a real answer (a
@@ -813,7 +837,26 @@ export class CourseAccessService {
     });
 
     if (!enrollment || enrollment.coversAllSections) return null;
-    return enrollment.sectionGrants.map((grant) => grant.sectionId);
+
+    const partSections = await this.prisma.courseSection.findMany({
+      where: {
+        courseId,
+        deletedAt: null,
+        status: { not: ContentStatus.ARCHIVED },
+        part: {
+          deletedAt: null,
+          entitlements: { some: { userId, revokedAt: null } },
+        },
+      },
+      select: { id: true },
+    });
+
+    return Array.from(
+      new Set([
+        ...enrollment.sectionGrants.map((grant) => grant.sectionId),
+        ...partSections.map((section) => section.id),
+      ]),
+    );
   }
 
   /**
