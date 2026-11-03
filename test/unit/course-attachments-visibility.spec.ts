@@ -204,6 +204,8 @@ function build(rows: Record<string, unknown>[] = ROWS) {
   const access = {
     resolve: jest.fn(async () => ({ canAccessContent: true, hasAccess: true })),
     toCourseAccess: jest.fn(() => ({ hasAccess: true })),
+    // Whole-course access: the section scope is not what this file tests.
+    allowedSectionIds: jest.fn(async () => null),
   };
   const storage = { publicAssetUrl: jest.fn(async () => null) };
 

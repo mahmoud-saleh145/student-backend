@@ -147,11 +147,33 @@ records something withdrawn, not something held.
 
 ## "Eventually the complete course"
 
-Buying every part grants every section **that exists now**. `coversAllSections`
-stays `false`, so a section added later must be bought. This matches the existing
-access-code snapshot philosophy exactly: you get what you paid for. The student
-API reports `ownsAllParts: true` so the app can say "complete" without the
-backend giving away future content.
+Buying every part grants every section of every part. `coversAllSections`
+stays `false`, so a section added later **outside any part** must be bought.
+The student API reports `ownsAllParts: true` so the app can say "complete"
+without the backend giving away future content.
+
+## Part ownership is live
+
+What a part holder may open is decided on every read by
+`CourseAccessService.allowedSectionIds()`, and it is the **union** of:
+
+- the `enrollment_section_grants` rows written when the card was redeemed
+  (frozen, append-only — the student keeps what they paid for even if a
+  section later leaves the part), and
+- every live, non-archived section whose `partId` is a part the student holds
+  a live `course_part_entitlements` row for.
+
+The second half is what makes a section an administrator adds to a part
+**after** cards were sold reach existing holders immediately. Before 2026-11-03
+only the frozen rows were consulted, so a second lecturer's Pre-Mid section
+added to "Part 1 — Before Mid" was visible in the dashboard, counted as owned
+by the entitlement, and refused by the lesson gate for every student who had
+already redeemed a Part 1 card. No grant rows are back-filled; the live
+relationship is the source of truth, so nothing can drift.
+
+`GET /courses/:id` applies the same section scope to its `sections[].locked`
+flags as `GET /courses/:id/sections` does, so the outline the apps render
+agrees with the lesson, playback and attachment gates.
 
 A student who already holds the whole course (a pre-parts enrollment, or a
 course-wide code) reads as owning every part, so they are never invited to buy

@@ -335,6 +335,19 @@ export class CoursesService {
       includeUnpublished: Boolean(isStaff),
     });
 
+    // Section-scoped access, applied exactly as `sections()` below applies it.
+    //
+    // This endpoint is what the student web and the mobile app render the
+    // course outline from, and it used to lock sections on course-level
+    // access alone. A student holding one part (or one section card) saw every
+    // section of the course unlocked here, tapped a lecture in a section they
+    // did not hold, and was refused by the lesson gate — the outline and the
+    // gate disagreed. `null` is whole-course access and leaves the previous
+    // behaviour exactly as it was.
+    const allowedSections = params.userId
+      ? await this.access.allowedSectionIds(params.userId, course.id)
+      : null;
+
     const progressRows = params.userId
       ? await this.prisma.watchProgress.findMany({
           where: { userId: params.userId, courseId: course.id },
@@ -392,7 +405,12 @@ export class CoursesService {
       outcomes: course.outcomes,
       updatedAt: course.updatedAt.toISOString(),
       sections: sections.map((section) =>
-        toSection({ section, hasCourseAccess: hasAccess, progressByLesson }),
+        toSection({
+          section,
+          hasCourseAccess:
+            hasAccess && (allowedSections === null || allowedSections.includes(section.id)),
+          progressByLesson,
+        }),
       ),
       attachments: attachments.map((a) => toAttachment(a, hasAccess)),
       completionRule: {
