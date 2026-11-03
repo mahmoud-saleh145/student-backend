@@ -1,4 +1,4 @@
-import { ContentStatus } from '@prisma/client';
+import { CodeTargetType, ContentStatus } from '@prisma/client';
 
 import { CourseAccessService } from '../../src/modules/courses/course-access.service';
 import { CoursesService } from '../../src/modules/courses/courses.service';
@@ -232,5 +232,100 @@ describe('CoursesService.detail applies the section scope to locked flags', () =
 
     expect(t.access.allowedSectionIds).not.toHaveBeenCalled();
     expect(result.sections.every((s) => s.locked)).toBe(true);
+  });
+});
+
+describe('allowedSectionIds for a whole-course card bought under the old snapshot rule', () => {
+  function build(opts: {
+    coversAll?: boolean;
+    grants?: Array<{ sectionId: string; codeId: string | null }>;
+    partSections?: string[];
+    /** How many of the grant codes are COURSE cards THIS student redeemed. */
+    wholeCourseRedemptions?: number;
+  }) {
+    const redemptionCount = jest.fn(async (_args: unknown) => opts.wholeCourseRedemptions ?? 0);
+    const sectionFindMany = jest.fn(async (_args: unknown) =>
+      (opts.partSections ?? []).map((id) => ({ id })),
+    );
+    const prisma = {
+      enrollment: {
+        findUnique: jest.fn(async () => ({
+          id: 'enr_1',
+          coversAllSections: opts.coversAll ?? false,
+          sectionGrants: opts.grants ?? [],
+        })),
+      },
+      accessCodeRedemption: { count: redemptionCount },
+      courseSection: { findMany: sectionFindMany },
+    };
+    const service = new CourseAccessService(prisma as never, null as never, null as never);
+    service.targetingEnforced = false;
+    return { service, redemptionCount, sectionFindMany };
+  }
+
+  const courseCardGrants = [
+    { sectionId: 'sec_1', codeId: 'code_course' },
+    { sectionId: 'sec_2', codeId: 'code_course' },
+  ];
+
+  it('treats an enrollment holding grants from a redeemed COURSE card as the whole course', async () => {
+    const t = build({ grants: courseCardGrants, wholeCourseRedemptions: 1 });
+
+    expect(await t.service.allowedSectionIds('stu_1', 'crs_1')).toBeNull();
+    // Nothing else is consulted once the course is whole.
+    expect(t.sectionFindMany).not.toHaveBeenCalled();
+  });
+
+  it('binds the card to THIS student, THIS course and the COURSE target type', async () => {
+    const t = build({ grants: courseCardGrants, wholeCourseRedemptions: 1 });
+
+    await t.service.allowedSectionIds('stu_1', 'crs_1');
+
+    expect(t.redemptionCount).toHaveBeenCalledTimes(1);
+    expect(t.redemptionCount.mock.calls[0]![0]).toEqual({
+      where: {
+        userId: 'stu_1',
+        codeId: { in: ['code_course'] },
+        code: {
+          targetType: CodeTargetType.COURSE,
+          OR: [{ courseId: 'crs_1' }, { courseId: null }],
+        },
+      },
+    });
+  });
+
+  it('does not widen access when the student never redeemed the card the grant cites', async () => {
+    const t = build({ grants: courseCardGrants, wholeCourseRedemptions: 0 });
+
+    expect(await t.service.allowedSectionIds('stu_1', 'crs_1')).toEqual(['sec_1', 'sec_2']);
+  });
+
+  it('never consults cards for grants that carry no code id (admin grants)', async () => {
+    const t = build({ grants: [{ sectionId: 'sec_1', codeId: null }] });
+
+    expect(await t.service.allowedSectionIds('stu_1', 'crs_1')).toEqual(['sec_1']);
+    expect(t.redemptionCount).not.toHaveBeenCalled();
+  });
+
+  it('a section or part card (non-COURSE target) leaves the enrollment restricted', async () => {
+    // The double answers 0 because the where clause asks for COURSE cards only;
+    // the assertion above pins that clause, this one pins the consequence.
+    const t = build({
+      grants: [{ sectionId: 'sec_1', codeId: 'code_part' }],
+      partSections: ['sec_1', 'sec_3'],
+      wholeCourseRedemptions: 0,
+    });
+
+    expect(await t.service.allowedSectionIds('stu_1', 'crs_1')).toEqual(['sec_1', 'sec_3']);
+  });
+
+  it('holdsWholeCourse agrees with allowedSectionIds for both shapes of whole-course access', async () => {
+    expect(await build({ coversAll: true }).service.holdsWholeCourse('stu_1', 'crs_1')).toBe(true);
+    expect(
+      await build({ grants: courseCardGrants, wholeCourseRedemptions: 1 }).service.holdsWholeCourse('stu_1', 'crs_1'),
+    ).toBe(true);
+    expect(
+      await build({ grants: courseCardGrants, wholeCourseRedemptions: 0 }).service.holdsWholeCourse('stu_1', 'crs_1'),
+    ).toBe(false);
   });
 });

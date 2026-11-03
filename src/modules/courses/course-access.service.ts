@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
+  CodeTargetType,
   ContentStatus,
   CourseStatus,
   type Prisma,
@@ -832,11 +833,22 @@ export class CourseAccessService {
       select: {
         id: true,
         coversAllSections: true,
-        sectionGrants: { select: { sectionId: true } },
+        sectionGrants: { select: { sectionId: true, codeId: true } },
       },
     });
 
     if (!enrollment || enrollment.coversAllSections) return null;
+
+    // A whole-course card bought the course, not a list of sections. Course
+    // cards used to redeem as a section snapshot (see resolveRedemptionScope),
+    // which left every such student with `coversAllSections = false` and a grant
+    // per section that existed on the day the card was printed. Those rows are
+    // history, not a limit: an enrollment that holds any grant written by a
+    // COURSE card is whole-course access, live, like every other whole-course
+    // enrollment. No data is rewritten; the rule is applied on every read.
+    if (await this.grantedByWholeCourseCard(userId, courseId, enrollment.sectionGrants)) {
+      return null;
+    }
 
     const partSections = await this.prisma.courseSection.findMany({
       where: {
@@ -857,6 +869,65 @@ export class CourseAccessService {
         ...partSections.map((section) => section.id),
       ]),
     );
+  }
+
+  /**
+   * Whether the student's enrollment on this course is whole-course access:
+   * `coversAllSections`, or any grant written by a COURSE card (the pre-fix
+   * shape of a whole-course purchase). Says nothing about the enrollment's
+   * state or window - callers decide liveness with `decide()`.
+   */
+  async holdsWholeCourse(userId: string, courseId: string): Promise<boolean> {
+    const enrollment = await this.prisma.enrollment.findUnique({
+      where: { userId_courseId: { userId, courseId } },
+      select: { coversAllSections: true, sectionGrants: { select: { codeId: true } } },
+    });
+    if (!enrollment) return false;
+    if (enrollment.coversAllSections) return true;
+    return this.grantedByWholeCourseCard(userId, courseId, enrollment.sectionGrants);
+  }
+
+  /**
+   * True when any of these grant rows was written by a COURSE card that THIS
+   * student redeemed for THIS course.
+   *
+   * Three facts have to line up, and each comes from a different table:
+   *
+   *   1. the grant row names the card (`codeId`) - only `grantAccess` inside the
+   *      redemption transaction writes that column, admin grants leave it null;
+   *   2. the card is a whole-course card: `targetType = COURSE`, issued for this
+   *      course or for no course at all (a global card usable anywhere); and
+   *   3. this student holds a redemption record for that very card, written in
+   *      the same transaction as the grant. A grant row that merely cites a
+   *      course card (a hand-edited row, a card someone else redeemed) widens
+   *      nothing.
+   *
+   * The card's CURRENT status is deliberately not consulted: a card is
+   * single-use and reads EXHAUSTED the moment it is redeemed, and withdrawing
+   * access afterwards is an enrollment decision (`revokeEnrollment`, which also
+   * deletes the grant rows this reads), never a card-status edit.
+   */
+  private async grantedByWholeCourseCard(
+    userId: string,
+    courseId: string,
+    grants: { codeId: string | null }[],
+  ): Promise<boolean> {
+    const codeIds = Array.from(
+      new Set(grants.map((g) => g.codeId).filter((id): id is string => typeof id === 'string')),
+    );
+    if (codeIds.length === 0) return false;
+
+    const wholeCourseRedemptions = await this.prisma.accessCodeRedemption.count({
+      where: {
+        userId,
+        codeId: { in: codeIds },
+        code: {
+          targetType: CodeTargetType.COURSE,
+          OR: [{ courseId }, { courseId: null }],
+        },
+      },
+    });
+    return wholeCourseRedemptions > 0;
   }
 
   /**
