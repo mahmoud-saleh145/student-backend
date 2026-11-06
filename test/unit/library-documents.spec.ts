@@ -2,6 +2,7 @@ import { ContentStatus, UserRole } from '@prisma/client';
 
 import { ErrorCode } from '../../src/common/errors/error-codes';
 import { LibraryDocumentsService } from '../../src/modules/library/library-documents.service';
+import { openEligibility } from './helpers/library-eligibility-double';
 
 /**
  * Opening a library document.
@@ -44,12 +45,18 @@ function build(options: Options = {}) {
     pageCount: 42,
     isPreview: options.isPreview ?? false,
     status: options.partStatus ?? ContentStatus.PUBLISHED,
+    isActive: true,
     deletedAt: null,
     material: {
+      id: 'lm_1',
       title: 'Physics Revision Papers',
       status: options.materialStatus ?? ContentStatus.PUBLISHED,
       isActive: true,
       deletedAt: null,
+      universityId: 'uni_1',
+      facultyId: 'fac_1',
+      departmentScope: 'FACULTY',
+      departments: [],
     },
   };
 
@@ -91,6 +98,7 @@ function build(options: Options = {}) {
     storage as never,
     security as never,
     config as never,
+    openEligibility() as never,
   );
 
   return { service, prisma, signMediaUrl, assertAuthorizedForProtectedContent, record };
@@ -176,13 +184,15 @@ describe('without an entitlement', () => {
     expect(signMediaUrl).not.toHaveBeenCalled();
   });
 
-  it('refuses when the entitlement has been revoked', async () => {
+  it('refuses when the entitlement has been revoked, saying so (F4)', async () => {
+    // A revoked entitlement is never ownership. The student held it, so the
+    // specific code discloses nothing they did not already know.
     const { service, signMediaUrl } = build({
       entitlement: { id: 'le_1', revokedAt: new Date() },
     });
 
     await expect(open(service)).rejects.toMatchObject({
-      code: ErrorCode.PAYMENT_REQUIRED,
+      code: ErrorCode.LIBRARY_ENTITLEMENT_REVOKED,
     });
     expect(signMediaUrl).not.toHaveBeenCalled();
   });
@@ -224,14 +234,26 @@ describe('previews and staff', () => {
     expect(assertAuthorizedForProtectedContent).not.toHaveBeenCalled();
   });
 
-  it('lets staff read without an entitlement, so review is possible', async () => {
-    const { service, prisma } = build({ entitlement: null });
+  it('has no staff bypass: no entitlement means no ticket, whatever the role (B4)', async () => {
+    // The route is student-only; the service no longer carries a dead branch
+    // that would mint an OWNED (`lib_`) ticket without an entitlement.
+    const { service, prisma, signMediaUrl } = build({ entitlement: null });
 
-    const ticket = await open(service, UserRole.ADMIN);
+    await expect(open(service, UserRole.ADMIN)).rejects.toMatchObject({
+      code: ErrorCode.PAYMENT_REQUIRED,
+    });
+    expect(prisma.libraryEntitlement.findUnique).toHaveBeenCalled();
+    expect(signMediaUrl).not.toHaveBeenCalled();
+  });
 
-    expect(ticket.url).toBeTruthy();
-    // Staff skip the entitlement lookup entirely.
-    expect(prisma.libraryEntitlement.findUnique).not.toHaveBeenCalled();
+  it('signs an owned part as `lib_` and a preview as `libp_`', async () => {
+    const owned = build({ entitlement: { id: 'le_1', revokedAt: null } });
+    await open(owned.service);
+    expect(owned.signMediaUrl.mock.calls[0][0].ticketId).toBe('lib_lp_1');
+
+    const preview = build({ isPreview: true, entitlement: null });
+    await open(preview.service);
+    expect(preview.signMediaUrl.mock.calls[0][0].ticketId).toBe('libp_lp_1');
   });
 });
 

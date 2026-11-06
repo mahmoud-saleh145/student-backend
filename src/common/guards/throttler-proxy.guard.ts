@@ -1,6 +1,14 @@
-import { Injectable } from '@nestjs/common';
+import { type ExecutionContext, Inject, Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { ThrottlerGuard } from '@nestjs/throttler';
 import type { Request } from 'express';
+
+import type { PlaybackConfig } from '../../config/configuration';
+import {
+  EDGE_LIVENESS_ROUTE,
+  EDGE_SECRET_HEADER,
+  hasValidEdgeSecret,
+} from '../security/edge-liveness';
 
 /**
  * Rate-limit key resolution.
@@ -19,6 +27,27 @@ import type { Request } from 'express';
  */
 @Injectable()
 export class ThrottlerProxyGuard extends ThrottlerGuard {
+  @Inject(ConfigService) private readonly config!: ConfigService;
+
+  /**
+   * The media Worker, and only the media Worker, skips the throttle on the
+   * liveness route. Its probes all come from a few Cloudflare addresses, so one
+   * per-IP bucket would otherwise be shared by every reader, and a Library
+   * document fails closed on a 429. Anyone without the secret is counted.
+   */
+  protected override async shouldSkip(context: ExecutionContext): Promise<boolean> {
+    const isEdgeRoute = this.reflector.getAllAndOverride<boolean>(EDGE_LIVENESS_ROUTE, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (!isEdgeRoute) return false;
+    const request = context.switchToHttp().getRequest<Request>();
+    return hasValidEdgeSecret(
+      request.headers[EDGE_SECRET_HEADER],
+      this.config.get<PlaybackConfig>('playback')?.edgeLivenessSecret,
+    );
+  }
+
   protected override async getTracker(req: Request): Promise<string> {
     if (req.user?.id) return `user:${req.user.id}`;
 

@@ -146,7 +146,10 @@ export class MediaOriginController {
     // the last thirty seconds. The ticket may have been revoked, the device
     // unbound or the session ended since.
     if (tid) {
-      const { live } = await this.playback.ticketLiveness(tid, uid);
+      const { live } = await this.playback.ticketLiveness(tid, uid, {
+        sid: sid ?? null,
+        did: did ?? null,
+      });
       if (!live) {
         throw new AppException(ErrorCode.PLAYBACK_TICKET_EXPIRED, {
           message: 'ticket_revoked',

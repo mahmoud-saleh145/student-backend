@@ -16,7 +16,14 @@ import { PlaybackService } from '../../src/modules/playback/playback.service';
  * These tests pin both halves: the library branch validates the same rules
  * `issueTicket` applied when it minted the URL, and the video branch is
  * untouched.
+ *
+ * They run through `legacyProbe`, the account-wide answer the previous Worker
+ * gets during the rollout, because that is the branch with these session and
+ * device counts. The exact binding every other caller gets is pinned in
+ * library-ticket-binding.spec.ts.
  */
+
+const LEGACY = { legacyProbe: true };
 
 const USER_ID = 'usr_student';
 const PART_ID = 'lpart_1';
@@ -109,7 +116,7 @@ function build(options: Options = {}) {
 describe('library document tickets', () => {
   it('an entitled student on a live session and device is live', async () => {
     const { service } = build();
-    await expect(service.ticketLiveness(LIB_TICKET, USER_ID)).resolves.toEqual({
+    await expect(service.ticketLiveness(LIB_TICKET, USER_ID, LEGACY)).resolves.toEqual({
       live: true,
     });
   });
@@ -119,7 +126,7 @@ describe('library document tickets', () => {
     // was guaranteed to answer "revoked".
     const { service, playbackTicketFindFirst, libraryPartFindFirst } = build();
 
-    await service.ticketLiveness(LIB_TICKET, USER_ID);
+    await service.ticketLiveness(LIB_TICKET, USER_ID, LEGACY);
 
     expect(playbackTicketFindFirst).not.toHaveBeenCalled();
     const call = libraryPartFindFirst.mock.calls[0];
@@ -129,14 +136,14 @@ describe('library document tickets', () => {
 
   it('is not live without an entitlement', async () => {
     const { service } = build({ entitlement: null });
-    await expect(service.ticketLiveness(LIB_TICKET, USER_ID)).resolves.toEqual({
+    await expect(service.ticketLiveness(LIB_TICKET, USER_ID, LEGACY)).resolves.toEqual({
       live: false,
     });
   });
 
   it('is not live once the entitlement is revoked', async () => {
     const { service } = build({ entitlement: { revokedAt: new Date() } });
-    await expect(service.ticketLiveness(LIB_TICKET, USER_ID)).resolves.toEqual({
+    await expect(service.ticketLiveness(LIB_TICKET, USER_ID, LEGACY)).resolves.toEqual({
       live: false,
     });
   });
@@ -145,14 +152,14 @@ describe('library document tickets', () => {
     // Signing the student out must kill an already-minted URL; this is the
     // property the edge check exists for.
     const { service } = build({ activeSessions: 0 });
-    await expect(service.ticketLiveness(LIB_TICKET, USER_ID)).resolves.toEqual({
+    await expect(service.ticketLiveness(LIB_TICKET, USER_ID, LEGACY)).resolves.toEqual({
       live: false,
     });
   });
 
   it('is not live when the account has no authorised device', async () => {
     const { service } = build({ activeDevices: 0 });
-    await expect(service.ticketLiveness(LIB_TICKET, USER_ID)).resolves.toEqual({
+    await expect(service.ticketLiveness(LIB_TICKET, USER_ID, LEGACY)).resolves.toEqual({
       live: false,
     });
   });
@@ -161,50 +168,61 @@ describe('library document tickets', () => {
     const { service } = build({
       part: { materialStatus: ContentStatus.ARCHIVED },
     });
-    await expect(service.ticketLiveness(LIB_TICKET, USER_ID)).resolves.toEqual({
+    await expect(service.ticketLiveness(LIB_TICKET, USER_ID, LEGACY)).resolves.toEqual({
       live: false,
     });
   });
 
   it('is not live when the material has been deleted', async () => {
     const { service } = build({ part: { materialDeletedAt: new Date() } });
-    await expect(service.ticketLiveness(LIB_TICKET, USER_ID)).resolves.toEqual({
+    await expect(service.ticketLiveness(LIB_TICKET, USER_ID, LEGACY)).resolves.toEqual({
       live: false,
     });
   });
 
   it('is not live when the part itself is archived', async () => {
     const { service } = build({ part: { status: ContentStatus.ARCHIVED } });
-    await expect(service.ticketLiveness(LIB_TICKET, USER_ID)).resolves.toEqual({
+    await expect(service.ticketLiveness(LIB_TICKET, USER_ID, LEGACY)).resolves.toEqual({
       live: false,
     });
   });
 
   it('is not live when the part no longer exists', async () => {
     const { service } = build({ part: null });
-    await expect(service.ticketLiveness(LIB_TICKET, USER_ID)).resolves.toEqual({
+    await expect(service.ticketLiveness(LIB_TICKET, USER_ID, LEGACY)).resolves.toEqual({
       live: false,
     });
   });
 
-  it('a preview needs no entitlement and is not device-bound', async () => {
-    // `issueTicket` skips both checks for a preview, so re-checking must too —
-    // the edge must never refuse a grant the issuing path would have allowed.
+  it('a `lib_` ticket ALWAYS needs an unrevoked entitlement, even for a preview part (H3)', async () => {
+    // `lib_` is the OWNED ticket. Previews are issued as `libp_` and checked by
+    // their own branch, so a `lib_` URL for a preview part without an
+    // entitlement — which only the previous backend could mint — is dead.
     const { service, entitlementFindUnique } = build({
       part: { isPreview: true },
       entitlement: null,
       activeDevices: 0,
     });
 
-    await expect(service.ticketLiveness(LIB_TICKET, USER_ID)).resolves.toEqual({
+    await expect(service.ticketLiveness(LIB_TICKET, USER_ID, LEGACY)).resolves.toEqual({
+      live: false,
+    });
+    expect(entitlementFindUnique).toHaveBeenCalled();
+  });
+
+  it('an OWNED preview part (lib_) is still not device-bound', async () => {
+    const { service } = build({
+      part: { isPreview: true },
+      activeDevices: 0,
+    });
+    await expect(service.ticketLiveness(LIB_TICKET, USER_ID, LEGACY)).resolves.toEqual({
       live: true,
     });
-    expect(entitlementFindUnique).not.toHaveBeenCalled();
   });
 
   it('still refuses a preview once the student is signed out', async () => {
     const { service } = build({ part: { isPreview: true }, activeSessions: 0 });
-    await expect(service.ticketLiveness(LIB_TICKET, USER_ID)).resolves.toEqual({
+    await expect(service.ticketLiveness(LIB_TICKET, USER_ID, LEGACY)).resolves.toEqual({
       live: false,
     });
   });

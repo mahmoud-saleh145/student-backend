@@ -255,6 +255,10 @@ GET /playback/keys/:ticketId                   AES-128 key, live tickets only
 GET /playback/tickets/:ticketId/state          edge Worker liveness probe
 ```
 
+The liveness probe is for the media Worker only, which sends the
+`EDGE_LIVENESS_SECRET` value in `x-edge-secret`. With the right secret it is not
+throttled. Once `EDGE_LIVENESS_ENFORCE=true`, anyone else gets a 401.
+
 Ticket response:
 
 ```json
@@ -299,6 +303,44 @@ Notes for the player:
 GET /attachments/:id/ticket      short-lived signed URL
 GET /lessons/:lessonId/attachments
 ```
+
+### Library (students)
+
+Academic eligibility (university + faculty + department scope) comes from the
+student's own profile and is always enforced. Nothing is discoverable or
+purchasable while `LIBRARY_STOREFRONT_ENABLED` is off. Full rules and the
+authorization matrix: `docs/LIBRARY.md`.
+
+The signed document URL can be refused by the media Worker: 403 when the ticket
+is dead, 503 (`x-deny-reason: ticket_unverifiable`) when it could not be checked.
+Clients ask `POST /library/parts/:id/open` again rather than retrying the URL.
+
+```
+GET  /library/materials?q&academicYearId&subjectId&page&pageSize
+     items[]: { id, title, titleAr, description, coverUrl, subject,
+                academicYear {id,name,nameAr,kind} | null,
+                partCount, packageCount, ownedPartCount, priceFrom, priceTotal }
+     (universityId/facultyId are no longer accepted — 422)
+GET  /library/materials/:id
+     view: FULL  -> parts[] { …, price, access, ownedSince }, packages[] { …, access }
+     view: OWNER -> parts[] { …, access: OWNED, ownedSince }, packages: []  (no prices)
+     404 NOT_FOUND for anything the student may not see
+GET  /library/me            items[] { …, status: READABLE | WITHDRAWN }
+GET  /library/me/purchases
+POST /library/quote         { kind: PART | PACKAGE, targetId } — same errors as purchase
+POST /library/purchase      { kind: PART | PACKAGE, targetId }
+POST /library/parts/:id/open  signed URL (tid lib_… owned / libp_… preview) + watermark
+```
+
+`access` per part — what the student can do now, first match wins:
+`OWNED | PREVIEW | REVOKED | PURCHASABLE | UNAVAILABLE`; and, independently,
+`ownership` per part — what the student holds: `OWNED | REVOKED | NONE`
+(always `OWNED` in the owner view). A revoked part that is still an eligible
+free preview answers `access: PREVIEW, ownership: REVOKED` (Decision B);
+opening it mints a preview (`libp_`) ticket, never an owned one. Per package:
+`OWNED | PURCHASABLE | UNAVAILABLE`. The booleans `owned`,
+`purchasable`, `isPreview`, `fullyOwned` and `available` are deprecated mirrors,
+kept only until the clients read `access`/`status`.
 
 ### Notifications
 
@@ -419,6 +461,8 @@ fix.
 | `COURSE_ARCHIVED` | 403 |
 | `COURSE_NOT_AVAILABLE` | 403 |
 | `ALREADY_ENROLLED` | 409 |
+| `LIBRARY_NOT_AVAILABLE` | 403 — only to an owner of an out-of-scope material, trying to buy |
+| `LIBRARY_ENTITLEMENT_REVOKED` | 403 — the part (or a package item) was revoked; no debit |
 
 ### Codes and payment
 

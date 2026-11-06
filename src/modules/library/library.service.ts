@@ -1,10 +1,22 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { AuditAction, ContentStatus, type Prisma, UserRole } from '@prisma/client';
+import {
+  AuditAction,
+  ContentStatus,
+  LibraryDepartmentScope,
+  type Prisma,
+  UserRole,
+} from '@prisma/client';
 
 import { AppException } from '../../common/errors/app.exception';
 import { paginated } from '../../common/types/api-response';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
+import {
+  LIBRARY_PLACEMENT,
+  checkAcademicStructure,
+  checkYearInLadder,
+} from '../catalog/academic-placement';
+import { CatalogService } from '../catalog/catalog.service';
 import {
   assertObjectKeyInNamespace,
   MAX_DOCUMENT_BYTES,
@@ -12,19 +24,72 @@ import {
 } from '../storage/storage.service';
 import { PlatformSettingsService } from '../settings/platform-settings.service';
 
+import {
+  LibraryEligibilityService,
+  MATERIAL_AUDIENCE_SELECT,
+  PUBLISHED_MATERIAL,
+  toAudience,
+} from './library-eligibility.service';
+
+/**
+ * What one student can do with one part right now. Precedence, first match
+ * wins:
+ *
+ *   OWNED        an unrevoked entitlement: read as an owner
+ *   PREVIEW      a free sample the student may open right now (the full view
+ *                already implies storefront on, in scope and published)
+ *   REVOKED      an entitlement exists but was revoked and nothing else is
+ *                offered (never ownership, never for sale again)
+ *   PURCHASABLE  storefront on, in scope, on sale, priced
+ *   UNAVAILABLE  anything else
+ *
+ * Decision B: revocation and preview eligibility are separate. A revoked
+ * entitlement never grants owned access, but it does not take away a free
+ * preview the student is otherwise eligible for, so PREVIEW outranks REVOKED.
+ * What the student owns is reported on its own, as `ownership`, so a revoked
+ * preview part still says it was revoked.
+ */
+export type LibraryPartAccess = 'OWNED' | 'REVOKED' | 'PREVIEW' | 'PURCHASABLE' | 'UNAVAILABLE';
+
+/**
+ * What the student holds for one part, independent of what they can do:
+ * an unrevoked entitlement, a revoked one, or none.
+ */
+export type LibraryPartOwnership = 'OWNED' | 'REVOKED' | 'NONE';
+export type LibraryPackageAccess = 'OWNED' | 'PURCHASABLE' | 'UNAVAILABLE';
+
+/** The audience block: written and validated as one unit. */
+const AUDIENCE_KEYS = [
+  'universityId',
+  'facultyId',
+  'departmentScope',
+  'departmentIds',
+  'academicYearId',
+] as const;
+
+interface AudienceInput {
+  universityId: string | null;
+  facultyId: string | null;
+  departmentScope: LibraryDepartmentScope;
+  departmentIds: string[];
+  academicYearId: string | null;
+}
+
+/** A published part, as the catalogue would show it. */
+const PUBLISHED_PART = {
+  ...notDeleted,
+  isActive: true,
+  status: ContentStatus.PUBLISHED,
+} as const;
+
 /**
  * Library structure, and what a student sees of it.
  *
- * The Library is a separate top-level system, and the separation is real rather
- * than cosmetic: nothing in this file references a course, an enrollment or a
- * section. A student may buy library material while enrolled in nothing, and
- * owning every course on the platform grants nothing here.
- *
- * Pricing is deliberately simpler than course parts. Each part carries its own
- * absolute price, because there is no whole-material price to take a percentage
- * of — so there is no allocation to validate and no arithmetic that can fail to
- * add up. A package is priced independently of its contents, because a bundle
- * discount is the entire point of a bundle.
+ * The Library is a separate top-level system: nothing here references a course,
+ * an enrollment or a section. What a student sees is decided by two independent
+ * layers — academic visibility (LibraryEligibilityService, unconditional) and
+ * the storefront switch (fail-closed) — and what they can OPEN is decided
+ * separately, per part, by entitlement (library-documents.service.ts).
  */
 @Injectable()
 export class LibraryService {
@@ -37,6 +102,8 @@ export class LibraryService {
     // SettingsModule is @Global, so this arrives without a module import and
     // without risking a cycle back into the library.
     private readonly settings: PlatformSettingsService,
+    private readonly eligibility: LibraryEligibilityService,
+    private readonly catalog: CatalogService,
   ) {}
 
   /**
@@ -70,14 +137,7 @@ export class LibraryService {
    *
    * Three tiers, most specific first: the part's own thumbnail, the
    * material's cover, then the platform default. Resolved HERE, on read,
-   * rather than written onto the row — which is the whole point. If the
-   * default were copied into `thumbnailKey` at publish time, an inherited
-   * image would be indistinguishable from a chosen one, and the next time an
-   * Admin changed the default there would be no way to tell which rows to
-   * update without also overwriting the ones they had picked deliberately.
-   *
-   * `defaultKey` is passed in rather than read per part so listing a material
-   * with twenty parts costs one settings read, not twenty.
+   * rather than written onto the row.
    */
   private async resolvePartThumbnailUrl(
     partThumbnailKey: string | null,
@@ -95,37 +155,44 @@ export class LibraryService {
   /**
    * Browse the catalogue.
    *
-   * Only published, active material, filtered and paginated server-side. A part
-   * row never carries its `objectKey` — the document is reached through a
-   * ticket, and leaking the key here would make every other check pointless.
+   * Published, active material the student is academically eligible for, and
+   * nothing at all while the storefront is off. The academic filter comes from
+   * the student's own profile; the client can only NARROW it (year, subject,
+   * search). The search `OR` and the eligibility `OR` live in separate `AND`
+   * branches, so neither can widen the other.
    */
   async browse(params: {
     page: number;
     pageSize: number;
     q?: string;
-    universityId?: string;
-    facultyId?: string;
     academicYearId?: string;
     subjectId?: string;
     userId: string;
   }) {
+    if (!this.eligibility.storefrontEnabled) {
+      return paginated([], 0, params.page, params.pageSize);
+    }
+
+    const scope = await this.eligibility.scopeFor(params.userId);
+
     const where: Prisma.LibraryMaterialWhereInput = {
-      ...notDeleted,
-      isActive: true,
-      status: ContentStatus.PUBLISHED,
-      ...(params.universityId ? { universityId: params.universityId } : {}),
-      ...(params.facultyId ? { facultyId: params.facultyId } : {}),
-      ...(params.academicYearId ? { academicYearId: params.academicYearId } : {}),
-      ...(params.subjectId ? { subjectId: params.subjectId } : {}),
-      ...(params.q
-        ? {
-            OR: [
-              { title: { contains: params.q, mode: 'insensitive' } },
-              { titleAr: { contains: params.q } },
-              { description: { contains: params.q, mode: 'insensitive' } },
-            ],
-          }
-        : {}),
+      AND: [
+        PUBLISHED_MATERIAL,
+        this.eligibility.materialWhere(scope),
+        ...(params.academicYearId ? [{ academicYearId: params.academicYearId }] : []),
+        ...(params.subjectId ? [{ subjectId: params.subjectId }] : []),
+        ...(params.q
+          ? [
+              {
+                OR: [
+                  { title: { contains: params.q, mode: 'insensitive' as const } },
+                  { titleAr: { contains: params.q } },
+                  { description: { contains: params.q, mode: 'insensitive' as const } },
+                ],
+              },
+            ]
+          : []),
+      ],
     };
 
     const [rows, total] = await this.prisma.$transaction([
@@ -141,15 +208,32 @@ export class LibraryService {
           description: true,
           coverKey: true,
           subject: { select: { id: true, name: true } },
-          _count: { select: { parts: true, packages: true } },
+          academicYear: {
+            select: { id: true, name: true, nameAr: true, structure: { select: { kind: true } } },
+          },
+          // Only what a student could actually buy is counted.
+          _count: {
+            select: {
+              packages: { where: { ...notDeleted, isActive: true, status: ContentStatus.PUBLISHED } },
+            },
+          },
           parts: {
-            where: { ...notDeleted, isActive: true, status: ContentStatus.PUBLISHED },
-            select: { price: true },
+            where: PUBLISHED_PART,
+            select: { id: true, price: true },
           },
         },
       }),
       this.prisma.libraryMaterial.count({ where }),
     ]);
+
+    const listedPartIds = rows.flatMap((row) => row.parts.map((p) => p.id));
+    const ownedRows = listedPartIds.length
+      ? await this.prisma.libraryEntitlement.findMany({
+          where: { userId: params.userId, revokedAt: null, libraryPartId: { in: listedPartIds } },
+          select: { libraryPartId: true },
+        })
+      : [];
+    const owned = new Set(ownedRows.map((r) => r.libraryPartId));
 
     const items = await Promise.all(
       rows.map(async (row) => {
@@ -161,10 +245,17 @@ export class LibraryService {
           description: row.description,
           coverUrl: await this.storage.publicAssetUrl(row.coverKey),
           subject: row.subject,
+          academicYear: row.academicYear
+            ? {
+                id: row.academicYear.id,
+                name: row.academicYear.name,
+                nameAr: row.academicYear.nameAr,
+                kind: row.academicYear.structure.kind,
+              }
+            : null,
           partCount: row.parts.length,
           packageCount: row._count.packages,
-          // What it would cost to buy the whole thing part by part — the
-          // number a package price is meant to look good against.
+          ownedPartCount: row.parts.filter((p) => owned.has(p.id)).length,
           priceFrom: prices.length ? Math.min(...prices) : null,
           priceTotal: prices.length
             ? Number(prices.reduce((a, b) => a + b, 0).toFixed(2))
@@ -177,19 +268,20 @@ export class LibraryService {
   }
 
   /**
-   * One material with its parts and packages, each marked owned or locked.
+   * One material.
    *
-   * Locked parts show their title, page count and price — enough to decide
-   * whether to buy — and nothing that could be read.
+   *   FULL   in scope and storefront on: every published part with its access
+   *          state, and packages.
+   *   OWNER  not visible (out of scope, or storefront off) but the student owns
+   *          at least one part: the material header and ONLY the owned parts.
+   *          No prices, no packages, no counts, nothing purchasable.
+   *   404    everything else — and the same 404 for "does not exist",
+   *          "unpublished", "out of scope" and "storefront off", so the
+   *          response cannot be used to discover a hidden material.
    */
   async materialForStudent(materialId: string, userId: string) {
     const material = await this.prisma.libraryMaterial.findFirst({
-      where: {
-        id: materialId,
-        ...notDeleted,
-        isActive: true,
-        status: ContentStatus.PUBLISHED,
-      },
+      where: { id: materialId, ...PUBLISHED_MATERIAL },
       select: {
         id: true,
         title: true,
@@ -197,90 +289,168 @@ export class LibraryService {
         description: true,
         coverKey: true,
         subject: { select: { id: true, name: true } },
-        parts: {
-          where: { ...notDeleted, isActive: true, status: ContentStatus.PUBLISHED },
-          orderBy: { sortOrder: 'asc' },
-          select: {
-            id: true,
-            title: true,
-            titleAr: true,
-            description: true,
-            sortOrder: true,
-            price: true,
-            currency: true,
-            pageCount: true,
-            mimeType: true,
-            isPreview: true,
-            thumbnailKey: true,
-          },
+        academicYear: {
+          select: { id: true, name: true, nameAr: true, structure: { select: { kind: true } } },
         },
-        packages: {
-          where: { ...notDeleted, isActive: true, status: ContentStatus.PUBLISHED },
-          orderBy: { sortOrder: 'asc' },
-          select: {
-            id: true,
-            title: true,
-            titleAr: true,
-            description: true,
-            price: true,
-            currency: true,
-            items: {
-              orderBy: { sortOrder: 'asc' },
-              select: { libraryPartId: true },
-            },
-          },
-        },
+        ...MATERIAL_AUDIENCE_SELECT,
       },
     });
 
     if (!material) throw AppException.notFound('Library material', materialId);
 
-    const partIds = material.parts.map((p) => p.id);
-    const entitlements = await this.prisma.libraryEntitlement.findMany({
-      where: { userId, libraryPartId: { in: partIds }, revokedAt: null },
-      select: { libraryPartId: true, grantedAt: true },
-    });
-    const owned = new Map(entitlements.map((e) => [e.libraryPartId, e.grantedAt]));
+    const scope = await this.eligibility.scopeFor(userId);
+    const visible =
+      this.eligibility.storefrontEnabled &&
+      this.eligibility.isVisible(scope, toAudience(material));
 
-    // One read for the whole material, not one per part.
-    const defaultThumbnailKey = await this.settings.libraryDefaultThumbnailKey();
-
-    const parts = await Promise.all(
-      material.parts.map(async (part) => ({
-        id: part.id,
-        title: part.title,
-        titleAr: part.titleAr,
-        description: part.description,
-        sortOrder: part.sortOrder,
-        price: Number(part.price),
-        currency: part.currency,
-        pageCount: part.pageCount,
-        mimeType: part.mimeType,
-        isPreview: part.isPreview,
-        thumbnailUrl: await this.resolvePartThumbnailUrl(
-          part.thumbnailKey,
-          material.coverKey,
-          defaultThumbnailKey,
-        ),
-        // A preview reads as open because it is; no purchase will ever be
-        // required for it.
-        owned: part.isPreview || owned.has(part.id),
-        ownedSince: owned.get(part.id)?.toISOString() ?? null,
-        purchasable: !owned.has(part.id) && !part.isPreview && Number(part.price) > 0,
-      })),
-    );
-
-    return {
+    const header = {
       id: material.id,
       title: material.title,
       titleAr: material.titleAr,
       description: material.description,
       coverUrl: await this.storage.publicAssetUrl(material.coverKey),
       subject: material.subject,
+      academicYear: material.academicYear
+        ? {
+            id: material.academicYear.id,
+            name: material.academicYear.name,
+            nameAr: material.academicYear.nameAr,
+            kind: material.academicYear.structure.kind,
+          }
+        : null,
+    };
+
+    if (visible) return this.fullView(material.id, material.coverKey, header, userId);
+
+    if (await this.eligibility.ownsAnyPartOf(userId, material.id)) {
+      return this.ownerView(material.id, material.coverKey, header, userId);
+    }
+
+    // Identical to the not-found case above, on purpose.
+    throw AppException.notFound('Library material', materialId);
+  }
+
+  private async fullView(
+    materialId: string,
+    coverKey: string | null,
+    header: Record<string, unknown>,
+    userId: string,
+  ) {
+    const [parts, packages] = await Promise.all([
+      this.prisma.libraryPart.findMany({
+        where: { materialId, ...PUBLISHED_PART },
+        orderBy: { sortOrder: 'asc' },
+        select: {
+          id: true,
+          title: true,
+          titleAr: true,
+          description: true,
+          sortOrder: true,
+          price: true,
+          currency: true,
+          pageCount: true,
+          mimeType: true,
+          isPreview: true,
+          thumbnailKey: true,
+        },
+      }),
+      this.prisma.libraryPackage.findMany({
+        where: { materialId, ...notDeleted, isActive: true, status: ContentStatus.PUBLISHED },
+        orderBy: { sortOrder: 'asc' },
+        select: {
+          id: true,
+          title: true,
+          titleAr: true,
+          description: true,
+          price: true,
+          currency: true,
+          items: {
+            orderBy: { sortOrder: 'asc' },
+            select: { libraryPartId: true },
+          },
+        },
+      }),
+    ]);
+
+    const partIds = parts.map((p) => p.id);
+    const entitlements = partIds.length
+      ? await this.prisma.libraryEntitlement.findMany({
+          where: { userId, libraryPartId: { in: partIds } },
+          select: { libraryPartId: true, grantedAt: true, revokedAt: true },
+        })
+      : [];
+    const owned = new Map(
+      entitlements.filter((e) => e.revokedAt === null).map((e) => [e.libraryPartId, e.grantedAt]),
+    );
+    const revoked = new Set(
+      entitlements.filter((e) => e.revokedAt !== null).map((e) => e.libraryPartId),
+    );
+
+    const defaultThumbnailKey = await this.settings.libraryDefaultThumbnailKey();
+
+    const ownershipOf = (partId: string): LibraryPartOwnership =>
+      owned.has(partId) ? 'OWNED' : revoked.has(partId) ? 'REVOKED' : 'NONE';
+
+    // Decision B: a revoked entitlement may coexist with preview eligibility.
+    // Mirrors LibraryDocumentsService.issueTicket, which mints a preview
+    // ticket for a published, in-scope preview part whatever the ownership.
+    const accessOf = (part: (typeof parts)[number]): LibraryPartAccess => {
+      if (owned.has(part.id)) return 'OWNED';
+      if (part.isPreview) return 'PREVIEW';
+      if (revoked.has(part.id)) return 'REVOKED';
+      if (Number(part.price) > 0) return 'PURCHASABLE';
+      return 'UNAVAILABLE';
+    };
+
+    const visibleIds = new Set(partIds);
+
+    return {
+      ...header,
+      view: 'FULL' as const,
       ownsAllParts: partIds.length > 0 && partIds.every((id) => owned.has(id)),
-      parts,
-      packages: material.packages.map((pkg) => {
-        const included = pkg.items.map((i) => i.libraryPartId);
+      parts: await Promise.all(
+        parts.map(async (part) => {
+          const access = accessOf(part);
+          return {
+            id: part.id,
+            title: part.title,
+            titleAr: part.titleAr,
+            description: part.description,
+            sortOrder: part.sortOrder,
+            price: Number(part.price),
+            currency: part.currency,
+            pageCount: part.pageCount,
+            mimeType: part.mimeType,
+            thumbnailUrl: await this.resolvePartThumbnailUrl(
+              part.thumbnailKey,
+              coverKey,
+              defaultThumbnailKey,
+            ),
+            access,
+            ownership: ownershipOf(part.id),
+            ownedSince: owned.get(part.id)?.toISOString() ?? null,
+            // Deprecated mirrors of `access`, kept only until the Student Web
+            // and Mobile clients read `access` (Phases 3–4). Remove then.
+            isPreview: part.isPreview,
+            owned: access === 'OWNED' || access === 'PREVIEW',
+            purchasable: access === 'PURCHASABLE',
+          };
+        }),
+      ),
+      packages: packages.map((pkg) => {
+        const items = pkg.items.map((i) => i.libraryPartId);
+        // Only this material's published parts are ever named. An item that is
+        // not one of them makes the whole package unavailable (decision F5) and
+        // its id is not disclosed.
+        const included = items.filter((id) => visibleIds.has(id));
+        const complete = items.length > 0 && included.length === items.length;
+        const anyRevoked = included.some((id) => revoked.has(id));
+        const allOwned = complete && included.every((id) => owned.has(id));
+        const access: LibraryPackageAccess = allOwned
+          ? 'OWNED'
+          : complete && !anyRevoked && Number(pkg.price) > 0
+            ? 'PURCHASABLE'
+            : 'UNAVAILABLE';
         const ownedInPackage = included.filter((id) => owned.has(id)).length;
         return {
           id: pkg.id,
@@ -291,16 +461,94 @@ export class LibraryService {
           currency: pkg.currency,
           partCount: included.length,
           partIds: included,
-          // Surfaced so a student can see a bundle overlaps what they hold
-          // before they spend, rather than discovering it afterwards.
           partsAlreadyOwned: ownedInPackage,
-          fullyOwned: included.length > 0 && ownedInPackage === included.length,
+          access,
+          // Deprecated mirror of `access`; see parts above.
+          fullyOwned: access === 'OWNED',
         };
       }),
     };
   }
 
-  /** Everything the student can currently open. */
+  /**
+   * The ownership exception: the material header and the student's own parts.
+   *
+   * Its own query, so nothing about the parts they do not own — ids, titles,
+   * prices, counts — and nothing about packages is ever loaded for this view.
+   */
+  private async ownerView(
+    materialId: string,
+    coverKey: string | null,
+    header: Record<string, unknown>,
+    userId: string,
+  ) {
+    const owned = await this.prisma.libraryEntitlement.findMany({
+      where: {
+        userId,
+        revokedAt: null,
+        part: { materialId, ...PUBLISHED_PART },
+      },
+      orderBy: { part: { sortOrder: 'asc' } },
+      select: {
+        grantedAt: true,
+        part: {
+          select: {
+            id: true,
+            title: true,
+            titleAr: true,
+            description: true,
+            sortOrder: true,
+            pageCount: true,
+            mimeType: true,
+            thumbnailKey: true,
+            isPreview: true,
+          },
+        },
+      },
+    });
+
+    const defaultThumbnailKey = await this.settings.libraryDefaultThumbnailKey();
+
+    return {
+      ...header,
+      view: 'OWNER' as const,
+      parts: await Promise.all(
+        owned.map(async ({ part, grantedAt }) => ({
+          id: part.id,
+          title: part.title,
+          titleAr: part.titleAr,
+          description: part.description,
+          sortOrder: part.sortOrder,
+          pageCount: part.pageCount,
+          mimeType: part.mimeType,
+          thumbnailUrl: await this.resolvePartThumbnailUrl(
+            part.thumbnailKey,
+            coverKey,
+            defaultThumbnailKey,
+          ),
+          access: 'OWNED' as const,
+          ownership: 'OWNED' as const,
+          ownedSince: grantedAt.toISOString(),
+          // Deprecated mirrors of `access`, for the Student Web build that is
+          // live today: without them it shows an owner no Read button here.
+          // Still no price and nothing purchasable. Remove with the others
+          // once the clients read `access` (Phases 3–4).
+          isPreview: part.isPreview,
+          owned: true,
+          purchasable: false,
+        })),
+      ),
+      packages: [] as never[],
+    };
+  }
+
+  /**
+   * Everything the student owns (unrevoked entitlements only, decision G3).
+   *
+   * Independent of academic scope and of the storefront: an owner keeps their
+   * documents whatever happens to the catalogue. Withdrawn material stays
+   * listed — they did buy it — marked `WITHDRAWN` rather than vanishing.
+   */
   async myLibrary(userId: string, page: number, pageSize: number) {
     const where: Prisma.LibraryEntitlementWhereInput = {
       userId,
@@ -326,7 +574,7 @@ export class LibraryService {
               pageCount: true,
               mimeType: true,
               status: true,
-              material: { select: { id: true, title: true, status: true } },
+              material: { select: { id: true, title: true, status: true, deletedAt: true } },
             },
           },
         },
@@ -335,23 +583,29 @@ export class LibraryService {
     ]);
 
     return paginated(
-      rows.map((row) => ({
-        entitlementId: row.id,
-        partId: row.part.id,
-        title: row.part.title,
-        titleAr: row.part.titleAr,
-        materialId: row.part.material.id,
-        materialTitle: row.part.material.title,
-        pageCount: row.part.pageCount,
-        mimeType: row.part.mimeType,
-        source: row.source,
-        grantedAt: row.grantedAt.toISOString(),
-        // Withdrawn material stays in the list — they did buy it — but is
-        // marked unreadable rather than silently vanishing.
-        available:
-          row.part.status !== ContentStatus.ARCHIVED &&
-          row.part.material.status !== ContentStatus.ARCHIVED,
-      })),
+      rows.map((row) => {
+        // Mirrors what LibraryDocumentsService.issueTicket refuses for an owner.
+        const withdrawn =
+          row.part.status === ContentStatus.ARCHIVED ||
+          row.part.material.status === ContentStatus.ARCHIVED ||
+          row.part.material.deletedAt !== null;
+        return {
+          entitlementId: row.id,
+          partId: row.part.id,
+          title: row.part.title,
+          titleAr: row.part.titleAr,
+          materialId: row.part.material.id,
+          materialTitle: row.part.material.title,
+          pageCount: row.part.pageCount,
+          mimeType: row.part.mimeType,
+          source: row.source,
+          grantedAt: row.grantedAt.toISOString(),
+          status: withdrawn ? ('WITHDRAWN' as const) : ('READABLE' as const),
+          // Deprecated mirror of `status`, kept until the clients read
+          // `status` (Phases 3–4), so existing owners keep a working list.
+          available: !withdrawn,
+        };
+      }),
       total,
       page,
       pageSize,
@@ -389,8 +643,9 @@ export class LibraryService {
         take: params.pageSize,
         include: {
           subject: { select: { id: true, name: true } },
+          faculty: { select: { id: true, name: true, nameAr: true } },
           createdBy: { select: { id: true, fullName: true } },
-          _count: { select: { parts: true, packages: true } },
+          _count: { select: { parts: true, packages: true, departments: true } },
         },
       }),
       this.prisma.libraryMaterial.count({ where }),
@@ -405,6 +660,9 @@ export class LibraryService {
         isActive: row.isActive,
         sortOrder: row.sortOrder,
         subject: row.subject,
+        faculty: row.faculty,
+        departmentScope: row.departmentScope,
+        departmentCount: row._count.departments,
         partCount: row._count.parts,
         packageCount: row._count.packages,
         createdBy: row.createdBy,
@@ -422,6 +680,17 @@ export class LibraryService {
       where: { id: materialId, ...notDeleted },
       include: {
         subject: { select: { id: true, name: true } },
+        university: { select: { id: true, name: true, nameAr: true } },
+        faculty: { select: { id: true, name: true, nameAr: true } },
+        academicYear: {
+          select: { id: true, name: true, nameAr: true, structure: { select: { kind: true } } },
+        },
+        departments: {
+          orderBy: { createdAt: 'asc' },
+          select: {
+            department: { select: { id: true, name: true, nameAr: true, studyType: true } },
+          },
+        },
         parts: {
           where: notDeleted,
           orderBy: { sortOrder: 'asc' },
@@ -440,8 +709,6 @@ export class LibraryService {
 
     if (!material) throw AppException.notFound('Library material', materialId);
 
-    // One read for the whole editor. Passed down rather than looked up per
-    // part, so a twenty-part material costs one settings read.
     const adminDefaultThumbnailKey = await this.settings.libraryDefaultThumbnailKey();
 
     return {
@@ -456,12 +723,23 @@ export class LibraryService {
       facultyId: material.facultyId,
       academicYearId: material.academicYearId,
       subjectId: material.subjectId,
+      departmentScope: material.departmentScope,
+      departmentIds: material.departments.map((d) => d.department.id),
+      audience: {
+        university: material.university,
+        faculty: material.faculty,
+        departmentScope: material.departmentScope,
+        departments: material.departments.map((d) => d.department),
+        academicYear: material.academicYear
+          ? {
+              id: material.academicYear.id,
+              name: material.academicYear.name,
+              nameAr: material.academicYear.nameAr,
+              kind: material.academicYear.structure.kind,
+            }
+          : null,
+      },
       coverUrl: await this.storage.publicAssetUrl(material.coverKey),
-      /**
-       * The default is reported alongside the parts rather than folded into
-       * each one, so the editor can say "inherited" instead of showing an
-       * image the administrator never chose and might then "keep" by accident.
-       */
       defaultThumbnailUrl: await this.storage.publicAssetUrl(adminDefaultThumbnailKey),
       parts: await Promise.all(material.parts.map(async (part) => ({
         id: part.id,
@@ -477,11 +755,8 @@ export class LibraryService {
         sizeBytes: part.sizeBytes === null ? null : Number(part.sizeBytes),
         pageCount: part.pageCount,
         isPreview: part.isPreview,
-        // Never the object key. An admin does not need it and an accidental
-        // leak into a log or a browser devtools panel is one copy too many.
+        // Never the object key.
         hasDocument: !!part.objectKey,
-        // The key so the editor can tell a chosen image from an inherited
-        // one, and the resolved URL so it can render whichever is in force.
         thumbnailKey: part.thumbnailKey,
         thumbnailUrl: await this.resolvePartThumbnailUrl(
           part.thumbnailKey,
@@ -507,6 +782,56 @@ export class LibraryService {
     };
   }
 
+  // --- audience --------------------------------------------------------------
+
+  /**
+   * The whole audience must hold, or nothing is written.
+   *
+   * University and faculty are required (F5); the faculty belongs to the
+   * university; departments belong to the faculty, are active, and never mix
+   * General with Programs; FACULTY scope carries no departments and DEPARTMENTS
+   * scope carries at least one; the year/level, when set, is an active rung of
+   * the ladder that governs the faculty — or of every selected department.
+   */
+  private async assertAudience(audience: AudienceInput): Promise<void> {
+    const fields: Record<string, string[]> = {};
+    if (
+      audience.departmentScope === LibraryDepartmentScope.FACULTY &&
+      audience.departmentIds.length > 0
+    ) {
+      fields.departmentIds = ['a faculty-wide material has no department selection'];
+    }
+    if (
+      audience.departmentScope === LibraryDepartmentScope.DEPARTMENTS &&
+      audience.departmentIds.length === 0
+    ) {
+      fields.departmentIds = ['choose at least one department'];
+    }
+    if (Object.keys(fields).length > 0) throw AppException.validation(fields);
+
+    await checkAcademicStructure(
+      this.prisma,
+      {
+        universityId: audience.universityId,
+        facultyId: audience.facultyId,
+        departmentIds: audience.departmentIds,
+      },
+      LIBRARY_PLACEMENT,
+    );
+
+    await checkYearInLadder(
+      this.prisma,
+      this.catalog,
+      {
+        universityId: audience.universityId,
+        facultyId: audience.facultyId,
+        departmentIds: audience.departmentIds,
+        academicYearId: audience.academicYearId,
+      },
+      LIBRARY_PLACEMENT,
+    );
+  }
+
   // --- materials -------------------------------------------------------------
 
   async createMaterial(
@@ -514,26 +839,50 @@ export class LibraryService {
       title: string;
       titleAr?: string;
       description?: string;
-      universityId?: string;
-      facultyId?: string;
-      academicYearId?: string;
-      subjectId?: string;
+      universityId?: string | null;
+      facultyId?: string | null;
+      departmentScope?: LibraryDepartmentScope;
+      departmentIds?: string[];
+      academicYearId?: string | null;
+      subjectId?: string | null;
       coverKey?: string;
     },
     actor: { id: string; role: UserRole },
   ) {
-    const material = await this.prisma.libraryMaterial.create({
-      data: {
-        title: input.title,
-        titleAr: input.titleAr ?? null,
-        description: input.description ?? null,
-        universityId: input.universityId ?? null,
-        facultyId: input.facultyId ?? null,
-        academicYearId: input.academicYearId ?? null,
-        subjectId: input.subjectId ?? null,
-        coverKey: input.coverKey ?? null,
-        createdById: actor.id,
-      },
+    const audience: AudienceInput = {
+      universityId: input.universityId ?? null,
+      facultyId: input.facultyId ?? null,
+      departmentScope: input.departmentScope ?? LibraryDepartmentScope.FACULTY,
+      departmentIds: [...new Set(input.departmentIds ?? [])],
+      academicYearId: input.academicYearId ?? null,
+    };
+    await this.assertAudience(audience);
+
+    const material = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.libraryMaterial.create({
+        data: {
+          title: input.title,
+          titleAr: input.titleAr ?? null,
+          description: input.description ?? null,
+          universityId: audience.universityId,
+          facultyId: audience.facultyId,
+          departmentScope: audience.departmentScope,
+          academicYearId: audience.academicYearId,
+          subjectId: input.subjectId ?? null,
+          coverKey: input.coverKey ?? null,
+          createdById: actor.id,
+        },
+      });
+      if (audience.departmentIds.length > 0) {
+        await tx.libraryMaterialDepartment.createMany({
+          data: audience.departmentIds.map((departmentId) => ({
+            materialId: created.id,
+            facultyId: audience.facultyId!,
+            departmentId,
+          })),
+        });
+      }
+      return created;
     });
 
     await this.audit.record({
@@ -542,7 +891,7 @@ export class LibraryService {
       action: AuditAction.CREATE,
       entity: 'library_material',
       entityId: material.id,
-      after: { title: material.title },
+      after: { title: material.title, audience },
     });
 
     return this.materialForAdmin(material.id);
@@ -559,6 +908,8 @@ export class LibraryService {
       sortOrder: number;
       universityId: string | null;
       facultyId: string | null;
+      departmentScope: LibraryDepartmentScope;
+      departmentIds: string[];
       academicYearId: string | null;
       subjectId: string | null;
       coverKey: string | null;
@@ -567,18 +918,101 @@ export class LibraryService {
   ) {
     const before = await this.prisma.libraryMaterial.findFirst({
       where: { id: materialId, ...notDeleted },
+      include: { departments: { select: { departmentId: true } } },
     });
     if (!before) throw AppException.notFound('Library material', materialId);
 
-    await this.prisma.libraryMaterial.update({
-      where: { id: materialId },
-      data: {
-        ...input,
-        // Stamped the first time it goes live, and never rewritten after.
-        ...(input.status === ContentStatus.PUBLISHED && !before.publishedAt
-          ? { publishedAt: new Date() }
-          : {}),
-      },
+    const {
+      universityId,
+      facultyId,
+      departmentScope,
+      departmentIds,
+      academicYearId,
+      ...scalars
+    } = input;
+
+    // Atomic audience: touching any part of it means sending all of it, so an
+    // edit can never widen or narrow the audience as a side effect.
+    const touched = AUDIENCE_KEYS.filter((key) => input[key] !== undefined);
+    if (touched.length > 0 && touched.length < AUDIENCE_KEYS.length) {
+      const missing = AUDIENCE_KEYS.filter((key) => input[key] === undefined);
+      throw AppException.validation(
+        Object.fromEntries(
+          missing.map((key) => [key, ['send the whole audience when changing any part of it']]),
+        ),
+      );
+    }
+
+    const beforeAudience: AudienceInput = {
+      universityId: before.universityId,
+      facultyId: before.facultyId,
+      departmentScope: before.departmentScope,
+      departmentIds: before.departments.map((d) => d.departmentId),
+      academicYearId: before.academicYearId,
+    };
+    const nextAudience: AudienceInput | null =
+      touched.length > 0
+        ? {
+            universityId: universityId ?? null,
+            facultyId: facultyId ?? null,
+            departmentScope: departmentScope!,
+            departmentIds: [...new Set(departmentIds ?? [])],
+            academicYearId: academicYearId ?? null,
+          }
+        : null;
+
+    // A new audience is always validated. Publishing (or re-activating) also
+    // re-validates the stored one, so a legacy row with an invalid year — two
+    // exist — cannot go live until an administrator fixes it.
+    const goingLive =
+      (scalars.status === ContentStatus.PUBLISHED && before.status !== ContentStatus.PUBLISHED) ||
+      (scalars.isActive === true && !before.isActive);
+    if (nextAudience) await this.assertAudience(nextAudience);
+    else if (goingLive) await this.assertAudience(beforeAudience);
+
+    await this.prisma.$transaction(async (tx) => {
+      if (nextAudience) {
+        const keep =
+          nextAudience.facultyId === before.facultyId
+            ? nextAudience.departmentIds
+            : [];
+        // Links leave BEFORE the faculty changes: the composite foreign key
+        // would otherwise cascade the new faculty into rows whose department
+        // belongs to the old one, and refuse.
+        await tx.libraryMaterialDepartment.deleteMany({
+          where: { materialId, departmentId: { notIn: keep } },
+        });
+      }
+
+      await tx.libraryMaterial.update({
+        where: { id: materialId },
+        data: {
+          ...scalars,
+          ...(nextAudience
+            ? {
+                universityId: nextAudience.universityId,
+                facultyId: nextAudience.facultyId,
+                departmentScope: nextAudience.departmentScope,
+                academicYearId: nextAudience.academicYearId,
+              }
+            : {}),
+          // Stamped the first time it goes live, and never rewritten after.
+          ...(scalars.status === ContentStatus.PUBLISHED && !before.publishedAt
+            ? { publishedAt: new Date() }
+            : {}),
+        },
+      });
+
+      if (nextAudience && nextAudience.departmentIds.length > 0) {
+        await tx.libraryMaterialDepartment.createMany({
+          data: nextAudience.departmentIds.map((departmentId) => ({
+            materialId,
+            facultyId: nextAudience.facultyId!,
+            departmentId,
+          })),
+          skipDuplicates: true,
+        });
+      }
     });
 
     await this.audit.record({
@@ -587,8 +1021,13 @@ export class LibraryService {
       action: AuditAction.UPDATE,
       entity: 'library_material',
       entityId: materialId,
-      before: { title: before.title, status: before.status, isActive: before.isActive },
-      after: input,
+      before: {
+        title: before.title,
+        status: before.status,
+        isActive: before.isActive,
+        ...(nextAudience ? { audience: beforeAudience } : {}),
+      },
+      after: { ...scalars, ...(nextAudience ? { audience: nextAudience } : {}) },
     });
 
     return this.materialForAdmin(materialId);
@@ -661,13 +1100,8 @@ export class LibraryService {
 
     this.assertLibraryPartKeys(input.objectKey, input.thumbnailKey, `thumbnails/library/${materialId}/`);
 
-    // The object's real size, read back from storage.
-    //
-    // The document was uploaded by a presigned PUT, and that signature binds
-    // only `host` — R2 does not honour `x-amz-content-length-range`, so nothing
-    // stopped the bytes that actually landed from exceeding the declared
-    // `sizeBytes`. `library` is the bucket the write site uses and the only one
-    // whose prefix selects it on read.
+    // The object's real size, read back from storage: a presigned PUT does not
+    // bind the length, so the declared `sizeBytes` is only a claim.
     const sizeBytes = await this.storage.assertUploadWithinLimit({
       bucket: 'library',
       objectKey: input.objectKey,
@@ -695,9 +1129,6 @@ export class LibraryService {
           sizeBytes: BigInt(sizeBytes),
           pageCount: input.pageCount ?? null,
           isPreview: input.isPreview ?? false,
-          // Null, not the library default. The default is resolved at read
-          // time; writing it here would make an inherited image look like a
-          // chosen one and the next change of default would overwrite it.
           thumbnailKey: input.thumbnailKey ?? null,
           uploadedById: actor.id,
         },
@@ -747,8 +1178,6 @@ export class LibraryService {
     });
     if (!part) throw AppException.notFound('Library part', partId);
 
-    // Reassigned when a replacement document is verified, so the write below
-    // always persists the measured size rather than the declared one.
     let patch = input;
 
     this.assertLibraryPartKeys(
@@ -758,10 +1187,6 @@ export class LibraryService {
     );
 
     if (input.objectKey && input.objectKey !== part.objectKey) {
-      // Replacing the document is a second way to register an object, so it
-      // carries the same verification `createPart` does. Without this, the
-      // create-time check would be bypassed by creating a valid part and then
-      // PATCHing an oversized object onto it.
       const verifiedSize = await this.storage.assertUploadWithinLimit({
         bucket: 'library',
         objectKey: input.objectKey,
@@ -769,7 +1194,6 @@ export class LibraryService {
         field: 'objectKey',
       });
 
-      // The declared size loses to the measured one, for the same reason.
       patch = { ...patch, sizeBytes: verifiedSize };
 
       const holders = await this.prisma.libraryEntitlement.count({
@@ -849,9 +1273,36 @@ export class LibraryService {
 
   // --- packages --------------------------------------------------------------
 
+  /**
+   * Every item must be a (non-deleted) part of the package's own material
+   * (decision G4: enforced here and re-checked at purchase, not by the schema).
+   */
+  private async assertPackageItems(materialId: string, partIds: string[]): Promise<void> {
+    const unique = [...new Set(partIds)];
+    const parts = await this.prisma.libraryPart.findMany({
+      where: { id: { in: unique }, ...notDeleted },
+      select: { id: true, materialId: true },
+    });
+
+    const found = new Set(parts.map((p) => p.id));
+    const missing = unique.filter((id) => !found.has(id));
+    if (missing.length > 0) {
+      throw AppException.validation({
+        partIds: [`these documents do not exist: ${missing.join(', ')}`],
+      });
+    }
+
+    const foreign = parts.filter((p) => p.materialId !== materialId).map((p) => p.id);
+    if (foreign.length > 0) {
+      throw AppException.validation({
+        partIds: [`these documents belong to another material: ${foreign.join(', ')}`],
+      });
+    }
+  }
+
   async createPackage(
     input: {
-      materialId?: string;
+      materialId: string;
       title: string;
       titleAr?: string;
       description?: string;
@@ -867,31 +1318,18 @@ export class LibraryService {
       });
     }
 
-    const parts = await this.prisma.libraryPart.findMany({
-      where: { id: { in: input.partIds }, ...notDeleted },
-      select: { id: true, materialId: true },
+    const material = await this.prisma.libraryMaterial.findFirst({
+      where: { id: input.materialId, ...notDeleted },
+      select: { id: true },
     });
+    if (!material) throw AppException.notFound('Library material', input.materialId);
 
-    if (parts.length !== input.partIds.length) {
-      const found = new Set(parts.map((p) => p.id));
-      throw AppException.validation({
-        partIds: [
-          `these documents do not exist: ${input.partIds.filter((id) => !found.has(id)).join(', ')}`,
-        ],
-      });
-    }
+    await this.assertPackageItems(input.materialId, input.partIds);
 
     const pkg = await this.prisma.$transaction(async (tx) => {
       const created = await tx.libraryPackage.create({
         data: {
-          // Defaults to the material the parts come from when they all share
-          // one, which is the ordinary case; a package spanning materials
-          // simply has no single home.
-          materialId:
-            input.materialId ??
-            (new Set(parts.map((p) => p.materialId)).size === 1
-              ? parts[0].materialId
-              : null),
+          materialId: input.materialId,
           title: input.title,
           titleAr: input.titleAr ?? null,
           description: input.description ?? null,
@@ -921,16 +1359,14 @@ export class LibraryService {
       after: { title: pkg.title, price: Number(pkg.price), parts: input.partIds.length },
     });
 
-    return pkg.materialId ? this.materialForAdmin(pkg.materialId) : { id: pkg.id };
+    return this.materialForAdmin(pkg.materialId);
   }
 
   /**
    * Edits a package, optionally replacing its contents.
    *
-   * Changing the contents affects only future purchases. Everyone who already
-   * bought it holds entitlements to the parts it contained on the day they
-   * bought — that is the whole reason entitlements are stored per part rather
-   * than as a pointer to the package.
+   * Changing the contents affects only future purchases: entitlements are
+   * stored per part, so what anyone already bought is untouched.
    */
   async updatePackage(
     packageId: string,
@@ -957,6 +1393,7 @@ export class LibraryService {
         partIds: ['a package must contain at least one document'],
       });
     }
+    if (input.partIds) await this.assertPackageItems(pkg.materialId, input.partIds);
 
     const { partIds, ...scalars } = input;
 
@@ -992,7 +1429,7 @@ export class LibraryService {
       after: input,
     });
 
-    return pkg.materialId ? this.materialForAdmin(pkg.materialId) : { id: packageId };
+    return this.materialForAdmin(pkg.materialId);
   }
 
   async removePackage(packageId: string, actor: { id: string; role: UserRole }) {
@@ -1084,8 +1521,7 @@ export class LibraryService {
       ...page,
       totals: {
         // Credits spent in the Library. NOT cash income — that was recognised
-        // when the credits were bought (recharge_revenue). Summing the two
-        // would count the same money twice.
+        // when the credits were bought (recharge_revenue).
         creditsSpent: Number(Number(totals._sum.priceAtPurchase ?? 0).toFixed(2)),
         count: total,
       },

@@ -60,6 +60,7 @@
  *     TICKET_CHECK = "true"
  *
  *   wrangler secret put MEDIA_SIGNING_KEY     # same value as the API's
+ *   wrangler secret put EDGE_LIVENESS_SECRET  # same value as the API's
  *   wrangler deploy
  *
  * Then point MEDIA_CDN_BASE_URL at the Worker's route, e.g.
@@ -79,7 +80,7 @@
 export default {
   /**
    * @param {Request} request
-   * @param {{ MEDIA: R2Bucket, LIBRARY?: R2Bucket, MEDIA_SIGNING_KEY: string, API_ORIGIN?: string, TICKET_CHECK?: string }} env
+   * @param {{ MEDIA: R2Bucket, LIBRARY?: R2Bucket, MEDIA_SIGNING_KEY: string, EDGE_LIVENESS_SECRET?: string, API_ORIGIN?: string, TICKET_CHECK?: string }} env
    * @param {ExecutionContext} ctx
    */
   async fetch(request, env, ctx) {
@@ -151,8 +152,22 @@ export default {
     // prove the grant is *still* valid — the student may have been signed out,
     // their device revoked, or a capture detected since. One cached round-trip
     // to the API closes that gap.
-    if (env.TICKET_CHECK === 'true' && tid && env.API_ORIGIN) {
-      const live = await ticketIsLive(env, ctx, tid, uid);
+    //
+    // A Library grant (`lib_` owned, `libp_` preview) FAILS CLOSED: a failed
+    // check is not evidence the grant is still good. Without a configured check,
+    // on any network error or timeout, any non-200 answer, a body that is not
+    // JSON, or anything but a clear boolean, the answer is 503: nothing was
+    // decided, and trying again may work. A clear `live: false` is 403.
+    // Attachment and video grants keep the behaviour below.
+    if (isLibraryTicket(tid)) {
+      if (env.TICKET_CHECK !== 'true' || !env.API_ORIGIN) {
+        return deny(503, 'ticket_unverifiable', origin);
+      }
+      const live = await libraryTicketIsLive(env, ctx, tid, uid, sid, did);
+      if (live === null) return deny(503, 'ticket_unverifiable', origin);
+      if (!live) return deny(403, 'ticket_revoked', origin);
+    } else if (env.TICKET_CHECK === 'true' && tid && env.API_ORIGIN) {
+      const live = await ticketIsLive(env, ctx, tid, uid, sid, did);
       if (!live) return deny(403, 'ticket_revoked', origin);
     }
 
@@ -300,6 +315,99 @@ function renditionHeight(objectKey) {
   return match ? Number(match[1]) : null;
 }
 
+/** `tid` prefixes; must match library-documents.service.ts. Inside the HMAC. */
+const LIBRARY_OWNED_TICKET_PREFIX = 'lib_';
+const LIBRARY_PREVIEW_TICKET_PREFIX = 'libp_';
+
+/**
+ * The liveness probe URL, which is also the cache key.
+ *
+ * For Library grants the URL carries the session (`sid`) and device (`did`) the
+ * signed URL was minted for, so one session's or device's cached answer can
+ * never be reused for another. Video and attachment probes are byte-for-byte
+ * what they were.
+ */
+function livenessProbe(env, ticketId, userId, sid, did) {
+  let probe = `${env.API_ORIGIN}/api/v1/playback/tickets/${ticketId}/state?uid=${encodeURIComponent(userId)}`;
+  if (isLibraryTicket(ticketId)) {
+    probe += `&sid=${encodeURIComponent(sid ?? '')}&did=${encodeURIComponent(did ?? '')}`;
+  }
+  return probe;
+}
+
+function isLibraryTicket(ticketId) {
+  return (
+    ticketId.startsWith(LIBRARY_OWNED_TICKET_PREFIX) ||
+    ticketId.startsWith(LIBRARY_PREVIEW_TICKET_PREFIX)
+  );
+}
+
+/**
+ * The headers on every liveness probe. The secret is a header, never part of
+ * the probe URL, so it stays out of logs and of the cache key. Probes do not
+ * follow redirects, so it is never sent anywhere but API_ORIGIN.
+ */
+function probeHeaders(env) {
+  const headers = { 'x-edge-check': '1' };
+  if (env.EDGE_LIVENESS_SECRET) headers['x-edge-secret'] = env.EDGE_LIVENESS_SECRET;
+  return headers;
+}
+
+/**
+ * Library liveness. Returns true or false for a clear answer from the API, and
+ * null when there is none. The caller refuses both false and null.
+ *
+ * The timeout is longer than the video probe's: this runs once per document
+ * rather than once per segment, and a slow database should not refuse a paid
+ * document that a moment's patience would have opened.
+ *
+ * Cache: a per-data-centre Cache API entry, `max-age=10`, keyed by the probe URL
+ * (ticket, user, session, device), so a clear answer is at most 10 seconds
+ * stale, and a failed probe is never cached. Cloudflare documents that Cache API
+ * operations have no effect on `*.workers.dev`: on that hostname every request
+ * probes, staleness is zero, and the API sees one probe per document fetch.
+ */
+async function libraryTicketIsLive(env, ctx, ticketId, userId, sid, did) {
+  const probe = livenessProbe(env, ticketId, userId, sid, did);
+  const cacheKey = new Request(probe, { method: 'GET' });
+  const cache = caches.default;
+
+  try {
+    const cached = await cache.match(cacheKey);
+    if (cached) return readLive(await cached.json());
+  } catch {
+    // An unreadable cache entry is not an answer; ask the API.
+  }
+
+  let payload;
+  try {
+    const response = await fetch(probe, {
+      headers: probeHeaders(env),
+      signal: AbortSignal.timeout(5000),
+      redirect: 'manual',
+    });
+    if (response.status !== 200) return null;
+    payload = await response.json();
+  } catch {
+    return null;
+  }
+
+  // Only a clear boolean is an answer. Anything else is denied and NOT cached,
+  // so a malformed reply cannot pin a decision for the cache window.
+  const raw = payload?.data?.live ?? payload?.live;
+  if (typeof raw !== 'boolean') return null;
+  const live = raw === true;
+  ctx.waitUntil(
+    cache.put(
+      cacheKey,
+      new Response(JSON.stringify({ live }), {
+        headers: { 'cache-control': 'max-age=10', 'content-type': 'application/json' },
+      }),
+    ),
+  );
+  return live;
+}
+
 /**
  * Asks the API whether a playback ticket is still live.
  *
@@ -308,9 +416,11 @@ function renditionHeight(objectKey) {
  * API call per segment per viewer on the origin. Ten seconds is short enough
  * that a revocation takes effect almost immediately and long enough to cut the
  * call volume by an order of magnitude.
+ *
+ * Video and attachment grants only. Library grants use `libraryTicketIsLive`.
  */
-async function ticketIsLive(env, ctx, ticketId, userId) {
-  const probe = `${env.API_ORIGIN}/api/v1/playback/tickets/${ticketId}/state?uid=${encodeURIComponent(userId)}`;
+async function ticketIsLive(env, ctx, ticketId, userId, sid, did) {
+  const probe = livenessProbe(env, ticketId, userId, sid, did);
   const cacheKey = new Request(probe, { method: 'GET' });
   const cache = caches.default;
 
@@ -322,8 +432,9 @@ async function ticketIsLive(env, ctx, ticketId, userId) {
   let response;
   try {
     response = await fetch(probe, {
-      headers: { 'x-edge-check': '1' },
+      headers: probeHeaders(env),
       signal: AbortSignal.timeout(2000),
+      redirect: 'manual',
     });
   } catch {
     // Fail OPEN on a network error, deliberately.

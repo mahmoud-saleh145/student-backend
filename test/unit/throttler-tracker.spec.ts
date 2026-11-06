@@ -39,6 +39,35 @@ describe('ThrottlerProxyGuard.getTracker', () => {
   });
 });
 
+describe('ThrottlerProxyGuard.shouldSkip: the Worker on the liveness route', () => {
+  const SECRET = 'edge-secret-value-used-only-in-this-test';
+  const skip = (o: { edgeRoute: boolean; header?: unknown; secret?: string | null }) => {
+    const guard = Object.create(ThrottlerProxyGuard.prototype) as Record<string, unknown> & {
+      shouldSkip(context: unknown): Promise<boolean>;
+    };
+    guard.reflector = { getAllAndOverride: () => o.edgeRoute };
+    guard.config = { get: () => ({ edgeLivenessSecret: o.secret === undefined ? SECRET : o.secret }) };
+    return guard.shouldSkip({
+      getHandler: () => undefined,
+      getClass: () => undefined,
+      switchToHttp: () => ({ getRequest: () => ({ headers: { 'x-edge-secret': o.header } }) }),
+    });
+  };
+
+  it('skips only for the right secret on the marked route', async () => {
+    await expect(skip({ edgeRoute: true, header: SECRET })).resolves.toBe(true);
+  });
+
+  it.each<[string, Parameters<typeof skip>[0]]>([
+    ['no header', { edgeRoute: true }],
+    ['a wrong header', { edgeRoute: true, header: 'wrong' }],
+    ['no configured secret', { edgeRoute: true, header: SECRET, secret: null }],
+    ['the right secret on any other route', { edgeRoute: false, header: SECRET }],
+  ])('counts the request with %s', async (_name, o) => {
+    await expect(skip(o)).resolves.toBe(false);
+  });
+});
+
 describe('global guard order', () => {
   it('runs authentication before throttling, so the per-user bucket is reachable', () => {
     // Read the providers straight off the module metadata.

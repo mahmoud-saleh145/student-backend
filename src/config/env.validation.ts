@@ -10,6 +10,7 @@ import {
   Max,
   Min,
   MinLength,
+  ValidateIf,
   validateSync,
 } from 'class-validator';
 
@@ -192,6 +193,23 @@ export class EnvironmentVariables {
   @IsString()
   @MinLength(32, { message: 'HLS_KEY_ROOT must be at least 32 characters' })
   HLS_KEY_ROOT!: string;
+
+  // --- Library ----------------------------------------------------------------
+  /**
+   * The Library storefront switch. Optional string, NOT `@IsBoolean`: an
+   * invalid value must mean "storefront OFF" (configuration.ts
+   * `parseStorefrontFlag`), never a refusal to boot. Only `true` turns it on.
+   */
+  @IsOptional() @IsString() LIBRARY_STOREFRONT_ENABLED?: string;
+
+  // --- Media edge -------------------------------------------------------------
+  /** Shared with the media Worker, as a Worker secret. Never in Git. */
+  @ValidateIf((env: EnvironmentVariables) => Boolean(env.EDGE_LIVENESS_SECRET))
+  @IsString()
+  @MinLength(32, { message: 'EDGE_LIVENESS_SECRET must be at least 32 characters' })
+  EDGE_LIVENESS_SECRET?: string;
+  /** Only `true` enforces. Set after the Worker has the secret. */
+  @IsOptional() @IsString() EDGE_LIVENESS_ENFORCE?: string;
 
   // --- DRM ------------------------------------------------------------------
   @toBool() @IsBoolean() DRM_ENABLED = false;
@@ -430,6 +448,11 @@ export function validateEnv(raw: Record<string, unknown>): EnvironmentVariables 
     throw new Error(`Invalid environment configuration:\n${detail}`);
   }
 
+  // Enforcing with nothing to compare against would refuse every Worker probe.
+  if (config.EDGE_LIVENESS_ENFORCE === 'true' && !config.EDGE_LIVENESS_SECRET) {
+    throw new Error('EDGE_LIVENESS_ENFORCE=true requires EDGE_LIVENESS_SECRET.');
+  }
+
   // A resume window at or below the ticket lifetime defeats the setting's only
   // purpose: the ticket would expire before the window that exists to absorb
   // that expiry, so a student who reads past the TTL starts a second play and
@@ -534,6 +557,15 @@ export function validateEnv(raw: Record<string, unknown>): EnvironmentVariables 
         `[config] PUBLIC_API_URL resolves to "${publicUrl}". Protected playback will not work ` +
           'from a phone until it is the API\'s public https origin (e.g. ' +
           'https://student-backend-814y.onrender.com) — manifest and AES-key URLs are built from it.',
+      );
+    }
+    // Logged, not thrown: this is the normal state during the rollout, and it
+    // must stay visible until the rollout finishes.
+    if (config.EDGE_LIVENESS_ENFORCE !== 'true') {
+      console.error(
+        '[config] EDGE_LIVENESS_ENFORCE is not on: the ticket liveness route still answers ' +
+          'unauthenticated callers and still accepts Library probes without a session id. ' +
+          'Finish the rollout in docs/runbooks/library-academic-scope-migration.md.',
       );
     }
     if (config.MEDIA_LOCAL_ORIGIN) {

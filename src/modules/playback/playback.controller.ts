@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  Headers,
   HttpCode,
   HttpStatus,
   Param,
@@ -29,6 +30,7 @@ import type { Request } from 'express';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Public } from '../../common/decorators/public.decorator';
 import { PlaybackThrottle } from '../../common/decorators/throttle.decorator';
+import { EDGE_SECRET_HEADER, EdgeLivenessRoute } from '../../common/security/edge-liveness';
 import type { AuthenticatedUser } from '../../common/types/request-context';
 
 import { PlaybackService } from './playback.service';
@@ -231,16 +233,20 @@ export class PlaybackController {
 
   @Get('tickets/:ticketId/state')
   @Public()
+  @EdgeLivenessRoute()
   @ApiOperation({
     summary: 'Is this playback grant still live? (edge use)',
     description:
-      'Consumed by the media edge Worker. Returns { live } only — never ticket contents.',
+      'Consumed by the media edge Worker, which authenticates with a shared secret header. Returns { live } only — never ticket contents. `sid`/`did` are the session and device the URL was signed for; Library grants (`lib_`, `libp_`) are checked against them, other grants ignore them.',
   })
   ticketState(
     @Param('ticketId') ticketId: string,
-    @Query('uid') uid?: string,
+    @Query('uid') uid?: unknown,
+    @Query('sid') sid?: unknown,
+    @Query('did') did?: unknown,
+    @Headers(EDGE_SECRET_HEADER) edgeSecret?: unknown,
   ): Promise<{ live: boolean }> {
-    return this.playback.ticketLiveness(ticketId, uid ?? null);
+    return this.playback.edgeTicketState(ticketId, { uid, sid, did, edgeSecret });
   }
 
   @Post('security-events')

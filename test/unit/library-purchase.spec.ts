@@ -9,6 +9,7 @@ import {
 import { AppException } from '../../src/common/errors/app.exception';
 import { ErrorCode } from '../../src/common/errors/error-codes';
 import { LibraryPurchaseService } from '../../src/modules/library/library-purchase.service';
+import { openEligibility } from './helpers/library-eligibility-double';
 
 /**
  * Buying library documents with wallet credits.
@@ -26,6 +27,11 @@ import { LibraryPurchaseService } from '../../src/modules/library/library-purcha
  */
 
 const MATERIAL = {
+  id: 'lm_1',
+  universityId: 'uni_1',
+  facultyId: 'fac_1',
+  departmentScope: 'FACULTY',
+  departments: [] as { departmentId: string }[],
   title: 'Physics Revision Papers',
   status: ContentStatus.PUBLISHED,
   isActive: true,
@@ -56,6 +62,8 @@ function build(options: Options = {}) {
 
   const part = {
     ...PARTS[0],
+    materialId: 'lm_1',
+    isPreview: false,
     isActive: true,
     status: ContentStatus.PUBLISHED,
     deletedAt: null,
@@ -72,11 +80,14 @@ function build(options: Options = {}) {
     status: ContentStatus.PUBLISHED,
     deletedAt: null,
     ...options.packageOverrides,
+    materialId: 'lm_1',
     material: MATERIAL,
     items: PARTS.map((p, i) => ({
       sortOrder: i,
+      libraryPartId: p.id,
       part: {
         id: p.id,
+        materialId: 'lm_1',
         isActive: !withdrawn.has(p.id),
         status: withdrawn.has(p.id) ? ContentStatus.ARCHIVED : ContentStatus.PUBLISHED,
         deletedAt: null,
@@ -108,6 +119,7 @@ function build(options: Options = {}) {
           .map((libraryPartId) => ({ libraryPartId })),
       ),
       createMany: entitlementCreateMany,
+      count: jest.fn(async () => 0),
     },
     libraryPurchase: { create: purchaseCreate },
   };
@@ -125,6 +137,7 @@ function build(options: Options = {}) {
           .filter((id) => owns.has(id))
           .map((libraryPartId) => ({ libraryPartId })),
       ),
+      count: jest.fn(async () => 0),
     },
   };
 
@@ -155,6 +168,7 @@ function build(options: Options = {}) {
     prisma as never,
     wallet as never,
     audit as never,
+    openEligibility() as never,
   );
 
   return { service, tx, prisma, debit, purchaseCreate, entitlementCreateMany };
@@ -290,16 +304,19 @@ describe('buying a package', () => {
     expect(debit).not.toHaveBeenCalled();
   });
 
-  it('excludes withdrawn parts from what the buyer receives', async () => {
-    const { service, entitlementCreateMany, purchaseCreate } = build({
+  it('refuses the WHOLE package when any item is withdrawn, debiting nothing (F5)', async () => {
+    // It used to drop the withdrawn item and still charge the full package
+    // price. A package is now sold whole or not at all.
+    const { service, entitlementCreateMany, purchaseCreate, debit } = build({
       withdrawnPartIds: ['lp_2'],
     });
 
-    await service.purchase(BUY_PACKAGE);
-
-    const granted = entitlementCreateMany.mock.calls[0][0].data.map((r) => r.libraryPartId);
-    expect(granted).toEqual(['lp_1', 'lp_3']);
-    expect(purchaseCreate.mock.calls[0][0].data.partIdsSnapshot).toEqual(['lp_1', 'lp_3']);
+    await expect(service.purchase(BUY_PACKAGE)).rejects.toMatchObject({
+      code: ErrorCode.INVALID_STATE,
+    });
+    expect(debit).not.toHaveBeenCalled();
+    expect(purchaseCreate).not.toHaveBeenCalled();
+    expect(entitlementCreateMany).not.toHaveBeenCalled();
   });
 });
 
@@ -417,10 +434,18 @@ describe('quotes', () => {
       isActive: true,
       status: ContentStatus.PUBLISHED,
       deletedAt: null,
+      materialId: 'lm_1',
       material: MATERIAL,
       items: PARTS.map((p, i) => ({
         sortOrder: i,
-        part: { id: p.id, isActive: true, status: ContentStatus.PUBLISHED, deletedAt: null },
+        libraryPartId: p.id,
+        part: {
+          id: p.id,
+          materialId: 'lm_1',
+          isActive: true,
+          status: ContentStatus.PUBLISHED,
+          deletedAt: null,
+        },
       })),
     }));
 
@@ -448,20 +473,11 @@ describe('quotes', () => {
     expect(quote.fullyOwned).toBe(true);
   });
 
-  it('names how many package items are withdrawn before the student pays', async () => {
-    // A package at full price with a withdrawn part is a reduced bundle. The
-    // count mismatch alone is easy to miss; the quote must say it outright so
-    // the client can show "2 of 3 parts currently available" pre-payment.
+  it('refuses to quote a package with a withdrawn item, as the purchase would (G2)', async () => {
     const { service } = build({ withdrawnPartIds: ['lp_2'] });
 
-    const quote = await service.quote({
-      userId: 'usr_1',
-      kind: LibraryPurchaseKind.PACKAGE,
-      targetId: 'pkg_1',
-    });
-
-    expect(quote.partCount).toBe(2);
-    expect(quote.totalPartCount).toBe(3);
-    expect(quote.withdrawnPartCount).toBe(1);
+    await expect(
+      service.quote({ userId: 'usr_1', kind: LibraryPurchaseKind.PACKAGE, targetId: 'pkg_1' }),
+    ).rejects.toMatchObject({ code: ErrorCode.INVALID_STATE });
   });
 });

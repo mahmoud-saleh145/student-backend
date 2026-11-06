@@ -9,6 +9,7 @@ import { ErrorCode } from 'src/common/errors/error-codes';
 import { AttachmentsService } from 'src/modules/attachments/attachments.service';
 import { LibraryService } from 'src/modules/library/library.service';
 import { MAX_DOCUMENT_BYTES, StorageService } from 'src/modules/storage/storage.service';
+import { openEligibility, catalogDouble } from './helpers/library-eligibility-double';
 
 /**
  * REGISTRATION-TIME SIZE VERIFICATION
@@ -307,6 +308,11 @@ function buildLibrary(actual: number | typeof UNAVAILABLE) {
     description: null,
     coverKey: null,
     subject: null,
+    university: null,
+    faculty: null,
+    academicYear: null,
+    departmentScope: 'FACULTY',
+    departments: [],
     parts: [],
     packages: [],
   };
@@ -350,6 +356,8 @@ function buildLibrary(actual: number | typeof UNAVAILABLE) {
     audit as never,
     storage as never,
     settings as never,
+    openEligibility() as never,
+    catalogDouble() as never,
   );
 
   return { service, prisma: prismaWithTx, storage, txCreate };

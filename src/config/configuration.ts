@@ -82,6 +82,17 @@ export const playbackConfig = registerAs('playback', () => ({
   captureStrikes: num(process.env.PLAYBACK_CAPTURE_STRIKES, 3),
 
   /**
+   * Worker-to-backend authentication for the liveness route. See
+   * common/security/edge-liveness.ts and the Library runbook for the rollout.
+   *
+   * The secret alone exempts the Worker from throttling. `Enforce` then refuses
+   * every caller without it, and ends the legacy (no `sid`) Library probe. It
+   * has one spelling for "on", and is set only after the Worker holds the secret.
+   */
+  edgeLivenessSecret: process.env.EDGE_LIVENESS_SECRET || null,
+  edgeLivenessEnforce: process.env.EDGE_LIVENESS_ENFORCE === 'true',
+
+  /**
    * How many times a student may play one protected video. Enforced in
    * `PlaybackService.claimPlay` by counting `video_plays` rows, so it survives
    * a reinstall; the client is never trusted with it.
@@ -280,6 +291,24 @@ export const throttleConfig = registerAs('throttle', () => ({
   authLimit: num(process.env.THROTTLE_AUTH_LIMIT, 10),
 }));
 
+/**
+ * The Library storefront switch, parsed fail-closed.
+ *
+ * ONLY the exact string `true` opens the storefront. Unset, empty, `TRUE`,
+ * `1`, `yes`, ` true` — anything else — is OFF. Deliberately NOT the `bool()`
+ * helper above, which also accepts `'1'`: an emergency switch must have one
+ * spelling for "on" and treat every typo as "off".
+ *
+ * OFF never widens access: academic eligibility is enforced unconditionally,
+ * and owners keep My Library and entitlement-based reading either way.
+ */
+export const parseStorefrontFlag = (value: unknown): boolean => value === 'true';
+
+export const libraryConfig = registerAs('library', () => ({
+  /** Read once at boot; changing it requires a restart. */
+  storefrontEnabled: parseStorefrontFlag(process.env.LIBRARY_STOREFRONT_ENABLED),
+}));
+
 export const configurations = [
   appConfig,
   authConfig,
@@ -292,6 +321,7 @@ export const configurations = [
   notificationConfig,
   redisConfig,
   throttleConfig,
+  libraryConfig,
 ];
 
 export type AppConfig = ReturnType<typeof appConfig>;
@@ -304,5 +334,6 @@ export type PaymentConfig = ReturnType<typeof paymentConfig>;
 export type NotificationConfig = ReturnType<typeof notificationConfig>;
 export type RedisConfig = ReturnType<typeof redisConfig>;
 export type ThrottleConfig = ReturnType<typeof throttleConfig>;
+export type LibraryConfig = ReturnType<typeof libraryConfig>;
 
 export { env };

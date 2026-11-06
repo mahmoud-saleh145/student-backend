@@ -15,6 +15,7 @@ import {
 } from '../../src/common/publication';
 import { grantPartFromCode } from '../../src/modules/course-parts/grant-part-from-code';
 import { LibraryPurchaseService } from '../../src/modules/library/library-purchase.service';
+import { openEligibility } from './helpers/library-eligibility-double';
 
 /**
  * Unpublished content must not be acquirable.
@@ -297,6 +298,10 @@ const purchaseCreate = jest.fn(async ({ data }: { data: Record<string, unknown> 
     status: shape.materialStatus ?? ContentStatus.PUBLISHED,
     isActive: shape.materialActive ?? true,
     deletedAt: shape.materialDeletedAt ?? null,
+    universityId: 'uni_1',
+    facultyId: 'fac_1',
+    departmentScope: 'FACULTY',
+    departments: [] as { departmentId: string }[],
   };
 
   const part = {
@@ -307,6 +312,8 @@ const purchaseCreate = jest.fn(async ({ data }: { data: Record<string, unknown> 
     status: shape.partStatus ?? ContentStatus.PUBLISHED,
     isActive: shape.partActive ?? true,
     deletedAt: shape.partDeletedAt ?? null,
+    materialId: 'mat_1',
+    isPreview: false,
     material,
   };
 
@@ -318,10 +325,11 @@ const purchaseCreate = jest.fn(async ({ data }: { data: Record<string, unknown> 
     status: shape.packageStatus ?? ContentStatus.PUBLISHED,
     isActive: shape.packageActive ?? true,
     deletedAt: null,
+    materialId: 'mat_1',
     material,
     items: [
-      { sortOrder: 0, part: { id: 'lp_1', status: ContentStatus.PUBLISHED, isActive: true, deletedAt: null } },
-      { sortOrder: 1, part: { id: 'lp_2', status: ContentStatus.PUBLISHED, isActive: true, deletedAt: null } },
+      { sortOrder: 0, libraryPartId: 'lp_1', part: { id: 'lp_1', materialId: 'mat_1', status: ContentStatus.PUBLISHED, isActive: true, deletedAt: null } },
+      { sortOrder: 1, libraryPartId: 'lp_2', part: { id: 'lp_2', materialId: 'mat_1', status: ContentStatus.PUBLISHED, isActive: true, deletedAt: null } },
     ],
   };
 
@@ -332,6 +340,7 @@ const purchaseCreate = jest.fn(async ({ data }: { data: Record<string, unknown> 
     libraryEntitlement: {
       findMany: jest.fn(async () => []),
       createMany: entitlementCreateMany,
+      count: jest.fn(async () => 0),
     },
     libraryPurchase: { create: purchaseCreate },
   };
@@ -341,7 +350,7 @@ const purchaseCreate = jest.fn(async ({ data }: { data: Record<string, unknown> 
     libraryPurchase: { findUnique: jest.fn(async () => null) },
     libraryPart: { findFirst: jest.fn(async () => part) },
     libraryPackage: { findFirst: jest.fn(async () => pkg) },
-    libraryEntitlement: { findMany: jest.fn(async () => []) },
+    libraryEntitlement: { findMany: jest.fn(async () => []), count: jest.fn(async () => 0) },
   };
 
   const wallet = {
@@ -363,6 +372,7 @@ const purchaseCreate = jest.fn(async ({ data }: { data: Record<string, unknown> 
     prisma as never,
     wallet as never,
     { record: jest.fn(async () => undefined) } as never,
+    openEligibility() as never,
   );
 
   const buy = (kind: LibraryPurchaseKind, targetId: string) =>
@@ -409,12 +419,12 @@ describe('the library will not sell unpublished content', () => {
   it.each([ContentStatus.DRAFT, ContentStatus.HIDDEN, ContentStatus.ARCHIVED])(
     'refuses a published part inside a %s material',
     async (materialStatus) => {
-      // The old rule refused DRAFT on the material but let HIDDEN through, which
-      // is the same intent spelled two ways with two different answers.
+      // An unpublished material is not visible to students at all, so buying
+      // into it answers exactly like a material that does not exist (404).
       const { buy, wallet } = libraryService({ materialStatus });
 
       await expect(buy(LibraryPurchaseKind.PART, 'lp_1')).rejects.toMatchObject({
-        code: 'INVALID_STATE',
+        code: 'NOT_FOUND',
       });
       expect(wallet.debit).not.toHaveBeenCalled();
     },
@@ -424,7 +434,7 @@ describe('the library will not sell unpublished content', () => {
     const { buy, wallet } = libraryService({ materialActive: false });
 
     await expect(buy(LibraryPurchaseKind.PART, 'lp_1')).rejects.toMatchObject({
-      code: 'INVALID_STATE',
+      code: 'NOT_FOUND',
     });
     expect(wallet.debit).not.toHaveBeenCalled();
   });
@@ -445,7 +455,7 @@ describe('the library will not sell unpublished content', () => {
     const { buy, wallet } = libraryService({ materialStatus: ContentStatus.HIDDEN });
 
     await expect(buy(LibraryPurchaseKind.PACKAGE, 'pkg_1')).rejects.toMatchObject({
-      code: 'INVALID_STATE',
+      code: 'NOT_FOUND',
     });
     expect(wallet.debit).not.toHaveBeenCalled();
   });
