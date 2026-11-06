@@ -5,6 +5,10 @@ Migration `20261105120000_library_academic_scope` and the backend that reads it.
 > **Every step below needs its own explicit authorization.** Nothing in this
 > document authorizes a production action by itself.
 
+> **Status, 2026-11-06 23:19 UTC:** the migration in step 2 has been applied to
+> production. 23 of 23 applied, `db:gate` exits 0. Restore point taken just before:
+> Neon branch `br-summer-tooth-b1o7ivh7`. Next is step 3.
+
 Release order at a glance:
 
 | # | Action | Gate to continue |
@@ -33,10 +37,15 @@ Context that shapes the order:
 * **Vercel auto-deploys `main`** for the dashboard and student web.
 * **Every material follows the same rules.** There is no per-material exception.
   Production has no storefront rule today, so from the backend merge until launch
-  **no non-owner can browse, open or buy any material, including the two on sale
-  today, Mechanica and Microprocessors**. This temporary state is accepted. Owners
-  keep reading. At launch, each material reaches the students academically
-  eligible for it, and no one else.
+  **no non-owner can browse, open or buy any material, including the five on sale
+  on 2026-11-06: DSp, Introduction of engineering, Microprocessors, PLC and
+  Physics**. This temporary state is
+  accepted. Owners keep reading. At launch, each published material reaches the
+  students academically eligible for it, and no one else.
+* **Mechanica is a draft by decision.** It was moved from PUBLISHED to DRAFT on
+  2026-11-06 at 12:15 UTC, and has 3 live entitlements. An owner of a draft material
+  can still open their document and see it in My Library, but the material's own page
+  returns 404. See section C.
 * **The new variable is harmless to the code already running.** The old backend
   and the old Worker ignore it, so it is set first.
 * **The old Worker keeps working with the new backend** through a rollout
@@ -55,8 +64,9 @@ Context that shapes the order:
    production applied it from `bac8288`, and `257bca2` later added only comments.
    This is expected. Do not run `migrate dev` against production.
 2. Materials (section E): no live material may be missing its placement, or the
-   migration fails. Read on 2026-11-06: 0 missing. Mechanica and Microprocessors
-   are on sale, and they stop selling to non-owners at step 4 until launch.
+   migration fails. Read on 2026-11-06: 0 missing. DSp, Introduction of engineering,
+   Microprocessors, PLC and Physics are on sale, and they stop selling to non-owners
+   at step 4 until launch.
 3. Run the snapshot (section A) and keep the output.
 4. Record the deployed Worker version: `wrangler deployments list --name edu-media-gate`.
 5. Look for 429s on `/playback/tickets/*/state` in the Render logs, to compare later.
@@ -149,25 +159,28 @@ and an owned PDF, a preview, an attachment and a video all still open.
 
 ## 9. Admin data review, and the integrity gate
 
-* Mechanica: confirm `FACULTY` (Mansoura → Faculty of Engineering (General),
-  208 eligible students on 2026-11-06).
-* Microprocessors: confirm `FACULTY` (Mansoura → Faculty of Engineering (Programs),
-  300 eligible students at the read-only gate on 2026-11-06, and 303 by the
-  rehearsal later that day: this grows as students register).
-* Two live materials carry a year that is not on their faculty's ladder:
-  **Microprocessors** (published) and **"ميكانيكا برامج"** (draft). Choose an entry
-  from the faculty's ladder or clear the year. Reading is unaffected, because the
-  year is never an eligibility rule, but the new dashboard refuses edits to them
-  until this is done. Fix both before launch.
+* DSp, Microprocessors, PLC and Physics: confirm `FACULTY` (Mansoura → Faculty of
+  Engineering (Programs), 411 eligible students on 2026-11-06 at 23:19 UTC; this
+  grows as students register).
+* Introduction of engineering: confirm `FACULTY` (Mansoura → Faculty of Engineering
+  (General), 210 eligible students on 2026-11-06 at 23:19 UTC).
+* Mechanica: a draft by decision. If it is published again, confirm `FACULTY`
+  (Mansoura → Faculty of Engineering (General), 208 eligible students when last
+  published).
+* Four live materials carry a year that is not on their faculty's ladder:
+  **Microprocessors**, **PLC** and **Physics** (published), and **"ميكانيكا برامج"**
+  (draft). Choose an entry from the faculty's ladder or clear the year. Reading is
+  unaffected, because the year is never an eligibility rule, but the new dashboard
+  refuses audience edits to them until this is done. Fix all four before launch.
 * Other drafts: review as appropriate. Never infer departments from titles.
 * Run section B.
 
 ## 10. Launch (separate approval)
 
 Set `LIBRARY_STOREFRONT_ENABLED=true` on Render (restarts the service).
-Verify with test accounts: Mechanica and Microprocessors are each listed for an
-eligible student, and are 404 for a student outside their university or faculty,
-like any other material.
+Verify with test accounts: each published material is listed for an eligible
+student, and is 404 for a student outside its university or faculty, like any other
+material. A draft material, such as Mechanica, is listed for nobody.
 Monitor 404 / 403 (`LIBRARY_NOT_AVAILABLE`, `LIBRARY_ENTITLEMENT_REVOKED`)
 rates, purchase success, open errors (402/410/device), `UNAUTHORIZED_ACCESS`
 security events, and Worker `ticket_revoked` / `ticket_unverifiable` denials.
@@ -202,10 +215,12 @@ SELECT count(*) AS packages FROM library_packages;
 COMMIT;
 ```
 
-Read on 2026-11-06: 7 purchases totalling 60, 7 live entitlements of 7 (4 students,
-checksum `532dd4e47fd737b8afdb4f7ed45f02af`), 7 Library wallet transactions totalling
-60, 223 wallets with balances of 1090, 7 materials (1 soft-deleted), 7 parts
-(1 soft-deleted), 0 packages. Production stays live, so a purchase or a wallet top-up
+Read on 2026-11-06 at 23:20 UTC, after the migration: 23 of 23 migrations applied, 11
+purchases totalling 100, 11 live entitlements of 11 (6 students, checksum
+`3c555f05f0986cc387e69b6cc4d616d0`), 11 Library wallet transactions totalling 100, 17
+wallet transactions in all totalling 1350, 238 wallets with balances of 1150, 10
+materials (1 soft-deleted, 5 published), 14 parts (2 soft-deleted), 0 packages.
+Production stays live, so a purchase or a wallet top-up
 between two snapshots moves these numbers: compare against the snapshot taken
 immediately before the step, and explain any difference.
 
@@ -230,14 +245,16 @@ SELECT count(*) FROM (SELECT d."materialId" FROM library_material_departments d
 SELECT count(*) FROM library_package_items i JOIN library_packages p ON p.id=i."packageId"
   JOIN library_parts lp ON lp.id=i."libraryPartId" WHERE lp."materialId" <> p."materialId";
 -- live materials whose year is not on their faculty's ladder
--- (expected until fixed: Microprocessors and ميكانيكا برامج)
+-- (expected until fixed: Microprocessors, PLC, Physics and ميكانيكا برامج)
 SELECT m.id, m.title, m.status FROM library_materials m
   JOIN academic_years y ON y.id=m."academicYearId"
   LEFT JOIN academic_structure_faculties af ON af."facultyId"=m."facultyId"
  WHERE m."deletedAt" IS NULL AND af."structureId" IS NOT NULL AND y."structureId" <> af."structureId";
 -- rows edited between migration and backend deploy (review each)
 SELECT id, title, "updatedAt" FROM library_materials WHERE "updatedAt" > '<migration time>';
--- eligible students for each published material (2026-11-06: Mechanica 208, Microprocessors 300 to 303)
+-- eligible students for each published material
+-- (2026-11-06 23:19 UTC: DSp, Microprocessors, PLC and Physics, 411 each;
+--  Introduction of engineering, 210)
 SELECT m.title, count(p.id) FROM library_materials m JOIN student_profiles p
   ON p."universityId"=m."universityId" AND p."facultyId"=m."facultyId"
  AND (m."departmentScope"='FACULTY' OR EXISTS (SELECT 1 FROM library_material_departments d
@@ -250,6 +267,21 @@ COMMIT;
 
 For each live entitlement holder: `POST /library/parts/:id/open` returns a
 `lib_` URL, and the Worker serves it. No production write is involved.
+
+Two things are separate for an owner of a material that is not published, such as
+Mechanica:
+
+| Path | Answer |
+|---|---|
+| `POST /library/parts/:id/open`, the reader | Works. It is refused only if the part or material is ARCHIVED or deleted |
+| `GET /library/me`, My Library | Lists the document as readable, and links to the reader |
+| `GET /library/materials/:id`, the material page | 404, in the deployed backend and the new one |
+
+Check owners through My Library and the reader, not through the material page.
+
+Right after a backend restart, the new Worker's first probe can fail, which refuses
+that one document with a 503 and "couldn't verify your access". Seen locally: Reopen
+worked at once. A rise beyond the restart itself needs investigation.
 
 ## D. Schema rollback (only with separate approval)
 
