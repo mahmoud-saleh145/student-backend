@@ -5,6 +5,22 @@ Migration `20261105120000_library_academic_scope` and the backend that reads it.
 > **Every step below needs its own explicit authorization.** Nothing in this
 > document authorizes a production action by itself.
 
+Release order at a glance:
+
+| # | Action | Gate to continue |
+|---|---|---|
+| 0 | Read-only gates, restore branch, migration rehearsal on a child of it | All pass |
+| 1 | Set `EDGE_LIVENESS_SECRET` on Render | Service healthy |
+| 2 | Run the migration on production | `db:gate` exits 0, section A unchanged |
+| 3 | Freeze Library edits in the dashboard | Admins told |
+| 4 | Merge the backend | Browse empty for non-owners, owners read, no 5xx rise |
+| 5 | Merge the dashboard immediately, then end the freeze | Edit and publish work on a draft |
+| 6 | Set the Worker secret and deploy the Worker | Owned PDF, attachment and video open, no 429s |
+| 7 | Merge Student Web | Reader and owner view work |
+| 8 | Set `EDGE_LIVENESS_ENFORCE=true` | Unauthenticated probe gets a 401, documents still open |
+| 9 | Admin data review and integrity gate | Section B passes |
+| 10 | Launch, under separate approval | Monitoring is clean |
+
 Context that shapes the order:
 
 * **Render auto-deploys `main`.** Merging the backend PR deploys it. The new
@@ -15,11 +31,12 @@ Context that shapes the order:
   faculty). Only writes that would now be invalid fail: a live material without
   a university/faculty (CHECK) and a package without a material (NOT NULL).
 * **Vercel auto-deploys `main`** for the dashboard and student web.
-* **Every material follows the same rules, Mechanica included.** There is no
-  per-material exception. Production has no storefront rule today, so from the
-  backend merge until launch **no non-owner can browse, open or buy any material,
-  Mechanica included**. Owners keep reading. At launch, each material reaches the
-  students academically eligible for it, and no one else.
+* **Every material follows the same rules.** There is no per-material exception.
+  Production has no storefront rule today, so from the backend merge until launch
+  **no non-owner can browse, open or buy any material, including the two on sale
+  today, Mechanica and Microprocessors**. This temporary state is accepted. Owners
+  keep reading. At launch, each material reaches the students academically
+  eligible for it, and no one else.
 * **The new variable is harmless to the code already running.** The old backend
   and the old Worker ignore it, so it is set first.
 * **The old Worker keeps working with the new backend** through a rollout
@@ -30,18 +47,28 @@ Context that shapes the order:
 
 ## 0. Read-only gates (stop if any fails)
 
-1. Production migration state: `npx prisma migrate status`. Note every pending
-   migration: `migrate deploy` applies all of them, and the two before this one
-   (`20261027120000_account_deletion_requests`, `20261030100000_deletion_settlement`)
-   say "not applied" in their own headers. If they are pending, review them too:
-   the code on `main` already reads their columns.
+1. Production migration state: `npx prisma migrate status`. Read on 2026-11-06:
+   22 of 23 applied, none failed, and **only
+   `20261105120000_library_academic_scope` pending**. If anything else is pending
+   now, stop and review it: `migrate deploy` applies everything pending.
+   `20261012120000_shared_video_assets` has a checksum that differs from the file:
+   production applied it from `bac8288`, and `257bca2` later added only comments.
+   This is expected. Do not run `migrate dev` against production.
 2. Materials (section E): no live material may be missing its placement, or the
-   migration fails. Know what is on sale today, because it stops selling to
-   non-owners at step 4 until launch.
+   migration fails. Read on 2026-11-06: 0 missing. Mechanica and Microprocessors
+   are on sale, and they stop selling to non-owners at step 4 until launch.
 3. Run the snapshot (section A) and keep the output.
 4. Record the deployed Worker version: `wrangler deployments list --name edu-media-gate`.
 5. Look for 429s on `/playback/tickets/*/state` in the Render logs, to compare later.
-6. Restore point: a Neon branch of production (or a recorded point-in-time timestamp).
+6. Confirm Render's `DATABASE_URL` host is the database checked above, and that
+   `LIBRARY_STOREFRONT_ENABLED` and `EDGE_LIVENESS_ENFORCE` are unset.
+7. Restore point: a dedicated Neon branch of production, auto-delete off, with its
+   id and creation time recorded. Create a fresh one immediately before the
+   production migration. A branch is a copy at that moment: anything written to
+   production afterward is not in it, and restoring it would lose that work.
+8. Rehearse on a separate child of that branch, so the restore point itself stays
+   before the migration, never on production: `migrate status`, `migrate deploy`,
+   `db:gate`, then sections A and B. Stop if anything differs.
 
 ## 1. Set the backend secret (the running backend ignores it)
 
@@ -55,14 +82,22 @@ Verify: the service restarted healthy; the Library behaves as before.
 
 ## 2. Apply the migration (from the unmerged release commit)
 
+Run in a quiet period, from the head of `feat/library-academic-scope`, over the
+direct, non-pooler connection. Rehearsed on an isolated branch on 2026-11-06: only
+this migration applied, `db:gate` passed, no drift, data unchanged.
+
 ```bash
 git checkout <release-commit>
 DATABASE_URL=<production> DIRECT_URL=<production> npx prisma migrate deploy
 DATABASE_URL=<production> DIRECT_URL=<production> npm run db:gate   # must exit 0
 ```
 
-Then run section A again: every number must be identical, plus the
-constraint/structure checks in section B must pass.
+Then run section A again: every number must match the snapshot taken just before,
+plus the constraint/structure checks in section B must pass.
+
+The migration should roll back as one unit if it fails, but it leaves a failed
+record that blocks later deploys. Clearing that needs `prisma migrate resolve`,
+which is a production write and needs its own authorization.
 
 ## 3. Freeze Library edits in the dashboard
 
@@ -115,17 +150,24 @@ and an owned PDF, a preview, an attachment and a video all still open.
 ## 9. Admin data review, and the integrity gate
 
 * Mechanica: confirm `FACULTY` (Mansoura → Faculty of Engineering (General),
-  205 eligible students at the last count).
-* "ميكانيكا برامج" and "Dsp" (Programs, LEVEL ladder): choose a LEVEL entry or
-  clear the year — they carry YEAR rungs and cannot be published as they are.
+  208 eligible students on 2026-11-06).
+* Microprocessors: confirm `FACULTY` (Mansoura → Faculty of Engineering (Programs),
+  300 eligible students at the read-only gate on 2026-11-06, and 303 by the
+  rehearsal later that day: this grows as students register).
+* Two live materials carry a year that is not on their faculty's ladder:
+  **Microprocessors** (published) and **"ميكانيكا برامج"** (draft). Choose an entry
+  from the faculty's ladder or clear the year. Reading is unaffected, because the
+  year is never an eligibility rule, but the new dashboard refuses edits to them
+  until this is done. Fix both before launch.
 * Other drafts: review as appropriate. Never infer departments from titles.
 * Run section B.
 
 ## 10. Launch (separate approval)
 
 Set `LIBRARY_STOREFRONT_ENABLED=true` on Render (restarts the service).
-Verify with test accounts: Mechanica is listed for an eligible student, and is
-404 for a student outside its university or faculty, like any other material.
+Verify with test accounts: Mechanica and Microprocessors are each listed for an
+eligible student, and are 404 for a student outside their university or faculty,
+like any other material.
 Monitor 404 / 403 (`LIBRARY_NOT_AVAILABLE`, `LIBRARY_ENTITLEMENT_REVOKED`)
 rates, purchase success, open errors (402/410/device), `UNAUTHORIZED_ACCESS`
 security events, and Worker `ticket_revoked` / `ticket_unverifiable` denials.
@@ -140,6 +182,7 @@ security events, and Worker `ticket_revoked` / `ticket_unverifiable` denials.
 | Backend defect | Unset `EDGE_LIVENESS_ENFORCE`, roll the Worker back, then revert the PR on `main` (auto-deploys the previous backend). The new Worker must not stay in front of the old backend, which throttles its probes. **Reverting reopens the unscoped catalogue**: every published material visible to every student, as production is today. **Keep the schema** — the old backend works with it. Do not run the old image's `db:gate`: it reports the newer migration as drift, which is expected. |
 | Dashboard defect | Revert its PR. Library edits then fail again, so restore the freeze. |
 | Student Web defect | Revert its PR. The old web works against the new backend. |
+| Database restore | Last resort, with its own authorization. Restoring `production` from the restore branch discards everything written after that branch was created, and does not undo a backend, Worker or Vercel deployment. |
 | Schema rollback | **Never automatic, never part of an ordinary rollback.** Only if section D shows no audience data exists, or after a separately approved export (section D) and recovery plan. |
 
 ## A. Read-only snapshot (before and after each step)
@@ -159,8 +202,12 @@ SELECT count(*) AS packages FROM library_packages;
 COMMIT;
 ```
 
-Expected at the time of writing: 6 purchases, 6 live entitlements (4 students),
-7 materials (1 soft-deleted), 6 parts (1 soft-deleted), 0 packages.
+Read on 2026-11-06: 7 purchases totalling 60, 7 live entitlements of 7 (4 students,
+checksum `532dd4e47fd737b8afdb4f7ed45f02af`), 7 Library wallet transactions totalling
+60, 223 wallets with balances of 1090, 7 materials (1 soft-deleted), 7 parts
+(1 soft-deleted), 0 packages. Production stays live, so a purchase or a wallet top-up
+between two snapshots moves these numbers: compare against the snapshot taken
+immediately before the step, and explain any difference.
 
 ## B. Read-only integrity gate
 
@@ -182,14 +229,15 @@ SELECT count(*) FROM (SELECT d."materialId" FROM library_material_departments d
 -- packages with an item from another material (must be 0)
 SELECT count(*) FROM library_package_items i JOIN library_packages p ON p.id=i."packageId"
   JOIN library_parts lp ON lp.id=i."libraryPartId" WHERE lp."materialId" <> p."materialId";
--- live materials whose year is not on their faculty's ladder (expected: the 2 Programs drafts until fixed)
+-- live materials whose year is not on their faculty's ladder
+-- (expected until fixed: Microprocessors and ميكانيكا برامج)
 SELECT m.id, m.title, m.status FROM library_materials m
   JOIN academic_years y ON y.id=m."academicYearId"
   LEFT JOIN academic_structure_faculties af ON af."facultyId"=m."facultyId"
  WHERE m."deletedAt" IS NULL AND af."structureId" IS NOT NULL AND y."structureId" <> af."structureId";
 -- rows edited between migration and backend deploy (review each)
 SELECT id, title, "updatedAt" FROM library_materials WHERE "updatedAt" > '<migration time>';
--- eligible students for each published material (Mechanica expected: 205 at last count)
+-- eligible students for each published material (2026-11-06: Mechanica 208, Microprocessors 300 to 303)
 SELECT m.title, count(p.id) FROM library_materials m JOIN student_profiles p
   ON p."universityId"=m."universityId" AND p."facultyId"=m."facultyId"
  AND (m."departmentScope"='FACULTY' OR EXISTS (SELECT 1 FROM library_material_departments d
