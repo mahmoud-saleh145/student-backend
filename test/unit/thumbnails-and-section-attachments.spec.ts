@@ -2,6 +2,7 @@ import { AttachmentKind, UserRole } from '@prisma/client';
 
 import { AttachmentsService } from '../../src/modules/attachments/attachments.service';
 import { LibraryService } from '../../src/modules/library/library.service';
+import { openEligibility, catalogDouble } from './helpers/library-eligibility-double';
 
 /**
  * Two things that ship together and are each easy to get subtly wrong.
@@ -332,6 +333,11 @@ function buildLibrary(opts: {
     description: null,
     coverKey: opts.coverKey,
     subject: null,
+    academicYear: null,
+    universityId: 'uni_1',
+    facultyId: 'fac_1',
+    departmentScope: 'FACULTY',
+    departments: [],
     parts: [
       {
         id: 'lp_1',
@@ -357,6 +363,12 @@ function buildLibrary(opts: {
     libraryEntitlement: {
       findMany: jest.fn(async (_args: { where: unknown; select: unknown }) => []),
     },
+    libraryPart: {
+      findMany: jest.fn(async (_args: { where: unknown; select: unknown }) => material.parts),
+    },
+    libraryPackage: {
+      findMany: jest.fn(async (_args: { where: unknown; select: unknown }) => material.packages),
+    },
   };
   const audit = { record: jest.fn(async (_e: Record<string, unknown>) => undefined) };
   // Echoes the key back, so the assertion is about WHICH key was chosen.
@@ -372,6 +384,8 @@ function buildLibrary(opts: {
     audit as never,
     storage as never,
     settings as never,
+    openEligibility() as never,
+    catalogDouble() as never,
   );
 
   return { service, settings, storage };

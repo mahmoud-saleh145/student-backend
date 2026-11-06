@@ -23,6 +23,13 @@ import { AuditService } from '../audit/audit.service';
 import { fromPiastres, parseAmount, toEgpNumber } from '../wallet/money';
 import { WalletService } from '../wallet/wallet.service';
 
+import {
+  LibraryEligibilityService,
+  MATERIAL_AUDIENCE_SELECT,
+  isPublished,
+  toAudience,
+} from './library-eligibility.service';
+
 export interface LibraryPurchaseResult {
   purchaseId: string;
   kind: LibraryPurchaseKind;
@@ -83,7 +90,101 @@ export class LibraryPurchaseService {
     private readonly prisma: PrismaService,
     private readonly wallet: WalletService,
     private readonly audit: AuditService,
+    private readonly eligibility: LibraryEligibilityService,
   ) {}
+
+  /**
+   * May this student acquire this item at all? The gate every quote and every
+   * purchase passes first: before the idempotent replay, and again inside the
+   * money transaction, before the debit.
+   *
+   *   storefront off                        -> 404
+   *   item or its material not published    -> 404 (indistinguishable from absent)
+   *   out of scope, student owns none of it -> 404
+   *   out of scope, student owns a part     -> 403 LIBRARY_NOT_AVAILABLE
+   *   any target part revoked for them      -> 403 LIBRARY_ENTITLEMENT_REVOKED
+   *   a free preview part                   -> 409 INVALID_STATE (nothing to buy)
+   *
+   * Academic eligibility comes from the student's own profile and is never
+   * switched off. Ownership grants no purchase eligibility.
+   */
+  private async assertMayAcquire(
+    tx: Prisma.TransactionClient | PrismaService,
+    userId: string,
+    kind: LibraryPurchaseKind,
+    targetId: string,
+  ): Promise<void> {
+    const notFound = () =>
+      kind === LibraryPurchaseKind.PART
+        ? AppException.notFound('Library part', targetId)
+        : AppException.notFound('Library package', targetId);
+
+    if (!this.eligibility.storefrontEnabled) throw notFound();
+
+    const materialSelect = {
+      id: true,
+      status: true,
+      isActive: true,
+      deletedAt: true,
+      ...MATERIAL_AUDIENCE_SELECT,
+    } as const;
+
+    let material;
+    let partIds: string[];
+    let isPreviewPart = false;
+
+    if (kind === LibraryPurchaseKind.PART) {
+      const part = await tx.libraryPart.findFirst({
+        where: { id: targetId, ...notDeleted },
+        select: { id: true, isPreview: true, material: { select: materialSelect } },
+      });
+      if (!part) throw notFound();
+      material = part.material;
+      partIds = [part.id];
+      isPreviewPart = part.isPreview;
+    } else {
+      const pkg = await tx.libraryPackage.findFirst({
+        where: { id: targetId, ...notDeleted },
+        select: {
+          id: true,
+          material: { select: materialSelect },
+          items: { select: { libraryPartId: true } },
+        },
+      });
+      if (!pkg) throw notFound();
+      material = pkg.material;
+      partIds = pkg.items.map((item) => item.libraryPartId);
+    }
+
+    if (!isPublished(material)) throw notFound();
+
+    const scope = await this.eligibility.scopeFor(userId, tx);
+    if (!this.eligibility.isVisible(scope, toAudience(material))) {
+      if (await this.eligibility.ownsAnyPartOf(userId, material.id, tx)) {
+        throw new AppException(ErrorCode.LIBRARY_NOT_AVAILABLE);
+      }
+      throw notFound();
+    }
+
+    // Every source counts (purchase, package, admin): a revoked part is never
+    // bought back around the revocation, and nothing restores it silently.
+    const revoked = partIds.length
+      ? await tx.libraryEntitlement.count({
+          where: { userId, libraryPartId: { in: partIds }, revokedAt: { not: null } },
+        })
+      : 0;
+    if (revoked > 0) {
+      throw new AppException(ErrorCode.LIBRARY_ENTITLEMENT_REVOKED, {
+        details: { targetId },
+      });
+    }
+
+    if (isPreviewPart) {
+      throw new AppException(ErrorCode.INVALID_STATE, {
+        message: 'This document is a free preview; there is nothing to buy',
+      });
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Quotes
@@ -101,6 +202,10 @@ export class LibraryPurchaseService {
     kind: LibraryPurchaseKind;
     targetId: string;
   }) {
+    // Same refusals as `purchase` (decision G2), so a Buy button is never shown
+    // for something that would be refused.
+    await this.assertMayAcquire(this.prisma, params.userId, params.kind, params.targetId);
+
     const [balance, target] = await Promise.all([
       this.wallet.summary(params.userId),
       params.kind === LibraryPurchaseKind.PART
@@ -157,6 +262,10 @@ export class LibraryPurchaseService {
         ? `libpart:${params.targetId}:${params.userId}`
         : `libpkg:${params.targetId}:${params.userId}`;
 
+    // The gate runs BEFORE the idempotent replay: a replay must never be a way
+    // around the storefront, academic scope or a revocation.
+    await this.assertMayAcquire(this.prisma, params.userId, params.kind, params.targetId);
+
     // The retry path — far more common than a genuine race — answers without
     // opening a transaction.
     const existing = await this.findExisting(idempotencyKey);
@@ -165,6 +274,10 @@ export class LibraryPurchaseService {
     const result = await withSerializableRetry(
       this.prisma,
       async (tx) => {
+        // Again inside the money transaction, so nothing that changed since the
+        // first check can slip past the debit below.
+        await this.assertMayAcquire(tx, params.userId, params.kind, params.targetId);
+
         const target =
           params.kind === LibraryPurchaseKind.PART
             ? await this.loadPart(tx, params.targetId)
@@ -468,6 +581,7 @@ export class LibraryPurchaseService {
             part: {
               select: {
                 id: true,
+                materialId: true,
                 isActive: true,
                 status: true,
                 deletedAt: true,
@@ -490,25 +604,26 @@ export class LibraryPurchaseService {
 
     // A package whose material has been withdrawn is not for sale either, even
     // when the package row itself is untouched.
-    if (pkg.material) assertMaterialOnSale(pkg.material, pkg.material.id ?? pkg.id);
+    assertMaterialOnSale(pkg.material, pkg.material.id);
 
-    // Withdrawn parts are excluded from what the buyer receives. Selling access
-    // to material that has been taken down would be selling nothing. Only
-    // `PUBLISHED` parts are included now — a draft or hidden part inside an
-    // otherwise sound package must not be handed over silently.
-    const partIds = pkg.items
-      .filter((item) => isOnSale(item.part))
-      .map((item) => item.part.id);
-
-    if (partIds.length === 0) {
+    // All or nothing (decision F5). A package is sold whole or not at all: an
+    // unavailable item, or one that is not a part of this package's own
+    // material, makes the whole package unavailable. It used to drop such
+    // items silently and still charge the full package price.
+    const unavailable = pkg.items.filter(
+      (item) => !isOnSale(item.part) || item.part.materialId !== pkg.materialId,
+    );
+    if (pkg.items.length === 0 || unavailable.length > 0) {
       throw new AppException(ErrorCode.INVALID_STATE, {
-        message: 'This package has no purchasable content',
+        message: 'This package is not currently available',
       });
     }
 
+    const partIds = pkg.items.map((item) => item.part.id);
+
     return {
       title: pkg.title,
-      materialTitle: pkg.material?.title ?? null,
+      materialTitle: pkg.material.title,
       currency: pkg.currency,
       pricePiastres: parseAmount(pkg.price.toString(), 'price'),
       partIds,

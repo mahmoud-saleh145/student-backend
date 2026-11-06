@@ -1,6 +1,7 @@
 import { ContentStatus, UserRole } from '@prisma/client';
 
 import { LibraryService } from '../../src/modules/library/library.service';
+import { openEligibility, catalogDouble } from './helpers/library-eligibility-double';
 
 /**
  * Publishing a library material.
@@ -34,6 +35,12 @@ function build(
     isActive: true,
     publishedAt: before.publishedAt ?? null,
     deletedAt: null,
+    // A valid faculty-wide audience: publishing re-validates the stored one.
+    universityId: 'uni_1',
+    facultyId: 'fac_1',
+    departmentScope: 'FACULTY',
+    academicYearId: null,
+    departments: [] as { departmentId: string }[],
   };
 
   // Typed parameters throughout: `jest.fn(async () => …)` infers an empty
@@ -55,10 +62,28 @@ function build(
   // `noImplicitAny`). `browse` uses the array form and nothing else under test
   // opens a transaction at all, so a path that did would fail loudly here
   // rather than being quietly accommodated.
-  const prisma = {
+  // Both transaction forms: `browse` uses the array form, `updateMaterial` the
+  // callback form (it writes the material and its department links together).
+  // Typed loosely so the callback can receive the client itself.
+  const prisma: Record<string, unknown> = {
     libraryMaterial: { findFirst, update, findMany, count },
-    $transaction: jest.fn(async (operations: readonly unknown[]) => Promise.all(operations)),
+    libraryEntitlement: { findMany: jest.fn(async () => []) },
+    libraryMaterialDepartment: {
+      deleteMany: jest.fn(async () => ({ count: 0 })),
+      createMany: jest.fn(async () => ({ count: 0 })),
+    },
+    university: { findFirst: jest.fn(async () => ({ id: 'uni_1', isActive: true })) },
+    faculty: {
+      findFirst: jest.fn(async () => ({ id: 'fac_1', universityId: 'uni_1', isActive: true })),
+    },
+    department: { findMany: jest.fn(async () => []) },
+    academicYear: { findFirst: jest.fn(async () => null) },
   };
+  prisma.$transaction = jest.fn(async (arg: unknown) =>
+    typeof arg === 'function'
+      ? (arg as (tx: unknown) => Promise<unknown>)(prisma)
+      : Promise.all(arg as readonly unknown[]),
+  );
 
   // The parameter is named even though the body ignores it: a zero-arity
   // `jest.fn(async () => …)` infers an EMPTY parameter tuple, which makes
@@ -84,6 +109,8 @@ function build(
     audit as never,
     storage as never,
     settings as never,
+    openEligibility() as never,
+    catalogDouble() as never,
   );
 
   // `updateMaterial` returns `materialForAdmin`, which re-reads. The second
@@ -184,9 +211,18 @@ describe('student-facing reads filter on PUBLISHED', () => {
     const call = findMany.mock.calls[0];
     if (!call) throw new Error('libraryMaterial.findMany was never called');
 
-    const where = call[0].where as { status?: ContentStatus; isActive?: boolean };
-    expect(where.status).toBe(ContentStatus.PUBLISHED);
-    expect(where.isActive).toBe(true);
+    // Publication is its own `AND` branch, beside the academic filter, so no
+    // other condition (search, eligibility) can widen it.
+    const where = call[0].where as { AND: Array<Record<string, unknown>> };
+    expect(where.AND).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          status: ContentStatus.PUBLISHED,
+          isActive: true,
+          deletedAt: null,
+        }),
+      ]),
+    );
   });
 
   it('a direct read of a draft material finds nothing', async () => {

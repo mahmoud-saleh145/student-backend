@@ -89,15 +89,110 @@ admin report labels its total `creditsSpent`, never "revenue".
 Never sum a Library figure with a course figure: they are different systems and
 the money entered them by different routes.
 
+## Academic audience and visibility
+
+Every live material is filed to a **university and a faculty** (required; a
+`CHECK` constraint holds it in the database) and has a `departmentScope`:
+
+| Scope | Who sees it | Department links |
+|---|---|---|
+| `FACULTY` (default) | every department of that faculty | none |
+| `DEPARTMENTS` | only the linked departments | one or more |
+
+Links live in `library_material_departments`; two composite foreign keys make the
+database refuse a department that is not in the material's faculty. General vs
+Programs comes from `Department.studyType`, and one material never mixes them.
+Year/level (`academicYearId`) is an **optional browsing filter only**, validated
+against the ladder that governs the faculty (or each selected department).
+
+Eligibility (`LibraryEligibilityService`) is read from the student's **own
+profile** and is **always enforced** — no switch disables it. It fails closed: no
+profile, a missing university/faculty on either side, or `DEPARTMENTS` with no
+links matches nobody. Clients can only narrow (year, subject, search).
+
+Admin writes validate the audience **as one unit**
+(`universityId, facultyId, departmentScope, departmentIds, academicYearId`):
+sending any of them means sending all five, so an edit cannot widen or narrow
+who sees a material as a side effect. Publishing re-validates the stored one.
+
+### The storefront switch
+
+`LIBRARY_STOREFRONT_ENABLED` — read once at boot (restart to change), parsed
+**fail-closed**: only the exact string `true` is ON. While OFF: browse is empty,
+non-owners get 404 on detail, quote/purchase/package are refused, preview
+tickets are refused and preview liveness is dead. Owners keep `/library/me` and
+entitlement-based reading. Turning it off never widens academic access.
+
+### Authorization
+
+| Action | In scope, storefront on | Out of scope, owner | Out of scope, non-owner | Storefront off, owner |
+|---|---|---|---|---|
+| Browse | published + eligible | not listed | not listed | empty |
+| Detail | `view: FULL` | `view: OWNER` | 404 | `view: OWNER` |
+| Quote / purchase | allowed if on sale | 403 `LIBRARY_NOT_AVAILABLE` | 404 | 404 |
+| Open owned part | `lib_` ticket | `lib_` ticket | — | `lib_` ticket |
+| Open preview | `libp_` ticket | 404 | 404 | refused |
+
+* **Owner view** — material header and ONLY the student's unrevoked, published
+  parts: no prices, no packages, no counts, nothing purchasable. A revoked
+  entitlement is never ownership. Publication still applies.
+* **404 is uniform** — missing, unpublished, out of scope and storefront-off all
+  answer the same `NOT_FOUND`, so nothing hidden can be discovered.
+* **Per-part `access`** — what the student can do now, first match wins:
+  `OWNED | PREVIEW | REVOKED | PURCHASABLE | UNAVAILABLE`.
+* **Per-part `ownership`** — what the student holds, independent of `access`:
+  `OWNED | REVOKED | NONE`. **Decision B:** revocation and preview eligibility
+  are separate. A revoked entitlement never grants owned access (`lib_` is
+  refused at issue and dies at liveness), but it does not remove a free preview
+  the student is otherwise eligible for (storefront on, part and material
+  published, in academic scope, session and device valid): such a part answers
+  `access: PREVIEW, ownership: REVOKED` and opens with a `libp_` ticket only.
+  Having owned a part never stands in for any preview condition.
+  (`owned`/`purchasable`/`isPreview`/`fullyOwned`/`available` are deprecated
+  mirrors kept until the Student Web and Mobile clients move to `access`.)
+* **Packages** belong to exactly one material and are sold **whole or not at
+  all**: any unavailable, unpublished, out-of-scope, revoked or foreign item
+  refuses the package before any debit.
+* **Revoked entitlements** — quote and purchase refuse with
+  `LIBRARY_ENTITLEMENT_REVOKED` before any debit; nothing restores one
+  automatically.
+* The gate runs **before** the idempotent purchase replay and again inside the
+  money transaction, before the debit.
+
 ## Opening a document
 
 `POST /library/parts/:partId/open` returns a **short-lived signed URL** bound to
 the user, session and device, plus the watermark payload the client renders over
-the page. It is minted only after four checks: authenticated, account active,
-device authorised, entitlement held.
+the page. There are exactly two ways in, and the ticket type is inside the HMAC:
 
-The object key is never sent to a client, never returned by an admin endpoint,
-and the underlying object is never public. This reuses
+* **`lib_<partId>` — owned.** An unrevoked entitlement to that exact part; the
+  material not withdrawn; device authorised. Scope and the storefront do not
+  matter. Edge liveness re-checks the entitlement, the exact session the URL was
+  signed for, and, for device-bound content, the exact device. Another active
+  session or another approved device does not keep it alive.
+* **`libp_<partId>` — preview.** Storefront on, part and material published, the
+  student eligible. Edge liveness re-checks all of that
+  plus the exact session. **No approved device is needed**, so the device is not
+  consulted; revoking a device revokes its sessions, which still ends the URL.
+
+For both, the Worker **fails closed**: an API that is unreachable, times out, or
+answers 429, 5xx or anything but a clear boolean proves nothing, so the document
+is refused (503 `ticket_unverifiable`). A clear `live: false` is 403
+`ticket_revoked`. A clear answer is cached for at most 10 s where the Cache API
+works; Cloudflare documents that it has no effect on `*.workers.dev`, where every
+fetch probes. Course attachments and video keep their own, unchanged rules.
+
+The Worker authenticates its probes with a shared secret
+(`EDGE_LIVENESS_SECRET`, in a header, compared in constant time), which also
+exempts it from the per-IP throttle. Once `EDGE_LIVENESS_ENFORCE=true`, anyone
+else gets a 401. Rollout order: `docs/runbooks/library-academic-scope-migration.md`.
+
+There is no staff path. A non-owner who could not see the material gets 404;
+one who can (in scope, or owning another part) gets 402.
+
+The object key is never sent as a field and never returned by an admin endpoint
+(it is the path of the signed URL, which is HMAC-bound and expires), and the
+underlying object is never public. This reuses
 `StorageService.signMediaUrl` — the same mechanism that already protects course
 attachments — so there is one place where protected media is signed.
 
@@ -113,7 +208,7 @@ account being probed or shared.
 Archived material stops being readable **even for someone who bought it**, in
 the same way an archived course stops playing. The entitlement is not revoked
 and the purchase stands; only delivery is withheld, and `GET /library/me` flags
-the row `available: false` rather than hiding it.
+the row `status: WITHDRAWN` rather than hiding it.
 
 ### The honest limit
 
@@ -122,6 +217,12 @@ at a screen. Nothing can. It makes casual redistribution inconvenient and
 deliberate redistribution traceable. OS-level capture blocking and server-side
 rendering of a per-student watermarked file are Phase 4; neither changes that
 limit.
+
+**Accepted for this release:** the watermark is drawn in the browser, on top of
+an unmodified PDF. A technically capable student can obtain the original,
+unwatermarked file from network traffic while their signed URL is valid, and a
+signed URL works from any device until it expires as long as its ticket stays
+live. Server-side watermarking and DRM are out of scope for this release.
 
 ## API
 
@@ -154,6 +255,12 @@ something they paid for. Deactivating hides it and keeps them whole.
 `20260918014216_library` — purely additive. No existing table is altered and no
 existing row is touched. Folder named with the real UTC clock, so a
 Prisma-generated migration cannot sort into the middle of the sequence.
+
+`20261105120000_library_academic_scope` — additive: the scope enum and column
+(constant default, no row rewritten), the department link table with its
+composite foreign keys, the placement `CHECK`, and `library_packages.materialId`
+NOT NULL (no rows). Applied **before** the backend that reads it is deployed;
+see `docs/runbooks/library-academic-scope-migration.md`.
 
 ## Not built yet
 

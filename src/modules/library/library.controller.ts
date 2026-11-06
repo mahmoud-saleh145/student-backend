@@ -60,15 +60,13 @@ export class LibraryController {
   @ApiOperation({
     summary: 'Browse the library',
     description:
-      'Published, active material only. Server-side searched, filtered and paginated. Reports what the whole material would cost part by part, which is the figure a package price is meant to beat.',
+      'Published, active material the student is academically eligible for (university, faculty and department from their own profile). Empty while the storefront is off. Year/level, subject and search only narrow the result.',
   })
   browse(@Query() query: BrowseLibraryDto, @CurrentUser() user: AuthenticatedUser) {
     return this.library.browse({
       page: query.page,
       pageSize: query.pageSize,
       q: query.q,
-      universityId: query.universityId,
-      facultyId: query.facultyId,
       academicYearId: query.academicYearId,
       subjectId: query.subjectId,
       userId: user.id,

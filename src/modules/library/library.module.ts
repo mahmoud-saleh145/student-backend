@@ -1,9 +1,11 @@
 import { Module } from '@nestjs/common';
 
+import { CatalogModule } from '../catalog/catalog.module';
 import { DevicesModule } from '../devices/devices.module';
 import { WalletModule } from '../wallet/wallet.module';
 
 import { LibraryDocumentsService } from './library-documents.service';
+import { LibraryEligibilityService } from './library-eligibility.service';
 import { LibraryPurchaseService } from './library-purchase.service';
 import { LibraryAdminController, LibraryController } from './library.controller';
 import { LibraryService } from './library.service';
@@ -21,9 +23,16 @@ import { LibraryService } from './library.service';
  * `@Global`, so signing and security events arrive without an import.
  */
 @Module({
-  imports: [WalletModule, DevicesModule],
+  // `CatalogModule` resolves which year/level ladder governs a faculty or
+  // department, for audience validation. It imports nothing, so no cycle.
+  imports: [WalletModule, DevicesModule, CatalogModule],
   controllers: [LibraryController, LibraryAdminController],
-  providers: [LibraryService, LibraryPurchaseService, LibraryDocumentsService],
+  providers: [
+    LibraryService,
+    LibraryPurchaseService,
+    LibraryDocumentsService,
+    LibraryEligibilityService,
+  ],
   exports: [LibraryService, LibraryPurchaseService, LibraryDocumentsService],
 })
 export class LibraryModule {}

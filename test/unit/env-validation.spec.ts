@@ -28,6 +28,28 @@ const MINIMAL = {
 const validate = (overrides: Record<string, unknown> = {}, env = NodeEnv.Development) =>
   validateEnv({ ...MINIMAL, NODE_ENV: env, ...overrides });
 
+describe('the edge liveness secret', () => {
+  it.each([
+    ['unset', {}],
+    ['empty', { EDGE_LIVENESS_SECRET: '', EDGE_LIVENESS_ENFORCE: '' }],
+    ['set', { EDGE_LIVENESS_SECRET: 'f'.repeat(32) }],
+    ['set and enforced', { EDGE_LIVENESS_SECRET: 'f'.repeat(32), EDGE_LIVENESS_ENFORCE: 'true' }],
+  ])('%s boots', (_name, overrides) => {
+    expect(() => validate(overrides)).not.toThrow();
+  });
+
+  it('refuses a short secret', () => {
+    expect(() => validate({ EDGE_LIVENESS_SECRET: 'short' })).toThrow(/EDGE_LIVENESS_SECRET/);
+  });
+
+  it('refuses enforcement with nothing to compare against', () => {
+    expect(() => validate({ EDGE_LIVENESS_ENFORCE: 'true' })).toThrow(/requires EDGE_LIVENESS_SECRET/);
+    expect(() => validate({ EDGE_LIVENESS_ENFORCE: 'true', EDGE_LIVENESS_SECRET: '' })).toThrow(
+      /requires EDGE_LIVENESS_SECRET/,
+    );
+  });
+});
+
 /**
  * A production environment that passes every guard, so each test can break
  * exactly one thing. Without this, CORS_ORIGINS trips first and every later

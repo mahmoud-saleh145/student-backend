@@ -55,6 +55,21 @@ export enum ErrorCode {
    * story, which already narrows by department.
    */
   COURSE_NOT_TARGETED = 'COURSE_NOT_TARGETED',
+  /**
+   * The student owns part of this Library material, but the material is no
+   * longer in their academic scope, so nothing more can be bought from it.
+   *
+   * Returned ONLY to an owner: they can already see the material through the
+   * ownership exception, so a 403 reveals nothing. A non-owner gets 404.
+   */
+  LIBRARY_NOT_AVAILABLE = 'LIBRARY_NOT_AVAILABLE',
+  /**
+   * The student's entitlement to this Library part was revoked. Buying it again
+   * is refused before any wallet debit, and nothing restores it automatically:
+   * a revocation may be a refund, an administrative restriction or a security
+   * action, and the model cannot yet tell them apart.
+   */
+  LIBRARY_ENTITLEMENT_REVOKED = 'LIBRARY_ENTITLEMENT_REVOKED',
   ACCESS_EXPIRED = 'ACCESS_EXPIRED',
   NOT_ENROLLED = 'NOT_ENROLLED',
   ENROLLMENT_PENDING = 'ENROLLMENT_PENDING',
@@ -133,6 +148,8 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   [ErrorCode.COURSE_NOT_AVAILABLE]: 404,
   [ErrorCode.COURSE_ARCHIVED]: 410,
   [ErrorCode.COURSE_NOT_TARGETED]: 403,
+  [ErrorCode.LIBRARY_NOT_AVAILABLE]: 403,
+  [ErrorCode.LIBRARY_ENTITLEMENT_REVOKED]: 403,
   [ErrorCode.ACCESS_EXPIRED]: 410,
   [ErrorCode.NOT_ENROLLED]: 403,
   [ErrorCode.ENROLLMENT_PENDING]: 409,
@@ -203,6 +220,10 @@ export const ERROR_MESSAGE: Record<ErrorCode, string> = {
   [ErrorCode.NOT_FOUND]: 'Resource not found',
   [ErrorCode.COURSE_NOT_AVAILABLE]: 'Course is not available',
   [ErrorCode.COURSE_NOT_TARGETED]: 'This course is not offered to your department',
+  [ErrorCode.LIBRARY_NOT_AVAILABLE]:
+    'This material is no longer offered to your department. You can still read what you own.',
+  [ErrorCode.LIBRARY_ENTITLEMENT_REVOKED]:
+    'Your access to this document was withdrawn. Contact support.',
   [ErrorCode.COURSE_ARCHIVED]: 'Course has been archived',
   [ErrorCode.ACCESS_EXPIRED]: 'Access to this content has expired',
   [ErrorCode.NOT_ENROLLED]: 'Not enrolled in this course',

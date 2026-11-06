@@ -94,6 +94,13 @@ TICKET_CHECK = "true"
 #     wrangler secret put MEDIA_SIGNING_KEY
 #
 # It must be byte-identical to MEDIA_SIGNING_KEY in the API's .env.
+#
+# EDGE_LIVENESS_SECRET is also an encrypted Worker secret, never a var:
+#
+#     wrangler secret put EDGE_LIVENESS_SECRET
+#
+# It authenticates liveness probes to the API, and must match the API's value.
+# Rollout order: docs/runbooks/library-academic-scope-migration.md.
 
 # --- custom domain -----------------------------------------------------------
 # Commented out for the FIRST deploy on purpose: if the zone is not yet on this

@@ -481,12 +481,21 @@ model LibraryMaterial {
   isActive    Boolean       @default(true)
   sortOrder   Int           @default(0)
 
-  /// Optional catalogue placement, mirroring how courses are filed, so the
-  /// same browse filters work. All nullable: a material need belong to nothing.
+  /// Academic audience. University and faculty are required for every live
+  /// material — enforced by the `library_materials_placement_chk` CHECK
+  /// constraint (raw SQL in the migration) and by the admin validator. They
+  /// stay nullable in the column type only because a soft-deleted legacy row
+  /// predates the rule and is never rewritten.
   universityId   String?
   facultyId      String?
+  /// Optional browsing filter, never an eligibility rule.
   academicYearId String?
   subjectId      String?
+
+  /// FACULTY: every department of `facultyId` (and no department links).
+  /// DEPARTMENTS: only the linked departments (at least one link). A
+  /// DEPARTMENTS material with no links is visible to nobody — fail closed.
+  departmentScope LibraryDepartmentScope @default(FACULTY)
 
   createdById String?
   publishedAt DateTime?
@@ -500,15 +509,45 @@ model LibraryMaterial {
   subject      Subject?      @relation(fields: [subjectId], references: [id], onDelete: SetNull)
   createdBy    User?         @relation("MaterialCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
 
-  parts    LibraryPart[]
-  packages LibraryPackage[]
+  parts       LibraryPart[]
+  packages    LibraryPackage[]
+  departments LibraryMaterialDepartment[]
 
+  /// Target of the composite foreign key on `library_material_departments`.
+  @@unique([id, facultyId])
   @@index([status, sortOrder])
   @@index([universityId, facultyId, academicYearId])
   @@index([subjectId])
   @@index([deletedAt])
   @@index([title])
   @@map("library_materials")
+}
+
+/// Who may see a Library material.
+enum LibraryDepartmentScope {
+  FACULTY
+  DEPARTMENTS
+}
+
+/// LibraryMaterial ↔ Department, for `departmentScope = DEPARTMENTS`.
+///
+/// `facultyId` is carried on the row so two composite foreign keys can hold
+/// the invariant in the database rather than only in the service: the
+/// department must belong to the same faculty as the material. Changing a
+/// material's faculty cascades into these rows and is then refused by the
+/// department key unless the links are replaced in the same transaction.
+model LibraryMaterialDepartment {
+  materialId   String
+  facultyId    String
+  departmentId String
+  createdAt    DateTime @default(now())
+
+  material   LibraryMaterial @relation(fields: [materialId, facultyId], references: [id, facultyId], onDelete: Cascade, onUpdate: Cascade)
+  department Department      @relation(fields: [departmentId, facultyId], references: [id, facultyId], onDelete: Restrict, onUpdate: Restrict)
+
+  @@id([materialId, departmentId])
+  @@index([departmentId])
+  @@map("library_material_departments")
 }
 
 /// One sellable document within a material.
@@ -563,8 +602,9 @@ model LibraryPart {
 /// A bundle of parts at one price. Usually cheaper than buying them separately.
 model LibraryPackage {
   id          String        @id @default(cuid())
-  /// Usually one material's parts, but a package may span materials.
-  materialId  String?
+  /// Exactly one material. Every item must be a part of this material —
+  /// enforced by the admin validator (decision G4) and re-checked at purchase.
+  materialId  String
   title       String
   titleAr     String?
   description String?
@@ -579,7 +619,7 @@ model LibraryPackage {
   updatedAt DateTime  @updatedAt
   deletedAt DateTime?
 
-  material  LibraryMaterial?     @relation(fields: [materialId], references: [id], onDelete: SetNull)
+  material  LibraryMaterial      @relation(fields: [materialId], references: [id], onDelete: Restrict)
   items     LibraryPackageItem[]
   purchases LibraryPurchase[]    @relation("LibraryPackagePurchases")
 
@@ -791,8 +831,14 @@ model Department {
   students StudentProfile[]
   courses  CourseDepartment[]
   academicStructures AcademicStructure[]
+  libraryMaterials   LibraryMaterialDepartment[]
 
   @@unique([facultyId, name])
+  /// Target of the composite foreign key on `library_material_departments`.
+  /// `id` is already unique, so this adds no constraint of its own; it exists
+  /// so the database itself can refuse a Library department link whose
+  /// department belongs to a different faculty than the material.
+  @@unique([id, facultyId])
   @@index([facultyId, isActive])
   @@index([facultyId, studyType, isActive])
   @@map("departments")

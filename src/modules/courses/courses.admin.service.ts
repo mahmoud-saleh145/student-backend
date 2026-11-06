@@ -1,7 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import {
   AccountStatus,
-  AcademicStructureKind,
   AuditAction,
   CourseStatus,
   EnrollmentMethod,
@@ -17,6 +16,11 @@ import { paginated } from '../../common/types/api-response';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { withSerializableRetry } from '../../database/serializable-retry';
 import { AuditService } from '../audit/audit.service';
+import {
+  COURSE_PLACEMENT,
+  checkAcademicStructure,
+  checkYearInLadder,
+} from '../catalog/academic-placement';
 import { CatalogService } from '../catalog/catalog.service';
 import { CloudinaryService } from '../storage/cloudinary.service';
 import { assertObjectKeyInNamespace, StorageService } from '../storage/storage.service';
@@ -1497,89 +1501,25 @@ export class CoursesAdminService {
   /**
    * University → College → Department must actually hold.
    *
-   * The dashboard filters each select by its parent, but a filtered dropdown
-   * is a convenience, not a constraint: the API accepts whatever is posted.
-   * `users.service.ts` has checked this for student profiles since the
-   * beginning; courses never did, so a course could be saved with a college
-   * belonging to a different university and nothing would complain.
-   *
-   * Returns the department ids it validated, so the caller does not have to
-   * re-derive them.
+   * Moved verbatim to `catalog/academic-placement.ts` so the Library can apply
+   * the same rules; this delegate runs it with `COURSE_PLACEMENT`, which is the
+   * exact behaviour this method had (pinned by
+   * test/unit/academic-placement-equivalence.spec.ts).
    */
   private async assertAcademicStructure(input: {
     universityId?: string | null;
     facultyId?: string | null;
     departmentIds?: string[] | null;
   }): Promise<void> {
-    const fields: Record<string, string[]> = {};
-
-    const facultyId = input.facultyId ?? null;
-    const universityId = input.universityId ?? null;
-    const departmentIds = [...new Set(input.departmentIds ?? [])];
-
-    const faculty = facultyId
-      ? await this.prisma.faculty.findFirst({
-          where: { id: facultyId, ...notDeleted },
-          select: { id: true, universityId: true },
-        })
-      : null;
-
-    if (facultyId && !faculty) {
-      fields.facultyId = ['college not found'];
-    } else if (faculty && universityId && faculty.universityId !== universityId) {
-      fields.facultyId = ['does not belong to the selected university'];
-    }
-
-    if (departmentIds.length > 0) {
-      if (!facultyId) {
-        // A department is only meaningful under a college. Accepting one
-        // without a parent would store a hierarchy that cannot be rendered.
-        fields.departmentIds = ['choose a college before choosing departments'];
-      } else {
-        const found = await this.prisma.department.findMany({
-          where: { id: { in: departmentIds }, ...notDeleted },
-          select: { id: true, facultyId: true, studyType: true },
-        });
-
-        if (new Set(found.map((d) => d.studyType)).size > 1) {
-          fields.departmentIds = ['General and Programs departments cannot be combined'];
-        }
-
-        const missing = departmentIds.filter((id) => !found.some((d) => d.id === id));
-        const foreign = found.filter((d) => d.facultyId !== facultyId);
-
-        if (missing.length > 0) {
-          fields.departmentIds = ['one or more departments do not exist'];
-        } else if (foreign.length > 0) {
-          fields.departmentIds = [
-            'one or more departments do not belong to the selected college',
-          ];
-        }
-      }
-    }
-
-    if (Object.keys(fields).length > 0) {
-      throw AppException.validation(fields);
-    }
+    await checkAcademicStructure(this.prisma, input, COURSE_PLACEMENT);
   }
 
   /**
    * A rung must belong to the ladder that will actually govern this course.
    *
-   * `academicYearId` used to be stored without a word of checking, which is how
-   * a course ended up filed under "First Year" while living in a faculty whose
-   * ladder counts in levels: the year existed, the course was valid, and nothing
-   * ever said the two belonged together. The dashboard dropdown hid it by
-   * always listing the platform ladder, so an administrator had no way to see
-   * or fix it.
-   *
-   * Resolution goes through `CatalogService.resolveAcademicStructure` rather
-   * than a second copy of the department -> faculty -> university -> platform
-   * precedence. One implementation of "which ladder governs this unit" is the
-   * whole point of that method; duplicating it here is how the two would drift.
-   *
-   * A course offered to several departments must use a rung that belongs to
-   * every selected department ladder. Separate ladders cannot be combined.
+   * Same move, same guarantee: `checkYearInLadder` with `COURSE_PLACEMENT`
+   * resolves the ladder through `CatalogService.resolveAcademicStructure` and
+   * produces the messages this method always produced.
    */
   private async assertAcademicYearBelongsToStructure(input: {
     universityId?: string | null;
@@ -1587,46 +1527,7 @@ export class CoursesAdminService {
     departmentIds?: string[] | null;
     academicYearId?: string | null;
   }): Promise<void> {
-    const academicYearId = input.academicYearId;
-    if (!academicYearId) return;
-
-    const departmentIds = [...new Set(input.departmentIds ?? [])].sort();
-    const departmentId = departmentIds[0];
-    for (const additionalDepartment of departmentIds.slice(1)) {
-      await this.assertAcademicYearBelongsToStructure({
-        ...input,
-        departmentIds: [additionalDepartment],
-      });
-    }
-
-    const structure = await this.catalog.resolveAcademicStructure({
-      departmentId: departmentId ?? null,
-      facultyId: departmentId ? null : (input.facultyId ?? null),
-      universityId: departmentId || input.facultyId ? null : (input.universityId ?? null),
-    });
-
-    // No ladder anywhere up the chain: there is nothing to belong to, and the
-    // row cannot be rendered by anything that lists years.
-    if (!structure) {
-      throw AppException.validation({
-        academicYearId: ['no academic structure covers this course; create one first'],
-      });
-    }
-
-    const rung = await this.prisma.academicYear.findFirst({
-      where: { id: academicYearId, structureId: structure.id },
-      select: { id: true },
-    });
-
-    if (!rung) {
-      throw AppException.validation({
-        academicYearId: [
-          structure.kind === AcademicStructureKind.LEVEL
-            ? 'that level is not part of this course academic structure'
-            : 'that year is not part of this course academic structure',
-        ],
-      });
-    }
+    await checkYearInLadder(this.prisma, this.catalog, input, COURSE_PLACEMENT);
   }
 
   private async assertTeachersExist(teacherIds: string[]): Promise<void> {

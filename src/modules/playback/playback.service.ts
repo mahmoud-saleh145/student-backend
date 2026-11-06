@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
+  AccountStatus,
   ContentStatus,
   DeviceStatus,
   PlaybackTicketStatus,
@@ -15,12 +16,20 @@ import { createHash, randomBytes } from 'node:crypto';
 
 import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
+import { hasValidEdgeSecret } from '../../common/security/edge-liveness';
 import type { AuthenticatedUser } from '../../common/types/request-context';
-import type { PlaybackConfig, VideoConfig } from '../../config/configuration';
+import type { LibraryConfig, PlaybackConfig, VideoConfig } from '../../config/configuration';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { CourseAccessService } from '../courses/course-access.service';
 import { DevicesService } from '../devices/devices.service';
+import {
+  MATERIAL_AUDIENCE_SELECT,
+  isAcademicallyVisible,
+  isPublished,
+  loadStudentScope,
+  toAudience,
+} from '../library/library-eligibility.service';
 import { SecurityEventService } from '../security/security-event.service';
 import { StorageService } from '../storage/storage.service';
 import { TokenService } from '../auth/token.service';
@@ -36,6 +45,18 @@ import { DrmVerificationService } from './drm-verification.service';
  * that contract, and the two must agree.
  */
 const LIBRARY_TICKET_PREFIX = 'lib_';
+
+/**
+ * A Library PREVIEW grant (`libp_<partId>`). Distinct from `lib_` and checked
+ * BEFORE it is — although `libp_` does not start with `lib_` (index 3 is `p`,
+ * not `_`), the order makes that independent of spelling. The ticket type is
+ * inside the HMAC, so it cannot be changed to the other kind.
+ */
+const LIBRARY_PREVIEW_TICKET_PREFIX = 'libp_';
+
+/** A session or device id the liveness probe will look up. Anything else is absent. */
+const cleanProbeId = (value: unknown): string | null =>
+  typeof value === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(value) ? value : null;
 
 /**
  * Lecture/section/course document grants.
@@ -149,6 +170,12 @@ export class PlaybackService {
   private readonly cfg: PlaybackConfig;
   private readonly videoCfg: VideoConfig;
 
+  /**
+   * `LIBRARY_STOREFRONT_ENABLED`, parsed fail-closed at boot (configuration.ts).
+   * Only preview liveness reads it. A field so tests can set it.
+   */
+  libraryStorefrontEnabled: boolean;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
@@ -164,6 +191,10 @@ export class PlaybackService {
   ) {
     this.cfg = config.getOrThrow<PlaybackConfig>('playback');
     this.videoCfg = config.getOrThrow<VideoConfig>('video');
+    // Fails closed: a config double without `get`, or a missing namespace, is OFF.
+    this.libraryStorefrontEnabled =
+      typeof config.get === 'function' &&
+      config.get<LibraryConfig>('library')?.storefrontEnabled === true;
   }
 
   // ---------------------------------------------------------------------------
@@ -1451,8 +1482,28 @@ export class PlaybackService {
    * `uid` must match the ticket's owner. That is what stops one student's
    * ticket id, lifted from a URL, being used to probe another's.
    */
-  async ticketLiveness(ticketId: string, uid: string | null): Promise<{ live: boolean }> {
+  async ticketLiveness(
+    ticketId: string,
+    uid: string | null,
+    /**
+     * The session and device the URL was signed for. Library tickets are held
+     * to them; video and attachment tickets ignore them, unchanged.
+     *
+     * `legacyProbe` is the rollout allowance for the Worker deployed before
+     * this check, whose probe carries neither. Only `edgeTicketState` sets it,
+     * and only until EDGE_LIVENESS_ENFORCE is on. Every other caller is strict.
+     */
+    bound: { sid?: unknown; did?: unknown; legacyProbe?: boolean } = {},
+  ): Promise<{ live: boolean }> {
     if (!ticketId || !uid) return { live: false };
+
+    if (ticketId.startsWith(LIBRARY_PREVIEW_TICKET_PREFIX)) {
+      return this.libraryPreviewTicketLiveness(
+        ticketId.slice(LIBRARY_PREVIEW_TICKET_PREFIX.length),
+        uid,
+        bound,
+      );
+    }
 
     // A library document grant carries no PlaybackTicket row: `issueTicket` in
     // library-documents.service.ts signs `lib_<partId>` and relies on the
@@ -1464,6 +1515,7 @@ export class PlaybackService {
       return this.libraryTicketLiveness(
         ticketId.slice(LIBRARY_TICKET_PREFIX.length),
         uid,
+        bound,
       );
     }
 
@@ -1523,23 +1575,29 @@ export class PlaybackService {
    *     `ARCHIVED`. Mirrored exactly from `issueTicket`, including that
    *     `isActive` is deliberately *not* part of it: the edge must not refuse
    *     a grant the issuing path would have allowed.
-   *   - a non-preview part needs a live entitlement. A preview is openable by
-   *     anyone, which is what makes it a preview.
+   *   - the student must hold an UNREVOKED entitlement. Always: `lib_` is the
+   *     OWNED ticket and is minted for nothing else. (It used to skip this for
+   *     preview parts; previews now carry `libp_` and are checked by
+   *     `libraryPreviewTicketLiveness`, so an old `lib_` preview URL dies.)
    *
-   * **One deliberate difference.** The edge probe carries only the ticket id
-   * and `uid` (`ticketIsLive` in docs/cloudflare-worker.js), not `sid`/`did`,
-   * so the specific session and device in the URL cannot be identified here
-   * without changing the Worker contract. Instead this asks whether the
-   * account still has *any* live session, and any authorised device for
-   * device-bound content. That keeps the property the check exists for — a
-   * signed URL dies when the student is signed out, their device revoked or
-   * their binding reset — while being weaker than the video branch for an
-   * account holding several devices, where revoking one does not kill a URL
-   * minted on it until the URL expires (PLAYBACK_TICKET_TTL, 300s).
+   *   - the EXACT session the URL was signed for is still live for this user,
+   *     so another active session cannot keep it alive;
+   *   - for device-bound content, the EXACT device the URL was signed for is
+   *     ACTIVE for this user, and is the one that session is bound to, so
+   *     another approved device cannot validate it. A part that is also a
+   *     preview is not device-bound when minted, so it is not here either.
+   *
+   * The Worker takes `sid`/`did` from the signed URL, after checking the HMAC.
+   *
+   * **Rollout allowance.** A `legacyProbe` has neither, because it comes from
+   * the Worker deployed before this check. It gets the old account-wide answer
+   * until EDGE_LIVENESS_ENFORCE is on, after which it cannot reach this code.
+   * Missing identifiers are refused everywhere else.
    */
   private async libraryTicketLiveness(
     libraryPartId: string,
     userId: string,
+    bound: { sid?: unknown; did?: unknown; legacyProbe?: boolean },
   ): Promise<{ live: boolean }> {
     if (!libraryPartId) return { live: false };
 
@@ -1563,27 +1621,152 @@ export class PlaybackService {
       return { live: false };
     }
 
-    if (!part.isPreview) {
-      const entitlement = await this.prisma.libraryEntitlement.findUnique({
-        where: { userId_libraryPartId: { userId, libraryPartId: part.id } },
-        select: { revokedAt: true },
-      });
+    const entitlement = await this.prisma.libraryEntitlement.findUnique({
+      where: { userId_libraryPartId: { userId, libraryPartId: part.id } },
+      select: { revokedAt: true },
+    });
 
-      if (!entitlement || entitlement.revokedAt !== null) return { live: false };
+    if (!entitlement || entitlement.revokedAt !== null) return { live: false };
+
+    if (bound.legacyProbe) {
+      const [activeSessions, activeDevices] = await this.prisma.$transaction([
+        this.prisma.session.count({ where: { userId, status: 'ACTIVE' } }),
+        this.prisma.device.count({ where: { userId, status: DeviceStatus.ACTIVE } }),
+      ]);
+      if (activeSessions === 0) return { live: false };
+      if (!part.isPreview && activeDevices === 0) return { live: false };
+      return { live: true };
     }
 
-    const [activeSessions, activeDevices] = await this.prisma.$transaction([
-      this.prisma.session.count({ where: { userId, status: 'ACTIVE' } }),
-      this.prisma.device.count({ where: { userId, status: DeviceStatus.ACTIVE } }),
-    ]);
-
-    if (activeSessions === 0) return { live: false };
+    const session = await this.liveLibrarySession(bound.sid, userId);
+    if (!session) return { live: false };
 
     // Previews are not device-bound when the URL is minted, so they are not
     // device-bound when it is re-checked either.
-    if (!part.isPreview && activeDevices === 0) return { live: false };
+    if (part.isPreview) return { live: true };
 
-    return { live: true };
+    const deviceId = cleanProbeId(bound.did);
+    if (!deviceId) return { live: false };
+    if (session.deviceId && session.deviceId !== deviceId) return { live: false };
+
+    const device = await this.prisma.device.findFirst({
+      where: { id: deviceId, userId, status: DeviceStatus.ACTIVE },
+      select: { id: true },
+    });
+    return { live: device !== null };
+  }
+
+  /**
+   * The exact session a Library URL was signed for, if it is still good: the
+   * same test the auth guard applies to an access token, on the session row.
+   */
+  private liveLibrarySession(sessionId: unknown, userId: string) {
+    const id = cleanProbeId(sessionId);
+    if (!id) return Promise.resolve(null);
+    return this.prisma.session.findFirst({
+      where: {
+        id,
+        userId,
+        status: 'ACTIVE',
+        expiresAt: { gt: new Date() },
+        user: {
+          deletedAt: null,
+          status: { notIn: [AccountStatus.DISABLED, AccountStatus.SUSPENDED] },
+        },
+      },
+      select: { id: true, deviceId: true },
+    });
+  }
+
+  /**
+   * The liveness route, as the edge calls it.
+   *
+   * Decides who is asking, then answers. Under EDGE_LIVENESS_ENFORCE a caller
+   * without the secret gets a 401 and learns nothing. Before that, a probe with
+   * no secret and no identifiers is taken for the previous Worker.
+   */
+  async edgeTicketState(
+    ticketId: string,
+    probe: { uid?: unknown; sid?: unknown; did?: unknown; edgeSecret?: unknown },
+  ): Promise<{ live: boolean }> {
+    const authenticated = hasValidEdgeSecret(probe.edgeSecret, this.cfg.edgeLivenessSecret);
+    if (this.cfg.edgeLivenessEnforce === true && !authenticated) {
+      throw new AppException(ErrorCode.UNAUTHORIZED);
+    }
+    return this.ticketLiveness(ticketId, typeof probe.uid === 'string' ? probe.uid : null, {
+      sid: probe.sid,
+      did: probe.did,
+      legacyProbe:
+        !authenticated &&
+        this.cfg.edgeLivenessEnforce !== true &&
+        probe.sid === undefined &&
+        probe.did === undefined,
+    });
+  }
+
+  /**
+   * Is a Library PREVIEW grant still good? Everything must hold; any doubt is
+   * `live: false` (and the Worker fails closed on anything but a clear `true`).
+   *
+   *   - the storefront is on;
+   *   - the part is still a published, active, non-deleted preview, and its
+   *     material is published, active and not deleted;
+   *   - the student is still academically eligible for the material;
+   *   - the EXACT session the URL was signed for is still live for this user,
+   *     so a revoked session's URL dies even while they are signed in elsewhere.
+   *
+   * Free previews need no approved device, so the device is not consulted, and
+   * a missing one bypasses nothing above. Revoking a device or resetting a
+   * binding revokes its sessions, so that still ends the URL.
+   *
+   * Decision B: ownership is deliberately not consulted. A revoked entitlement
+   * never keeps a `lib_` grant alive, and it neither grants nor removes a
+   * preview: the conditions above decide alone.
+   *
+   * A `legacyProbe` (see `ticketLiveness`) has no session id, so until
+   * EDGE_LIVENESS_ENFORCE is on it needs any live session for this user.
+   */
+  private async libraryPreviewTicketLiveness(
+    libraryPartId: string,
+    userId: string,
+    bound: { sid?: unknown; legacyProbe?: boolean },
+  ): Promise<{ live: boolean }> {
+    if (!libraryPartId) return { live: false };
+    if (!this.libraryStorefrontEnabled) return { live: false };
+
+    const part = await this.prisma.libraryPart.findFirst({
+      where: { id: libraryPartId, ...notDeleted },
+      select: {
+        isPreview: true,
+        status: true,
+        isActive: true,
+        deletedAt: true,
+        material: {
+          select: {
+            status: true,
+            isActive: true,
+            deletedAt: true,
+            ...MATERIAL_AUDIENCE_SELECT,
+          },
+        },
+      },
+    });
+
+    if (!part || !part.isPreview) return { live: false };
+    if (!isPublished(part) || !isPublished(part.material)) return { live: false };
+
+    const scope = await loadStudentScope(this.prisma, userId);
+    if (!isAcademicallyVisible(scope, toAudience(part.material))) return { live: false };
+
+    if (bound.legacyProbe) {
+      const activeSessions = await this.prisma.session.count({
+        where: { userId, status: 'ACTIVE' },
+      });
+      return { live: activeSessions > 0 };
+    }
+
+    const session = await this.liveLibrarySession(bound.sid, userId);
+    return { live: session !== null };
   }
 
   /**

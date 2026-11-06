@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { ContentStatus, LibraryPurchaseKind } from '@prisma/client';
+import { ContentStatus, LibraryDepartmentScope, LibraryPurchaseKind } from '@prisma/client';
 import { Type } from 'class-transformer';
 import {
   ArrayMaxSize,
@@ -21,9 +21,16 @@ import {
 import { SearchablePaginationDto } from '../../../common/dto/pagination.dto';
 import { MAX_MONEY_EGP } from '../../wallet/money';
 
+/**
+ * Browsing filters. They can only NARROW what the student is eligible for.
+ *
+ * There is deliberately no `universityId`/`facultyId`: academic eligibility is
+ * read from the student's own profile on the server, and a client-supplied
+ * placement would be meaningless at best. The validation pipe forbids unknown
+ * properties, so sending them is a 400.
+ */
 export class BrowseLibraryDto extends SearchablePaginationDto {
-  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) universityId?: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) facultyId?: string;
+  /** Optional Year/Level browsing filter. Never an eligibility rule. */
   @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) academicYearId?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) subjectId?: string;
 }
@@ -52,29 +59,65 @@ export class AdminListLibraryDto extends SearchablePaginationDto {
   status?: ContentStatus;
 }
 
+/**
+ * A material and its audience.
+ *
+ * The audience — university, faculty, scope, departments, year/level — is
+ * validated as one unit by LibraryService. University and faculty are required
+ * there (a null is refused with a field error naming the field). `null` clears
+ * `academicYearId`/`subjectId`.
+ */
 export class CreateMaterialDto {
   @ApiProperty() @IsString() @MinLength(2) @MaxLength(200) title!: string;
   @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(200) titleAr?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(4000) description?: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) universityId?: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) facultyId?: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) academicYearId?: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) subjectId?: string;
+  @ApiProperty() @IsOptional() @IsString() @MaxLength(32) universityId?: string | null;
+  @ApiProperty() @IsOptional() @IsString() @MaxLength(32) facultyId?: string | null;
+  @ApiPropertyOptional({ enum: LibraryDepartmentScope, default: LibraryDepartmentScope.FACULTY })
+  @IsOptional()
+  @IsEnum(LibraryDepartmentScope)
+  departmentScope?: LibraryDepartmentScope;
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(50)
+  @IsString({ each: true })
+  @MaxLength(32, { each: true })
+  departmentIds?: string[];
+  @ApiPropertyOptional({ nullable: true }) @IsOptional() @IsString() @MaxLength(32) academicYearId?: string | null;
+  @ApiPropertyOptional({ nullable: true }) @IsOptional() @IsString() @MaxLength(32) subjectId?: string | null;
   @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(512) coverKey?: string;
 }
 
+/**
+ * Editing a material. Sending ANY audience field means sending all five
+ * (universityId, facultyId, departmentScope, departmentIds, academicYearId);
+ * a partial audience is refused, so an edit cannot change who sees a material
+ * as a side effect.
+ */
 export class UpdateMaterialDto {
   @ApiPropertyOptional() @IsOptional() @IsString() @MinLength(2) @MaxLength(200) title?: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(200) titleAr?: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(4000) description?: string;
+  @ApiPropertyOptional({ nullable: true }) @IsOptional() @IsString() @MaxLength(200) titleAr?: string | null;
+  @ApiPropertyOptional({ nullable: true }) @IsOptional() @IsString() @MaxLength(4000) description?: string | null;
   @ApiPropertyOptional({ enum: ContentStatus }) @IsOptional() @IsEnum(ContentStatus) status?: ContentStatus;
   @ApiPropertyOptional() @IsOptional() @IsBoolean() isActive?: boolean;
   @ApiPropertyOptional() @IsOptional() @Type(() => Number) @IsInt() @Min(0) sortOrder?: number;
-  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) universityId?: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) facultyId?: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) academicYearId?: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) subjectId?: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(512) coverKey?: string;
+  @ApiPropertyOptional({ nullable: true }) @IsOptional() @IsString() @MaxLength(32) universityId?: string | null;
+  @ApiPropertyOptional({ nullable: true }) @IsOptional() @IsString() @MaxLength(32) facultyId?: string | null;
+  @ApiPropertyOptional({ enum: LibraryDepartmentScope })
+  @IsOptional()
+  @IsEnum(LibraryDepartmentScope)
+  departmentScope?: LibraryDepartmentScope;
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(50)
+  @IsString({ each: true })
+  @MaxLength(32, { each: true })
+  departmentIds?: string[];
+  @ApiPropertyOptional({ nullable: true }) @IsOptional() @IsString() @MaxLength(32) academicYearId?: string | null;
+  @ApiPropertyOptional({ nullable: true }) @IsOptional() @IsString() @MaxLength(32) subjectId?: string | null;
+  @ApiPropertyOptional({ nullable: true }) @IsOptional() @IsString() @MaxLength(512) coverKey?: string | null;
 }
 
 export class CreateLibraryPartDto {
@@ -142,7 +185,8 @@ export class UpdateLibraryPartDto {
 }
 
 export class CreateLibraryPackageDto {
-  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) materialId?: string;
+  /** Required: a package belongs to exactly one material, and so do its items. */
+  @ApiProperty() @IsString() @MaxLength(32) materialId!: string;
   @ApiProperty() @IsString() @MinLength(2) @MaxLength(200) title!: string;
   @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(200) titleAr?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(4000) description?: string;
