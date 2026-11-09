@@ -203,6 +203,38 @@ export const videoConfig = registerAs('video', () => ({
   segmentSeconds: num(process.env.HLS_SEGMENT_SECONDS, 6),
   encryptionEnabled: bool(process.env.HLS_ENCRYPTION_ENABLED, true),
   keyRoot: process.env.HLS_KEY_ROOT!,
+  /** ffmpeg `-threads`; 0 lets ffmpeg decide (every core). */
+  transcodeThreads: num(process.env.TRANSCODE_THREADS, 0),
+  /**
+   * Free space that must REMAIN on the scratch volume after a job's budget is
+   * taken (GB). On the laptop this volume is the Windows system drive, so the
+   * reserve is what keeps Windows, Docker's WSL2 image and the other projects
+   * on that drive working while lectures encode. See ScratchGuard.
+   */
+  minFreeBytes: Math.max(0, num(process.env.TRANSCODE_MIN_FREE_GB, 25)) * 1024 ** 3,
+  /** How often a running encode re-checks free space (seconds). */
+  diskCheckSeconds: num(process.env.TRANSCODE_DISK_CHECK_SECONDS, 15),
+  /**
+   * Independent mobile pipeline: our own AES-128 HLS on R2, served through the
+   * API's per-ticket manifests and the media edge, with no Gumlet involvement.
+   */
+  mobile: {
+    /**
+     * What a bound Android/iOS device is handed. `hls` is the independent
+     * pipeline; `gumlet` keeps every platform on Gumlet (the pre-migration
+     * behaviour). Web is never affected by this switch.
+     */
+    delivery: (process.env.MOBILE_VIDEO_DELIVERY ?? 'hls') as 'hls' | 'gumlet',
+    /**
+     * While a video has not been processed for mobile yet, hand mobile its
+     * Gumlet stream instead of refusing. Turn off once the library is migrated
+     * and Gumlet is being retired: a video the mobile pipeline has not produced
+     * is then reported as "still being prepared".
+     */
+    gumletFallback: bool(process.env.MOBILE_HLS_GUMLET_FALLBACK, true),
+    /** Queue a mobile transcode for every completed upload automatically. */
+    autoProcess: bool(process.env.MOBILE_PIPELINE_ENABLED, true),
+  },
   drm: {
     enabled: bool(process.env.DRM_ENABLED),
     provider: (process.env.DRM_PROVIDER ?? 'none') as 'none' | 'gumlet',

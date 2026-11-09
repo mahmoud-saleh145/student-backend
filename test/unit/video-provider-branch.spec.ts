@@ -4,7 +4,7 @@ import { VideoProcessor } from 'src/jobs/processors/video.processor';
 import { GumletIngestService } from 'src/modules/videos/gumlet-ingest.service';
 
 // fs is stubbed wholesale: the ffmpeg pipeline is not what these tests are
-// about, and letting it run would spawn real processes.
+// about, and letting it run would touch the disk.
 jest.mock('node:fs/promises', () => ({
   mkdir: jest.fn(async () => undefined),
   rm: jest.fn(async () => undefined),
@@ -22,12 +22,12 @@ const WORK_DIR = 'D:\\work';
  * This is the single decision point that separates the two delivery pipelines,
  * so the tests here are about routing and safety, not about transcoding:
  *
- *  - a legacy video must fall through to the untouched ffmpeg/HLS path
+ *  - a legacy video must fall through to the local ffmpeg/HLS path
  *  - a Gumlet video must never reach ffmpeg at all
  *  - the decision comes from the database, so a replayed job cannot reroute
  *
- * `GumletIngestService` is stubbed; every other step is stubbed too, so no
- * subprocess, network call or file write happens.
+ * `GumletIngestService` and the `HlsTranscoder` are stubbed, so no subprocess,
+ * network call or file write happens.
  */
 function build(opts: {
   claimed?: boolean;
@@ -51,10 +51,24 @@ function build(opts: {
     })),
   };
 
-  const storage = {
-    putObject: jest.fn(async () => undefined),
-    putFile: jest.fn(async () => undefined),
-    downloadToFile: jest.fn(async () => undefined),
+  const transcoder = {
+    run: jest.fn(async () => ({
+      probe: {
+        durationSeconds: 120,
+        width: 1280,
+        height: 720,
+        frameRate: 25,
+        videoCodec: 'h264',
+        audioCodec: 'aac',
+      },
+      renditions: [
+        { height: 720, width: 1280, bitrateKbps: 2328, playlistKey: 'hls/v_1/720p/index.m3u8', sizeBytes: 10 },
+      ],
+      hlsPrefix: 'hls/v_1/',
+      masterPlaylistKey: 'hls/v_1/master.m3u8',
+      thumbnailKey: 'thumbs/v_1.jpg',
+      isEncrypted: true,
+    })),
   };
 
   const config = {
@@ -68,46 +82,13 @@ function build(opts: {
   };
 
   const processor = new VideoProcessor(
-    storage as never,
+    transcoder as never,
     videos as never,
     gumletIngest as never,
     config as never,
   );
 
-  // Replace every step after the provider branch so a legacy fall-through runs
-  // to completion without touching disk or spawning ffmpeg.
-  const steps = {
-    probe: jest
-      .spyOn(processor as never as { probe: (p: string) => Promise<unknown> }, 'probe')
-      .mockResolvedValue({
-        durationSeconds: 120,
-        width: 1280,
-        height: 720,
-        frameRate: 25,
-        videoCodec: 'h264',
-        audioCodec: 'aac',
-      }),
-    runFfmpeg: jest
-      .spyOn(processor as never as { runFfmpeg: () => Promise<void> }, 'runFfmpeg')
-      .mockResolvedValue(undefined),
-    uploadRendition: jest
-      .spyOn(processor as never as { uploadRendition: () => Promise<{ totalBytes: number }> }, 'uploadRendition')
-      .mockResolvedValue({ totalBytes: 10 }),
-    extractThumbnail: jest
-      .spyOn(
-        processor as never as { extractThumbnail: () => Promise<string | undefined> },
-        'extractThumbnail',
-      )
-      .mockResolvedValue('thumbs/v_1.jpg'),
-    writeKeyInfo: jest
-      .spyOn(processor as never as { writeKeyInfo: () => Promise<string> }, 'writeKeyInfo')
-      .mockResolvedValue('D:\\work\\v_1\\enc.keyinfo'),
-    downloadSource: jest
-      .spyOn(processor as never as { downloadSource: () => Promise<void> }, 'downloadSource')
-      .mockResolvedValue(undefined),
-  };
-
-  return { processor, videos, gumletIngest, storage, steps };
+  return { processor, videos, gumletIngest, transcoder };
 }
 
 function job(overrides: Partial<TranscodeJobData> = {}, name: string = VIDEO_JOBS.transcode) {
@@ -148,16 +129,21 @@ describe('a stale job for a video already claimed', () => {
 });
 
 describe('a legacy video (drmProvider null in the database)', () => {
-  it('falls through to the unchanged ffmpeg HLS pipeline', async () => {
+  it('falls through to the local ffmpeg HLS pipeline', async () => {
     const t = build({ handled: false });
 
     const result = await t.processor.process(job());
 
     // `handled: false` means "not mine" - the ingest service declines and the
-    // original path runs.
+    // local path runs.
     expect(t.gumletIngest.processFromJob).toHaveBeenCalledWith('v_1', 'uploads/v_1.bin');
-    expect(t.steps.runFfmpeg).toHaveBeenCalled();
-    expect(t.videos.markReady).toHaveBeenCalled();
+    expect(t.transcoder.run).toHaveBeenCalledWith(
+      expect.objectContaining({ videoId: 'v_1', sourceKey: 'uploads/v_1.bin', ladder: [720] }),
+    );
+    expect(t.videos.markReady).toHaveBeenCalledWith(
+      'v_1',
+      expect.objectContaining({ hlsPrefix: 'hls/v_1/', isEncrypted: true, encryptionKeyId: 'derived:v_1' }),
+    );
     expect(result).toEqual({ videoId: 'v_1', renditions: 1 });
   });
 
@@ -169,20 +155,20 @@ describe('a legacy video (drmProvider null in the database)', () => {
     expect(result.provider).toBeUndefined();
   });
 
-  it('derives its AES-128 key when the job asks for encryption', async () => {
+  it('asks for AES-128 encryption when the job does', async () => {
     const t = build({ handled: false });
 
     await t.processor.process(job({ encrypt: true }));
 
-    expect(t.steps.writeKeyInfo).toHaveBeenCalled();
+    expect(t.transcoder.run).toHaveBeenCalledWith(expect.objectContaining({ encrypt: true }));
   });
 
-  it('does not derive a key when the job does not ask for encryption', async () => {
+  it('does not encrypt when the job does not ask for it', async () => {
     const t = build({ handled: false });
 
     await t.processor.process(job({ encrypt: false }));
 
-    expect(t.steps.writeKeyInfo).not.toHaveBeenCalled();
+    expect(t.transcoder.run).toHaveBeenCalledWith(expect.objectContaining({ encrypt: false }));
   });
 });
 
@@ -199,8 +185,7 @@ describe('a Gumlet-backed video', () => {
       playable: true,
     });
     // The whole point: no ffmpeg, no HLS renditions, no local master playlist.
-    expect(t.steps.runFfmpeg).not.toHaveBeenCalled();
-    expect(t.steps.uploadRendition).not.toHaveBeenCalled();
+    expect(t.transcoder.run).not.toHaveBeenCalled();
     expect(t.videos.markReady).not.toHaveBeenCalled();
   });
 
@@ -227,7 +212,7 @@ describe('a Gumlet-backed video', () => {
       status: 'errored',
       playable: false,
     });
-    expect(t.steps.runFfmpeg).not.toHaveBeenCalled();
+    expect(t.transcoder.run).not.toHaveBeenCalled();
   });
 
   it('is never routed by the job payload', async () => {
@@ -244,9 +229,9 @@ describe('a Gumlet-backed video', () => {
 });
 
 describe('failures', () => {
-  it('are recorded on the video when the provider branch throws', async () => {
+  it('are recorded on the video when the local pipeline throws', async () => {
     const t = build({ handled: false });
-    t.steps.probe.mockRejectedValue(new Error('ffprobe could not be started'));
+    t.transcoder.run.mockRejectedValue(new Error('ffprobe could not be started'));
 
     await expect(t.processor.process(job())).rejects.toThrow(/ffprobe/);
 
@@ -258,7 +243,6 @@ describe('failures', () => {
     t.gumletIngest.processFromJob.mockRejectedValue(new Error('Gumlet API unreachable'));
 
     await expect(t.processor.process(job())).rejects.toThrow(/unreachable/);
-
     expect(t.videos.markFailed).toHaveBeenCalledWith('v_1', expect.stringContaining('unreachable'));
     expect(t.videos.markReady).not.toHaveBeenCalled();
   });

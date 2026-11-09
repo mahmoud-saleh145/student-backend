@@ -15,7 +15,7 @@ import { LessonVideoService } from './lesson-video.service';
 
 @Module({
   imports: [
-    BullModule.registerQueue({ name: QUEUE_NAMES.video }),
+    BullModule.registerQueue({ name: QUEUE_NAMES.video }, { name: QUEUE_NAMES.mobileVideo }),
     NotificationsModule,
     // Exports GumletDrmService (asset API + licensing), DrmVerificationService
     // (the DRM proof authority) and Prisma/Storage wiring.

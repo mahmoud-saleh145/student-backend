@@ -3,6 +3,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   AuditAction,
+  MobileVideoStatus,
   NotificationKind,
   type Prisma,
   type UserRole,
@@ -16,11 +17,18 @@ import type { VideoConfig } from '../../config/configuration';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import {
   DEFAULT_JOB_OPTIONS,
+  MOBILE_VIDEO_JOBS,
   QUEUE_NAMES,
   VIDEO_JOBS,
+  type MobileTranscodeJobData,
   type TranscodeJobData,
 } from '../../jobs/queue.constants';
-import { readWorkerHeartbeat } from '../../jobs/worker-heartbeat';
+import { readWorkerHeartbeat, type WorkerHeartbeatPayload } from '../../jobs/worker-heartbeat';
+import { readPauseState, writePauseState, type PauseState } from '../../jobs/processors/scratch-guard';
+import {
+  MOBILE_DELIVERY_OVERRIDE_KEY,
+  type MobileDeliveryOverride,
+} from '../playback/mobile-delivery-override';
 import { TRANSCODE_BACKOFF_BASE_MS, TRANSCODE_BACKOFF_JITTER } from '../../jobs/queue.tuning';
 import { RedisService } from '../../redis/redis.service';
 import { AuditService } from '../audit/audit.service';
@@ -51,6 +59,20 @@ const ALLOWED_VIDEO_TYPES = new Set([
  * that could never succeed, discovered only after the whole transfer.
  */
 export const MAX_SOURCE_BYTES = 5 * 1024 * 1024 * 1024 - 5 * 1024 * 1024;
+
+/** Outcome of one pass of `migrateLibraryToMobile`. Video ids only. */
+export interface MobileMigrationReport {
+  dryRun: boolean;
+  scanned: number;
+  queued: string[];
+  wouldQueue: string[];
+  /** Source object gone from R2: needs a re-upload, reported and left untouched. */
+  missingSource: string[];
+  noSourceKey: string[];
+  queueErrors: { videoId: string; error: string }[];
+  /** Live videos still not mobile-READY after this pass. */
+  remaining: number;
+}
 
 /**
  * Video lifecycle.
@@ -89,6 +111,13 @@ export class VideosService {
     // Gumlet. `GumletIngestService`'s own graph never reaches back into
     // `VideosService`, so this introduces no cycle.
     private readonly gumletIngest: GumletIngestService,
+    /**
+     * The independent mobile pipeline's queue. Last so the many existing
+     * tests that build this service positionally keep compiling; every use
+     * is guarded, and a missing queue only means "mobile processing is off".
+     */
+    @InjectQueue(QUEUE_NAMES.mobileVideo)
+    private readonly mobileQueue?: Queue<MobileTranscodeJobData>,
   ) {
     this.cfg = config.getOrThrow<VideoConfig>('video');
   }
@@ -540,6 +569,20 @@ export class VideosService {
 
     this.logger.log(`queued transcode job ${jobId} for video ${videoId} (${size} bytes)`);
 
+    // The independent mobile pipeline runs beside the primary one for every
+    // upload. Best effort here: the upload is already confirmed and queued for
+    // web, and a mobile queue failure is recorded on the row (FAILED, with the
+    // reason) where the dashboard and the recovery sweep can see it.
+    if (this.cfg.mobile?.autoProcess !== false) {
+      await this.enqueueMobileTranscode(
+        { id: videoId, sourceKey: video.sourceKey },
+        'upload',
+        actor.id,
+      ).catch((error) =>
+        this.logger.warn(`video ${videoId}: mobile transcode not queued: ${(error as Error).message}`),
+      );
+    }
+
     return {
       videoId,
       status: VideoStatus.QUEUED,
@@ -654,7 +697,12 @@ export class VideosService {
    * (out of memory on a large source), a retention sweep. Such a video sits
    * in QUEUED or PROCESSING indefinitely; this is what moves it again.
    */
-  async recoverStrandedVideos(now = new Date()): Promise<{ requeued: number; failed: number; synced: number }> {
+  async recoverStrandedVideos(now = new Date()): Promise<{
+    requeued: number;
+    failed: number;
+    synced: number;
+    mobile: { requeued: number; failed: number };
+  }> {
     const queuedCutoff = new Date(now.getTime() - 10 * 60_000);
     const processingCutoff = new Date(now.getTime() - 3 * 3600_000);
     // A Gumlet row is re-checked sooner than the 3-hour legacy cutoff, because
@@ -763,7 +811,559 @@ export class VideosService {
         `stranded videos: requeued ${requeued}, marked failed ${failed}, gumlet synced ${synced}`,
       );
     }
-    return { requeued, failed, synced };
+    const mobile = await this.recoverStrandedMobileVideos(now).catch((error) => {
+      this.logger.warn(`mobile recovery sweep failed: ${(error as Error).message}`);
+      return { requeued: 0, failed: 0 };
+    });
+    return { requeued, failed, synced, mobile };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Independent mobile pipeline
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Puts a mobile transcode on its queue and records it on the row.
+   *
+   * Mirrors `enqueueTranscode`: QUEUED is written only once the job is really
+   * in Redis, and a refused write leaves FAILED with the reason so nothing sits
+   * "queued" with no job behind it. A video already QUEUED/PROCESSING with a
+   * live job is left alone; a stale one is re-queued.
+   */
+  async enqueueMobileTranscode(
+    video: { id: string; sourceKey: string },
+    trigger: MobileTranscodeJobData['trigger'],
+    requestedById?: string,
+  ): Promise<{ jobId: string | null; alreadyQueued: boolean }> {
+    if (!this.mobileQueue) {
+      throw new AppException(ErrorCode.QUEUE_UNAVAILABLE, {
+        message: 'The mobile processing queue is not configured on this process',
+      });
+    }
+
+    const current = await this.prisma.video.findFirst({
+      where: { id: video.id, ...notDeleted },
+      select: { mobileStatus: true, mobileJobId: true, durationSeconds: true },
+    });
+    if (!current) throw AppException.notFound('Video', video.id);
+    if (
+      (current.mobileStatus === MobileVideoStatus.QUEUED ||
+        current.mobileStatus === MobileVideoStatus.PROCESSING) &&
+      (await this.mobileJobIsLive(current.mobileJobId))
+    ) {
+      return { jobId: current.mobileJobId, alreadyQueued: true };
+    }
+
+    let jobId: string;
+    try {
+      const job = await this.mobileQueue.add(
+        MOBILE_VIDEO_JOBS.transcode,
+        {
+          videoId: video.id,
+          sourceKey: video.sourceKey,
+          ladder: this.cfg.ladder,
+          encrypt: this.cfg.encryptionEnabled,
+          // Known for every Gumlet-processed row; lets the worker size its
+          // scratch preflight before it downloads anything.
+          durationSeconds: current.durationSeconds > 0 ? current.durationSeconds : undefined,
+          trigger,
+          requestedById,
+        },
+        {
+          ...DEFAULT_JOB_OPTIONS,
+          attempts: 2,
+          backoff: {
+            type: 'exponential',
+            delay: TRANSCODE_BACKOFF_BASE_MS,
+            jitter: TRANSCODE_BACKOFF_JITTER,
+          },
+          jobId: `mobile-hls:${video.id}:${Date.now()}`,
+        },
+      );
+      jobId = String(job.id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.prisma.video.update({
+        where: { id: video.id },
+        data: {
+          mobileStatus: MobileVideoStatus.FAILED,
+          mobileError: `Could not queue mobile processing: ${message}`.slice(0, 1000),
+        },
+      });
+      throw new AppException(ErrorCode.QUEUE_UNAVAILABLE, {
+        message: 'The mobile processing queue is unavailable; try again shortly.',
+      });
+    }
+
+    await this.prisma.video.update({
+      where: { id: video.id },
+      data: { mobileStatus: MobileVideoStatus.QUEUED, mobileJobId: jobId, mobileError: null },
+    });
+    return { jobId, alreadyQueued: false };
+  }
+
+  /** Staff action: run (or re-run) the mobile transcode for one video. */
+  async retryMobileProcessing(videoId: string, actor: { id: string; role: UserRole }) {
+    const video = await this.prisma.video.findFirst({
+      where: { id: videoId, ...notDeleted },
+      select: { id: true, courseId: true, sourceKey: true, mobileStatus: true },
+    });
+    if (!video) throw AppException.notFound('Video', videoId);
+    await this.access.assertCanManageCourse(actor.id, actor.role, video.courseId, 'content');
+    if (!video.sourceKey) {
+      throw new AppException(ErrorCode.INVALID_STATE, {
+        message: 'No source file to process for mobile — re-upload the video',
+      });
+    }
+    if (!(await this.storage.exists('uploads', video.sourceKey))) {
+      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
+        message:
+          'The stored source file is no longer in storage, so this video cannot be processed ' +
+          'for mobile — re-upload the file',
+      });
+    }
+    const result = await this.enqueueMobileTranscode(
+      { id: video.id, sourceKey: video.sourceKey },
+      'retry',
+      actor.id,
+    );
+    await this.audit.record({
+      action: AuditAction.UPDATE,
+      actorId: actor.id,
+      actorRole: actor.role,
+      entity: 'video',
+      entityId: videoId,
+      after: { mobileRetry: true, ...result },
+    });
+    return { videoId, ...result, ...(await this.workerStatus()) };
+  }
+
+  /**
+   * Migration of the existing library onto the mobile pipeline.
+   *
+   * Walks every live video that is not yet mobile-READY and, when its source
+   * object is still in R2, queues a mobile transcode. A video whose source is
+   * gone is REPORTED, never marked anything: it needs a re-upload, and a row
+   * that claimed to be migrated with no media behind it would be worse than an
+   * honest gap. `dryRun` does the full scan and queues nothing.
+   */
+  async migrateLibraryToMobile(params: {
+    dryRun: boolean;
+    limit: number;
+    actorId: string;
+  }): Promise<MobileMigrationReport> {
+    const pending = {
+      ...notDeleted,
+      status: { in: [VideoStatus.READY, VideoStatus.ARCHIVED] },
+      mobileStatus: { in: [MobileVideoStatus.NONE, MobileVideoStatus.FAILED] },
+    };
+    const candidates = await this.prisma.video.findMany({
+      where: pending,
+      select: { id: true, sourceKey: true },
+      orderBy: { createdAt: 'asc' },
+      take: Math.max(1, Math.min(params.limit, 500)),
+    });
+
+    const report: MobileMigrationReport = {
+      dryRun: params.dryRun,
+      scanned: candidates.length,
+      queued: [],
+      wouldQueue: [],
+      missingSource: [],
+      noSourceKey: [],
+      queueErrors: [],
+      remaining: 0,
+    };
+
+    for (const video of candidates) {
+      if (!video.sourceKey) {
+        report.noSourceKey.push(video.id);
+        continue;
+      }
+      if (!(await this.storage.exists('uploads', video.sourceKey))) {
+        report.missingSource.push(video.id);
+        continue;
+      }
+      if (params.dryRun) {
+        report.wouldQueue.push(video.id);
+        continue;
+      }
+      try {
+        await this.enqueueMobileTranscode(
+          { id: video.id, sourceKey: video.sourceKey },
+          'migration',
+          params.actorId,
+        );
+        report.queued.push(video.id);
+      } catch (error) {
+        report.queueErrors.push({ videoId: video.id, error: (error as Error).message });
+      }
+    }
+
+    report.remaining = await this.prisma.video.count({ where: pending });
+
+    if (!params.dryRun) {
+      await this.audit.record({
+        action: AuditAction.UPDATE,
+        actorId: params.actorId,
+        entity: 'video',
+        entityId: 'mobile-migration',
+        after: {
+          queued: report.queued.length,
+          missingSource: report.missingSource.length,
+          noSourceKey: report.noSourceKey.length,
+        },
+      });
+    }
+    return report;
+  }
+
+  /**
+   * The migration dashboard: counts per mobile state, what is left, how fast
+   * the worker has been going and what that implies for the remainder, the
+   * worker's own view of its host (scratch, load, pause, active job), and the
+   * queue's view of the jobs. Everything an operator needs to decide whether
+   * to queue the next batch, in one read.
+   */
+  async mobilePipelineOverview(): Promise<{
+    byStatus: Record<MobileVideoStatus, number>;
+    liveVideos: number;
+    /** Live videos the migration targets (READY or ARCHIVED on the web pipeline). */
+    migratable: number;
+    remaining: number;
+    progressPercent: number;
+    throughput: {
+      /** Encode seconds per content second over the most recent READY videos (null until one finished). */
+      secondsPerContentSecond: number | null;
+      sampleSize: number;
+      /** Content seconds still to process. */
+      remainingContentSeconds: number;
+      estimatedRemainingHours: number | null;
+      estimatedRemainingMinutes: number | null;
+    };
+    output: { readyVideos: number; totalBytes: number; averageBytesPerContentHour: number | null };
+    queue: Record<string, number> | null;
+    pause: PauseState;
+    deliveryOverride: MobileDeliveryOverride | null;
+    worker: Awaited<ReturnType<VideosService['workerStatus']>> & {
+      detail: Pick<WorkerHeartbeatPayload, 'host' | 'build' | 'queues' | 'scratch' | 'load' | 'activeJobs' | 'lastDeferral'> | null;
+    };
+    recentFailures: { videoId: string; error: string | null; at: string | null }[];
+  }> {
+    const migratableWhere = {
+      ...notDeleted,
+      status: { in: [VideoStatus.READY, VideoStatus.ARCHIVED] },
+    };
+    const pendingWhere = {
+      ...migratableWhere,
+      mobileStatus: { in: [MobileVideoStatus.NONE, MobileVideoStatus.FAILED, MobileVideoStatus.QUEUED, MobileVideoStatus.PROCESSING] },
+    };
+    const [rows, migratable, pendingAgg, recent, output, failures, beat, pause, deliveryOverride, queue] =
+      await Promise.all([
+        this.prisma.video.groupBy({ by: ['mobileStatus'], where: notDeleted, _count: { _all: true } }),
+        this.prisma.video.count({ where: migratableWhere }),
+        this.prisma.video.aggregate({ where: pendingWhere, _count: { _all: true }, _sum: { durationSeconds: true } }),
+        this.prisma.video.findMany({
+          where: { ...notDeleted, mobileStatus: MobileVideoStatus.READY, mobileProcessedAt: { not: null }, mobileProcessingStartedAt: { not: null } },
+          orderBy: { mobileProcessedAt: 'desc' },
+          take: 20,
+          select: { durationSeconds: true, mobileProcessedAt: true, mobileProcessingStartedAt: true },
+        }),
+        this.prisma.videoRendition.aggregate({
+          where: { video: { ...notDeleted, mobileStatus: MobileVideoStatus.READY } },
+          _sum: { sizeBytes: true },
+        }),
+        this.prisma.video.findMany({
+          where: { ...notDeleted, mobileStatus: MobileVideoStatus.FAILED },
+          orderBy: { updatedAt: 'desc' },
+          take: 10,
+          select: { id: true, mobileError: true, updatedAt: true },
+        }),
+        readWorkerHeartbeat(this.redis),
+        readPauseState(this.redis),
+        this.redis.getJson<MobileDeliveryOverride>(MOBILE_DELIVERY_OVERRIDE_KEY),
+        this.mobileQueue ? this.mobileQueue.getJobCounts().catch(() => null) : Promise.resolve(null),
+      ]);
+
+    const byStatus = Object.fromEntries(
+      Object.values(MobileVideoStatus).map((s) => [s, 0]),
+    ) as Record<MobileVideoStatus, number>;
+    let liveVideos = 0;
+    for (const row of rows) {
+      byStatus[row.mobileStatus] = row._count._all;
+      liveVideos += row._count._all;
+    }
+
+    const samples = recent
+      .map((r) => ({
+        content: r.durationSeconds,
+        encode: (r.mobileProcessedAt!.getTime() - r.mobileProcessingStartedAt!.getTime()) / 1000,
+      }))
+      .filter((s) => s.content > 0 && s.encode > 0);
+    const contentTotal = samples.reduce((a, s) => a + s.content, 0);
+    const encodeTotal = samples.reduce((a, s) => a + s.encode, 0);
+    const secondsPerContentSecond = contentTotal > 0 ? encodeTotal / contentTotal : null;
+    const remainingContentSeconds = pendingAgg._sum.durationSeconds ?? 0;
+    const remaining = pendingAgg._count._all;
+    const readyMigratable = Math.max(0, migratable - remaining);
+    const readyContentHours =
+      (await this.prisma.video.aggregate({
+        where: { ...notDeleted, mobileStatus: MobileVideoStatus.READY },
+        _sum: { durationSeconds: true },
+      }))._sum.durationSeconds ?? 0;
+    const totalBytes = Number(output._sum.sizeBytes ?? 0);
+
+    return {
+      byStatus,
+      liveVideos,
+      migratable,
+      remaining,
+      progressPercent: migratable > 0 ? Math.round((readyMigratable / migratable) * 1000) / 10 : 100,
+      throughput: {
+        secondsPerContentSecond: secondsPerContentSecond === null ? null : Math.round(secondsPerContentSecond * 1000) / 1000,
+        sampleSize: samples.length,
+        remainingContentSeconds,
+        estimatedRemainingHours:
+          secondsPerContentSecond === null
+            ? null
+            : Math.round(((remainingContentSeconds * secondsPerContentSecond) / 3600) * 10) / 10,
+        estimatedRemainingMinutes:
+          secondsPerContentSecond === null
+            ? null
+            : Math.round((remainingContentSeconds * secondsPerContentSecond) / 60),
+      },
+      output: {
+        readyVideos: byStatus[MobileVideoStatus.READY],
+        totalBytes,
+        averageBytesPerContentHour: readyContentHours > 0 ? Math.round(totalBytes / (readyContentHours / 3600)) : null,
+      },
+      queue,
+      pause,
+      deliveryOverride,
+      worker: {
+        ...(await this.workerStatus()),
+        detail: beat
+          ? {
+              host: beat.host,
+              build: beat.build ?? null,
+              queues: beat.queues,
+              scratch: beat.scratch,
+              load: beat.load,
+              activeJobs: beat.activeJobs,
+              lastDeferral: beat.lastDeferral ?? null,
+            }
+          : null,
+      },
+      recentFailures: failures.map((f) => ({ videoId: f.id, error: f.mobileError, at: f.updatedAt?.toISOString() ?? null })),
+    };
+  }
+
+  /**
+   * Operator pause of mobile encodes. Takes effect before the next job is
+   * claimed; the encode already running completes. Recorded in the audit log.
+   */
+  async setMobileProcessingPaused(
+    paused: boolean,
+    actor: { id: string; role: UserRole },
+    reason?: string,
+  ): Promise<PauseState> {
+    const state = await writePauseState(this.redis, paused, actor.id, reason);
+    await this.audit.record({
+      action: AuditAction.UPDATE,
+      actorId: actor.id,
+      actorRole: actor.role,
+      entity: 'video',
+      entityId: 'mobile-pipeline',
+      after: { paused: state.paused, reason: state.reason },
+    });
+    return state;
+  }
+
+  /**
+   * Emergency routing switch for mobile playback, without a redeploy or an
+   * app release: `gumlet` sends every bound mobile device back to Gumlet for
+   * every video (the pre-migration behaviour); `null` restores the configured
+   * behaviour. Authorization is untouched either way - this only picks which
+   * of the two gated pipelines mints the ticket.
+   */
+  async setMobileDeliveryOverride(
+    override: MobileDeliveryOverride | null,
+    actor: { id: string; role: UserRole },
+  ): Promise<MobileDeliveryOverride | null> {
+    if (override) {
+      await this.redis.setJsonPersistent(MOBILE_DELIVERY_OVERRIDE_KEY, {
+        ...override,
+        by: actor.id,
+        at: new Date().toISOString(),
+      });
+    } else {
+      await this.redis.del(MOBILE_DELIVERY_OVERRIDE_KEY);
+    }
+    await this.audit.record({
+      action: AuditAction.UPDATE,
+      actorId: actor.id,
+      actorRole: actor.role,
+      entity: 'video',
+      entityId: 'mobile-delivery',
+      after: { override },
+    });
+    return this.redis.getJson<MobileDeliveryOverride>(MOBILE_DELIVERY_OVERRIDE_KEY);
+  }
+
+  /**
+   * Claims a video for mobile processing. False when the job is stale: the
+   * video was deleted, its source was replaced, or it is already READY from a
+   * newer job.
+   */
+  async markMobileProcessing(videoId: string, sourceKey: string, jobId: string): Promise<boolean> {
+    // The source key is the staleness guard: a re-upload changes it, and a
+    // deleted row is excluded. The mobile state is deliberately NOT part of the
+    // claim. `enqueueMobileTranscode` writes QUEUED only after the job is in
+    // Redis, so a worker on the same network can pick the job up while the row
+    // still reads NONE (or READY, for a retry) - a status filter here made
+    // exactly that job "stale" and the video was never encoded.
+    const claimed = await this.prisma.video.updateMany({
+      where: {
+        id: videoId,
+        deletedAt: null,
+        sourceKey,
+      },
+      data: {
+        mobileStatus: MobileVideoStatus.PROCESSING,
+        mobileJobId: jobId,
+        mobileProcessingStartedAt: new Date(),
+        mobileError: null,
+      },
+    });
+    return claimed.count > 0;
+  }
+
+  /**
+   * Records a finished mobile ladder. Touches only the HLS output fields and
+   * the mobile state; `status` and every Gumlet field stay exactly as they
+   * were, and metadata Gumlet already supplied (duration, size, poster) is
+   * only filled in where it is missing.
+   */
+  async markMobileReady(
+    videoId: string,
+    result: Parameters<VideosService['markReady']>[1],
+  ): Promise<void> {
+    await this.prisma.$transaction(async (tx) => {
+      const current = await tx.video.findUniqueOrThrow({
+        where: { id: videoId },
+        select: { durationSeconds: true, width: true, height: true, thumbnailKey: true },
+      });
+      await tx.videoRendition.deleteMany({ where: { videoId } });
+      await tx.video.update({
+        where: { id: videoId },
+        data: {
+          hlsPrefix: result.hlsPrefix,
+          masterPlaylistKey: result.masterPlaylistKey,
+          isEncrypted: result.isEncrypted,
+          encryptionKeyId: result.encryptionKeyId,
+          ...(current.durationSeconds > 0 ? {} : { durationSeconds: result.durationSeconds }),
+          ...(current.width ? {} : { width: result.width, height: result.height }),
+          ...(current.thumbnailKey || !result.thumbnailKey ? {} : { thumbnailKey: result.thumbnailKey }),
+          frameRate: result.frameRate,
+          videoCodec: result.videoCodec,
+          audioCodec: result.audioCodec,
+          mobileStatus: MobileVideoStatus.READY,
+          mobileError: null,
+          mobileProcessedAt: new Date(),
+          renditions: {
+            create: result.renditions.map((r) => ({
+              height: r.height,
+              width: r.width,
+              bitrateKbps: r.bitrateKbps,
+              playlistKey: r.playlistKey,
+              sizeBytes: r.sizeBytes ? BigInt(r.sizeBytes) : null,
+            })),
+          },
+        },
+      });
+    });
+    this.logger.log(`video ${videoId} is mobile-READY (${result.renditions.length} renditions)`);
+  }
+
+  /**
+   * The encode was stopped for a reason that is not the video's (disk pressure
+   * on the worker): back to QUEUED with the note, so the dashboard explains the
+   * wait and the sweep does not count it as a failure.
+   */
+  async markMobileDeferred(videoId: string, note: string): Promise<void> {
+    await this.prisma.video.update({
+      where: { id: videoId },
+      data: { mobileStatus: MobileVideoStatus.QUEUED, mobileError: note.slice(0, 1000) },
+    });
+    this.logger.warn(`video ${videoId} mobile processing deferred: ${note}`);
+  }
+
+  async markMobileFailed(videoId: string, error: string): Promise<void> {
+    await this.prisma.video.update({
+      where: { id: videoId },
+      data: { mobileStatus: MobileVideoStatus.FAILED, mobileError: error.slice(0, 1000) },
+    });
+    this.logger.error(`video ${videoId} mobile processing failed: ${error}`);
+  }
+
+  /** Same contract as the legacy sweep, for the mobile queue. */
+  async recoverStrandedMobileVideos(now = new Date()): Promise<{ requeued: number; failed: number }> {
+    if (!this.mobileQueue) return { requeued: 0, failed: 0 };
+    const queuedCutoff = new Date(now.getTime() - 10 * 60_000);
+    const processingCutoff = new Date(now.getTime() - 4 * 3600_000);
+
+    const stranded = await this.prisma.video.findMany({
+      where: {
+        ...notDeleted,
+        OR: [
+          { mobileStatus: MobileVideoStatus.QUEUED, updatedAt: { lt: queuedCutoff } },
+          {
+            mobileStatus: MobileVideoStatus.PROCESSING,
+            mobileProcessingStartedAt: { lt: processingCutoff },
+          },
+        ],
+      },
+      select: { id: true, sourceKey: true, mobileStatus: true, mobileJobId: true },
+      take: 50,
+    });
+
+    let requeued = 0;
+    let failed = 0;
+    for (const video of stranded) {
+      if (await this.mobileJobIsLive(video.mobileJobId)) continue;
+      if (!video.sourceKey) continue;
+      if (video.mobileStatus === MobileVideoStatus.PROCESSING) {
+        await this.markMobileFailed(
+          video.id,
+          'Mobile processing was interrupted (job gone); the sweep re-queues it',
+        );
+        failed += 1;
+      }
+      try {
+        await this.enqueueMobileTranscode({ id: video.id, sourceKey: video.sourceKey }, 'recovery');
+        requeued += 1;
+      } catch (error) {
+        this.logger.warn(`video ${video.id}: mobile re-queue failed: ${(error as Error).message}`);
+      }
+    }
+    if (requeued || failed) {
+      this.logger.warn(`stranded mobile videos: requeued ${requeued}, marked failed ${failed}`);
+    }
+    return { requeued, failed };
+  }
+
+  private async mobileJobIsLive(jobId: string | null): Promise<boolean> {
+    if (!jobId || !this.mobileQueue) return false;
+    const job = await this.mobileQueue.getJob(jobId).catch(() => null);
+    if (!job) return false;
+    const state = await job.getState().catch(() => 'missing');
+    return (
+      state === 'waiting' ||
+      state === 'active' ||
+      state === 'delayed' ||
+      state === 'prioritized' ||
+      state === 'waiting-children'
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -851,6 +1451,15 @@ export class VideosService {
         bitrateKbps: r.bitrateKbps,
         sizeBytes: r.sizeBytes ? Number(r.sizeBytes) : null,
       })),
+      /** The independent mobile pipeline, separate from `status` (web/Gumlet). */
+      mobile: {
+        status: video.mobileStatus,
+        error: video.mobileError,
+        jobId: video.mobileJobId,
+        processingStartedAt: video.mobileProcessingStartedAt?.toISOString() ?? null,
+        processedAt: video.mobileProcessedAt?.toISOString() ?? null,
+        renditions: video.mobileStatus === MobileVideoStatus.READY ? video.renditions.length : 0,
+      },
       captions: video.captions.map((c) => ({
         language: c.language,
         label: c.label,
@@ -1169,7 +1778,12 @@ export class VideosService {
         id: videoId,
         deletedAt: null,
         ...(sourceKey ? { sourceKey } : {}),
-        status: { in: [VideoStatus.QUEUED, VideoStatus.PROCESSING, VideoStatus.FAILED] },
+        // UPLOADING is included because `enqueueTranscode` writes QUEUED only
+        // after the job is in Redis; a fast worker can claim the job first and
+        // must not treat that window as a stale job.
+        status: {
+          in: [VideoStatus.UPLOADING, VideoStatus.QUEUED, VideoStatus.PROCESSING, VideoStatus.FAILED],
+        },
       },
       data: { status: VideoStatus.PROCESSING, processingStartedAt: new Date(), processingError: null },
     });
@@ -1222,6 +1836,11 @@ export class VideosService {
           encryptionKeyId: result.encryptionKeyId,
           processedAt: new Date(),
           processingError: null,
+          // The legacy local transcode produces exactly the mobile pipeline's
+          // output, so a video that finished here is mobile-ready too.
+          mobileStatus: MobileVideoStatus.READY,
+          mobileError: null,
+          mobileProcessedAt: new Date(),
           renditions: {
             create: result.renditions.map((r) => ({
               height: r.height,

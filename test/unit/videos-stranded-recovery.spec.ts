@@ -160,7 +160,7 @@ describe('recoverStrandedVideos selection', () => {
 
     const result = await service.recoverStrandedVideos(now);
 
-    expect(result).toEqual({ requeued: 0, failed: 0, synced: 0 });
+    expect(result).toEqual({ requeued: 0, failed: 0, synced: 0, mobile: { requeued: 0, failed: 0 } });
     expect(enqueued).toHaveLength(0);
   });
 
@@ -188,7 +188,7 @@ describe('recoverStrandedVideos selection', () => {
 
     const result = await service.recoverStrandedVideos(now);
 
-    expect(result).toEqual({ requeued: 0, failed: 0, synced: 0 });
+    expect(result).toEqual({ requeued: 0, failed: 0, synced: 0, mobile: { requeued: 0, failed: 0 } });
     expect(enqueued).toHaveLength(0);
   });
 
@@ -211,7 +211,7 @@ describe('recoverStrandedVideos selection', () => {
 
     const result = await service.recoverStrandedVideos(now);
 
-    expect(result).toEqual({ requeued: 0, failed: 0, synced: 0 });
+    expect(result).toEqual({ requeued: 0, failed: 0, synced: 0, mobile: { requeued: 0, failed: 0 } });
     expect(enqueued).toHaveLength(0);
   });
 });
@@ -254,7 +254,7 @@ describe('recoverStrandedVideos Gumlet branch', () => {
     const result = await service.recoverStrandedVideos(now);
 
     // Not requeued, not failed: the provider was asked instead.
-    expect(result).toEqual({ requeued: 0, failed: 0, synced: 1 });
+    expect(result).toEqual({ requeued: 0, failed: 0, synced: 1, mobile: { requeued: 0, failed: 0 } });
     expect(synced).toEqual(['v1']);
   });
 
@@ -289,7 +289,7 @@ describe('recoverStrandedVideos Gumlet branch', () => {
 
     const result = await service.recoverStrandedVideos(now);
 
-    expect(result).toEqual({ requeued: 0, failed: 0, synced: 0 });
+    expect(result).toEqual({ requeued: 0, failed: 0, synced: 0, mobile: { requeued: 0, failed: 0 } });
     expect(synced).toEqual([]);
   });
 
@@ -318,7 +318,7 @@ describe('recoverStrandedVideos Gumlet branch', () => {
 
     // A provider outage must not be recorded as a provider verdict. The row
     // stays PROCESSING and is simply re-checked on the next sweep.
-    expect(result).toEqual({ requeued: 0, failed: 0, synced: 0 });
+    expect(result).toEqual({ requeued: 0, failed: 0, synced: 0, mobile: { requeued: 0, failed: 0 } });
     expect(synced).toEqual([]);
     expect(gumletIngest.sync).toHaveBeenCalledTimes(1);
   });
@@ -344,7 +344,7 @@ describe('recoverStrandedVideos Gumlet branch', () => {
 
     const result = await service.recoverStrandedVideos(now);
 
-    expect(result).toEqual({ requeued: 1, failed: 0, synced: 1 });
+    expect(result).toEqual({ requeued: 1, failed: 0, synced: 1, mobile: { requeued: 0, failed: 0 } });
     expect(synced).toEqual(['v1']);
     expect(enqueued).toHaveLength(1);
   });
@@ -359,7 +359,7 @@ describe('recoverStrandedVideos Gumlet branch', () => {
 
     const result = await service.recoverStrandedVideos(now);
 
-    expect(result).toEqual({ requeued: 0, failed: 0, synced: 0 });
+    expect(result).toEqual({ requeued: 0, failed: 0, synced: 0, mobile: { requeued: 0, failed: 0 } });
     expect(enqueued).toHaveLength(0);
     expect(synced).toEqual([]);
   });

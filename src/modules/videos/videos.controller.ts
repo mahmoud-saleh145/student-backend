@@ -8,7 +8,7 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiOperation, ApiProperty, ApiPropertyOptional, ApiTags } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import {
   IsBoolean,
@@ -23,7 +23,7 @@ import {
 } from 'class-validator';
 
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
-import { StaffOnly } from '../../common/decorators/roles.decorator';
+import { AdminOnly, StaffOnly } from '../../common/decorators/roles.decorator';
 import type { AuthenticatedUser } from '../../common/types/request-context';
 
 import { MAX_SOURCE_BYTES, VideosService } from './videos.service';
@@ -53,6 +53,32 @@ class AttachExistingVideoDto {
 class RemoveVideoQueryDto {
   /** The lecture the video is being removed from. Required for a shared asset. */
   @IsOptional() @IsString() @MaxLength(32) lessonId?: string;
+}
+
+class MobilePauseDto {
+  @ApiPropertyOptional({ description: 'Why processing is paused (shown on the overview)' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  reason?: string;
+}
+
+class MobileDeliveryDto {
+  @ApiProperty({ enum: ['gumlet', 'hls', 'configured'] })
+  @IsIn(['gumlet', 'hls', 'configured'])
+  mode!: 'gumlet' | 'hls' | 'configured';
+
+  @ApiPropertyOptional({ description: 'With mode=hls: whether unmigrated videos may still fall back to Gumlet' })
+  @IsOptional()
+  @IsBoolean()
+  gumletFallback?: boolean;
+}
+
+class MobileMigrationQueryDto {
+  /** Scan and report only; queue nothing. The default, so a bare call is safe. */
+  @IsOptional() @IsIn(['true', 'false']) dryRun?: string;
+  /** Videos considered per call. The worker processes one at a time anyway. */
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(500) limit?: number;
 }
 
 /**
@@ -146,6 +172,75 @@ export class VideosController {
   @ApiOperation({ summary: 'Re-run transcoding from the stored source' })
   retry(@Param('videoId') videoId: string, @CurrentUser() actor: AuthenticatedUser) {
     return this.videos.retryProcessing(videoId, actor);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Independent mobile pipeline
+  // ---------------------------------------------------------------------------
+
+  @Get('mobile/overview')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Mobile pipeline counts per state, plus whether a worker is online',
+  })
+  mobileOverview() {
+    return this.videos.mobilePipelineOverview();
+  }
+
+  @Post('mobile/migrate')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Queue the existing library for the independent mobile pipeline',
+    description:
+      'Scans videos that are not yet mobile-ready. With dryRun=true (the default) it only reports; ' +
+      'with dryRun=false it queues a mobile transcode for every video whose source is still in ' +
+      'storage. Videos with a missing source are listed and left untouched - they need a re-upload.',
+  })
+  mobileMigrate(@Query() query: MobileMigrationQueryDto, @CurrentUser() actor: AuthenticatedUser) {
+    return this.videos.migrateLibraryToMobile({
+      dryRun: query.dryRun !== 'false',
+      limit: query.limit ?? 100,
+      actorId: actor.id,
+    });
+  }
+
+  @Post('mobile/pause')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Pause mobile encodes (the running one finishes; queued ones wait until resumed)',
+  })
+  mobilePause(@Body() body: MobilePauseDto, @CurrentUser() actor: AuthenticatedUser) {
+    return this.videos.setMobileProcessingPaused(true, actor, body.reason);
+  }
+
+  @Post('mobile/resume')
+  @AdminOnly()
+  @ApiOperation({ summary: 'Resume mobile encodes' })
+  mobileResume(@CurrentUser() actor: AuthenticatedUser) {
+    return this.videos.setMobileProcessingPaused(false, actor);
+  }
+
+  @Post('mobile/delivery')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Emergency routing switch for mobile playback (no redeploy, no app release)',
+    description:
+      'mode=gumlet sends every bound mobile device back to Gumlet for every video; mode=configured ' +
+      'removes the override and restores MOBILE_VIDEO_DELIVERY / MOBILE_HLS_GUMLET_FALLBACK. ' +
+      'Authorization and device binding are unchanged either way.',
+  })
+  mobileDelivery(@Body() body: MobileDeliveryDto, @CurrentUser() actor: AuthenticatedUser) {
+    return this.videos.setMobileDeliveryOverride(
+      body.mode === 'configured' ? null : { delivery: body.mode, gumletFallback: body.gumletFallback },
+      actor,
+    );
+  }
+
+  @Post(':videoId/mobile/retry')
+  @StaffOnly()
+  @ApiOperation({ summary: 'Run (or re-run) the mobile transcode for one video' })
+  mobileRetry(@Param('videoId') videoId: string, @CurrentUser() actor: AuthenticatedUser) {
+    return this.videos.retryMobileProcessing(videoId, actor);
   }
 
   @Post(':videoId/captions')

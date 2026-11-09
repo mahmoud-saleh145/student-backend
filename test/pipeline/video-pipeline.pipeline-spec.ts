@@ -16,7 +16,6 @@
  * (needs redis-server and ffmpeg on PATH; skipped otherwise).
  */
 import { BullModule, getQueueToken } from '@nestjs/bullmq';
-import { allowDrm } from '../unit/helpers/drm-doubles';
 import { ConfigService } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
@@ -288,7 +287,6 @@ maybe('video pipeline (real Redis, BullMQ, ffmpeg, Worker code)', () => {
     manifest = new ManifestService(
       prisma as never,
       new LocalStorage(appCfg, cloudinaryDouble()),
-      allowDrm() as never,
       appCfg,
     );
     (ticket.video as { renditions: unknown[] }).renditions = [];

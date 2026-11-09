@@ -144,6 +144,17 @@ enum VideoStatus {
   ARCHIVED
 }
 
+/// State of the INDEPENDENT mobile pipeline (our own AES-128 HLS on R2),
+/// which runs beside the Gumlet pipeline for the same upload. `Video.status`
+/// keeps describing the primary (web/Gumlet) pipeline; this never changes it.
+enum MobileVideoStatus {
+  NONE
+  QUEUED
+  PROCESSING
+  READY
+  FAILED
+}
+
 enum AttachmentKind {
   PDF
   IMAGE
@@ -1577,6 +1588,16 @@ model Video {
   /// consulted for playability - `drmVerifiedAt` alone decides that.
   drmCheckedAt    DateTime?
 
+  /// Independent mobile pipeline. READY means `hlsPrefix` and `renditions`
+  /// describe a complete AES-128 HLS ladder on R2 that the native apps can play
+  /// with no Gumlet involvement. Written only by the mobile-video worker and the
+  /// legacy local transcode (whose output is the same format).
+  mobileStatus              MobileVideoStatus @default(NONE)
+  mobileError               String?
+  mobileJobId               String?
+  mobileProcessingStartedAt DateTime?
+  mobileProcessedAt         DateTime?
+
   processingJobId String?
   processingError String?
   processingStartedAt DateTime?
@@ -1604,6 +1625,8 @@ model Video {
   /// sweep. Declared here so the next `migrate dev` does not DROP them.
   @@index([drmVerifiedAt])
   @@index([drmProvider, drmVerifiedAt])
+  /// The mobile migration sweep and the stranded-job recovery scan by state.
+  @@index([mobileStatus, updatedAt])
   @@map("videos")
 }
 
@@ -2186,6 +2209,13 @@ model PlaybackTicket {
 
   ipAddress String?
   userAgent String?
+
+  /// Which pipeline this grant was minted for: `gumlet` (DASH/HLS + Widevine/
+  /// FairPlay from Gumlet) or `hls` (our own AES-128 HLS, mobile only). Decided
+  /// server-side at mint time from the bound device; the manifest and key
+  /// endpoints serve `hls` grants only, so a Gumlet ticket can never be used to
+  /// pull the unencrypted-at-rest ladder.
+  delivery String @default("gumlet")
 
   user        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   video       Video           @relation(fields: [videoId], references: [id], onDelete: Cascade)

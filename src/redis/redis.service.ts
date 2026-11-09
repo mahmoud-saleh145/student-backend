@@ -96,6 +96,48 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** Sets a JSON value with no expiry (operator flags that must survive restarts). */
+  async setJsonPersistent(key: string, value: unknown): Promise<void> {
+    try {
+      await this.client.set(this.key(key), JSON.stringify(value));
+    } catch (e) {
+      this.logger.debug(`persistent set failed for ${key}: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * Every JSON value under a pattern, with its full key, via SCAN + MGET.
+   * Small sets only (a handful of reservations); never used on hot paths.
+   */
+  async scanJson<T>(pattern: string): Promise<Array<[string, T | null]>> {
+    const out: Array<[string, T | null]> = [];
+    let cursor = '0';
+    try {
+      do {
+        const [next, found] = await this.client.scan(cursor, 'MATCH', this.key(pattern), 'COUNT', 200);
+        cursor = next;
+        if (found.length) {
+          const values = await this.client.mget(...found);
+          found.forEach((k, i) => {
+            const raw = values[i];
+            let parsed: T | null = null;
+            if (raw) {
+              try {
+                parsed = JSON.parse(raw) as T;
+              } catch {
+                parsed = null;
+              }
+            }
+            out.push([k, parsed]);
+          });
+        }
+      } while (cursor !== '0');
+    } catch (e) {
+      this.logger.debug(`scan read failed: ${(e as Error).message}`);
+    }
+    return out;
+  }
+
   /** Deletes every key under a prefix using SCAN (never KEYS). */
   async delByPattern(pattern: string): Promise<number> {
     let cursor = '0';
