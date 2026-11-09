@@ -151,17 +151,25 @@ function world(opts: {
   const drmVerification = new DrmVerificationService(prisma as never, gumlet, config as never);
   const signLicence = jest.spyOn(gumlet, 'signLicenseUrl');
 
+  // Issuance AND the heartbeat go through `assertContentAccess`, which (like
+  // the real service) is built on `resolve`, so a test can assert which course
+  // was re-authorised by looking at `resolve`.
+  type Decision = { canAccessContent: boolean; state: string; denialCode?: string };
+  const resolve = jest.fn(async (a: { courseId: string }): Promise<Decision> =>
+    entitled.has(a.courseId)
+      ? { canAccessContent: true, state: 'ACTIVE' }
+      : { canAccessContent: false, state: 'NOT_ENROLLED', denialCode: 'NOT_ENROLLED' },
+  );
   const access = {
-    assertContentAccess: jest.fn(async (a: { courseId: string }) => {
-      if (!entitled.has(a.courseId)) throw Object.assign(new Error('NOT_ENROLLED'), { code: 'NOT_ENROLLED' });
+    resolve,
+    assertContentAccess: jest.fn(async (a: { courseId: string }): Promise<Decision> => {
+      const decision = await resolve(a);
+      if (decision.canAccessContent) return decision;
+      throw new AppException(ErrorCode.NOT_ENROLLED, {
+        details: { accessState: decision.state, courseId: a.courseId },
+      });
     }),
     assertSectionAccessible: jest.fn(async () => undefined),
-    // Heartbeat re-authorisation.
-    resolve: jest.fn(async (a: { courseId: string }) =>
-      entitled.has(a.courseId)
-        ? { canAccessContent: true, state: 'ACTIVE' }
-        : { canAccessContent: false, state: 'NOT_ENROLLED', denialCode: 'NOT_ENROLLED' },
-    ),
   };
 
   const redisStore = new Map<string, unknown>();
