@@ -1,4 +1,3 @@
-/* eslint-disable no-console */
 /**
  * Real-ffmpeg verification of the mobile HLS quality ladder.
  *
@@ -20,7 +19,7 @@
  */
 import { spawnSync } from 'node:child_process';
 import { createHmac, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
