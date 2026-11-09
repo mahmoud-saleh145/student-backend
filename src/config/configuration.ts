@@ -195,7 +195,7 @@ export const videoConfig = registerAs('video', () => ({
   ffmpegPath: process.env.FFMPEG_PATH ?? 'ffmpeg',
   ffprobePath: process.env.FFPROBE_PATH ?? 'ffprobe',
   workDir: process.env.TRANSCODE_WORK_DIR ?? '/tmp/edu-transcode',
-  ladder: (process.env.TRANSCODE_LADDER ?? '360,480,720,1080')
+  ladder: (process.env.TRANSCODE_LADDER ?? '480,720,1080')
     .split(',')
     .map((h) => Number(h.trim()))
     .filter((h) => Number.isFinite(h) && h > 0)

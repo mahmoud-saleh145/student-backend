@@ -12,12 +12,35 @@ import { formatBytes, ScratchGuard, type ScratchAssessment } from './scratch-gua
 
 export interface ProbeResult {
   durationSeconds: number;
+  /** DISPLAY width: the coded width with the container's rotation applied, as a player shows it. */
   width: number;
+  /** DISPLAY height (see width). */
   height: number;
+  /** Rotation from the stream's display matrix or `rotate` tag, normalised to 0 / 90 / 180 / 270. */
+  rotation: number;
   frameRate: number;
   videoCodec: string;
   audioCodec: string;
 }
+
+/**
+ * One rung of the ladder as it will be encoded. `tier` is the quality the
+ * rung represents (480, 720, 1080: the length of the picture's SHORT side),
+ * `width` × `height` are the even output dimensions in display orientation.
+ */
+export interface PlannedRendition {
+  tier: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Tiers below this are never produced: a 360p rung of a 1080p lecture is
+ * unreadable for slides and code, and a ladder of 480/720/1080 covers weak
+ * mobile data at 480p. A source whose short side is below this is encoded
+ * once, at its own size.
+ */
+export const MIN_TIER = 480;
 
 export interface HlsRendition {
   height: number;
@@ -288,7 +311,12 @@ export class HlsTranscoder implements OnModuleDestroy {
         `${probe.frameRate}fps ${probe.videoCodec}/${probe.audioCodec}`,
     );
 
-    const targets = HlsTranscoder.planLadder(params.ladder, probe.height);
+    const planned = HlsTranscoder.planRenditions(params.ladder, probe.width, probe.height);
+    const targets = planned.map((p) => p.tier);
+    this.logger.log(
+      `plan ${videoId}: ${planned.map((p) => `${p.tier}p (${p.width}x${p.height})`).join(', ')}` +
+        (probe.rotation ? ` [rotation ${probe.rotation}°]` : ''),
+    );
 
     // Preflight 2: the exact duration and the real rungs are known now, and the
     // source is already on disk, so only the largest rung must still fit.
@@ -306,10 +334,10 @@ export class HlsTranscoder implements OnModuleDestroy {
     // 4. encode + upload, one rendition at a time ------------------------------
     const renditions: HlsRendition[] = [];
     const hlsPrefix = StorageService.keys.hlsPrefix(videoId);
-    for (const [index, height] of targets.entries()) {
-      const rate = BITRATES[height] ?? BITRATES[720]!;
-      const width = HlsTranscoder.evenWidth(probe.width, probe.height, height);
-      const outDir = join(workDir, `${height}p`);
+    for (const [index, rung] of planned.entries()) {
+      const { tier, width, height } = rung;
+      const rate = HlsTranscoder.rateForTier(tier);
+      const outDir = join(workDir, `${tier}p`);
       await mkdir(outDir, { recursive: true });
 
       // Encoding is ~70% of a rung's time, uploading the rest; ffmpeg's own
@@ -352,12 +380,12 @@ export class HlsTranscoder implements OnModuleDestroy {
       // as the source.
       await this.verifyRendition(outDir, probe, keyInfoPath ? join(workDir, 'enc.key') : undefined);
 
-      const uploaded = await this.uploadRendition(outDir, hlsPrefix, height);
+      const uploaded = await this.uploadRendition(outDir, hlsPrefix, tier);
       renditions.push({
         height,
         width,
         bitrateKbps: rate.video + rate.audio,
-        playlistKey: `${hlsPrefix}${height}p/index.m3u8`,
+        playlistKey: `${hlsPrefix}${tier}p/index.m3u8`,
         sizeBytes: uploaded.totalBytes,
       });
       // Free the scratch for this rendition before encoding the next one.
@@ -396,13 +424,54 @@ export class HlsTranscoder implements OnModuleDestroy {
   // Planning (pure; unit-tested)
   // ---------------------------------------------------------------------------
 
-  /** Never upscale: drop every rung above the source, but always keep the smallest. */
-  static planLadder(ladder: number[], sourceHeight: number): number[] {
-    const sorted = [...new Set(ladder.filter((h) => Number.isFinite(h) && h > 0))].sort((a, b) => a - b);
-    if (sorted.length === 0) return [360];
-    const smallest = sorted[0]!;
-    const targets = sorted.filter((h) => h <= sourceHeight || h === smallest);
-    return targets.length > 0 ? targets : [smallest];
+  /**
+   * The ladder for ONE source, from its display dimensions.
+   *
+   * Policy (2026-11-09):
+   *   short side ≥ 1080 → 1080p, 720p, 480p
+   *   720 ≤ short side < 1080 → 720p, 480p
+   *   480 ≤ short side < 720 → 480p
+   *   short side < 480 → one rung at the source's own size
+   *
+   * A tier is the length of the picture's SHORT side, so a portrait phone
+   * recording of 720×1280 is a 720p source (its 720p rung is 720×1280, its
+   * 480p rung 480×854) and is never stretched into a landscape frame. The
+   * aspect ratio is kept exactly (the long side scales with the short one and
+   * is rounded to an even number), nothing is ever upscaled, nothing below
+   * `MIN_TIER` is produced however `TRANSCODE_LADDER` is set, and every
+   * dimension is even for H.264 4:2:0.
+   */
+  static planRenditions(ladder: number[], displayWidth: number, displayHeight: number): PlannedRendition[] {
+    const w = Math.max(2, Math.floor(displayWidth));
+    const h = Math.max(2, Math.floor(displayHeight));
+    const portrait = h > w;
+    const short = Math.min(w, h);
+    const long = Math.max(w, h);
+    const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
+
+    const tiers = [...new Set(ladder.filter((t) => Number.isFinite(t) && t >= MIN_TIER).map((t) => even(t)))]
+      .filter((t) => t <= short)
+      .sort((a, b) => a - b);
+
+    if (tiers.length === 0) {
+      // Below the smallest tier: encode once at the source's own (even) size.
+      const shortOut = Math.max(2, Math.floor(short / 2) * 2);
+      const longOut = Math.max(2, Math.floor(long / 2) * 2);
+      return [portrait ? { tier: shortOut, width: shortOut, height: longOut } : { tier: shortOut, width: longOut, height: shortOut }];
+    }
+
+    return tiers.map((tier) => {
+      const longOut = even((long * tier) / short);
+      return portrait ? { tier, width: tier, height: longOut } : { tier, width: longOut, height: tier };
+    });
+  }
+
+  /** Bitrate profile for a tier: its own, else the largest profile below it, else the smallest. */
+  static rateForTier(tier: number): { video: number; audio: number; maxrate: number } {
+    if (BITRATES[tier]) return BITRATES[tier]!;
+    const keys = Object.keys(BITRATES).map(Number).sort((a, b) => a - b);
+    const below = keys.filter((k) => k <= tier);
+    return BITRATES[below.length ? below[below.length - 1]! : keys[0]!]!;
   }
 
   /** Widths must be even for H.264 chroma subsampling. */
@@ -517,13 +586,19 @@ export class HlsTranscoder implements OnModuleDestroy {
     return Math.abs(renditionSeconds - sourceSeconds) <= tolerance;
   }
 
+  /**
+   * Rung directories are named by TIER (the short side), so a portrait 720p
+   * rung lives in `720p/` although it is 1280 tall; RESOLUTION carries the
+   * real dimensions.
+   */
   static buildStaticMaster(renditions: { height: number; width: number; bitrateKbps: number }[]): string {
     const lines = ['#EXTM3U', '#EXT-X-VERSION:6', '#EXT-X-INDEPENDENT-SEGMENTS'];
     for (const r of renditions) {
+      const tier = Math.min(r.width, r.height);
       lines.push(
         `#EXT-X-STREAM-INF:BANDWIDTH=${r.bitrateKbps * 1000},RESOLUTION=${r.width}x${r.height},CODECS="${HLS_CODECS}"`,
       );
-      lines.push(`${r.height}p/index.m3u8`);
+      lines.push(`${tier}p/index.m3u8`);
     }
     return `${lines.join('\n')}\n`;
   }
@@ -535,7 +610,7 @@ export class HlsTranscoder implements OnModuleDestroy {
   static largestRungBytes(durationSeconds: number, ladder: number[]): number {
     const heights = ladder.filter((h) => Number.isFinite(h) && h > 0);
     const top = heights.length > 0 ? Math.max(...heights) : 720;
-    const rate = BITRATES[top] ?? BITRATES[720]!;
+    const rate = HlsTranscoder.rateForTier(top);
     const bytesPerSecond = ((rate.maxrate + rate.audio) * 1000) / 8;
     return Math.ceil(Math.max(0, durationSeconds) * bytesPerSecond * TS_OVERHEAD_MULTIPLIER);
   }
@@ -614,6 +689,8 @@ export class HlsTranscoder implements OnModuleDestroy {
         height?: number;
         r_frame_rate?: string;
         avg_frame_rate?: string;
+        tags?: { rotate?: string };
+        side_data_list?: { rotation?: number }[];
       }[];
     };
     const video = parsed.streams?.find((s) => s.codec_type === 'video');
@@ -631,14 +708,33 @@ export class HlsTranscoder implements OnModuleDestroy {
     };
     const frameRate = parseRate(video.avg_frame_rate) ?? parseRate(video.r_frame_rate) ?? 25;
 
+    // A phone recording is often stored landscape with a 90° display matrix
+    // (or a legacy `rotate` tag). ffmpeg applies that rotation before the
+    // scale filter, so the ladder must be planned on the DISPLAY dimensions.
+    const rotation = HlsTranscoder.normaliseRotation(
+      video.side_data_list?.find((s) => typeof s.rotation === 'number')?.rotation ?? video.tags?.rotate,
+    );
+    const codedWidth = video.width ?? 1280;
+    const codedHeight = video.height ?? 720;
+    const swapped = rotation === 90 || rotation === 270;
+
     return {
       durationSeconds: Number(parsed.format?.duration ?? 0),
-      width: video.width ?? 1280,
-      height: video.height ?? 720,
+      width: swapped ? codedHeight : codedWidth,
+      height: swapped ? codedWidth : codedHeight,
+      rotation,
       frameRate: Math.round(frameRate * 100) / 100,
       videoCodec: video.codec_name ?? 'unknown',
       audioCodec: audio?.codec_name ?? 'none',
     };
+  }
+
+  /** 0 / 90 / 180 / 270 from a display-matrix rotation (e.g. -90) or a `rotate` tag ("90"). */
+  static normaliseRotation(raw: number | string | undefined): number {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return 0;
+    const r = ((Math.round(n / 90) * 90) % 360 + 360) % 360;
+    return r;
   }
 
   /**

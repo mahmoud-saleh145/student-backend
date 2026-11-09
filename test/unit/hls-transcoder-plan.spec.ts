@@ -5,22 +5,116 @@ import { HlsTranscoder } from '../../src/jobs/processors/hls-transcoder';
  * invocation. These are what the audit of the old worker changed, so each
  * change is pinned here.
  */
-describe('HlsTranscoder.planLadder', () => {
-  it('never upscales: rungs above the source are dropped', () => {
-    expect(HlsTranscoder.planLadder([360, 480, 720, 1080], 720)).toEqual([360, 480, 720]);
+describe('HlsTranscoder.planRenditions (quality policy)', () => {
+  const LADDER = [480, 720, 1080];
+  const tiers = (r: { tier: number }[]) => r.map((x) => x.tier);
+
+  it('1080p landscape → 1080p, 720p, 480p, aspect kept, never upscaled', () => {
+    const plan = HlsTranscoder.planRenditions(LADDER, 1920, 1080);
+    expect(plan).toEqual([
+      { tier: 480, width: 854, height: 480 },
+      { tier: 720, width: 1280, height: 720 },
+      { tier: 1080, width: 1920, height: 1080 },
+    ]);
   });
 
-  it('always keeps the smallest rung, even for a tiny source', () => {
-    expect(HlsTranscoder.planLadder([360, 480, 720, 1080], 240)).toEqual([360]);
+  it('720p landscape → 720p, 480p', () => {
+    expect(tiers(HlsTranscoder.planRenditions(LADDER, 1280, 720))).toEqual([480, 720]);
   });
 
-  it('keeps the full ladder for a 1080p source and sorts it', () => {
-    expect(HlsTranscoder.planLadder([1080, 360, 720, 480], 1080)).toEqual([360, 480, 720, 1080]);
+  it('480p landscape → 480p only', () => {
+    expect(HlsTranscoder.planRenditions(LADDER, 854, 480)).toEqual([{ tier: 480, width: 854, height: 480 }]);
   });
 
-  it('ignores junk and duplicates in the configured ladder', () => {
-    expect(HlsTranscoder.planLadder([720, 720, 0, -1, Number.NaN, 360], 1080)).toEqual([360, 720]);
-    expect(HlsTranscoder.planLadder([], 1080)).toEqual([360]);
+  it('between tiers: a 900-line source gets 720p and 480p, no 900p and no 1080p', () => {
+    expect(tiers(HlsTranscoder.planRenditions(LADDER, 1600, 900))).toEqual([480, 720]);
+  });
+
+  it('above 1080p (4K) → the same three tiers, nothing larger', () => {
+    const plan = HlsTranscoder.planRenditions(LADDER, 3840, 2160);
+    expect(tiers(plan)).toEqual([480, 720, 1080]);
+    expect(plan[2]).toEqual({ tier: 1080, width: 1920, height: 1080 });
+  });
+
+  it('portrait phone recording keeps its orientation: tiers are the SHORT side', () => {
+    const plan = HlsTranscoder.planRenditions(LADDER, 1080, 1920);
+    expect(plan).toEqual([
+      { tier: 480, width: 480, height: 854 },
+      { tier: 720, width: 720, height: 1280 },
+      { tier: 1080, width: 1080, height: 1920 },
+    ]);
+  });
+
+  it('portrait 720×1106 → 720p at its own size and a 480p rung, never stretched', () => {
+    const plan = HlsTranscoder.planRenditions(LADDER, 720, 1106);
+    expect(plan).toEqual([
+      { tier: 480, width: 480, height: 738 },
+      { tier: 720, width: 720, height: 1106 },
+    ]);
+    for (const r of plan) expect(Math.abs(r.width / r.height - 720 / 1106)).toBeLessThan(0.01);
+  });
+
+  it('non-standard aspect (1740×1080 screen recording) scales the long side with the short one', () => {
+    const plan = HlsTranscoder.planRenditions(LADDER, 1740, 1080);
+    expect(plan).toEqual([
+      { tier: 480, width: 774, height: 480 },
+      { tier: 720, width: 1160, height: 720 },
+      { tier: 1080, width: 1740, height: 1080 },
+    ]);
+  });
+
+  it('odd source dimensions produce even outputs at every rung', () => {
+    for (const r of HlsTranscoder.planRenditions(LADDER, 1001, 563)) {
+      expect(r.width % 2).toBe(0);
+      expect(r.height % 2).toBe(0);
+    }
+    expect(tiers(HlsTranscoder.planRenditions(LADDER, 1001, 563))).toEqual([480]);
+  });
+
+  it('below 480p → exactly one rung at the source size (even), no 360p and no upscale', () => {
+    expect(HlsTranscoder.planRenditions(LADDER, 640, 360)).toEqual([{ tier: 360, width: 640, height: 360 }]);
+    expect(HlsTranscoder.planRenditions(LADDER, 427, 240)).toEqual([{ tier: 240, width: 426, height: 240 }]);
+    expect(HlsTranscoder.planRenditions(LADDER, 360, 640)).toEqual([{ tier: 360, width: 360, height: 640 }]);
+  });
+
+  it('ignores tiers below 480 in the configured ladder, duplicates and junk', () => {
+    expect(tiers(HlsTranscoder.planRenditions([360, 480, 480, 720, 1080, 0, -1, Number.NaN], 1920, 1080))).toEqual([480, 720, 1080]);
+    expect(tiers(HlsTranscoder.planRenditions([360, 240], 1920, 1080))).toEqual([1080]); // only the source's own size remains
+  });
+
+  it('never returns an empty plan', () => {
+    expect(HlsTranscoder.planRenditions([], 2, 2)).toHaveLength(1);
+  });
+});
+
+describe('HlsTranscoder.rateForTier', () => {
+  it('uses the tier profile when one exists, otherwise the nearest profile below it', () => {
+    expect(HlsTranscoder.rateForTier(1080).maxrate).toBe(5000);
+    expect(HlsTranscoder.rateForTier(720).maxrate).toBe(2600);
+    expect(HlsTranscoder.rateForTier(480).maxrate).toBe(1200);
+    expect(HlsTranscoder.rateForTier(360).maxrate).toBe(700);
+    expect(HlsTranscoder.rateForTier(240).maxrate).toBe(700); // smallest profile
+    expect(HlsTranscoder.rateForTier(900).maxrate).toBe(2600); // between 720 and 1080
+  });
+});
+
+describe('HlsTranscoder.normaliseRotation (display matrix / rotate tag)', () => {
+  it('maps every spelling onto 0 / 90 / 180 / 270', () => {
+    expect(HlsTranscoder.normaliseRotation(undefined)).toBe(0);
+    expect(HlsTranscoder.normaliseRotation('90')).toBe(90);
+    expect(HlsTranscoder.normaliseRotation(-90)).toBe(270);
+    expect(HlsTranscoder.normaliseRotation(270)).toBe(270);
+    expect(HlsTranscoder.normaliseRotation(180)).toBe(180);
+    expect(HlsTranscoder.normaliseRotation(-180)).toBe(180);
+    expect(HlsTranscoder.normaliseRotation(360)).toBe(0);
+    expect(HlsTranscoder.normaliseRotation('junk')).toBe(0);
+  });
+
+  it('a 1920×1080 stream rotated 90° is planned as a 1080×1920 portrait source', () => {
+    const rotation = HlsTranscoder.normaliseRotation(-90);
+    const swapped = rotation === 90 || rotation === 270;
+    const plan = HlsTranscoder.planRenditions([480, 720, 1080], swapped ? 1080 : 1920, swapped ? 1920 : 1080);
+    expect(plan[2]).toEqual({ tier: 1080, width: 1080, height: 1920 });
   });
 });
 

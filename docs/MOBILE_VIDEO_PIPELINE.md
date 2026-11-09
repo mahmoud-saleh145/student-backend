@@ -73,7 +73,10 @@ Queue `mobile-video-processing`, job `mobile-hls`, concurrency 1, 2 attempts
 with jittered backoff. `MobileVideoProcessor` → `HlsTranscoder`:
 
 1. check scratch space (source × 2.5 + 512 MB), download the source;
-2. `ffprobe`; plan the ladder (`TRANSCODE_LADDER`, never upscaled);
+2. `ffprobe` (display dimensions, rotation applied); plan the ladder: tiers are the
+   picture's SHORT side, 480/720/1080, nothing above the source, nothing below
+   480, a sub-480 source encoded once at its own size, portrait kept portrait
+   (`HlsTranscoder.planRenditions`);
 3. per rung: `libx264` High 4.1, 8-bit 4:2:0, `veryfast`, CRF 23 with the
    bitrate cap, GOP at the source frame rate, a keyframe forced on every
    segment boundary, AAC stereo 48 kHz; 6 s MPEG-TS segments encrypted with

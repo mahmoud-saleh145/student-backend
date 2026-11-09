@@ -191,3 +191,12 @@ describe('live-ticket gate on the playlists and the key', () => {
     ).toBe(ErrorCode.PLAYBACK_DENIED);
   });
 });
+
+describe('ManifestService.tierOf (quality of a rendition is its short side)', () => {
+  it('reads landscape and portrait rungs the same way', () => {
+    expect(ManifestService.tierOf({ width: 1920, height: 1080 })).toBe(1080);
+    expect(ManifestService.tierOf({ width: 720, height: 1280 })).toBe(720);
+    expect(ManifestService.tierOf({ width: 480, height: 738 })).toBe(480);
+    expect(ManifestService.tierOf({ width: null, height: 720 })).toBe(720);
+  });
+});

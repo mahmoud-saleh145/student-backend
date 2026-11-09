@@ -186,7 +186,7 @@ export class EnvironmentVariables {
   @IsString() FFMPEG_PATH = 'ffmpeg';
   @IsString() FFPROBE_PATH = 'ffprobe';
   @IsString() TRANSCODE_WORK_DIR = '/tmp/edu-transcode';
-  @IsString() TRANSCODE_LADDER = '360,480,720,1080';
+  @IsString() TRANSCODE_LADDER = '480,720,1080';
   @Type(() => Number) @IsInt() @Min(2) @Max(20) HLS_SEGMENT_SECONDS = 6;
   @toBool() @IsBoolean() HLS_ENCRYPTION_ENABLED = true;
   /** ffmpeg thread cap for the mobile transcode; 0 = all cores. */
