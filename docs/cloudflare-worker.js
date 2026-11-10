@@ -172,7 +172,16 @@ export default {
     }
 
     // --- serve --------------------------------------------------------------
-    const range = request.headers.get('range');
+    //
+    // Status follows the REQUEST, not the storage answer. R2 returns a `range`
+    // on every object read through `get(key, { range: undefined })`, and this
+    // Worker used to answer 206 whenever it was present - so every plain GET
+    // came back "206 Partial Content" with a whole-file Content-Range (72 h of
+    // production traffic up to 2026-11-10: 506 responses, all 206, not one
+    // 200). Now: 206 only for a Range the client sent and storage can satisfy,
+    // 416 for one it cannot, 200 otherwise; HEAD never reads the body.
+    const rangeHeader = request.method === 'GET' ? request.headers.get('range') : null;
+    const range = rangeHeader ? parseRange(rangeHeader) : undefined;
 
     // Library documents live in their own bucket so that paid PDFs do not
     // consume the capacity budgeted for protected video. The bucket is derived
@@ -184,11 +193,34 @@ export default {
     // Worker serving exactly what it served before this binding existed.
     const store = objectKey.startsWith('library/') && env.LIBRARY ? env.LIBRARY : env.MEDIA;
 
-    const object = await store.get(objectKey, {
-      range: range ? parseRange(range) : undefined,
-    });
+    if (range === UNSATISFIABLE) {
+      const head = await store.head(objectKey);
+      if (!head) return deny(404, 'not_found', origin);
+      return unsatisfiable(head.size, origin);
+    }
+
+    let object;
+    if (request.method === 'HEAD') {
+      object = await store.head(objectKey);
+    } else {
+      try {
+        object = await store.get(objectKey, range ? { range } : undefined);
+      } catch (error) {
+        // R2 refuses a range that starts past the end of the object.
+        if (!range) throw error;
+        const head = await store.head(objectKey);
+        if (!head) return deny(404, 'not_found', origin);
+        return unsatisfiable(head.size, origin);
+      }
+    }
 
     if (!object) return deny(404, 'not_found', origin);
+
+    const served = range ? servedRange(range, object.size) : null;
+    if (range && !served) {
+      await object.body?.cancel?.();
+      return unsatisfiable(object.size, origin);
+    }
 
     const headers = new Headers();
     object.writeHttpMetadata(headers);
@@ -208,22 +240,27 @@ export default {
     headers.set('cross-origin-resource-policy', 'same-site');
     applyCors(headers, origin);
 
-    if (object.range) {
-      const { offset = 0, length = object.size } = object.range;
-      headers.set(
-        'content-range',
-        `bytes ${offset}-${offset + length - 1}/${object.size}`,
-      );
-      return new Response(request.method === 'HEAD' ? null : object.body, {
-        status: 206,
-        headers,
-      });
+    if (request.method === 'HEAD') {
+      // No body to measure, so the length is stated.
+      headers.set('content-length', String(object.size));
+      return new Response(null, { status: 200, headers });
     }
 
-    return new Response(request.method === 'HEAD' ? null : object.body, {
-      status: 200,
-      headers,
-    });
+    if (served) {
+      // Computed from what was requested and the object's size, never read back
+      // from storage: R2 echoes a suffix request as `{ suffix }`, which the old
+      // code turned into "bytes 0-<size-1>" for the last N bytes.
+      headers.set('content-range', `bytes ${served.start}-${served.end}/${object.size}`);
+      // Advertised ONLY on a ranged answer, to a client that already asked for
+      // a range. On a 200 it would tell pdf.js - the web reader and the mobile
+      // WebView alike - to abandon the single download for dozens of 64 KB
+      // requests, each a fresh liveness check with the API, and each one able to
+      // fail "expired" once the five-minute ticket runs out mid-read.
+      headers.set('accept-ranges', 'bytes');
+      return new Response(object.body, { status: 206, headers });
+    }
+
+    return new Response(object.body, { status: 200, headers });
   },
 };
 
@@ -495,18 +532,50 @@ function contentTypeFor(objectKey) {
   return 'application/octet-stream';
 }
 
+/** Marker for a well-formed Range that can never be satisfied ("bytes=-0"). */
+const UNSATISFIABLE = Symbol('unsatisfiable');
+
+/**
+ * A single byte range, as R2 takes it. Anything else - several ranges, a
+ * malformed header, an end before its start - is ignored, and the whole object
+ * is served with 200, as RFC 9110 permits.
+ */
 function parseRange(header) {
-  const match = header.match(/^bytes=(\d*)-(\d*)$/);
+  const match = header.trim().match(/^bytes=(\d*)-(\d*)$/);
   if (!match) return undefined;
 
   const [, startRaw, endRaw] = match;
+  if (startRaw === '' && endRaw === '') return undefined;
 
   if (startRaw === '') {
-    return { suffix: Number(endRaw) };
+    const suffix = Number(endRaw);
+    return suffix === 0 ? UNSATISFIABLE : { suffix };
   }
 
   const offset = Number(startRaw);
-  return endRaw === ''
-    ? { offset }
-    : { offset, length: Number(endRaw) - offset + 1 };
+  if (endRaw === '') return { offset };
+  const end = Number(endRaw);
+  if (end < offset) return undefined;
+  return { offset, length: end - offset + 1 };
+}
+
+/** The inclusive byte span a parsed range covers in an object of `size`, or null. */
+function servedRange(range, size) {
+  if ('suffix' in range) {
+    if (size === 0) return null;
+    return { start: Math.max(size - range.suffix, 0), end: size - 1 };
+  }
+  if (range.offset >= size) return null;
+  const end = range.length === undefined ? size - 1 : Math.min(range.offset + range.length, size) - 1;
+  return { start: range.offset, end };
+}
+
+/** 416, with the size a client needs to ask again correctly. */
+function unsatisfiable(size, origin) {
+  const headers = new Headers({
+    'x-deny-reason': 'range_not_satisfiable',
+    'cache-control': 'no-store',
+    'content-range': `bytes */${size}`,
+  });
+  return new Response(null, { status: 416, headers: applyCors(headers, origin) });
 }
