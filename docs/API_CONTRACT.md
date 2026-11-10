@@ -691,6 +691,18 @@ student's academic details, `coversAllSections`, `sectionIds` and `redemption`.
   is now such a URL (Cloudinary course images are unchanged). `avatarUrl` is
   resolved the same way when the stored value is an `avatars/…` key. The
   media gate never served these: it refuses unsigned requests.
+- **Public images at the edge (2026-11-10).** With `PUBLIC_ASSET_BASE_URL`
+  set, those URLs point at the media gate Worker instead
+  (`<base>/<key>`, unsigned). The Worker serves only keys matching
+  `^(thumbnails/(courses|library)|avatars)(/[A-Za-z0-9_-]+)+\.(jpe?g|png|webp)$`
+  — the same pattern `/assets` now enforces — from its per-location cache
+  (`x-asset-cache: HIT|MISS`), reading R2 only on a miss. Browser policy
+  `public, max-age=31536000, immutable`; edge copy 1 day; a missing key is a
+  404 cached 60 s. Approximate per-address limits (Cloudflare-observed IP):
+  1200 requests/min overall, 120 cache misses/min; over either → 429 with
+  `Retry-After: 60`. `/assets` itself (fallback, old URLs) answers HEAD and
+  `If-None-Match` from object metadata and is limited to 300 requests/min per
+  address in memory. Clients need no change: they render whatever URL they get.
 - **Library cover upload.** `POST /storage/uploads/library-cover/content
   ?materialId&contentType` (admin, raw image body ≤ 10 MB) returns
   `{ objectKey, sizeBytes }`; register it as `coverKey` on the material.

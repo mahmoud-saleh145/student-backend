@@ -79,14 +79,37 @@ export const PUBLIC_ASSET_PREFIXES = [
   'avatars/',
 ] as const;
 
+/**
+ * The exact shape of a public image key, and nothing looser.
+ *
+ * Segments are `[A-Za-z0-9_-]+` and the last one ends in an image extension:
+ * precisely what the key builders above produce (`<prefix>/<id>/…/<uuid>.<ext>`
+ * with the extension chosen from the validated content type). So no `%`
+ * (encoded and double-encoded paths are refused before any decoding), no `.`
+ * or `..` segment, no `\`, no empty segment, no SVG or other active content,
+ * and no private namespace — `thumbnails/videos/` included.
+ *
+ * MUST stay byte-identical to PUBLIC_IMAGE_KEY in docs/cloudflare-worker.js;
+ * test/unit/public-assets.spec.ts reads both files and compares them.
+ */
+export const PUBLIC_IMAGE_KEY_PATTERN =
+  /^(?:thumbnails\/(?:courses|library)|avatars)(?:\/[A-Za-z0-9_-]+)+\.(?:jpe?g|png|webp)$/;
+
 export function isPublicAssetKey(objectKey: string): boolean {
-  if (!objectKey || objectKey.includes('..') || objectKey.startsWith('/')) return false;
-  return PUBLIC_ASSET_PREFIXES.some((prefix) => objectKey.startsWith(prefix));
+  if (!objectKey || objectKey.length > 512) return false;
+  return PUBLIC_IMAGE_KEY_PATTERN.test(objectKey);
 }
 
 /** What the public asset route needs to answer one GET. */
 export interface StoredObject {
   body: Buffer;
+  contentType: string | null;
+  etag: string | null;
+}
+
+/** What the public asset route needs to answer a HEAD or a conditional GET. */
+export interface StoredObjectHead {
+  size: number;
   contentType: string | null;
   etag: string | null;
 }
@@ -752,6 +775,11 @@ export class StorageService {
    */
   static publicAssetUrlSync(objectKey: string | null | undefined): string | null {
     if (!objectKey || !isPublicAssetKey(objectKey)) return null;
+    // The edge first: PUBLIC_ASSET_BASE_URL is the media gate Worker, which
+    // serves these keys unsigned from its cache and reads R2 only on a miss.
+    // Unset (the rollback), every URL points at this API's own route below.
+    const edge = (process.env.PUBLIC_ASSET_BASE_URL ?? '').trim().replace(/\/+$/, '');
+    if (edge) return `${edge}/${objectKey}`;
     const api = (process.env.PUBLIC_API_URL ?? '').replace(/\/+$/, '');
     if (!api) return null;
     const prefix = process.env.API_PREFIX ?? 'api';
@@ -828,12 +856,38 @@ export class StorageService {
       };
     } catch (error) {
       if (error instanceof AppException) throw error;
-      const name = (error as { name?: string }).name;
-      const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata
-        ?.httpStatusCode;
-      if (name === 'NoSuchKey' || name === 'NotFound' || status === 404) return null;
+      if (StorageService.isMissing(error)) return null;
       throw error;
     }
+  }
+
+  /**
+   * The object's metadata without its bytes, for HEAD and for a conditional
+   * GET: answering either used to download the whole image just to throw the
+   * body away. Null when the object does not exist.
+   */
+  async headPublicObject(bucket: Bucket, objectKey: string): Promise<StoredObjectHead | null> {
+    this.assertConfigured();
+    try {
+      const head = await this.client.send(
+        new HeadObjectCommand({ Bucket: this.bucketName(bucket), Key: objectKey }),
+      );
+      return {
+        size: head.ContentLength ?? 0,
+        contentType: head.ContentType ?? null,
+        etag: head.ETag ?? null,
+      };
+    } catch (error) {
+      if (StorageService.isMissing(error)) return null;
+      throw error;
+    }
+  }
+
+  private static isMissing(error: unknown): boolean {
+    const name = (error as { name?: string }).name;
+    const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata
+      ?.httpStatusCode;
+    return name === 'NoSuchKey' || name === 'NotFound' || status === 404;
   }
 
   // ---------------------------------------------------------------------------

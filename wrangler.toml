@@ -57,6 +57,32 @@ bucket_name = "edu-media"
 binding = "LIBRARY"
 bucket_name = "edu-library"
 
+# --- rate limits for public images ---------------------------------------------
+# Approximate and per Cloudflare location (Workers rate-limiting binding).
+# Keyed by `cf-connecting-ip`. Only the public-image branch calls them; signed
+# media and documents are unaffected. See servePublicImage in
+# docs/cloudflare-worker.js. `period` must be 10 or 60.
+#
+# Every public request: generous, because a university network or a mobile
+# carrier can put many students behind one address.
+[[ratelimits]]
+name = "PUBLIC_ASSET_LIMITER"
+namespace_id = "92001"
+
+  [ratelimits.simple]
+  limit = 1200
+  period = 60
+
+# Cache misses only (each costs an R2 read): a client walking many distinct
+# keys is the abuse pattern; ordinary browsing is almost entirely cache hits.
+[[ratelimits]]
+name = "PUBLIC_ASSET_MISS_LIMITER"
+namespace_id = "92002"
+
+  [ratelimits.simple]
+  limit = 120
+  period = 60
+
 # --- plain vars (not secrets) ------------------------------------------------
 [vars]
 # Origin the Worker asks whether a playback ticket is still live. It appends

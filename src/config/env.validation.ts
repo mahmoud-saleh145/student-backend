@@ -61,6 +61,14 @@ export class EnvironmentVariables {
   /// (Express `trust proxy` count). Only read when TRUST_PROXY is on.
   @Type(() => Number) @IsInt() @Min(1) @Max(10) TRUST_PROXY_HOPS = 1;
 
+  /// Forwarding hops the platform itself appends, counted the way Express
+  /// counts `trust proxy`, used ONLY to key the public image limiter on the
+  /// address the edge observed. On Render that is 3 (Cloudflare's view of the
+  /// client, Cloudflare's edge, Render's balancer); the diagnostic
+  /// `GET /admin/diagnostics/client-ip` shows the chain. Unset, the limiter
+  /// keys on `req.ip`.
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(10) PUBLIC_ASSET_CLIENT_IP_HOPS?: number;
+
   /// Owner decision D6: shared with the student web server ONLY (server-side
   /// env there, never NEXT_PUBLIC_*). When the web server presents it, the
   /// browser address it forwards is believed. Unset = never believed.
@@ -150,6 +158,13 @@ export class EnvironmentVariables {
   @IsOptional() @IsString() R2_ENDPOINT?: string;
 
   @IsOptional() @IsString() MEDIA_CDN_BASE_URL?: string;
+
+  /**
+   * Edge origin for PUBLIC images (thumbnails, covers, avatars), e.g. the media
+   * gate Worker. Optional: unset, image URLs point at this API's own
+   * `GET /assets/*` route, which is also the rollback.
+   */
+  @IsOptional() @IsString() PUBLIC_ASSET_BASE_URL?: string;
 
   // --- Cloudinary (course thumbnails) ---------------------------------------
   //
@@ -529,6 +544,12 @@ export function validateEnv(raw: Record<string, unknown>): EnvironmentVariables 
       throw new Error(
         'MEDIA_CDN_BASE_URL is required in production: signed media URLs must be ' +
           'verified at the edge. See docs/MANUAL_STEPS.md step 8.',
+      );
+    }
+    if (config.PUBLIC_ASSET_BASE_URL && !/^https:\/\/[^\s/?#]+(\/[^\s?#]*)?$/.test(config.PUBLIC_ASSET_BASE_URL.trim())) {
+      throw new Error(
+        'PUBLIC_ASSET_BASE_URL must be an https URL without a query or fragment ' +
+          '(e.g. https://edu-media-gate.example.workers.dev), or unset.',
       );
     }
     if (!raw.R2_BUCKET_LIBRARY) {

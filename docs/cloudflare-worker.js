@@ -105,6 +105,20 @@ export default {
     }
 
     const url = new URL(request.url);
+
+    // --- public images ------------------------------------------------------
+    // Course and library thumbnails, library covers and avatars are public by
+    // design and are requested WITHOUT a signature. They are served from this
+    // location's edge cache, and on a miss from the MEDIA binding — never via
+    // the API. Matched on the RAW path against a strict pattern, before any
+    // decoding, so an encoded or traversing path cannot reach this branch; it
+    // falls through to the signed path below and is refused there exactly as
+    // before. A signed URL (one carrying `sig`) always takes the signed path.
+    if (!url.searchParams.has('sig')) {
+      const publicKey = publicImageKey(url.pathname);
+      if (publicKey) return servePublicImage(request, env, ctx, publicKey);
+    }
+
     // Strip the leading slash: object keys are stored without one.
     const objectKey = decodeURIComponent(url.pathname.replace(/^\/+/, ''));
 
@@ -480,6 +494,179 @@ async function ticketIsLive(env, ctx, ticketId, userId, sid, did) {
 function readLive(payload) {
   const live = payload?.data?.live ?? payload?.live;
   return live === true;
+}
+
+// -----------------------------------------------------------------------------
+// Public images
+// -----------------------------------------------------------------------------
+
+/**
+ * The only keys served without a signature.
+ *
+ * Must stay identical to PUBLIC_IMAGE_KEY_PATTERN in
+ * src/modules/storage/storage.service.ts (a unit test reads both files and
+ * compares them). Segments are `[A-Za-z0-9_-]+` and the last ends in an image
+ * extension, which is exactly what the API's key builders produce. That rules
+ * out `%` (so no encoded or double-encoded bypass), `.` segments and `..`
+ * (no traversal), `\`, empty segments, query-like characters, and every
+ * private namespace: `hls/`, `source/`, `uploads/`, `library/`, `attachments/`,
+ * `captions/` and the video poster frames under `thumbnails/videos/`.
+ */
+const PUBLIC_IMAGE_KEY = /^(?:thumbnails\/(?:courses|library)|avatars)(?:\/[A-Za-z0-9_-]+)+\.(?:jpe?g|png|webp)$/;
+
+/** What the browser may keep: keys are versioned (a UUID per upload) and never rewritten. */
+const PUBLIC_BROWSER_CACHE = 'public, max-age=31536000, immutable';
+
+/**
+ * How long this location keeps a copy. Short on purpose: a deleted image (a
+ * cleared cover, a removed avatar) stays reachable at its old URL for at most
+ * this long, because a workers.dev cache cannot be purged from the API. A
+ * replacement is never stale — it is a new key, hence a new URL.
+ */
+const PUBLIC_EDGE_TTL_SECONDS = 86400;
+
+/** A missing key is remembered briefly, so a burst for it costs one R2 read. */
+const PUBLIC_MISSING_TTL_SECONDS = 60;
+
+/** Same ceiling as the upload routes; nothing larger belongs in these namespaces. */
+const PUBLIC_MAX_BYTES = 10 * 1024 * 1024;
+
+/** The cache key is the object key alone: query strings cannot bust the cache. */
+const PUBLIC_CACHE_ORIGIN = 'https://public-assets.edu-media-gate.internal/';
+
+function publicImageKey(pathname) {
+  const key = pathname.replace(/^\//, '');
+  return PUBLIC_IMAGE_KEY.test(key) ? key : null;
+}
+
+/**
+ * One public image.
+ *
+ * Two approximate, per-location limits, keyed by the client address Cloudflare
+ * itself observed (`cf-connecting-ip`, set by the edge, not by the client):
+ *
+ *   PUBLIC_ASSET_LIMITER       every public request. Generous, because a whole
+ *                              university or a mobile carrier can share one
+ *                              address and a catalogue page loads many images.
+ *   PUBLIC_ASSET_MISS_LIMITER  cache misses only — the requests that cost an
+ *                              R2 read. Tight, because only a client walking
+ *                              many distinct keys produces many of them.
+ *
+ * Both bindings are optional: without them (local tests, an older deploy)
+ * nothing is limited, which matches the behaviour before they existed.
+ */
+async function servePublicImage(request, env, ctx, key) {
+  const client = request.headers.get('cf-connecting-ip') || 'unknown';
+
+  if (env.PUBLIC_ASSET_LIMITER) {
+    const { success } = await env.PUBLIC_ASSET_LIMITER.limit({ key: `ip:${client}` });
+    if (!success) return publicTooMany();
+  }
+
+  const cache = typeof caches !== 'undefined' ? caches.default : null;
+  const cacheKey = new Request(PUBLIC_CACHE_ORIGIN + key, { method: 'GET' });
+
+  let stored = cache ? await cache.match(cacheKey) : undefined;
+  let source = 'HIT';
+
+  if (!stored) {
+    source = 'MISS';
+
+    if (env.PUBLIC_ASSET_MISS_LIMITER) {
+      const { success } = await env.PUBLIC_ASSET_MISS_LIMITER.limit({ key: `ip:${client}` });
+      if (!success) return publicTooMany();
+    }
+
+    const object = await env.MEDIA.get(key);
+
+    if (!object || !object.body || object.size > PUBLIC_MAX_BYTES) {
+      if (object && object.body) await object.body.cancel();
+      stored = new Response(null, {
+        status: 404,
+        headers: { 'cache-control': `public, max-age=${PUBLIC_MISSING_TTL_SECONDS}` },
+      });
+    } else {
+      const headers = new Headers({
+        'content-type': publicContentType(key),
+        'content-length': String(object.size),
+        etag: object.httpEtag,
+        'last-modified': new Date(object.uploaded).toUTCString(),
+        'cache-control': `public, max-age=${PUBLIC_EDGE_TTL_SECONDS}`,
+      });
+      stored = new Response(object.body, { status: 200, headers });
+    }
+
+    if (cache) ctx.waitUntil(cache.put(cacheKey, stored.clone()));
+  }
+
+  return publicResponse(request, stored, source);
+}
+
+/** The client's view of a stored entry: browser policy, validators, HEAD and 304. */
+async function publicResponse(request, stored, source) {
+  const headers = new Headers({
+    'x-content-type-options': 'nosniff',
+    'cross-origin-resource-policy': 'cross-origin',
+    'access-control-allow-origin': '*',
+    'x-asset-cache': source,
+  });
+
+  if (stored.status !== 200) {
+    if (stored.body) await stored.body.cancel();
+    headers.set('cache-control', `public, max-age=${PUBLIC_MISSING_TTL_SECONDS}`);
+    headers.set('x-deny-reason', 'not_found');
+    return new Response(null, { status: 404, headers });
+  }
+
+  for (const name of ['content-type', 'content-length', 'etag', 'last-modified']) {
+    const value = stored.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  headers.set('cache-control', PUBLIC_BROWSER_CACHE);
+
+  const etag = stored.headers.get('etag');
+  if (etag && etagMatches(request.headers.get('if-none-match'), etag)) {
+    if (stored.body) await stored.body.cancel();
+    headers.delete('content-length');
+    return new Response(null, { status: 304, headers });
+  }
+
+  if (request.method === 'HEAD') {
+    if (stored.body) await stored.body.cancel();
+    return new Response(null, { status: 200, headers });
+  }
+
+  return new Response(stored.body, { status: 200, headers });
+}
+
+/** RFC 9110 weak comparison, as If-None-Match requires; `*` matches any. */
+function etagMatches(header, etag) {
+  if (!header) return false;
+  const bare = (value) => value.trim().replace(/^W\//, '');
+  const target = bare(etag);
+  return header.split(',').some((candidate) => {
+    const value = candidate.trim();
+    return value === '*' || bare(value) === target;
+  });
+}
+
+/** Decided by the extension the pattern already guaranteed — never by stored metadata. */
+function publicContentType(key) {
+  if (key.endsWith('.png')) return 'image/png';
+  if (key.endsWith('.webp')) return 'image/webp';
+  return 'image/jpeg';
+}
+
+function publicTooMany() {
+  return new Response(null, {
+    status: 429,
+    headers: {
+      'retry-after': '60',
+      'cache-control': 'no-store',
+      'x-deny-reason': 'rate_limited',
+      'access-control-allow-origin': '*',
+    },
+  });
 }
 
 function contentTypeFor(objectKey) {
