@@ -1,5 +1,5 @@
 import { BullModule } from '@nestjs/bullmq';
-import { Logger, Module } from '@nestjs/common';
+import { Logger, Module, type Type } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
 import type { RedisConfig } from '../config/configuration';
@@ -10,10 +10,13 @@ import { PlaybackModule } from '../modules/playback/playback.module';
 import { VideosModule } from '../modules/videos/videos.module';
 
 import { AnalyticsProcessor } from './processors/analytics.processor';
+import { HlsTranscoder } from './processors/hls-transcoder';
 import { MaintenanceProcessor } from './processors/maintenance.processor';
+import { MobileVideoProcessor } from './processors/mobile-video.processor';
 import { PushProcessor } from './processors/push.processor';
+import { ScratchGuard } from './processors/scratch-guard';
 import { VideoProcessor } from './processors/video.processor';
-import { QUEUE_NAMES } from './queue.constants';
+import { QUEUE_NAMES, type QueueName } from './queue.constants';
 import { MaintenanceScheduler } from './schedulers/maintenance.scheduler';
 import { WorkerHeartbeat } from './worker-heartbeat';
 
@@ -26,6 +29,40 @@ import { WorkerHeartbeat } from './worker-heartbeat';
  * handling for CPU, and lets the two scale independently.
  */
 const runWorkers = process.env.RUN_WORKERS === 'true';
+
+const PROCESSOR_BY_QUEUE: Record<QueueName, Type<unknown>> = {
+  [QUEUE_NAMES.video]: VideoProcessor,
+  [QUEUE_NAMES.mobileVideo]: MobileVideoProcessor,
+  [QUEUE_NAMES.push]: PushProcessor,
+  [QUEUE_NAMES.maintenance]: MaintenanceProcessor,
+  [QUEUE_NAMES.analytics]: AnalyticsProcessor,
+};
+
+/**
+ * Which consumers this worker process registers.
+ *
+ * `WORKER_QUEUES` unset or empty means every queue, which is the single-host
+ * deployment. Naming queues lets the CPU-bound mobile transcode run on its own
+ * machine (`WORKER_QUEUES=mobile-video-processing`) while the light, latency-
+ * sensitive queues stay on a small always-on one. An unknown name is a boot
+ * error rather than a silently idle worker.
+ */
+export function selectProcessors(spec: string | undefined): Type<unknown>[] {
+  const names = (spec ?? '')
+    .split(',')
+    .map((n) => n.trim())
+    .filter(Boolean);
+  if (names.length === 0) return Object.values(PROCESSOR_BY_QUEUE);
+  return names.map((name) => {
+    const processor = PROCESSOR_BY_QUEUE[name as QueueName];
+    if (!processor) {
+      throw new Error(
+        `WORKER_QUEUES names unknown queue "${name}". Known: ${Object.keys(PROCESSOR_BY_QUEUE).join(', ')}`,
+      );
+    }
+    return processor;
+  });
+}
 
 if (!runWorkers && process.env.NODE_ENV !== 'test') {
   // Not an error — the API is meant to only enqueue — but it is the single
@@ -66,6 +103,7 @@ if (!runWorkers && process.env.NODE_ENV !== 'test') {
     }),
     BullModule.registerQueue(
       { name: QUEUE_NAMES.video },
+      { name: QUEUE_NAMES.mobileVideo },
       { name: QUEUE_NAMES.push },
       { name: QUEUE_NAMES.maintenance },
       { name: QUEUE_NAMES.analytics },
@@ -78,9 +116,10 @@ if (!runWorkers && process.env.NODE_ENV !== 'test') {
   ],
   providers: [
     MaintenanceScheduler,
-    ...(runWorkers
-      ? [VideoProcessor, PushProcessor, MaintenanceProcessor, AnalyticsProcessor, WorkerHeartbeat]
-      : []),
+    // Shared by the legacy and mobile video processors; harmless on the API.
+    HlsTranscoder,
+    ScratchGuard,
+    ...(runWorkers ? [...selectProcessors(process.env.WORKER_QUEUES), WorkerHeartbeat] : []),
   ],
   exports: [BullModule],
 })

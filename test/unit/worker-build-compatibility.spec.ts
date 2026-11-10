@@ -62,9 +62,22 @@ describe('the worker heartbeat', () => {
         written.push(payload);
       }),
     };
-    const hb = new WorkerHeartbeat(redis as never, { getOrThrow: () => ({ ffmpegPath: 'x', ffprobePath: 'y' }) } as never);
+    const guard = {
+      snapshot: jest.fn(async () => ({ path: '/tmp/edu-transcode/mobile', freeBytes: 1, minFreeBytes: 1, reservedBytes: 0, safe: true })),
+      pauseState: jest.fn(async () => ({ paused: false, reason: null, by: null, at: null })),
+      activeJobs: jest.fn(() => []),
+      lastDeferredJob: jest.fn(() => null),
+    };
+    const hb = new WorkerHeartbeat(
+      redis as never,
+      { getOrThrow: () => ({ ffmpegPath: 'x', ffprobePath: 'y', workDir: '/tmp/edu-transcode' }) } as never,
+      guard as never,
+    );
     await (hb as unknown as { beat: () => Promise<void> }).beat();
     expect(written[0]).toMatchObject({ build: 'c0f4883aaaaa', capabilities: ['drm-verification-sweep'] });
+    // The migration dashboard reads these from the same beat.
+    expect(written[0]).toMatchObject({ queues: 'all', scratch: expect.objectContaining({ safe: true }), pause: { paused: false } });
+    expect(written[0].load).toEqual(expect.objectContaining({ cpus: expect.any(Number) }));
     expect(WORKER_CAPABILITIES).toContain('drm-verification-sweep');
   });
 });

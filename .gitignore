@@ -26,3 +26,4 @@ _mirror-*.tgz
 # No trailing slash: also ignores a symlink named node_modules (a directory
 # pattern would not), which is how one was once committed by accident.
 node_modules
+deploy/laptop-worker/.env.worker

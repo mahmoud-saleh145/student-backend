@@ -1,0 +1,69 @@
+# =============================================================================
+# Student Center — production WORKER on the Windows laptop (Docker Desktop)
+# =============================================================================
+#
+# This is the only production service that runs on the laptop. The API runs
+# on Render, Redis on Upstash, Postgres on Neon, media on R2. The worker
+# consumes the queues (push, maintenance, analytics, the Gumlet hand-off for
+# web uploads, and the mobile FFmpeg → AES-128 HLS pipeline).
+#
+# What this file guarantees, and why each line exists:
+#
+#   scratch bind mount   Encodes write into C:\edu-transcode on the Windows
+#                        drive, not into the container's writable layer. Files
+#                        deleted there return space to Windows immediately; in
+#                        the container layer they grow docker_data.vhdx, which
+#                        never shrinks on its own.
+#   TRANSCODE_MIN_FREE_GB  The worker refuses or pauses encodes rather than let
+#                        the system drive drop below this many GB free.
+#   cpus / mem_limit     ffmpeg can never take the whole machine from Windows
+#                        or from the push/maintenance consumers in this same
+#                        process; see TRANSCODE_THREADS in .env.worker.
+#   logging limits       Container logs are capped (5 × 20 MB) so a chatty
+#                        week cannot eat the drive.
+#   restart: unless-stopped  Comes back after a reboot or a Docker restart
+#                        without anyone remembering to start it; a deliberate
+#                        `docker compose down` stays down.
+#   stop_grace_period    SIGTERM kills ffmpeg and lets the job fail as
+#                        "interrupted" (retried later); 30 s is plenty.
+#
+# Usage (PowerShell, from this folder):
+#   .\laptop-worker.ps1 preflight     # measure, create the scratch folder, verify the mount
+#   .\laptop-worker.ps1 up            # start (or restart) the worker
+#   .\laptop-worker.ps1 status        # heartbeat, scratch, queues, free space
+#   .\laptop-worker.ps1 logs          # follow logs
+#   .\laptop-worker.ps1 down          # stop (the running encode is interrupted and retried)
+#
+# Secrets live in .env.worker next to this file (never committed; see
+# .env.worker.example). Build the image from the repository root first:
+#   docker build --target production --build-arg BUILD_COMMIT=$(git rev-parse HEAD) -t edu-worker:<tag> .
+# and put that tag in WORKER_IMAGE below (or in the environment).
+# =============================================================================
+services:
+  worker:
+    image: ${WORKER_IMAGE:-edu-worker:latest}
+    container_name: edu-worker
+    command: ['node', 'dist/src/worker.js']
+    restart: unless-stopped
+    stop_grace_period: 30s
+    env_file:
+      - .env.worker
+    environment:
+      RUN_WORKERS: 'true'
+      # Inside the container; the host side is the bind mount below.
+      TRANSCODE_WORK_DIR: /tmp/edu-transcode
+    volumes:
+      # Host folder : container folder. The host side MUST be on the drive you
+      # measured in the preflight; the script checks the mapping from inside.
+      - ${SCRATCH_HOST_DIR:-C:/edu-transcode}:/tmp/edu-transcode
+    # Hard ceilings (compose v2, non-swarm). ffmpeg's own thread cap is
+    # TRANSCODE_THREADS in .env.worker; these are the backstop.
+    cpus: ${WORKER_CPUS:-8}
+    mem_limit: ${WORKER_MEM_LIMIT:-4g}
+    logging:
+      driver: json-file
+      options:
+        max-size: '20m'
+        max-file: '5'
+    # The image's HEALTHCHECK (scripts/healthcheck.ts) reads the worker's own
+    # Redis heartbeat; nothing to add here.

@@ -186,9 +186,25 @@ export class EnvironmentVariables {
   @IsString() FFMPEG_PATH = 'ffmpeg';
   @IsString() FFPROBE_PATH = 'ffprobe';
   @IsString() TRANSCODE_WORK_DIR = '/tmp/edu-transcode';
-  @IsString() TRANSCODE_LADDER = '360,480,720,1080';
+  @IsString() TRANSCODE_LADDER = '480,720,1080';
   @Type(() => Number) @IsInt() @Min(2) @Max(20) HLS_SEGMENT_SECONDS = 6;
   @toBool() @IsBoolean() HLS_ENCRYPTION_ENABLED = true;
+  /** ffmpeg thread cap for the mobile transcode; 0 = all cores. */
+  @Type(() => Number) @IsInt() @Min(0) @Max(64) TRANSCODE_THREADS = 0;
+  @Type(() => Number) @IsInt() @Min(0) @Max(2000) TRANSCODE_MIN_FREE_GB = 25;
+  @Type(() => Number) @IsInt() @Min(5) @Max(600) TRANSCODE_DISK_CHECK_SECONDS = 15;
+
+  // --- Independent mobile pipeline --------------------------------------------
+  @IsIn(['hls', 'gumlet']) MOBILE_VIDEO_DELIVERY = 'hls';
+  @toBool() @IsBoolean() MOBILE_HLS_GUMLET_FALLBACK = true;
+  @toBool() @IsBoolean() MOBILE_PIPELINE_ENABLED = true;
+  /**
+   * Which queues THIS worker process consumes, comma-separated
+   * (`video-processing,mobile-video-processing,push-delivery,maintenance,analytics`).
+   * Empty = all of them. Lets the CPU-bound mobile transcode run on its own host
+   * while push and maintenance stay on a small always-on one.
+   */
+  @IsOptional() @IsString() WORKER_QUEUES?: string;
 
   @IsString()
   @MinLength(32, { message: 'HLS_KEY_ROOT must be at least 32 characters' })

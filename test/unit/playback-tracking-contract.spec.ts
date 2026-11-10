@@ -1,5 +1,7 @@
 import { ContentStatus, CompletionRuleType, PlaybackTicketStatus, UserRole, WatchEventType } from '@prisma/client';
 
+import { AppException } from '../../src/common/errors/app.exception';
+import { ErrorCode } from '../../src/common/errors/error-codes';
 import { PlaybackService } from '../../src/modules/playback/playback.service';
 import { GumletDrmService } from '../../src/modules/playback/gumlet-drm.service';
 import { ProgressService } from '../../src/modules/progress/progress.service';
@@ -89,10 +91,27 @@ function buildPlayback(options: { expiresInMs?: number } = {}) {
     },
   };
 
+  // The heartbeat re-authorises through `assertContentAccess`, which (like the
+  // real service) is built on `resolve`; tests steer it by mocking `resolve`.
+  type Decision = { canAccessContent: boolean; state: string; denialCode?: string };
+  const resolve = jest.fn(
+    async (_a: { userId: string; role: unknown; courseId: string }): Promise<Decision> => ({
+      canAccessContent: true,
+      state: 'ACTIVE',
+    }),
+  );
   const access = {
-    assertContentAccess: jest.fn(async () => undefined),
+    resolve,
+    assertContentAccess: jest.fn(
+      async (a: { userId: string; role: unknown; courseId: string }): Promise<Decision> => {
+      const decision = await resolve({ userId: a.userId, role: a.role, courseId: a.courseId });
+      if (decision.canAccessContent) return decision;
+      throw new AppException((decision.denialCode ?? ErrorCode.NOT_ENROLLED) as ErrorCode, {
+        details: { accessState: decision.state, courseId: a.courseId },
+      });
+      },
+    ),
     assertSectionAccessible: jest.fn(async () => undefined),
-    resolve: jest.fn(async () => ({ canAccessContent: true, state: 'ACTIVE' })),
   };
 
   const gumletCfg = {

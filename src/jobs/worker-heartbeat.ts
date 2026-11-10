@@ -1,10 +1,12 @@
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { spawn } from 'node:child_process';
-import { hostname } from 'node:os';
+import { cpus, freemem, hostname, loadavg, totalmem } from 'node:os';
+import { join } from 'node:path';
 
 import type { VideoConfig } from '../config/configuration';
 import { RedisService } from '../redis/redis.service';
+import { type ActiveJobNote, type PauseState, ScratchGuard, type ScratchSnapshot } from './processors/scratch-guard';
 
 /**
  * Worker liveness, visible from the API.
@@ -68,6 +70,25 @@ export interface WorkerHeartbeatPayload {
   /** Absent on workers built before these fields existed. */
   build?: string | null;
   capabilities?: string[];
+  /** Which queues this process consumes ('all' when WORKER_QUEUES is unset). */
+  queues?: string[] | 'all';
+  /** The transcoding scratch volume as this process sees it. */
+  scratch?: ScratchSnapshot;
+  /** Host load and memory, for the migration dashboard. */
+  load?: { load1: number; cpus: number; freeMemBytes: number; totalMemBytes: number };
+  /** Operator pause of mobile encodes. */
+  pause?: PauseState;
+  /** Mobile encodes running in this process right now. */
+  activeJobs?: ActiveJobNote[];
+  lastDeferral?: { videoId: string; why: string; at: string } | null;
+}
+
+export function configuredQueues(spec: string | undefined = process.env.WORKER_QUEUES): string[] | 'all' {
+  const names = (spec ?? '')
+    .split(',')
+    .map((n) => n.trim())
+    .filter(Boolean);
+  return names.length === 0 ? 'all' : names;
 }
 
 export async function readWorkerHeartbeat(
@@ -99,6 +120,7 @@ export class WorkerHeartbeat implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly redis: RedisService,
     config: ConfigService,
+    private readonly guard: ScratchGuard,
   ) {
     this.cfg = config.getOrThrow<VideoConfig>('video');
   }
@@ -131,6 +153,10 @@ export class WorkerHeartbeat implements OnModuleInit, OnModuleDestroy {
   }
 
   private async beat(): Promise<void> {
+    const [scratch, pause] = await Promise.all([
+      this.guard.snapshot(join(this.cfg.workDir, 'mobile')).catch(() => undefined),
+      this.guard.pauseState().catch(() => undefined),
+    ]);
     const payload: WorkerHeartbeatPayload = {
       pid: process.pid,
       host: hostname(),
@@ -139,6 +165,12 @@ export class WorkerHeartbeat implements OnModuleInit, OnModuleDestroy {
       ...this.tools,
       build: runningBuild(),
       capabilities: [...WORKER_CAPABILITIES],
+      queues: configuredQueues(),
+      scratch,
+      load: { load1: loadavg()[0] ?? 0, cpus: cpus().length, freeMemBytes: freemem(), totalMemBytes: totalmem() },
+      pause,
+      activeJobs: this.guard.activeJobs(),
+      lastDeferral: this.guard.lastDeferredJob(),
     };
     await this.redis
       .setJson(WORKER_HEARTBEAT_KEY, payload, WORKER_HEARTBEAT_TTL_SECONDS)

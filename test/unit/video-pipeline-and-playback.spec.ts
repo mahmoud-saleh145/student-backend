@@ -1,5 +1,4 @@
 import { readFileSync } from 'node:fs';
-import { allowDrm } from './helpers/drm-doubles';
 import { join } from 'node:path';
 
 import { ValidationPipe } from '@nestjs/common';
@@ -64,7 +63,12 @@ describe('master playlist', () => {
           maxHeight: null,
           session: { status: 'ACTIVE' },
           device: { status: 'ACTIVE' },
-          video: { renditions: [...renditions].sort((a, b) => b.height - a.height) },
+          delivery: 'hls',
+          video: {
+            mobileStatus: 'READY',
+            hlsPrefix: 'hls/v1/',
+            renditions: [...renditions].sort((a, b) => b.height - a.height),
+          },
         }),
       },
     };
@@ -76,7 +80,7 @@ describe('master playlist', () => {
           video: { keyRoot: 'k'.repeat(40) },
         })[key],
     };
-    return new ManifestService(prisma as never, {} as never, allowDrm() as never, config as never);
+    return new ManifestService(prisma as never, {} as never, config as never);
   }
 
   it('advertises the codec the worker actually encodes (H.264 High 4.1)', async () => {
@@ -292,7 +296,7 @@ describe('VideosService.recoverStrandedVideos', () => {
       { id: 'vid_live', status: 'QUEUED', sourceKey: 'k2', lessonId: 'l2', courseId: 'c1', processingJobId: 'job-live' },
     ]);
 
-    await expect(svc.recoverStrandedVideos()).resolves.toEqual({ requeued: 1, failed: 0, synced: 0 });
+    await expect(svc.recoverStrandedVideos()).resolves.toEqual({ requeued: 1, failed: 0, synced: 0, mobile: { requeued: 0, failed: 0 } });
     expect(queue.add).toHaveBeenCalledTimes(1);
     expect((queue.add.mock.calls[0] as unknown[])[1]).toMatchObject({ videoId: 'vid_lost' });
   });
@@ -302,7 +306,7 @@ describe('VideosService.recoverStrandedVideos', () => {
     prisma.video.findMany.mockResolvedValue([
       { id: 'vid_dead', status: 'PROCESSING', sourceKey: 'k', lessonId: 'l', courseId: 'c', processingJobId: 'job-x' },
     ]);
-    await expect(svc.recoverStrandedVideos()).resolves.toEqual({ requeued: 0, failed: 1, synced: 0 });
+    await expect(svc.recoverStrandedVideos()).resolves.toEqual({ requeued: 0, failed: 1, synced: 0, mobile: { requeued: 0, failed: 0 } });
     expect(prisma.video.update).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ status: 'FAILED' }) }),
     );

@@ -37,6 +37,7 @@ import { orderSharedLectureCandidates } from '../videos/shared-lecture-order';
 
 import { ManifestService } from './manifest.service';
 import { GumletDrmService } from './gumlet-drm.service';
+import { effectiveMobileDelivery, MOBILE_DELIVERY_OVERRIDE_KEY, type MobileDeliveryOverride } from './mobile-delivery-override';
 import { DrmVerificationService } from './drm-verification.service';
 
 /**
@@ -91,6 +92,22 @@ class DrmGatePass {
     return this.videoId === videoId && Date.now() - this.at <= DRM_GATE_PASS_MAX_AGE_MS;
   }
 }
+
+/**
+ * Which pipeline a grant is minted for. Decided server-side from the BOUND
+ * DEVICE, never from anything the request body says.
+ *
+ *   gumlet  Gumlet DASH/HLS + Widevine/FairPlay. Carries the DRM gate pass that
+ *           was just obtained for this video, so nothing is written without it.
+ *   hls     The independent mobile pipeline: our own AES-128 HLS ladder on R2,
+ *           per-ticket manifests and key from this API, viewer-bound segment
+ *           URLs at the media edge. Only ever chosen for an ACTIVE Android/iOS
+ *           device binding, and only when the ladder exists.
+ */
+type DeliveryPlan = { delivery: 'gumlet'; drmGate: DrmGatePass } | { delivery: 'hls' };
+
+/** Device platforms the independent mobile pipeline serves. */
+const MOBILE_DEVICE_PLATFORMS = new Set(['android', 'ios']);
 
 /** An attached, non-deleted lecture as loaded for ticket authorisation. */
 type PlayableLesson = {
@@ -222,6 +239,8 @@ export class PlaybackService {
     lessonId?: string;
     /** TEMPORARY hotfix: explicit web opt-in to Gumlet's embed player. */
     delivery?: 'embed';
+    /** Client build capabilities; `hls-aes128` opts a mobile device into the independent pipeline. */
+    capabilities?: string[];
     ip?: string | null;
     userAgent?: string | null;
     integritySuspect: boolean;
@@ -419,6 +438,7 @@ export class PlaybackService {
       maxHeight: params.maxHeight ?? null,
       platform: params.platform,
       delivery: params.delivery,
+      clientSupportsHls: params.capabilities?.includes('hls-aes128') === true,
       ip: params.ip,
       userAgent: params.userAgent,
       rotatedFromId: null,
@@ -573,6 +593,8 @@ export class PlaybackService {
       gumletWorkspaceId: string | null;
       /** Provider-side asset status. Used to pick the student-facing message. */
       gumletStatus: string | null;
+      /** Independent mobile pipeline state; READY means the HLS ladder exists. */
+      mobileStatus?: string | null;
     };
     /**
      * The lecture this playback has been AUTHORISED in. Always resolved from the
@@ -587,6 +609,12 @@ export class PlaybackService {
     platform?: 'ios' | 'android' | 'web';
     /** TEMPORARY hotfix: explicit web opt-in to Gumlet's embed player. */
     delivery?: 'embed';
+    /**
+     * Whether the requesting build declared `hls-aes128`. A first issue from
+     * an older installed app is routed to Gumlet; a rotation inherits the
+     * pipeline through `stickyDelivery` and does not need to repeat it.
+     */
+    clientSupportsHls?: boolean;
     ip?: string | null;
     userAgent?: string | null;
     rotatedFromId: string | null;
@@ -598,11 +626,25 @@ export class PlaybackService {
      * otherwise the gate runs here.
      */
     drmGate?: DrmGatePass;
+    /**
+     * A rotation keeps the pipeline its original ticket was minted for, so a
+     * mobile ladder finishing mid-lesson never swaps the source under a playing
+     * student. Omitted on first issue.
+     */
+    stickyDelivery?: 'gumlet' | 'hls';
   }): Promise<PlaybackTicketResponse> {
     const { user, video, lesson } = params;
 
-    // Gate first: nothing is written for a video the strict DRM gate refuses.
-    const drmGate = params.drmGate?.covers(video.id) ? params.drmGate : await this.assertStrictDrmGate(video);
+    // Decide the pipeline first, then gate it: a Gumlet grant must pass the
+    // strict DRM gate before anything is written, and an HLS grant must have
+    // its ladder. Nothing is written for a video that fails either.
+    const plan = await this.planDelivery(
+      video,
+      params.deviceId,
+      params.drmGate,
+      params.stickyDelivery,
+      params.clientSupportsHls,
+    );
 
     const ttl = this.cfg.ticketTtl;
     const expiresAt = new Date(Date.now() + ttl * 1000);
@@ -640,6 +682,7 @@ export class PlaybackService {
         userAgent: params.userAgent?.slice(0, 500) ?? null,
         rotatedFromId: params.rotatedFromId,
         playId: params.playId,
+        delivery: plan.delivery,
       },
     });
 
@@ -673,7 +716,8 @@ export class PlaybackService {
       expiresAt,
       params.platform,
       params.delivery,
-      drmGate,
+      plan.delivery === 'gumlet' ? plan.drmGate : undefined,
+      plan,
     );
 
     const captions = await Promise.all(
@@ -864,6 +908,89 @@ export class PlaybackService {
   }
 
   /**
+   * Which pipeline this grant is minted for, and the gate that pipeline needs.
+   *
+   * The decision comes from the BOUND DEVICE (`Device.platform` of the row the
+   * session is bound to), never from the request body. The body's `platform`
+   * only picks Widevine vs FairPlay on the Gumlet path, exactly as before.
+   *
+   *   - no device, a web device, mobile delivery switched off, or a sticky
+   *     Gumlet rotation  → Gumlet, gated by the strict DRM check.
+   *   - a bound Android/iOS device and a READY mobile ladder → HLS.
+   *   - a bound mobile device whose ladder is not ready yet → Gumlet while the
+   *     fallback is on (the migration window); otherwise "still being prepared".
+   *
+   * AES-128 HLS is not DRM: a client that holds a live ticket also holds the
+   * key. The gate here is therefore not "is the stream unbreakable" but "is
+   * this an approved device of an entitled student, right now" - which is what
+   * device binding, the ticket chain and the per-viewer edge URLs enforce.
+   */
+  private async planDelivery(
+    video: Parameters<PlaybackService['mintTicket']>[0]['video'],
+    deviceId: string | null,
+    reusableGate?: DrmGatePass,
+    stickyDelivery?: 'gumlet' | 'hls',
+    clientSupportsHls?: boolean,
+  ): Promise<DeliveryPlan> {
+    const gumlet = async (): Promise<DeliveryPlan> => ({
+      delivery: 'gumlet',
+      drmGate: reusableGate?.covers(video.id) ? reusableGate : await this.assertStrictDrmGate(video),
+    });
+
+    // The configured switch, possibly overridden at runtime by the operator
+    // (POST /videos/mobile/delivery) - the emergency path back to Gumlet that
+    // needs neither a deploy nor an app release.
+    const configured = this.videoCfg.mobile;
+    const override = configured
+      ? await this.redis.getJson<MobileDeliveryOverride>(MOBILE_DELIVERY_OVERRIDE_KEY).catch(() => null)
+      : null;
+    const mobile = configured ? effectiveMobileDelivery(configured, override) : null;
+    if (!mobile || mobile.delivery !== 'hls' || stickyDelivery === 'gumlet') return gumlet();
+    if (!(await this.isBoundMobileDevice(deviceId))) return gumlet();
+    // An installed app from before the independent pipeline never declares the
+    // capability; it keeps getting the Gumlet grant it knows how to play. A
+    // rotation of an HLS grant is sticky and needs no re-declaration.
+    if (clientSupportsHls !== true && stickyDelivery !== 'hls') {
+      this.logger.log(`video ${video.id}: client did not declare hls-aes128; serving Gumlet to a mobile device`);
+      return gumlet();
+    }
+
+    if (PlaybackService.mobileLadderReady(video)) return { delivery: 'hls' };
+
+    if (mobile.gumletFallback !== false && stickyDelivery !== 'hls') {
+      this.logger.log(`video ${video.id}: mobile ladder not ready; serving Gumlet to a mobile device`);
+      return gumlet();
+    }
+    throw new AppException(ErrorCode.VIDEO_NOT_READY, {
+      message: 'This video is still being prepared for mobile playback',
+      details: { mobileStatus: video.mobileStatus ?? 'NONE' },
+    });
+  }
+
+  /** READY, with a prefix and at least one rendition: what ManifestService needs. */
+  static mobileLadderReady(video: {
+    mobileStatus?: string | null;
+    hlsPrefix?: string | null;
+    renditions: { height: number }[];
+  }): boolean {
+    return video.mobileStatus === 'READY' && Boolean(video.hlsPrefix) && video.renditions.length > 0;
+  }
+
+  /** An ACTIVE device binding whose platform is a native mobile OS. */
+  private async isBoundMobileDevice(deviceId: string | null): Promise<boolean> {
+    if (!deviceId) return false;
+    const device = await this.prisma.device.findUnique({
+      where: { id: deviceId },
+      select: { platform: true, status: true },
+    });
+    return (
+      device !== null &&
+      device.status === 'ACTIVE' &&
+      MOBILE_DEVICE_PLATFORMS.has(device.platform.trim().toLowerCase())
+    );
+  }
+
+  /**
    * Decide how THIS video is delivered, from the ticket's own video row.
    *
    * This is the single switch between the two playback paths:
@@ -892,12 +1019,35 @@ export class PlaybackService {
     delivery?: 'embed',
     /** The gate mintTicket just passed for this video; absent = gate here. */
     drmGate?: DrmGatePass,
+    /** The pipeline mintTicket chose. Absent = Gumlet (every caller before the mobile pipeline). */
+    plan?: DeliveryPlan,
   ): Promise<{
     manifestUrl: string;
     playbackHeaders: Record<string, string>;
     drm: PlaybackTicketResponse['drm'];
     embedUrl?: string | null;
   }> {
+    // ---- INDEPENDENT MOBILE PIPELINE ----------------------------------------
+    //
+    // Reached only through `planDelivery`, i.e. only for an ACTIVE Android/iOS
+    // device binding and a video whose mobile ladder is READY. The manifest is
+    // generated per ticket by this API (ManifestService), every segment URI in
+    // it is signed for this viewer, and the AES key is served only while the
+    // ticket is live. Nothing here touches Gumlet, so this path keeps working
+    // when the Gumlet account is gone.
+    //
+    // A web session can never reach this branch: its device row is `web` (or
+    // there is none), and `planDelivery` answers Gumlet for anything that is
+    // not a bound mobile device - whatever `platform` the request body claims.
+    if (plan?.delivery === 'hls') {
+      return {
+        manifestUrl: this.manifest.buildMasterUrl(ticketId, expiresAt),
+        playbackHeaders: {},
+        drm: { scheme: 'none', licenseUrl: null, certificateUrl: null, licenseHeaders: {} },
+        embedUrl: null,
+      };
+    }
+
     // ---- STRICT DRM GATE --------------------------------------------------
     //
     // There is NO legacy fallback from here. A video that is not verifiably
@@ -1237,16 +1387,30 @@ export class PlaybackService {
     }
 
     // --- live re-authorization ----------------------------------------------
-    const decision = await this.access.resolve({
-      userId: params.user.id,
-      role: params.user.role,
-      courseId: ticket.courseId,
-    });
-
-    if (!decision.canAccessContent) {
-      await this.revokeTicket(ticket.id, `Access lost mid-playback: ${decision.state}`);
+    //
+    // The SAME rule as issuance (`authorizeLessonForPlayback`), through the
+    // same function. This used to call `access.resolve()` directly and revoke
+    // on any course-level denial, which is one check fewer than issuance runs:
+    // a free preview lesson is issued to a student with no enrolment, and that
+    // student was then revoked with NOT_ENROLLED on the very first beat - the
+    // "video stops after about thirty seconds and asks me to join" report.
+    //
+    // Only an authorization decision revokes. A database or connection failure
+    // is rethrown with the ticket intact, so a blip never ends a lesson.
+    try {
+      await this.access.assertContentAccess({
+        userId: params.user.id,
+        role: params.user.role,
+        courseId: ticket.courseId,
+        allowPreview: true,
+        isPreviewContent: ticket.lesson?.isPreview ?? false,
+      });
+    } catch (error) {
+      if (!(error instanceof AppException)) throw error;
+      const state = (error.details as { accessState?: string } | undefined)?.accessState ?? 'DENIED';
+      await this.revokeTicket(ticket.id, `Access lost mid-playback: ${state}`);
       await this.releaseStreamSlot(params.user.id, params.user.sessionId);
-      return { ok: false, terminate: { reason: decision.denialCode ?? 'PLAYBACK_DENIED' } };
+      return { ok: false, terminate: { reason: error.code ?? 'PLAYBACK_DENIED' } };
     }
 
     // Course access alone is not the grant: a section-scoped student (a part
@@ -1362,7 +1526,8 @@ export class PlaybackService {
       // Refused before the live ticket is released: a video that stopped
       // verifying ends playback with the current grant, not with a half-rotation.
       // The pass is handed to mintTicket so the rotation verifies once, not three times.
-      const drmGate = await this.assertStrictDrmGate(ticket.video);
+      // An HLS grant has no DRM gate; its ladder is checked again by mintTicket.
+      const drmGate = ticket.delivery === 'hls' ? undefined : await this.assertStrictDrmGate(ticket.video);
 
       // The key system and delivery the ORIGINAL ticket was issued for. The
       // ticket row does not record them, and the heartbeat body does not carry
@@ -1398,6 +1563,7 @@ export class PlaybackService {
         platform: delivery?.platform,
         delivery: delivery?.delivery,
         drmGate,
+        stickyDelivery: ticket.delivery === 'hls' ? 'hls' : 'gumlet',
       });
 
       return { ok: true, ticket: rotated };
@@ -1539,13 +1705,17 @@ export class PlaybackService {
         status: true,
         expiresAt: true,
         lastHeartbeatAt: true,
+        releasedAt: true,
         session: { select: { status: true } },
         device: { select: { status: true } },
+        rotatedTo: { select: { status: true } },
       },
     });
 
     if (!ticket) return { live: false };
-    if (ticket.status !== PlaybackTicketStatus.ACTIVE) return { live: false };
+    if (ticket.status !== PlaybackTicketStatus.ACTIVE && !this.inRotationHandoff(ticket)) {
+      return { live: false };
+    }
     if (ticket.expiresAt.getTime() <= Date.now()) return { live: false };
 
     // A revoked session or device must stop segment delivery even though the
@@ -1562,6 +1732,30 @@ export class PlaybackService {
     }
 
     return { live: true };
+  }
+
+  /**
+   * A ticket that was RELEASED by a rotation (not by the student, not by a
+   * revocation) stays good for segment delivery for a short hand-off window.
+   *
+   * On the HLS pipeline every segment URL carries the ticket id and the edge
+   * asks whether that ticket is live. A rotation releases the old ticket and
+   * hands the player a new manifest, but the native player keeps pulling the
+   * segments it already queued from the OLD playlist for a few seconds while
+   * the new source initialises - and the student saw a stall or an error at
+   * every rotation. The window is two heartbeats, it applies only when the
+   * rotation produced a successor that is still ACTIVE, and a revoked ticket
+   * (REVOKED, not RELEASED) never qualifies.
+   */
+  private inRotationHandoff(ticket: {
+    status: PlaybackTicketStatus;
+    releasedAt: Date | null;
+    rotatedTo: { status: PlaybackTicketStatus } | null;
+  }): boolean {
+    if (ticket.status !== PlaybackTicketStatus.RELEASED || !ticket.releasedAt) return false;
+    if (ticket.rotatedTo?.status !== PlaybackTicketStatus.ACTIVE) return false;
+    const handoffMs = this.cfg.heartbeatInterval * 2 * 1000;
+    return Date.now() - ticket.releasedAt.getTime() <= handoffMs;
   }
 
   /**

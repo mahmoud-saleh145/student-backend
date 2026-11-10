@@ -10,6 +10,12 @@ import type { NotificationKind } from '@prisma/client';
  */
 export const QUEUE_NAMES = {
   video: 'video-processing',
+  /**
+   * The independent mobile pipeline (ffmpeg → AES-128 HLS → R2). Its own queue
+   * because one encode holds a worker for most of an hour on a small host, and
+   * that must never delay a Gumlet ingest, an announcement or a push.
+   */
+  mobileVideo: 'mobile-video-processing',
   push: 'push-delivery',
   maintenance: 'maintenance',
   analytics: 'analytics',
@@ -45,6 +51,31 @@ export const VIDEO_JOBS = {
   transcode: 'transcode',
   cleanup: 'cleanup-source',
 } as const;
+
+// ---------------------------------------------------------------------------
+// Independent mobile pipeline
+// ---------------------------------------------------------------------------
+
+export const MOBILE_VIDEO_JOBS = {
+  /** Source on R2 → ffmpeg ladder → AES-128 HLS on R2 → `mobileStatus = READY`. */
+  transcode: 'mobile-hls',
+} as const;
+
+export interface MobileTranscodeJobData {
+  videoId: string;
+  /** The exact source object this job is for; a changed source makes it stale. */
+  sourceKey: string;
+  ladder: number[];
+  encrypt: boolean;
+  /**
+   * The row's duration when known (Gumlet or a previous probe). Only used to
+   * size the scratch-space preflight before the source is downloaded.
+   */
+  durationSeconds?: number;
+  /** Why it was queued, for the log and the dashboard. */
+  trigger: 'upload' | 'migration' | 'retry' | 'recovery';
+  requestedById?: string;
+}
 
 // ---------------------------------------------------------------------------
 // Push delivery

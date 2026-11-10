@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { PlaybackTicketStatus, SessionStatus } from '@prisma/client';
+import { MobileVideoStatus, PlaybackTicketStatus, SessionStatus } from '@prisma/client';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
 import { AppException } from '../../common/errors/app.exception';
@@ -8,7 +8,6 @@ import { ErrorCode } from '../../common/errors/error-codes';
 import type { AppConfig, PlaybackConfig, VideoConfig } from '../../config/configuration';
 import { PrismaService } from '../../database/prisma.service';
 import { StorageService } from '../storage/storage.service';
-import { DrmVerificationService } from './drm-verification.service';
 
 /**
  * Dynamic HLS manifest generation.
@@ -47,28 +46,15 @@ export class ManifestService {
   private readonly app: AppConfig;
   private readonly cfg: PlaybackConfig;
   private readonly videoCfg: VideoConfig;
-  /**
-   * DRM-only mode. When true, the legacy HLS manifest/key/segment routes refuse
-   * any video that is not verifiably DRM-protected.
-   */
-  private readonly drmOnly: boolean;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly storage: StorageService,
-    private readonly drmVerification: DrmVerificationService,
     config: ConfigService,
   ) {
     this.app = config.getOrThrow<AppConfig>('app');
     this.cfg = config.getOrThrow<PlaybackConfig>('playback');
     this.videoCfg = config.getOrThrow<VideoConfig>('video');
-    // Defensive: a partially-populated config (a test harness, or a deployment
-    // missing the DRM block) must not throw during construction. Reading it as
-    // optional keeps boot resilient, and `drmOnly` simply stays false - which
-    // preserves the pre-existing legacy behaviour rather than inventing a new
-    // failure mode.
-    const drm = this.videoCfg?.drm;
-    this.drmOnly = Boolean(drm?.enabled && drm?.provider === 'gumlet');
   }
 
   // ---------------------------------------------------------------------------
@@ -170,36 +156,30 @@ export class ManifestService {
       });
     }
 
-    // ---- STRICT DRM GATE --------------------------------------------------
+    // ---- PIPELINE GATE ------------------------------------------------------
     //
-    // These endpoints serve AES-128 HLS from OUR OWN storage. On a DRM-only
-    // platform they must never produce a byte for a video that is not
-    // verifiably DRM-protected.
+    // These endpoints serve the AES-128 HLS ladder from OUR OWN storage. Only a
+    // grant that was MINTED for that pipeline may use them: `delivery` is
+    // written by PlaybackService from the bound device at mint time, so a
+    // Gumlet ticket - which is what every web session holds - cannot be pointed
+    // at a manifest URL to pull the ladder, whatever its signature says.
     //
-    // Ticket liveness alone is not sufficient. A ticket minted before the DRM
-    // gate shipped - or before the video was migrated - stays ACTIVE for its
-    // full TTL and would happily stream the legacy ladder the whole time. This
-    // check runs on EVERY manifest, media-playlist and key request, so an
-    // already-issued ticket stops working at the next segment boundary instead
-    // of at expiry.
-    if (this.drmOnly) {
-      const verdict = await this.drmVerification.evaluate({
-        id: ticket.video.id,
-        drmProvider: ticket.video.drmProvider,
-        drmRequested: ticket.video.drmRequested,
-        drmVerifiedAt: ticket.video.drmVerifiedAt,
-        drmBlockedReason: ticket.video.drmBlockedReason,
-        gumletAssetId: ticket.video.gumletAssetId,
-        gumletStatus: ticket.video.gumletStatus,
-        gumletWorkspaceId: ticket.video.gumletWorkspaceId,
-        status: ticket.video.status,
+    // Ticket liveness alone is not sufficient. A ticket stays ACTIVE for its
+    // full TTL, so this runs on EVERY manifest, media-playlist and key request
+    // and an already-issued grant stops at the next segment boundary, not at
+    // expiry. The ladder itself must still be READY: a video whose mobile output
+    // was replaced or failed after the ticket was minted is refused here too.
+    if (ticket.delivery !== 'hls') {
+      throw new AppException(ErrorCode.PLAYBACK_DENIED, {
+        message: 'This playback grant is not for the HLS pipeline',
+        details: { delivery: ticket.delivery },
       });
-      if (!verdict.playable) {
-        throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
-          message: 'This video is not available',
-          details: { drmState: verdict.reason },
-        });
-      }
+    }
+    if (ticket.video.mobileStatus !== MobileVideoStatus.READY || !ticket.video.hlsPrefix) {
+      throw new AppException(ErrorCode.VIDEO_NOT_READY, {
+        message: 'This video is still being prepared for mobile playback',
+        details: { mobileStatus: ticket.video.mobileStatus },
+      });
     }
 
     return ticket;
@@ -227,16 +207,19 @@ export class ManifestService {
       ticket.maxHeight ?? Number.MAX_SAFE_INTEGER,
     );
 
+    // A rendition's quality is the length of its SHORT side (a portrait 720p
+    // rung is 720 wide and 1280 tall), so the ceiling is compared with that,
+    // not with the stored height.
     const renditions = ticket.video.renditions
-      .filter((r) => r.height <= ceiling)
-      .sort((a, b) => a.height - b.height);
+      .filter((r) => ManifestService.tierOf(r) <= ceiling)
+      .sort((a, b) => ManifestService.tierOf(a) - ManifestService.tierOf(b));
 
     // Never return an empty ladder: if the ceiling is below every rendition,
     // serve the smallest one rather than a playlist the player can't use.
     const usable =
       renditions.length > 0
         ? renditions
-        : ticket.video.renditions.slice(-1);
+        : [...ticket.video.renditions].sort((a, b) => ManifestService.tierOf(a) - ManifestService.tierOf(b)).slice(0, 1);
 
     if (usable.length === 0) {
       throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
@@ -288,7 +271,7 @@ export class ManifestService {
       });
     }
 
-    if (ticket.maxHeight && params.height > ticket.maxHeight) {
+    if (ticket.maxHeight && ManifestService.tierOf(rendition) > ticket.maxHeight) {
       throw new AppException(ErrorCode.PLAYBACK_DENIED, {
         message: 'Requested rendition exceeds the granted ceiling',
       });
@@ -383,6 +366,11 @@ export class ManifestService {
   }
 
   /** Shared with the transcoding worker so both sides derive the same key. */
+  /** The quality a rendition represents: its short side (portrait rungs are taller than wide). */
+  static tierOf(rendition: { width?: number | null; height: number }): number {
+    return rendition.width ? Math.min(rendition.width, rendition.height) : rendition.height;
+  }
+
   static deriveContentKey(keyRoot: string, videoId: string): Buffer {
     return createHmac('sha256', keyRoot).update(`hls-key:${videoId}`).digest().subarray(0, 16);
   }

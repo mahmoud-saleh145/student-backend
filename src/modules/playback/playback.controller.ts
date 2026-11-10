@@ -16,6 +16,8 @@ import { Type } from 'class-transformer';
 import {
   IsBoolean,
   IsISO8601,
+  ArrayMaxSize,
+  IsArray,
   IsIn,
   IsInt,
   IsObject,
@@ -74,6 +76,19 @@ export class IssueTicketDto {
    * only when GUMLET_WEB_EMBED_ENABLED is true.
    */
   @IsOptional() @IsIn(['embed']) delivery?: string;
+
+  /**
+   * What this client build can play. An app that does not declare
+   * `hls-aes128` is an installed version from before the independent mobile
+   * pipeline and is handed Gumlet DRM grants exactly as before, so nobody has
+   * to update on the day the pipeline goes live. Declaring a capability grants
+   * nothing: entitlement, device binding and the play allowance are the same.
+   */
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(8)
+  @IsIn(['hls-aes128'], { each: true })
+  capabilities?: string[];
 }
 
 class HeartbeatDto {
@@ -155,6 +170,7 @@ export class PlaybackController {
       // reused asset is authorised in the destination course's context.
       lessonId: dto.lessonId,
       delivery: dto.delivery === 'embed' ? 'embed' : undefined,
+      capabilities: dto.capabilities,
       ip: req.ip ?? null,
       userAgent: req.header('user-agent') ?? null,
       integritySuspect: req.deviceContext?.integritySuspect ?? false,
