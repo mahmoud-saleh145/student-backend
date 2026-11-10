@@ -184,8 +184,10 @@ describe('registration still measures what actually landed', () => {
     );
 
     expect(source).toContain("bucket: 'library'");
-    // createPart and updatePart each verify.
-    expect(source.match(/assertUploadWithinLimit/g)?.length).toBe(2);
+    // createPart and updatePart each verify the document; the material cover
+    // is verified the same way (assertCoverKey), against the media bucket.
+    expect(source.match(/assertUploadWithinLimit/g)?.length).toBe(3);
+    expect(source.match(/bucket: 'library',\s*objectKey: input\.objectKey/g)?.length).toBe(2);
   });
 
   it('a successful PUT alone does not create a document', () => {
