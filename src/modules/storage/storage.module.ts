@@ -1,6 +1,7 @@
 import { Global, Module } from '@nestjs/common';
 
 import { CloudinaryService } from './cloudinary.service';
+import { PublicAssetsController } from './public-assets.controller';
 import { StorageController } from './storage.controller';
 import { StorageService } from './storage.service';
 
@@ -15,7 +16,7 @@ import { StorageService } from './storage.service';
  */
 @Global()
 @Module({
-  controllers: [StorageController],
+  controllers: [StorageController, PublicAssetsController],
   providers: [StorageService, CloudinaryService],
   exports: [StorageService, CloudinaryService],
 })

@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import {
+  type AcademicStructureKind,
   AuditAction,
   ContentStatus,
   LibraryDepartmentScope,
@@ -20,6 +21,7 @@ import { CatalogService } from '../catalog/catalog.service';
 import {
   assertObjectKeyInNamespace,
   MAX_DOCUMENT_BYTES,
+  MAX_IMAGE_BYTES,
   StorageService,
 } from '../storage/storage.service';
 import { PlatformSettingsService } from '../settings/platform-settings.service';
@@ -58,13 +60,19 @@ export type LibraryPartAccess = 'OWNED' | 'REVOKED' | 'PREVIEW' | 'PURCHASABLE' 
 export type LibraryPartOwnership = 'OWNED' | 'REVOKED' | 'NONE';
 export type LibraryPackageAccess = 'OWNED' | 'PURCHASABLE' | 'UNAVAILABLE';
 
-/** The audience block: written and validated as one unit. */
+/**
+ * The audience block: written and validated as one unit.
+ *
+ * The years come as `academicYearIds` (the list) or, from a client that
+ * predates the list, as the single `academicYearId`; either one satisfies the
+ * "send the whole audience" rule, and the list wins when both are present.
+ */
 const AUDIENCE_KEYS = [
   'universityId',
   'facultyId',
   'departmentScope',
   'departmentIds',
-  'academicYearId',
+  'academicYearIds',
 ] as const;
 
 interface AudienceInput {
@@ -72,7 +80,87 @@ interface AudienceInput {
   facultyId: string | null;
   departmentScope: LibraryDepartmentScope;
   departmentIds: string[];
-  academicYearId: string | null;
+  /** De-duplicated. Empty means "all years". */
+  academicYearIds: string[];
+}
+
+/**
+ * The year/level links as every read loads them: in ladder order, with the
+ * structure's kind so a client can label the rung "Year" or "Level".
+ */
+const MATERIAL_YEARS_SELECT = {
+  orderBy: { academicYear: { order: 'asc' as const } },
+  select: {
+    academicYear: {
+      select: {
+        id: true,
+        name: true,
+        nameAr: true,
+        order: true,
+        structure: { select: { kind: true } },
+      },
+    },
+  },
+} as const;
+
+interface MaterialYearLink {
+  academicYear: {
+    id: string;
+    name: string;
+    nameAr: string;
+    order: number;
+    structure: { kind: AcademicStructureKind };
+  };
+}
+
+export interface AcademicYearRef {
+  id: string;
+  name: string;
+  nameAr: string;
+  kind: AcademicStructureKind;
+}
+
+/** The rungs a material is filed under, in ladder order. Tolerates a row loaded without the relation. */
+function academicYearRefs(links: MaterialYearLink[] | undefined): AcademicYearRef[] {
+  return (links ?? []).map((link) => ({
+    id: link.academicYear.id,
+    name: link.academicYear.name,
+    nameAr: link.academicYear.nameAr,
+    kind: link.academicYear.structure.kind,
+  }));
+}
+
+/**
+ * The year/level browsing filter.
+ *
+ * A material filed under the requested rung matches, and so does a material
+ * filed under NO rung: "all years" means every year, this one included. The
+ * filter can therefore only narrow the eligible list, never surface anything
+ * outside it — eligibility is a separate `AND` branch (B7).
+ */
+export function academicYearFilter(academicYearId: string): Prisma.LibraryMaterialWhereInput {
+  return {
+    OR: [
+      { academicYears: { some: { academicYearId } } },
+      { academicYears: { none: {} } },
+    ],
+  };
+}
+
+/**
+ * Normalises the two ways a client can send the years into one list.
+ *
+ * `undefined` for both means "not sent" (an edit that leaves the audience
+ * alone); the caller decides what that means. Otherwise the list wins, then
+ * the legacy single id, and `null` for the legacy id is an explicit clear.
+ */
+function academicYearIdsFrom(input: {
+  academicYearId?: string | null;
+  academicYearIds?: string[];
+}): string[] | undefined {
+  if (input.academicYearIds !== undefined) return [...new Set(input.academicYearIds)];
+  if (input.academicYearId !== undefined) return input.academicYearId ? [input.academicYearId] : [];
+  return undefined;
 }
 
 /** A published part, as the catalogue would show it. */
@@ -179,7 +267,7 @@ export class LibraryService {
       AND: [
         PUBLISHED_MATERIAL,
         this.eligibility.materialWhere(scope),
-        ...(params.academicYearId ? [{ academicYearId: params.academicYearId }] : []),
+        ...(params.academicYearId ? [academicYearFilter(params.academicYearId)] : []),
         ...(params.subjectId ? [{ subjectId: params.subjectId }] : []),
         ...(params.q
           ? [
@@ -208,9 +296,7 @@ export class LibraryService {
           description: true,
           coverKey: true,
           subject: { select: { id: true, name: true } },
-          academicYear: {
-            select: { id: true, name: true, nameAr: true, structure: { select: { kind: true } } },
-          },
+          academicYears: MATERIAL_YEARS_SELECT,
           // Only what a student could actually buy is counted.
           _count: {
             select: {
@@ -238,6 +324,7 @@ export class LibraryService {
     const items = await Promise.all(
       rows.map(async (row) => {
         const prices = row.parts.map((p) => Number(p.price));
+        const academicYears = academicYearRefs(row.academicYears);
         return {
           id: row.id,
           title: row.title,
@@ -245,14 +332,10 @@ export class LibraryService {
           description: row.description,
           coverUrl: await this.storage.publicAssetUrl(row.coverKey),
           subject: row.subject,
-          academicYear: row.academicYear
-            ? {
-                id: row.academicYear.id,
-                name: row.academicYear.name,
-                nameAr: row.academicYear.nameAr,
-                kind: row.academicYear.structure.kind,
-              }
-            : null,
+          // Legacy single rung: the first of the list, for clients that
+          // predate `academicYears`. Null means every year.
+          academicYear: academicYears[0] ?? null,
+          academicYears,
           partCount: row.parts.length,
           packageCount: row._count.packages,
           ownedPartCount: row.parts.filter((p) => owned.has(p.id)).length,
@@ -289,9 +372,7 @@ export class LibraryService {
         description: true,
         coverKey: true,
         subject: { select: { id: true, name: true } },
-        academicYear: {
-          select: { id: true, name: true, nameAr: true, structure: { select: { kind: true } } },
-        },
+        academicYears: MATERIAL_YEARS_SELECT,
         ...MATERIAL_AUDIENCE_SELECT,
       },
     });
@@ -303,6 +384,7 @@ export class LibraryService {
       this.eligibility.storefrontEnabled &&
       this.eligibility.isVisible(scope, toAudience(material));
 
+    const academicYears = academicYearRefs(material.academicYears);
     const header = {
       id: material.id,
       title: material.title,
@@ -310,14 +392,8 @@ export class LibraryService {
       description: material.description,
       coverUrl: await this.storage.publicAssetUrl(material.coverKey),
       subject: material.subject,
-      academicYear: material.academicYear
-        ? {
-            id: material.academicYear.id,
-            name: material.academicYear.name,
-            nameAr: material.academicYear.nameAr,
-            kind: material.academicYear.structure.kind,
-          }
-        : null,
+      academicYear: academicYears[0] ?? null,
+      academicYears,
     };
 
     if (visible) return this.fullView(material.id, material.coverKey, header, userId);
@@ -621,18 +697,28 @@ export class LibraryService {
     pageSize: number;
     q?: string;
     status?: ContentStatus;
+    academicYearId?: string;
+    facultyId?: string;
   }) {
+    // The search `OR` and the year `OR` live in separate `AND` branches so
+    // neither can widen the other.
     const where: Prisma.LibraryMaterialWhereInput = {
-      ...notDeleted,
-      ...(params.status ? { status: params.status } : {}),
-      ...(params.q
-        ? {
-            OR: [
-              { title: { contains: params.q, mode: 'insensitive' } },
-              { titleAr: { contains: params.q } },
-            ],
-          }
-        : {}),
+      AND: [
+        notDeleted,
+        ...(params.status ? [{ status: params.status }] : []),
+        ...(params.facultyId ? [{ facultyId: params.facultyId }] : []),
+        ...(params.academicYearId ? [academicYearFilter(params.academicYearId)] : []),
+        ...(params.q
+          ? [
+              {
+                OR: [
+                  { title: { contains: params.q, mode: 'insensitive' as const } },
+                  { titleAr: { contains: params.q } },
+                ],
+              },
+            ]
+          : []),
+      ],
     };
 
     const [rows, total] = await this.prisma.$transaction([
@@ -644,6 +730,7 @@ export class LibraryService {
         include: {
           subject: { select: { id: true, name: true } },
           faculty: { select: { id: true, name: true, nameAr: true } },
+          academicYears: MATERIAL_YEARS_SELECT,
           createdBy: { select: { id: true, fullName: true } },
           _count: { select: { parts: true, packages: true, departments: true } },
         },
@@ -663,6 +750,8 @@ export class LibraryService {
         faculty: row.faculty,
         departmentScope: row.departmentScope,
         departmentCount: row._count.departments,
+        academicYears: academicYearRefs(row.academicYears),
+        hasCover: row.coverKey !== null,
         partCount: row._count.parts,
         packageCount: row._count.packages,
         createdBy: row.createdBy,
@@ -682,9 +771,7 @@ export class LibraryService {
         subject: { select: { id: true, name: true } },
         university: { select: { id: true, name: true, nameAr: true } },
         faculty: { select: { id: true, name: true, nameAr: true } },
-        academicYear: {
-          select: { id: true, name: true, nameAr: true, structure: { select: { kind: true } } },
-        },
+        academicYears: MATERIAL_YEARS_SELECT,
         departments: {
           orderBy: { createdAt: 'asc' },
           select: {
@@ -710,6 +797,7 @@ export class LibraryService {
     if (!material) throw AppException.notFound('Library material', materialId);
 
     const adminDefaultThumbnailKey = await this.settings.libraryDefaultThumbnailKey();
+    const academicYears = academicYearRefs(material.academicYears);
 
     return {
       id: material.id,
@@ -721,7 +809,10 @@ export class LibraryService {
       sortOrder: material.sortOrder,
       universityId: material.universityId,
       facultyId: material.facultyId,
-      academicYearId: material.academicYearId,
+      // Legacy single rung — the first of the list — kept for the dashboard
+      // build that is live today. `academicYearIds` is the whole audience.
+      academicYearId: academicYears[0]?.id ?? null,
+      academicYearIds: academicYears.map((year) => year.id),
       subjectId: material.subjectId,
       departmentScope: material.departmentScope,
       departmentIds: material.departments.map((d) => d.department.id),
@@ -730,15 +821,12 @@ export class LibraryService {
         faculty: material.faculty,
         departmentScope: material.departmentScope,
         departments: material.departments.map((d) => d.department),
-        academicYear: material.academicYear
-          ? {
-              id: material.academicYear.id,
-              name: material.academicYear.name,
-              nameAr: material.academicYear.nameAr,
-              kind: material.academicYear.structure.kind,
-            }
-          : null,
+        academicYear: academicYears[0] ?? null,
+        academicYears,
       },
+      // Never the object key itself; `hasCover` says whether one is set so the
+      // editor can offer "Clear" without being told the key.
+      hasCover: material.coverKey !== null,
       coverUrl: await this.storage.publicAssetUrl(material.coverKey),
       defaultThumbnailUrl: await this.storage.publicAssetUrl(adminDefaultThumbnailKey),
       parts: await Promise.all(material.parts.map(async (part) => ({
@@ -790,7 +878,7 @@ export class LibraryService {
    * University and faculty are required (F5); the faculty belongs to the
    * university; departments belong to the faculty, are active, and never mix
    * General with Programs; FACULTY scope carries no departments and DEPARTMENTS
-   * scope carries at least one; the year/level, when set, is an active rung of
+   * scope carries at least one; every year/level listed is an active rung of
    * the ladder that governs the faculty — or of every selected department.
    */
   private async assertAudience(audience: AudienceInput): Promise<void> {
@@ -819,17 +907,84 @@ export class LibraryService {
       LIBRARY_PLACEMENT,
     );
 
-    await checkYearInLadder(
-      this.prisma,
-      this.catalog,
-      {
-        universityId: audience.universityId,
-        facultyId: audience.facultyId,
-        departmentIds: audience.departmentIds,
-        academicYearId: audience.academicYearId,
-      },
-      LIBRARY_PLACEMENT,
-    );
+    // Each rung on its own, against the same ladder resolution a single rung
+    // always had. A refusal is reported on `academicYearIds`, the field the
+    // client sent, rather than on the legacy name the shared check uses.
+    for (const academicYearId of audience.academicYearIds) {
+      try {
+        await checkYearInLadder(
+          this.prisma,
+          this.catalog,
+          {
+            universityId: audience.universityId,
+            facultyId: audience.facultyId,
+            departmentIds: audience.departmentIds,
+            academicYearId,
+          },
+          LIBRARY_PLACEMENT,
+        );
+      } catch (error) {
+        const refused = error instanceof AppException ? error.fields?.academicYearId : undefined;
+        if (refused) throw AppException.validation({ academicYearIds: refused });
+        throw error;
+      }
+    }
+  }
+
+  /**
+   * The legacy `academicYearId` column mirrors the FIRST rung of the list, in
+   * ladder order, so a reader that predates the join table still sees a year.
+   */
+  private async firstAcademicYearId(academicYearIds: string[]): Promise<string | null> {
+    if (academicYearIds.length === 0) return null;
+    if (academicYearIds.length === 1) return academicYearIds[0] ?? null;
+    const rungs = await this.prisma.academicYear.findMany({
+      where: { id: { in: academicYearIds } },
+      select: { id: true, order: true },
+      orderBy: [{ order: 'asc' }, { id: 'asc' }],
+    });
+    return rungs[0]?.id ?? academicYearIds[0] ?? null;
+  }
+
+  /**
+   * Holds a submitted cover key to the namespace the cover upload route issues,
+   * then checks the object is really there and within the image limit.
+   *
+   * The key feeds a public, unsigned asset URL, so without the namespace check
+   * it could name any object in the bucket — a paid document, a video
+   * rendition. The existence check is what stops a mistyped or failed upload
+   * from being saved as a cover that never renders.
+   */
+  private async assertCoverKey(
+    coverKey: string,
+    namespace: string,
+    previous: string | null,
+  ): Promise<void> {
+    assertObjectKeyInNamespace(coverKey, namespace, 'coverKey');
+    if (coverKey === previous) return;
+    await this.storage.assertUploadWithinLimit({
+      bucket: 'media',
+      objectKey: coverKey,
+      maxBytes: MAX_IMAGE_BYTES,
+      field: 'coverKey',
+    });
+  }
+
+  /**
+   * Best-effort removal of a cover the material no longer points at. Only an
+   * object in this material's own cover namespace is ever deleted; the row has
+   * already moved, so a storage failure here is an orphaned file, never a
+   * failed edit.
+   */
+  private async discardReplacedCover(
+    materialId: string,
+    previousKey: string | null,
+    nextKey: string | null | undefined,
+  ): Promise<void> {
+    if (!previousKey) return;
+    if (nextKey === undefined || nextKey === previousKey) return;
+    if (!previousKey.startsWith(StorageService.libraryCoverPrefix(materialId))) return;
+    await Promise.resolve(this.storage.deleteObject('media', previousKey)).catch(() => undefined);
   }
 
   // --- materials -------------------------------------------------------------
@@ -844,6 +999,7 @@ export class LibraryService {
       departmentScope?: LibraryDepartmentScope;
       departmentIds?: string[];
       academicYearId?: string | null;
+      academicYearIds?: string[];
       subjectId?: string | null;
       coverKey?: string;
     },
@@ -854,9 +1010,17 @@ export class LibraryService {
       facultyId: input.facultyId ?? null,
       departmentScope: input.departmentScope ?? LibraryDepartmentScope.FACULTY,
       departmentIds: [...new Set(input.departmentIds ?? [])],
-      academicYearId: input.academicYearId ?? null,
+      academicYearIds: academicYearIdsFrom(input) ?? [],
     };
     await this.assertAudience(audience);
+
+    // A cover can only be filed under the library namespace here: the material
+    // has no id yet, so the per-material prefix is checked on edit instead.
+    if (input.coverKey) {
+      await this.assertCoverKey(input.coverKey, StorageService.LIBRARY_THUMBNAIL_ROOT, null);
+    }
+
+    const legacyYearId = await this.firstAcademicYearId(audience.academicYearIds);
 
     const material = await this.prisma.$transaction(async (tx) => {
       const created = await tx.libraryMaterial.create({
@@ -867,7 +1031,7 @@ export class LibraryService {
           universityId: audience.universityId,
           facultyId: audience.facultyId,
           departmentScope: audience.departmentScope,
-          academicYearId: audience.academicYearId,
+          academicYearId: legacyYearId,
           subjectId: input.subjectId ?? null,
           coverKey: input.coverKey ?? null,
           createdById: actor.id,
@@ -879,6 +1043,14 @@ export class LibraryService {
             materialId: created.id,
             facultyId: audience.facultyId!,
             departmentId,
+          })),
+        });
+      }
+      if (audience.academicYearIds.length > 0) {
+        await tx.libraryMaterialAcademicYear.createMany({
+          data: audience.academicYearIds.map((academicYearId) => ({
+            materialId: created.id,
+            academicYearId,
           })),
         });
       }
@@ -911,6 +1083,7 @@ export class LibraryService {
       departmentScope: LibraryDepartmentScope;
       departmentIds: string[];
       academicYearId: string | null;
+      academicYearIds: string[];
       subjectId: string | null;
       coverKey: string | null;
     }>,
@@ -918,7 +1091,10 @@ export class LibraryService {
   ) {
     const before = await this.prisma.libraryMaterial.findFirst({
       where: { id: materialId, ...notDeleted },
-      include: { departments: { select: { departmentId: true } } },
+      include: {
+        departments: { select: { departmentId: true } },
+        academicYears: { select: { academicYearId: true } },
+      },
     });
     if (!before) throw AppException.notFound('Library material', materialId);
 
@@ -928,14 +1104,19 @@ export class LibraryService {
       departmentScope,
       departmentIds,
       academicYearId,
+      academicYearIds,
       ...scalars
     } = input;
 
     // Atomic audience: touching any part of it means sending all of it, so an
-    // edit can never widen or narrow the audience as a side effect.
-    const touched = AUDIENCE_KEYS.filter((key) => input[key] !== undefined);
+    // edit can never widen or narrow the audience as a side effect. The years
+    // count as sent in either spelling.
+    const nextYearIds = academicYearIdsFrom({ academicYearId, academicYearIds });
+    const sent = (key: (typeof AUDIENCE_KEYS)[number]) =>
+      key === 'academicYearIds' ? nextYearIds !== undefined : input[key] !== undefined;
+    const touched = AUDIENCE_KEYS.filter(sent);
     if (touched.length > 0 && touched.length < AUDIENCE_KEYS.length) {
-      const missing = AUDIENCE_KEYS.filter((key) => input[key] === undefined);
+      const missing = AUDIENCE_KEYS.filter((key) => !sent(key));
       throw AppException.validation(
         Object.fromEntries(
           missing.map((key) => [key, ['send the whole audience when changing any part of it']]),
@@ -943,12 +1124,21 @@ export class LibraryService {
       );
     }
 
+    // The links are the audience; a row with none but a legacy column value —
+    // written before the join table, or straight into the table — still means
+    // that one year, so publishing re-validates it too.
+    const storedYearIds = (before.academicYears ?? []).map((y) => y.academicYearId);
     const beforeAudience: AudienceInput = {
       universityId: before.universityId,
       facultyId: before.facultyId,
       departmentScope: before.departmentScope,
       departmentIds: before.departments.map((d) => d.departmentId),
-      academicYearId: before.academicYearId,
+      academicYearIds:
+        storedYearIds.length > 0
+          ? storedYearIds
+          : before.academicYearId
+            ? [before.academicYearId]
+            : [],
     };
     const nextAudience: AudienceInput | null =
       touched.length > 0
@@ -957,7 +1147,7 @@ export class LibraryService {
             facultyId: facultyId ?? null,
             departmentScope: departmentScope!,
             departmentIds: [...new Set(departmentIds ?? [])],
-            academicYearId: academicYearId ?? null,
+            academicYearIds: nextYearIds ?? [],
           }
         : null;
 
@@ -969,6 +1159,18 @@ export class LibraryService {
       (scalars.isActive === true && !before.isActive);
     if (nextAudience) await this.assertAudience(nextAudience);
     else if (goingLive) await this.assertAudience(beforeAudience);
+
+    if (scalars.coverKey) {
+      await this.assertCoverKey(
+        scalars.coverKey,
+        StorageService.libraryThumbnailPrefix(materialId),
+        before.coverKey,
+      );
+    }
+
+    const legacyYearId = nextAudience
+      ? await this.firstAcademicYearId(nextAudience.academicYearIds)
+      : null;
 
     await this.prisma.$transaction(async (tx) => {
       if (nextAudience) {
@@ -982,6 +1184,9 @@ export class LibraryService {
         await tx.libraryMaterialDepartment.deleteMany({
           where: { materialId, departmentId: { notIn: keep } },
         });
+        await tx.libraryMaterialAcademicYear.deleteMany({
+          where: { materialId, academicYearId: { notIn: nextAudience.academicYearIds } },
+        });
       }
 
       await tx.libraryMaterial.update({
@@ -993,7 +1198,7 @@ export class LibraryService {
                 universityId: nextAudience.universityId,
                 facultyId: nextAudience.facultyId,
                 departmentScope: nextAudience.departmentScope,
-                academicYearId: nextAudience.academicYearId,
+                academicYearId: legacyYearId,
               }
             : {}),
           // Stamped the first time it goes live, and never rewritten after.
@@ -1013,7 +1218,18 @@ export class LibraryService {
           skipDuplicates: true,
         });
       }
+      if (nextAudience && nextAudience.academicYearIds.length > 0) {
+        await tx.libraryMaterialAcademicYear.createMany({
+          data: nextAudience.academicYearIds.map((yearId) => ({
+            materialId,
+            academicYearId: yearId,
+          })),
+          skipDuplicates: true,
+        });
+      }
     });
+
+    await this.discardReplacedCover(materialId, before.coverKey, scalars.coverKey);
 
     await this.audit.record({
       actorId: actor.id,

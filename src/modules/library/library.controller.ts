@@ -189,6 +189,8 @@ export class LibraryAdminController {
       pageSize: query.pageSize,
       q: query.q,
       status: query.status,
+      academicYearId: query.academicYearId,
+      facultyId: query.facultyId,
     });
   }
 

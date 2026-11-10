@@ -17,6 +17,7 @@ import { AuditService } from '../audit/audit.service';
 import { PlatformSettingsService } from '../settings/platform-settings.service';
 import { CatalogService } from '../catalog/catalog.service';
 import { PasswordService } from '../auth/password.service';
+import { StorageService } from '../storage/storage.service';
 
 /** Selection that produces exactly the mobile app's `User` shape. */
 const PUBLIC_USER_SELECT = {
@@ -174,7 +175,9 @@ export class UsersService {
       status: user.status,
       // The app's type has gender non-optional; default rather than send null.
       gender: user.gender ?? 'MALE',
-      avatarUrl: user.avatarUrl,
+      // A stored `avatars/…` key becomes the public asset URL; a client was
+      // otherwise handed the bare key and rendered a broken image.
+      avatarUrl: StorageService.resolveAvatarUrl(user.avatarUrl),
       university: user.studentProfile?.university ?? null,
       faculty: user.studentProfile?.faculty ?? null,
       department: user.studentProfile?.department ?? null,
@@ -846,7 +849,7 @@ export class UsersService {
       rows.map((t) => ({
         id: t.id,
         fullName: t.fullName,
-        avatarUrl: t.avatarUrl,
+        avatarUrl: StorageService.resolveAvatarUrl(t.avatarUrl),
         title: t.teacherProfile?.title ?? null,
         bio: t.teacherProfile?.bio ?? null,
       })),
@@ -928,7 +931,7 @@ export class UsersService {
           email: t.email,
           gender: t.gender ?? 'MALE',
           status: t.status,
-          avatarUrl: t.avatarUrl,
+          avatarUrl: StorageService.resolveAvatarUrl(t.avatarUrl),
           title: t.teacherProfile?.title ?? null,
           bio: t.teacherProfile?.bio ?? null,
           isPublic: t.teacherProfile?.isPublic ?? true,

@@ -311,7 +311,9 @@ describe('material detail: FULL / OWNER / 404', () => {
     };
 
     expect(Object.keys(detail).sort()).toEqual(
-      ['academicYear', 'coverUrl', 'description', 'id', 'packages', 'parts', 'subject', 'title', 'titleAr', 'view'].sort(),
+      // `academicYears` (the list) sits beside the legacy single `academicYear`;
+      // both are header fields, neither says anything about other parts.
+      ['academicYear', 'academicYears', 'coverUrl', 'description', 'id', 'packages', 'parts', 'subject', 'title', 'titleAr', 'view'].sort(),
     );
     expect(detail.view).toBe('OWNER');
     expect(detail.packages).toEqual([]);
@@ -415,7 +417,14 @@ describe('browse', () => {
     expect(where.AND).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ universityId: UNI, facultyId: FAC }),
-        { academicYearId: 'y1' },
+        // The year/level filter: filed under that rung, or under none ("all
+        // years"). Its own AND branch, so it can only narrow the eligible list.
+        {
+          OR: [
+            { academicYears: { some: { academicYearId: 'y1' } } },
+            { academicYears: { none: {} } },
+          ],
+        },
         expect.objectContaining({ OR: expect.any(Array) }),
       ]),
     );

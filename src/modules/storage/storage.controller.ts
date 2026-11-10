@@ -14,7 +14,7 @@ import type { Request } from 'express';
 import { CourseAccessService } from '../courses/course-access.service';
 
 import { CloudinaryService } from './cloudinary.service';
-import { MAX_DOCUMENT_BYTES, StorageService } from './storage.service';
+import { MAX_DOCUMENT_BYTES, MAX_IMAGE_BYTES, StorageService } from './storage.service';
 
 /**
  * Ceiling for a Library document, shared by both upload transports.
@@ -36,7 +36,7 @@ const MAX_LIBRARY_DOCUMENT_BYTES = MAX_DOCUMENT_BYTES;
  * would be the wrong trade. At this size streaming through the API costs a
  * held socket, not memory.
  */
-const MAX_THUMBNAIL_BYTES = 10 * 1024 * 1024;
+const MAX_THUMBNAIL_BYTES = MAX_IMAGE_BYTES;
 const MAX_ATTACHMENT_BYTES = MAX_DOCUMENT_BYTES;
 
 const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
@@ -118,6 +118,10 @@ class UploadCoursePartThumbnailQueryDto extends UploadThumbnailQueryDto {
 class UploadLibraryPartThumbnailQueryDto extends UploadThumbnailQueryDto {
   @IsString() @MaxLength(32) materialId!: string;
   @IsString() @MaxLength(32) partId!: string;
+}
+
+class UploadLibraryCoverQueryDto extends UploadThumbnailQueryDto {
+  @IsString() @MaxLength(32) materialId!: string;
 }
 
 class UploadAttachmentQueryDto {
@@ -508,6 +512,34 @@ export class StorageController {
       body: req,
       contentLength: declared,
       contentType: query.contentType,
+    });
+
+    return { objectKey, sizeBytes: declared };
+  }
+
+  @Post('uploads/library-cover/content')
+  @AdminOnly()
+  @ApiOperation({
+    summary: 'Upload a library material cover through the API',
+    description:
+      'Returns the object key. Register it with PATCH /admin/library/materials/:materialId as `coverKey`; ' +
+      'the material\'s parts inherit it when they have no thumbnail of their own. ' +
+      'Delivered by GET /assets/<key>.',
+  })
+  async libraryCoverContent(@Query() query: UploadLibraryCoverQueryDto, @Req() req: Request) {
+    const declared = this.requireLength(req, MAX_THUMBNAIL_BYTES);
+    const objectKey = StorageService.keys.libraryCover(
+      query.materialId,
+      extensionFor(query.contentType),
+    );
+
+    await this.storage.putStream({
+      bucket: 'media',
+      objectKey,
+      body: req,
+      contentLength: declared,
+      contentType: query.contentType,
+      cacheControl: 'public, max-age=31536000, immutable',
     });
 
     return { objectKey, sizeBytes: declared };

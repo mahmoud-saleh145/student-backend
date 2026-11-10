@@ -499,7 +499,9 @@ model LibraryMaterial {
   /// predates the rule and is never rewritten.
   universityId   String?
   facultyId      String?
-  /// Optional browsing filter, never an eligibility rule.
+  /// Legacy single year/level. Kept in step with the FIRST (lowest-order)
+  /// link in `academicYears` so a reader that predates the join table keeps
+  /// seeing a year. Optional browsing filter, never an eligibility rule.
   academicYearId String?
   subjectId      String?
 
@@ -523,6 +525,8 @@ model LibraryMaterial {
   parts       LibraryPart[]
   packages    LibraryPackage[]
   departments LibraryMaterialDepartment[]
+  /// Every year/level the material is filed under. No links means all years.
+  academicYears LibraryMaterialAcademicYear[]
 
   /// Target of the composite foreign key on `library_material_departments`.
   @@unique([id, facultyId])
@@ -559,6 +563,25 @@ model LibraryMaterialDepartment {
   @@id([materialId, departmentId])
   @@index([departmentId])
   @@map("library_material_departments")
+}
+
+/// LibraryMaterial ↔ AcademicYear: the years/levels a material is filed under.
+///
+/// A BROWSING FILTER, never an entitlement rule — `LibraryEligibilityService`
+/// does not read it. No links means the material is for every year. Deleting
+/// a rung removes its links (Cascade), which widens the material to "all
+/// years": exactly what `academicYearId`'s SetNull has always done.
+model LibraryMaterialAcademicYear {
+  materialId     String
+  academicYearId String
+  createdAt      DateTime @default(now())
+
+  material     LibraryMaterial @relation(fields: [materialId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  academicYear AcademicYear    @relation(fields: [academicYearId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@id([materialId, academicYearId])
+  @@index([academicYearId])
+  @@map("library_material_academic_years")
 }
 
 /// One sellable document within a material.
@@ -984,6 +1007,7 @@ model AcademicYear {
   students StudentProfile[]
   courses  Course[]
   libraryMaterials LibraryMaterial[]
+  libraryMaterialLinks LibraryMaterialAcademicYear[]
 
   @@unique([structureId, order])
   @@index([structureId, isActive, order])

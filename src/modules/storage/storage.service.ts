@@ -59,6 +59,38 @@ export type Bucket = 'media' | 'uploads' | 'library';
  */
 export const MAX_DOCUMENT_BYTES = 200 * 1024 * 1024;
 
+/**
+ * Ceiling for every image upload (course, part and library thumbnails, the
+ * library cover, the library default). Shared by the upload routes that read
+ * it from Content-Length and by the registration checks that HEAD the object.
+ */
+export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Namespaces the public asset route (`GET /assets/*`) serves without a
+ * signature: images that are public by design. Everything else in the media
+ * bucket — HLS renditions, captions, source uploads, video poster frames —
+ * stays behind the signed media gate. An allow-list, so a new namespace is
+ * private until someone decides otherwise.
+ */
+export const PUBLIC_ASSET_PREFIXES = [
+  'thumbnails/courses/',
+  'thumbnails/library/',
+  'avatars/',
+] as const;
+
+export function isPublicAssetKey(objectKey: string): boolean {
+  if (!objectKey || objectKey.includes('..') || objectKey.startsWith('/')) return false;
+  return PUBLIC_ASSET_PREFIXES.some((prefix) => objectKey.startsWith(prefix));
+}
+
+/** What the public asset route needs to answer one GET. */
+export interface StoredObject {
+  body: Buffer;
+  contentType: string | null;
+  etag: string | null;
+}
+
 export interface SignedUpload {
   uploadUrl: string;
   objectKey: string;
@@ -210,6 +242,9 @@ export class StorageService {
       `thumbnails/courses/${courseId}/parts/${partId}/${randomUUID()}${ext}`,
     libraryPartThumbnail: (materialId: string, partId: string, ext: string) =>
       `thumbnails/library/${materialId}/parts/${partId}/${randomUUID()}${ext}`,
+    /** The material's own cover, which its parts inherit when they have none. */
+    libraryCover: (materialId: string, ext: string) =>
+      `thumbnails/library/${materialId}/cover/${randomUUID()}${ext}`,
     /** The fallback image applied to library parts that have none of their own. */
     libraryDefaultThumbnail: (ext: string) =>
       `thumbnails/library/_default/${randomUUID()}${ext}`,
@@ -248,10 +283,22 @@ export class StorageService {
     return `thumbnails/courses/${courseId}/`;
   }
 
-  /** `thumbnails/library/<materialId>/…` — library part and default thumbnails. */
+  /** `thumbnails/library/<materialId>/…` — library part thumbnails and the cover. */
   static libraryThumbnailPrefix(materialId: string): string {
     return `thumbnails/library/${materialId}/`;
   }
+
+  /** `thumbnails/library/<materialId>/cover/…` — only the material's cover. */
+  static libraryCoverPrefix(materialId: string): string {
+    return `thumbnails/library/${materialId}/cover/`;
+  }
+
+  /**
+   * `thumbnails/library/…` — every library image. The widest namespace a
+   * material cover may be registered under, used only when the material has no
+   * id yet (creation); an edit checks the per-material prefix.
+   */
+  static LIBRARY_THUMBNAIL_ROOT = 'thumbnails/library/';
 
   /** `thumbnails/library/_default/…` — the site-wide fallback image. */
   static LIBRARY_DEFAULT_THUMBNAIL_PREFIX = 'thumbnails/library/_default/';
@@ -686,13 +733,51 @@ export class StorageService {
   }
 
   /**
-   * Public-ish URL for non-sensitive assets (avatars, video thumbnails).
+   * The URL of a public image, built without touching storage.
    *
-   * R2 keys are still signed here, with a long expiry and no viewer binding — a
-   * leaked URL is not a security event. Note that with a CDN configured this
-   * builds an *unsigned* URL to the media gate, which answers 403 `unsigned`;
-   * that branch only works when no CDN is set. Course images no longer rely on
-   * it at all, which is the reason they moved to Cloudinary.
+   * Public images (`PUBLIC_ASSET_PREFIXES`) are served by this API's own
+   * `GET /assets/<key>` route, which reads the media bucket with the bucket
+   * credentials. That is deliberately NOT the media gate: the gate refuses
+   * anything unsigned (`403 unsigned`) and, for a plain `<img>` that sends no
+   * Origin, answers with `cross-origin-resource-policy: same-site`, which the
+   * dashboard's browser then blocks. Every R2 thumbnail, cover and avatar used
+   * to be handed out as an unsigned gate URL, which is why none of them ever
+   * rendered in production; course images escaped only by moving to
+   * Cloudinary.
+   *
+   * Synchronous and static so serialisers without a StorageService instance
+   * (user rows, course cards) can resolve a stored key the same way. Returns
+   * null for a key outside the public namespaces, or when `PUBLIC_API_URL` is
+   * not set, so callers fall through to their own fallback.
+   */
+  static publicAssetUrlSync(objectKey: string | null | undefined): string | null {
+    if (!objectKey || !isPublicAssetKey(objectKey)) return null;
+    const api = (process.env.PUBLIC_API_URL ?? '').replace(/\/+$/, '');
+    if (!api) return null;
+    const prefix = process.env.API_PREFIX ?? 'api';
+    const version = process.env.API_VERSION ?? '1';
+    return `${api}/${prefix}/v${version}/assets/${objectKey.split('/').map(encodeURIComponent).join('/')}`;
+  }
+
+  /**
+   * A stored avatar is either a full URL (legacy, or an external picture) or
+   * an `avatars/…` key from `POST /storage/uploads/avatar`. A key is resolved
+   * to the public asset route; anything that is neither is not an image.
+   */
+  static resolveAvatarUrl(stored: string | null | undefined): string | null {
+    if (!stored) return null;
+    if (/^https?:\/\//i.test(stored)) return stored;
+    return StorageService.publicAssetUrlSync(stored);
+  }
+
+  /**
+   * Public URL for a non-sensitive image (thumbnails, covers, avatars).
+   *
+   * Resolution order: a Cloudinary key is returned as its delivery URL; a key
+   * in a public namespace becomes a `GET /assets/<key>` URL on this API (see
+   * `publicAssetUrlSync`); anything else keeps the historical behaviour — an
+   * unsigned CDN URL when a CDN is configured (which the gate refuses, so no
+   * caller should reach it with a new key), else a 24-hour presigned read.
    */
   async publicAssetUrl(objectKey: string | null): Promise<string | null> {
     if (!objectKey) return null;
@@ -702,6 +787,9 @@ export class StorageService {
     // nothing to say about a key from another provider.
     const cloudinaryUrl = this.cloudinary.resolveStoredKey(objectKey);
     if (cloudinaryUrl) return cloudinaryUrl;
+
+    const publicUrl = StorageService.publicAssetUrlSync(objectKey);
+    if (publicUrl) return publicUrl;
 
     if (this.cfg.cdnBaseUrl) {
       return new URL(objectKey, this.ensureTrailingSlash(this.cfg.cdnBaseUrl)).toString();
@@ -714,6 +802,38 @@ export class StorageService {
       objectKey,
       expiresIn: 24 * 3600,
     });
+  }
+
+  /**
+   * One whole object for the public asset route, or null when it does not
+   * exist. Images are capped at `MAX_IMAGE_BYTES` on the way in, so holding
+   * one in memory is bounded; anything larger is refused rather than streamed,
+   * because nothing that large belongs in a public namespace.
+   */
+  async getPublicObject(bucket: Bucket, objectKey: string): Promise<StoredObject | null> {
+    this.assertConfigured();
+    try {
+      const response = await this.client.send(
+        new GetObjectCommand({ Bucket: this.bucketName(bucket), Key: objectKey }),
+      );
+      if ((response.ContentLength ?? 0) > MAX_IMAGE_BYTES) {
+        throw new AppException(ErrorCode.NOT_FOUND, { message: 'asset_too_large' });
+      }
+      const bytes = await response.Body?.transformToByteArray();
+      if (!bytes) return null;
+      return {
+        body: Buffer.from(bytes),
+        contentType: response.ContentType ?? null,
+        etag: response.ETag ?? null,
+      };
+    } catch (error) {
+      if (error instanceof AppException) throw error;
+      const name = (error as { name?: string }).name;
+      const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata
+        ?.httpStatusCode;
+      if (name === 'NoSuchKey' || name === 'NotFound' || status === 404) return null;
+      throw error;
+    }
   }
 
   // ---------------------------------------------------------------------------
