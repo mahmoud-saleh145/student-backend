@@ -206,11 +206,18 @@ export default {
       try {
         object = await store.get(objectKey, range ? { range } : undefined);
       } catch (error) {
-        // R2 refuses a range that starts past the end of the object.
+        // R2 refuses a range it cannot serve as asked. Learn the size, and
+        // either refuse a range that starts past the end (416) or ask again
+        // with the range clamped to the object: "bytes=0-99999999" is a valid
+        // request for the whole file, not an error.
         if (!range) throw error;
         const head = await store.head(objectKey);
         if (!head) return deny(404, 'not_found', origin);
-        return unsatisfiable(head.size, origin);
+        const span = servedRange(range, head.size);
+        if (!span) return unsatisfiable(head.size, origin);
+        object = await store.get(objectKey, {
+          range: { offset: span.start, length: span.end - span.start + 1 },
+        });
       }
     }
 

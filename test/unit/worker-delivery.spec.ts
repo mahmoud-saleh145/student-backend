@@ -186,6 +186,25 @@ describe('Worker delivery — Range', () => {
     expect(res.headers.get('access-control-allow-origin')).toBe(WEB);
   });
 
+  it('a range whose end runs past the file is served to the end, even if storage refuses it as asked', async () => {
+    // A storage layer that rejects any span reaching past the end: the Worker
+    // must clamp and ask again, not answer 416 for a valid request.
+    const strict = r2();
+    const lenient = strict.get.getMockImplementation()!;
+    strict.get.mockImplementation(async (key: string, options?: { range?: R2Range }) => {
+      const r = options?.range;
+      if (r?.offset !== undefined && r.length !== undefined && r.offset + r.length > SIZE) {
+        throw new Error('get: The requested range is not satisfiable (10039)');
+      }
+      return lenient(key, options);
+    });
+    const res = await hit(await sign(), { headers: { range: 'bytes=0-99999999' } }, env(strict));
+    expect(res.status).toBe(206);
+    expect(res.headers.get('content-range')).toBe('bytes 0-999/1000');
+    expect(await res.text()).toHaveLength(SIZE);
+    expect(strict.get).toHaveBeenLastCalledWith(DOC, { range: { offset: 0, length: 1000 } });
+  });
+
   it('"bytes=-0" is 416 without reading the body', async () => {
     const e = env();
     const res = await hit(await sign(), { headers: { range: 'bytes=-0' } }, e);
