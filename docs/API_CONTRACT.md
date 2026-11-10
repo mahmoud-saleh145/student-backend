@@ -319,8 +319,14 @@ Clients ask `POST /library/parts/:id/open` again rather than retrying the URL.
 GET  /library/materials?q&academicYearId&subjectId&page&pageSize
      items[]: { id, title, titleAr, description, coverUrl, subject,
                 academicYear {id,name,nameAr,kind} | null,
+                academicYears[] {id,name,nameAr,kind},
                 partCount, packageCount, ownedPartCount, priceFrom, priceTotal }
      (universityId/facultyId are no longer accepted — 422)
+     academicYears: every year/level the material is filed under, in ladder
+     order; empty means "all years". academicYear is its first entry, kept for
+     clients that predate the list. The academicYearId filter matches a
+     material filed under that rung OR under none — it narrows the eligible
+     list and never widens it (the year is a browsing filter, not a rule).
 GET  /library/materials/:id
      view: FULL  -> parts[] { …, price, access, ownedSince }, packages[] { …, access }
      view: OWNER -> parts[] { …, access: OWNED, ownedSince }, packages: []  (no prices)
@@ -665,6 +671,31 @@ student's academic details, `coversAllSections`, `sectionIds` and `redemption`.
 
 - `PublicUser` (every `/auth/me`, `/profile`, `/admin/users` response) gained
   `email`, `locale`, `lastLoginAt`, `updatedAt`. No field was removed.
+- **Library years/levels (2026-11-10).** A material is filed under several
+  years/levels (`library_material_academic_years`). `GET /library/materials`
+  items and `GET /library/materials/:id` gained `academicYears[]`;
+  `academicYear` is now the first entry of that list (null when empty). Admin:
+  `POST/PATCH /admin/library/materials` accept `academicYearIds: string[]`
+  (max 20; empty = all years) beside the still-accepted `academicYearId`, and
+  the whole-audience rule counts either spelling; `GET
+  /admin/library/materials/:id` gained `academicYearIds`,
+  `audience.academicYears[]` and `hasCover`; list rows gained `academicYears[]`
+  and `hasCover`; the list accepts `academicYearId` and `facultyId` filters.
+  The column `library_materials.academicYearId` stays and mirrors the first
+  linked rung.
+- **Public images (2026-11-10).** `GET /assets/<key>` (public, no auth, no
+  signature) serves `thumbnails/courses/…`, `thumbnails/library/…` and
+  `avatars/…` from the media bucket with `Cache-Control: public, immutable`
+  and `Cross-Origin-Resource-Policy: cross-origin`; anything else is 404.
+  Every `coverUrl`, `thumbnailUrl` and `defaultThumbnailUrl` for an R2 key
+  is now such a URL (Cloudinary course images are unchanged). `avatarUrl` is
+  resolved the same way when the stored value is an `avatars/…` key. The
+  media gate never served these: it refuses unsigned requests.
+- **Library cover upload.** `POST /storage/uploads/library-cover/content
+  ?materialId&contentType` (admin, raw image body ≤ 10 MB) returns
+  `{ objectKey, sizeBytes }`; register it as `coverKey` on the material.
+  `coverKey` is now held to `thumbnails/library/<materialId>/` and must exist
+  in storage; `null` clears the cover and deletes the object.
 - `POST /codes/validate` gained `targetType`, `section`, `teacher`.
 - `GET /meta/app-config` gained `features.academicYearSelfService`,
   `features.supportTickets` and a `teacher` block with the four switches.

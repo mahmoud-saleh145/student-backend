@@ -21,6 +21,9 @@ import {
 import { SearchablePaginationDto } from '../../../common/dto/pagination.dto';
 import { MAX_MONEY_EGP } from '../../wallet/money';
 
+/** More rungs than any ladder has; a material filed under all of them is "all years". */
+export const MAX_MATERIAL_ACADEMIC_YEARS = 20;
+
 /**
  * Browsing filters. They can only NARROW what the student is eligible for.
  *
@@ -57,15 +60,22 @@ export class AdminListLibraryDto extends SearchablePaginationDto {
   @IsOptional()
   @IsEnum(ContentStatus)
   status?: ContentStatus;
+  /** Materials filed under this year/level, plus those filed under none ("all years"). */
+  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) academicYearId?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) facultyId?: string;
 }
 
 /**
  * A material and its audience.
  *
- * The audience — university, faculty, scope, departments, year/level — is
+ * The audience — university, faculty, scope, departments, years/levels — is
  * validated as one unit by LibraryService. University and faculty are required
  * there (a null is refused with a field error naming the field). `null` clears
  * `academicYearId`/`subjectId`.
+ *
+ * Years/levels: `academicYearIds` is the list (empty = all years). The legacy
+ * single `academicYearId` is still accepted — a client that sends it and not
+ * the list gets a one-year material — and when both are sent the list wins.
  */
 export class CreateMaterialDto {
   @ApiProperty() @IsString() @MinLength(2) @MaxLength(200) title!: string;
@@ -85,15 +95,23 @@ export class CreateMaterialDto {
   @MaxLength(32, { each: true })
   departmentIds?: string[];
   @ApiPropertyOptional({ nullable: true }) @IsOptional() @IsString() @MaxLength(32) academicYearId?: string | null;
+  @ApiPropertyOptional({ type: [String], description: 'Years/levels the material is filed under; empty means all years' })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(MAX_MATERIAL_ACADEMIC_YEARS)
+  @IsString({ each: true })
+  @MaxLength(32, { each: true })
+  academicYearIds?: string[];
   @ApiPropertyOptional({ nullable: true }) @IsOptional() @IsString() @MaxLength(32) subjectId?: string | null;
+  /** Object key issued by POST /storage/uploads/library-cover/content. Never a URL. */
   @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(512) coverKey?: string;
 }
 
 /**
- * Editing a material. Sending ANY audience field means sending all five
- * (universityId, facultyId, departmentScope, departmentIds, academicYearId);
- * a partial audience is refused, so an edit cannot change who sees a material
- * as a side effect.
+ * Editing a material. Sending ANY audience field means sending all of it
+ * (universityId, facultyId, departmentScope, departmentIds and the years —
+ * `academicYearIds`, or the legacy `academicYearId`); a partial audience is
+ * refused, so an edit cannot change who sees a material as a side effect.
  */
 export class UpdateMaterialDto {
   @ApiPropertyOptional() @IsOptional() @IsString() @MinLength(2) @MaxLength(200) title?: string;
@@ -116,7 +134,15 @@ export class UpdateMaterialDto {
   @MaxLength(32, { each: true })
   departmentIds?: string[];
   @ApiPropertyOptional({ nullable: true }) @IsOptional() @IsString() @MaxLength(32) academicYearId?: string | null;
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(MAX_MATERIAL_ACADEMIC_YEARS)
+  @IsString({ each: true })
+  @MaxLength(32, { each: true })
+  academicYearIds?: string[];
   @ApiPropertyOptional({ nullable: true }) @IsOptional() @IsString() @MaxLength(32) subjectId?: string | null;
+  /** Send null to remove the cover. A key must come from the library-cover upload route. */
   @ApiPropertyOptional({ nullable: true }) @IsOptional() @IsString() @MaxLength(512) coverKey?: string | null;
 }
 

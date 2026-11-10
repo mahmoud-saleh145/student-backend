@@ -281,6 +281,181 @@ describe('B — audience rules through the real service', () => {
   });
 });
 
+describe('D — several years/levels per material, against the real database', () => {
+  let year2: string;
+
+  beforeAll(async () => {
+    const ladder = await prisma.academicYear.findUniqueOrThrow({
+      where: { id: ids.year1 },
+      select: { structureId: true },
+    });
+    year2 = (
+      await prisma.academicYear.create({
+        data: { structureId: ladder.structureId, order: 2, name: 'First year', nameAr: 'الأولى' },
+      })
+    ).id;
+  });
+
+  const publish = (id: string) =>
+    library.updateMaterial(id, { status: ContentStatus.PUBLISHED }, ADMIN);
+
+  it('D1: the links are written in full and the legacy column mirrors the first rung', async () => {
+    const created = (await library.createMaterial(
+      { title: 'Two years', universityId: ids.uni, facultyId: ids.general, academicYearIds: [year2, ids.year1] },
+      ADMIN,
+    )) as { id: string; academicYearId: string | null; academicYearIds: string[]; audience: { academicYears: { id: string }[] } };
+
+    expect(created.academicYearIds).toEqual([ids.year1, year2]);
+    expect(created.academicYearId).toBe(ids.year1);
+    expect(created.audience.academicYears.map((y) => y.id)).toEqual([ids.year1, year2]);
+
+    const row = await prisma.libraryMaterial.findUniqueOrThrow({
+      where: { id: created.id },
+      include: { academicYears: true },
+    });
+    expect(row.academicYearId).toBe(ids.year1);
+    expect(row.academicYears.map((l) => l.academicYearId).sort()).toEqual([ids.year1, year2].sort());
+  });
+
+  it('D2: the filter matches a rung the material is filed under, and an "all years" material, never a stranger', async () => {
+    const twoYears = (await library.createMaterial(
+      { title: 'Filter: both', universityId: ids.uni, facultyId: ids.general, academicYearIds: [ids.year1, year2] },
+      ADMIN,
+    )) as { id: string };
+    const onlyFirst = (await library.createMaterial(
+      { title: 'Filter: first', universityId: ids.uni, facultyId: ids.general, academicYearIds: [ids.year1] },
+      ADMIN,
+    )) as { id: string };
+    const allYears = (await library.createMaterial(
+      { title: 'Filter: all', universityId: ids.uni, facultyId: ids.general },
+      ADMIN,
+    )) as { id: string };
+    await Promise.all([publish(twoYears.id), publish(onlyFirst.id), publish(allYears.id)]);
+
+    const under = async (academicYearId: string) =>
+      (await library.browse({ page: 1, pageSize: 50, userId: ids.civilStudent, academicYearId })).items.map(
+        (m: { id: string }) => m.id,
+      );
+
+    const secondYear = await under(year2);
+    expect(secondYear).toContain(twoYears.id);
+    expect(secondYear).toContain(allYears.id);
+    expect(secondYear).not.toContain(onlyFirst.id);
+
+    const firstYear = await under(ids.year1);
+    expect(firstYear).toEqual(expect.arrayContaining([twoYears.id, onlyFirst.id, allYears.id]));
+
+    // Still a browsing filter: the CCE student is out of scope whatever the year.
+    expect(await under.call(null, year2).then(() => (library.browse({ page: 1, pageSize: 50, userId: ids.cceStudent, academicYearId: year2 })))).toMatchObject({ items: [] });
+  });
+
+  it('D3: the student reads see the list and the legacy single rung together', async () => {
+    const created = (await library.createMaterial(
+      { title: 'Read shape', universityId: ids.uni, facultyId: ids.general, academicYearIds: [ids.year1, year2] },
+      ADMIN,
+    )) as { id: string };
+    await publish(created.id);
+
+    const listed = (await library.browse({ page: 1, pageSize: 50, userId: ids.civilStudent })).items.find(
+      (m: { id: string }) => m.id === created.id,
+    ) as { academicYear: { id: string } | null; academicYears: { id: string; kind: string }[] };
+    expect(listed.academicYears.map((y) => y.id)).toEqual([ids.year1, year2]);
+    expect(listed.academicYear?.id).toBe(ids.year1);
+    expect(listed.academicYears[0]?.kind).toBe(AcademicStructureKind.YEAR);
+
+    const detail = (await library.materialForStudent(created.id, ids.civilStudent)) as unknown as {
+      academicYear: { id: string } | null;
+      academicYears: { id: string }[];
+    };
+    expect(detail.academicYears.map((y) => y.id)).toEqual([ids.year1, year2]);
+    expect(detail.academicYear?.id).toBe(ids.year1);
+  });
+
+  it('D4: an edit replaces the links as one unit, and the legacy single id still works', async () => {
+    const created = (await library.createMaterial(
+      { title: 'Edit years', universityId: ids.uni, facultyId: ids.general, academicYearIds: [ids.year1, year2] },
+      ADMIN,
+    )) as { id: string };
+
+    await expect(
+      library.updateMaterial(created.id, { academicYearIds: [year2] }, ADMIN),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+
+    const narrowed = (await library.updateMaterial(
+      created.id,
+      { universityId: ids.uni, facultyId: ids.general, departmentScope: LibraryDepartmentScope.FACULTY, departmentIds: [], academicYearIds: [year2] },
+      ADMIN,
+    )) as { academicYearIds: string[]; academicYearId: string | null };
+    expect(narrowed.academicYearIds).toEqual([year2]);
+    expect(narrowed.academicYearId).toBe(year2);
+
+    const legacy = (await library.updateMaterial(
+      created.id,
+      { universityId: ids.uni, facultyId: ids.general, departmentScope: LibraryDepartmentScope.FACULTY, departmentIds: [], academicYearId: ids.year1 },
+      ADMIN,
+    )) as { academicYearIds: string[] };
+    expect(legacy.academicYearIds).toEqual([ids.year1]);
+
+    const cleared = (await library.updateMaterial(
+      created.id,
+      { universityId: ids.uni, facultyId: ids.general, departmentScope: LibraryDepartmentScope.FACULTY, departmentIds: [], academicYearId: null },
+      ADMIN,
+    )) as { academicYearIds: string[]; academicYearId: string | null };
+    expect(cleared.academicYearIds).toEqual([]);
+    expect(cleared.academicYearId).toBeNull();
+    expect(await prisma.libraryMaterialAcademicYear.count({ where: { materialId: created.id } })).toBe(0);
+  });
+
+  it('D5: a rung from another ladder is refused for the whole list, and the row stays untouched', async () => {
+    const created = (await library.createMaterial(
+      { title: 'Wrong ladder', universityId: ids.uni, facultyId: ids.general, academicYearIds: [ids.year1] },
+      ADMIN,
+    )) as { id: string };
+
+    await expect(
+      library.updateMaterial(
+        created.id,
+        { universityId: ids.uni, facultyId: ids.general, departmentScope: LibraryDepartmentScope.FACULTY, departmentIds: [], academicYearIds: [ids.year1, ids.level0] },
+        ADMIN,
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', fields: { academicYearIds: expect.any(Array) } });
+
+    const links = await prisma.libraryMaterialAcademicYear.findMany({ where: { materialId: created.id } });
+    expect(links.map((l) => l.academicYearId)).toEqual([ids.year1]);
+  });
+
+  it('D6: deleting a rung unfiles the material from it and widens it to "all years"', async () => {
+    const ladder = await prisma.academicYear.findUniqueOrThrow({ where: { id: ids.year1 }, select: { structureId: true } });
+    const doomed = await prisma.academicYear.create({
+      data: { structureId: ladder.structureId, order: 9, name: 'Temporary', nameAr: 'مؤقت' },
+    });
+    const created = (await library.createMaterial(
+      { title: 'Cascade', universityId: ids.uni, facultyId: ids.general, academicYearIds: [doomed.id] },
+      ADMIN,
+    )) as { id: string };
+
+    await prisma.academicYear.delete({ where: { id: doomed.id } });
+
+    const row = await prisma.libraryMaterial.findUniqueOrThrow({
+      where: { id: created.id },
+      include: { academicYears: true },
+    });
+    expect(row.academicYears).toEqual([]);
+    expect(row.academicYearId).toBeNull();
+  });
+
+  it('D7: the admin list filters by rung the same way, with "all years" included', async () => {
+    const page = (await library.listForAdmin({ page: 1, pageSize: 100, academicYearId: year2 })) as {
+      items: { title: string; academicYears: { id: string }[] }[];
+    };
+    const titles = page.items.map((m) => m.title);
+    expect(titles).toContain('Filter: both');
+    expect(titles).toContain('Filter: all');
+    expect(titles).not.toContain('Filter: first');
+    expect(page.items.find((m) => m.title === 'Filter: both')?.academicYears.map((y) => y.id)).toEqual([ids.year1, year2]);
+  });
+});
+
 describe('Decision B — revoked ownership vs free preview, against the real database', () => {
   const view = async (userId: string, materialId: string) =>
     (await library.materialForStudent(materialId, userId)) as {

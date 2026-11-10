@@ -109,6 +109,7 @@ describe('assertObjectKeyInNamespace', () => {
           'thumbnails/library/',
         ],
         [StorageService.keys.libraryDefaultThumbnail('.png'), 'thumbnails/library/'],
+        [StorageService.keys.libraryCover('mat_1', '.png'), 'thumbnails/library/mat_1/cover/'],
         [StorageService.keys.attachment('crs_1', 'notes.pdf'), 'attachments/crs_1/'],
         [StorageService.keys.libraryDocument('notes.pdf'), 'library/'],
       ] as const;
