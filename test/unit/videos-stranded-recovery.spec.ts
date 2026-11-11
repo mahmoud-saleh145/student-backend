@@ -107,6 +107,17 @@ function build(rows: Row[]) {
         ...rows.find((r) => r.id === args.where.id),
         ...args.data,
       })),
+      // markFailed is conditional (never over READY): evaluate its predicate.
+      updateMany: jest.fn(async (args: { where: { id: string; status?: { not?: string } }; data: Record<string, unknown> }) => {
+        const hit = rows.filter(
+          (r) => r.id === args.where.id && (args.where.status?.not === undefined || r.status !== args.where.status.not),
+        );
+        for (const r of hit) {
+          failed.push({ id: r.id, reason: String(args.data.processingError ?? '') });
+          Object.assign(r, args.data);
+        }
+        return { count: hit.length };
+      }),
     },
   };
 
@@ -145,7 +156,7 @@ function build(rows: Row[]) {
     gumletIngest as never,
   );
 
-  return { service, enqueued, failed, synced, gumletIngest };
+  return { service, enqueued, failed, synced, gumletIngest, prisma };
 }
 
 describe('recoverStrandedVideos selection', () => {
@@ -179,6 +190,28 @@ describe('recoverStrandedVideos selection', () => {
     expect(result.requeued).toBe(0);
     // PROCESSING rows are failed, not re-enqueued - they already ran.
     expect(enqueued).toHaveLength(0);
+  });
+
+  it('never fails a video that became READY after the sweep read it', async () => {
+    // The sweep decides from a snapshot. Between that read and its write, a
+    // provider sync (or a late job) can finish the video. markFailed is
+    // conditional, so the READY row is left READY and nothing is counted.
+    const stored = row({
+      processingStartedAt: new Date('2026-10-10T08:00:00Z'), // 4h old
+      processingJobId: 'transcode:v1:old',
+    });
+    const { service, failed, prisma } = build([stored]);
+    prisma.video.findMany.mockImplementationOnce(async () => {
+      const snapshot = { ...stored }; // what the sweep saw: PROCESSING
+      stored.status = 'READY'; // what is true by the time it writes
+      return [snapshot];
+    });
+
+    const result = await service.recoverStrandedVideos(now);
+
+    expect(result.failed).toBe(0);
+    expect(failed).toHaveLength(0);
+    expect(stored.status).toBe('READY');
   });
 
   it('leaves a recent PROCESSING video alone', async () => {

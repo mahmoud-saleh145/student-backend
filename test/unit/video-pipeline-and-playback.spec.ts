@@ -307,8 +307,12 @@ describe('VideosService.recoverStrandedVideos', () => {
       { id: 'vid_dead', status: 'PROCESSING', sourceKey: 'k', lessonId: 'l', courseId: 'c', processingJobId: 'job-x' },
     ]);
     await expect(svc.recoverStrandedVideos()).resolves.toEqual({ requeued: 0, failed: 1, synced: 0, mobile: { requeued: 0, failed: 0 } });
-    expect(prisma.video.update).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ status: 'FAILED' }) }),
+    // Conditional: never over a video that became READY meanwhile.
+    expect(prisma.video.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'vid_dead', status: { not: 'READY' } },
+        data: expect.objectContaining({ status: 'FAILED' }),
+      }),
     );
   });
 });

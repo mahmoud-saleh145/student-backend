@@ -7,6 +7,12 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { Prisma, PrismaClient } from '@prisma/client';
 
+import {
+  boundedOperationsExtension,
+  positiveIntSetting,
+  withConnectionTimeouts,
+} from './bounded-operations';
+
 /**
  * Prisma client wrapper.
  *
@@ -31,8 +37,17 @@ export class PrismaService
   constructor(config: ConfigService) {
     const isProduction = config.get<string>('app.env') === 'production';
 
+    // Bounded database behaviour (see bounded-operations.ts). Opt-in per
+    // process: the laptop worker sets these; the API sets none and keeps its
+    // exact previous connection string and client.
+    const operationTimeoutMs = positiveIntSetting(config.get('DATABASE_OPERATION_TIMEOUT_MS'));
+    const url = withConnectionTimeouts(config.getOrThrow<string>('DATABASE_URL'), {
+      connectTimeoutSeconds: positiveIntSetting(config.get('DATABASE_CONNECT_TIMEOUT_SECONDS')),
+      socketTimeoutSeconds: positiveIntSetting(config.get('DATABASE_SOCKET_TIMEOUT_SECONDS')),
+    });
+
     super({
-      datasources: { db: { url: config.getOrThrow<string>('DATABASE_URL') } },
+      datasources: { db: { url } },
       log: isProduction
         ? [
             { emit: 'event', level: 'warn' },
@@ -58,6 +73,16 @@ export class PrismaService
 
     this.$on('warn', (e) => this.logger.warn(e.message));
     this.$on('error', (e) => this.logger.error(e.message));
+
+    if (operationTimeoutMs) {
+      this.logger.log(`Database operations are bounded at ${operationTimeoutMs} ms in this process`);
+      // The extended client is a proxy over this instance: every method of
+      // this class and of PrismaClient stays reachable, and Nest injects the
+      // proxy wherever PrismaService is requested, so every query in the
+      // process - including those inside interactive transactions - is bounded.
+      // (PrismaClient's own constructor already returns a proxy; this wraps it.)
+      return this.$extends(boundedOperationsExtension(operationTimeoutMs)) as unknown as PrismaService;
+    }
   }
 
   async onModuleInit(): Promise<void> {

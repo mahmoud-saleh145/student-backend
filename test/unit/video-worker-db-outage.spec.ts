@@ -8,10 +8,16 @@ import {
   withDatabaseRetry,
 } from 'src/database/transient-db-error';
 import { VIDEO_JOBS, type TranscodeJobData } from 'src/jobs/queue.constants';
+import { databaseOperationTimeout } from 'src/database/bounded-operations';
 import { VideoProcessor } from 'src/jobs/processors/video.processor';
-import { GumletRequestError } from 'src/modules/playback/gumlet-drm.service';
+import {
+  GumletCreationOutcomeUnknownError,
+  GumletDrmService,
+  GumletRequestError,
+} from 'src/modules/playback/gumlet-drm.service';
 import {
   GumletAdoptionNotRecordedError,
+  GumletIngestAbandonedError,
   GumletIngestService,
 } from 'src/modules/videos/gumlet-ingest.service';
 import { buildDrmVerification, fetchManifestViaGlobalFetch } from './helpers/drm-doubles';
@@ -224,6 +230,10 @@ function ingestHarness(opts: { reads?: () => boolean; writes?: () => boolean } =
         if (a.where?.gumletAssetId !== undefined && a.where.gumletAssetId !== row.gumletAssetId) {
           return { count: 0 };
         }
+        // The status guards the conditional writes rely on.
+        const status = a.where?.status as { not?: string; in?: string[] } | undefined;
+        if (status?.not !== undefined && row.status === status.not) return { count: 0 };
+        if (status?.in !== undefined && !status.in.includes(row.status as string)) return { count: 0 };
         writes.push(a.data);
         Object.assign(row, a.data);
         return { count: 1 };
@@ -324,17 +334,18 @@ describe('Gumlet ingest survives the database dropping out', () => {
       return { assetId: ASSET, status: 'pre-queued', playbackUrl: null };
     });
     // createAsset runs BEFORE markAdopted, so let the adoption write through.
-    const realUpdate = t.prisma.video.update.getMockImplementation()!;
+    // (markAdopted is a conditional updateMany: it never replaces another asset.)
+    const realUpdateMany = t.prisma.video.updateMany.getMockImplementation()!;
     let adopted = false;
-    t.prisma.video.update.mockImplementation(async (a: { data: Row }) => {
+    t.prisma.video.updateMany.mockImplementation(async (a: { where?: Row; data: Row }) => {
       if (!adopted && a.data.gumletAssetId === ASSET) {
         adopted = true;
         down = false;
-        const r = await realUpdate(a);
+        const r = await realUpdateMany(a);
         down = true;
         return r;
       }
-      return realUpdate(a);
+      return realUpdateMany(a);
     });
 
     const error = await t.service.processFromJob('v1', 'key').catch((e: unknown) => e);
@@ -398,6 +409,320 @@ describe('Gumlet ingest survives the database dropping out', () => {
 
     expect(isTransientDatabaseError(error)).toBe(true);
     expect(t.gumlet.createAsset).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-11-11: the connection that drops silently
+// ---------------------------------------------------------------------------
+
+/** Lets pending promise callbacks run (setTimeout is mocked to run instantly). */
+const flush = async () => {
+  for (let i = 0; i < 20; i += 1) await new Promise((r) => setImmediate(r));
+};
+
+describe('a Neon connection drop during Gumlet polling (bounded operations, P1008)', () => {
+  let sleep: jest.SpyInstance;
+  beforeEach(() => {
+    quietLogs();
+    sleep = instantSleeps();
+    jest.spyOn(global, 'fetch').mockResolvedValue({ ok: true, status: 200, text: async () => DRM_MANIFEST } as never);
+  });
+  afterEach(() => {
+    sleep.mockRestore();
+    jest.restoreAllMocks();
+  });
+
+  // In production the poll's query never settled. The worker now races each
+  // operation against DATABASE_OPERATION_TIMEOUT_MS and turns the loser into
+  // this error - so the poll sees exactly what a bounded hang produces.
+  const hung = () => {
+    throw databaseOperationTimeout('Video.findFirst', 60_000);
+  };
+
+  it('a few hung polls are waited out: one asset, READY, nothing marked FAILED', async () => {
+    let drops = 0;
+    const t = ingestHarness({ reads: () => t.row.gumletAssetId !== null && drops < 3 && ++drops > 0 });
+    t.prisma.video.findFirst.mockImplementation(async () => {
+      if (t.failRead.fn()) hung();
+      return { ...t.row };
+    });
+
+    const res = await t.service.processFromJob('v1', 'key');
+
+    expect(drops).toBe(3);
+    expect(res).toEqual({ handled: true, status: 'ready', playable: true });
+    expect(t.gumlet.createAsset).toHaveBeenCalledTimes(1);
+    expect(t.row.status).toBe('READY');
+    expect(t.writes.some((w) => w.status === 'FAILED')).toBe(false);
+  });
+
+  it('a long drop hands the job back; the retry REUSES the recorded asset (no second asset)', async () => {
+    let down = false;
+    const t = ingestHarness({ reads: () => down });
+    t.prisma.video.findFirst.mockImplementation(async () => {
+      if (t.failRead.fn()) hung();
+      return { ...t.row };
+    });
+    t.prisma.video.findUniqueOrThrow.mockImplementation(async () => {
+      if (t.failRead.fn()) hung();
+      return { status: t.row.status };
+    });
+    // The connection dies right after the row records the new asset: every
+    // poll after that hangs.
+    const realUpdateMany = t.prisma.video.updateMany.getMockImplementation()!;
+    t.prisma.video.updateMany.mockImplementation(async (a: { where?: Row; data: Row }) => {
+      const r = await realUpdateMany(a);
+      if (a.data.gumletAssetId === ASSET) down = true;
+      return r;
+    });
+
+    const first = await t.service.processFromJob('v1', 'key').catch((e: unknown) => e);
+    expect(isTransientDatabaseError(first)).toBe(true);
+    expect(t.row.gumletAssetId).toBe(ASSET);
+    expect(t.row.status).toBe('PROCESSING');
+
+    // The queue's retry, after Neon is back.
+    down = false;
+    const second = await t.service.processFromJob('v1', 'key');
+
+    expect(second.playable).toBe(true);
+    expect(t.gumlet.createAsset).toHaveBeenCalledTimes(1);
+    expect(t.row.gumletAssetId).toBe(ASSET);
+    expect(t.row.status).toBe('READY');
+  });
+});
+
+describe('an ingest abandoned at the job deadline writes nothing', () => {
+  let sleep: jest.SpyInstance;
+  beforeEach(() => {
+    quietLogs();
+    sleep = instantSleeps();
+    jest.spyOn(global, 'fetch').mockResolvedValue({ ok: true, status: 200, text: async () => DRM_MANIFEST } as never);
+  });
+  afterEach(() => {
+    sleep.mockRestore();
+    jest.restoreAllMocks();
+  });
+
+  it('a poll that resumes after the abort neither verifies nor writes', async () => {
+    const t = ingestHarness();
+    Object.assign(t.row, { gumletAssetId: ASSET, gumletWorkspaceId: 'ws', gumletStatus: 'pre-queued' });
+
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    t.gumlet.getAsset.mockImplementation(async () => {
+      await gate; // the provider (or the database before it) is stuck
+      // ...and when it answers, the asset is READY: the one answer that would
+      // otherwise run the DRM verification and write READY.
+      return {
+        assetId: ASSET, status: 'ready', progress: 100, playbackUrl: null, dashPlaybackUrl: null,
+        error: null, errorCode: null, durationSeconds: 600, width: null, height: null, frameRate: null, drmSystems: null,
+      };
+    });
+
+    const controller = new AbortController();
+    const outcome = t.service.processFromJob('v1', 'key', { signal: controller.signal }).catch((e: unknown) => e);
+    await flush();
+    const writesBefore = t.writes.length;
+
+    controller.abort(); // the worker's deadline gave up on this call
+    release();
+
+    expect(await outcome).toBeInstanceOf(GumletIngestAbandonedError);
+    expect(t.writes.length).toBe(writesBefore);
+    expect(global.fetch).not.toHaveBeenCalled(); // no DRM verification either
+    expect(t.row.status).toBe('PROCESSING');
+  });
+
+  it('an abort before the asset exists means no asset is ever created', async () => {
+    const t = ingestHarness();
+    // processFromJob's own read is answered; adopt()'s read hangs.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let reads = 0;
+    t.prisma.video.findFirst.mockImplementation(async () => {
+      reads += 1;
+      if (reads === 2) await gate;
+      return { ...t.row };
+    });
+
+    const controller = new AbortController();
+    const outcome = t.service.processFromJob('v1', 'key', { signal: controller.signal }).catch((e: unknown) => e);
+    await flush();
+    controller.abort();
+    release();
+
+    expect(await outcome).toBeInstanceOf(GumletIngestAbandonedError);
+    expect(t.gumlet.createAsset).not.toHaveBeenCalled();
+    expect(t.writes).toEqual([]);
+  });
+});
+
+describe('a READY video is protected from stale PROCESSING writes', () => {
+  let sleep: jest.SpyInstance;
+  beforeEach(() => {
+    quietLogs();
+    sleep = instantSleeps();
+    jest.spyOn(global, 'fetch').mockResolvedValue({ ok: true, status: 200, text: async () => DRM_MANIFEST } as never);
+  });
+  afterEach(() => {
+    sleep.mockRestore();
+    jest.restoreAllMocks();
+  });
+
+  it('a stale "processing" observation of a READY video changes nothing', async () => {
+    const t = ingestHarness();
+    Object.assign(t.row, { gumletAssetId: ASSET, gumletWorkspaceId: 'ws', status: 'READY', gumletStatus: 'ready' });
+    t.gumlet.getAsset.mockImplementation(async () => ({
+      assetId: ASSET, status: 'processing', progress: 50, playbackUrl: null, dashPlaybackUrl: null,
+      error: null, errorCode: null, durationSeconds: null, width: null, height: null, frameRate: null, drmSystems: null,
+    }));
+
+    await t.service.sync('v1');
+
+    expect(t.row.status).toBe('READY');
+    expect(t.row.gumletStatus).toBe('ready');
+    expect(t.writes).toEqual([]);
+  });
+
+  it('a poll that runs out its budget after the sweep made the video READY leaves it READY', async () => {
+    const t = ingestHarness();
+    Object.assign(t.row, { gumletAssetId: ASSET, gumletWorkspaceId: 'ws', gumletStatus: 'pre-queued' });
+    t.gumlet.getAsset.mockImplementation(async () => ({
+      assetId: ASSET, status: 'processing', progress: 50, playbackUrl: null, dashPlaybackUrl: null,
+      error: null, errorCode: null, durationSeconds: null, width: null, height: null, frameRate: null, drmSystems: null,
+    }));
+    // Each clock read moves time 5 minutes, so the 20-minute budget runs out.
+    // At the very moment it does - after the last poll, before the "still
+    // processing" write - the recovery sweep verifies the asset and makes the
+    // video READY. (Any earlier and the poll itself would see READY and stop.)
+    const start = Date.now();
+    let clock = start;
+    jest.spyOn(Date, 'now').mockImplementation(() => {
+      clock += 5 * 60_000;
+      if (clock >= start + 25 * 60_000) t.row.status = 'READY';
+      return clock;
+    });
+
+    const res = await t.service.processFromJob('v1', 'key');
+
+    expect(res.playable).toBeFalsy();
+    expect(t.gumlet.getAsset).toHaveBeenCalled();
+    expect(t.row.status).toBe('READY');
+    // The budget-exhausted write ("still PROCESSING") was conditional and skipped.
+    expect(t.writes.some((w) => w.status === 'PROCESSING')).toBe(false);
+  });
+});
+
+describe('no duplicate Gumlet asset', () => {
+  let sleep: jest.SpyInstance;
+  beforeEach(() => {
+    quietLogs();
+    sleep = instantSleeps();
+    jest.spyOn(global, 'fetch').mockResolvedValue({ ok: true, status: 200, text: async () => DRM_MANIFEST } as never);
+  });
+  afterEach(() => {
+    sleep.mockRestore();
+    jest.restoreAllMocks();
+  });
+
+  it('an existing asset is reused on recovery, even when the row is FAILED', async () => {
+    const t = ingestHarness();
+    Object.assign(t.row, {
+      gumletAssetId: ASSET,
+      gumletWorkspaceId: 'ws',
+      status: 'FAILED',
+      gumletStatus: 'processing',
+      drmRequested: true,
+    });
+
+    const res = await t.service.processFromJob('v1', 'key');
+
+    expect(res.playable).toBe(true);
+    expect(t.gumlet.createAsset).not.toHaveBeenCalled();
+    expect(t.row.gumletAssetId).toBe(ASSET);
+  });
+
+  it('a late adoption never overwrites an asset another run already recorded', async () => {
+    const t = ingestHarness();
+    t.gumlet.createAsset.mockImplementation(async () => {
+      t.row.gumletAssetId = 'asset-recorded-by-the-newer-run';
+      return { assetId: ASSET, status: 'pre-queued', playbackUrl: null };
+    });
+
+    const error = await t.service.processFromJob('v1', 'key').catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(GumletAdoptionNotRecordedError);
+    expect((error as Error).message).toContain(ASSET);
+    expect(t.row.gumletAssetId).toBe('asset-recorded-by-the-newer-run');
+  });
+
+  it('a create request without an answer is reported as an unknown outcome, never as a refusal', async () => {
+    const t = ingestHarness();
+    t.gumlet.createAsset.mockRejectedValue(new GumletCreationOutcomeUnknownError(['edu-video:v1'], 'no answer'));
+
+    const error = await t.service.processFromJob('v1', 'key').catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(GumletCreationOutcomeUnknownError);
+    expect(t.gumlet.createAsset).toHaveBeenCalledTimes(1);
+    expect(t.writes.some((w) => w.status === 'FAILED')).toBe(false);
+  });
+});
+
+describe('GumletDrmService.createAsset without an answer', () => {
+  const service = () =>
+    new GumletDrmService({
+      getOrThrow: () => ({
+        drm: { enabled: true, provider: 'gumlet', gumlet: { apiKey: 'k', workspaceId: 'ws', resolutions: [720] } },
+      }),
+    } as never);
+  beforeEach(quietLogs);
+  afterEach(() => jest.restoreAllMocks());
+
+  it.each([
+    ['a timeout', Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' })],
+    ['a dropped connection', new TypeError('fetch failed')],
+  ])('turns %s into GumletCreationOutcomeUnknownError naming the tag, and sends one request', async (_, cause) => {
+    const fetchSpy = jest.spyOn(global, 'fetch').mockRejectedValue(cause);
+
+    const error = await service()
+      .createAsset({ sourceUrl: 'https://r2.example/x', tag: ['edu-video:v1'] })
+      .catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(GumletCreationOutcomeUnknownError);
+    expect((error as Error).message).toContain('edu-video:v1');
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect((fetchSpy.mock.calls[0][1] as RequestInit).signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('a success status whose body never arrives is an unknown outcome too (Gumlet accepted it)', async () => {
+    jest.spyOn(global, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: async () => {
+        throw Object.assign(new Error('aborted'), { name: 'TimeoutError' });
+      },
+    } as never);
+
+    const error = await service()
+      .createAsset({ sourceUrl: 'https://r2.example/x', tag: ['edu-video:v1'] })
+      .catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(GumletCreationOutcomeUnknownError);
+  });
+
+  it('a request that provably never left (DNS, refused) stays an ordinary retryable blip', async () => {
+    jest
+      .spyOn(global, 'fetch')
+      .mockRejectedValue(Object.assign(new TypeError('fetch failed'), { cause: { code: 'ENOTFOUND' } }));
+
+    const error = await service()
+      .createAsset({ sourceUrl: 'https://r2.example/x', tag: ['edu-video:v1'] })
+      .catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(GumletRequestError);
+    expect((error as GumletRequestError).transient).toBe(true);
   });
 });
 
