@@ -727,4 +727,187 @@ describe('course parts: live section membership', () => {
     expect(Object.values(lockMap((await detail(s, none).expect(200)).body.data.sections))).toEqual([true, true, true]);
     await expectNewSectionRefused(s, none, 'NOT_ENROLLED');
   });
+
+  // ---------------------------------------------------------------------------
+  // Cards redeemed through the real endpoint, the JOIN sheet, and removal
+  // ---------------------------------------------------------------------------
+
+  const joinOptions = (s: Scenario, session: Session) =>
+    http(app).get(`${API}/courses/${s.course.id}/join-options`).set(session.headers);
+
+  /** A fresh, unredeemed card, the way the dashboard prints one. */
+  const freshCard = (
+    s: Scenario,
+    data: {
+      code: string;
+      targetType: CodeTargetType;
+      sectionId?: string;
+      coursePartId?: string;
+      grantedSectionIds: string[];
+    },
+  ) =>
+    prisma.accessCode.create({
+      data: {
+        code: data.code,
+        courseId: s.course.id,
+        targetType: data.targetType,
+        sectionId: data.sectionId ?? null,
+        coursePartId: data.coursePartId ?? null,
+        grantedSectionIds: data.grantedSectionIds,
+        grantedCourseIds: [s.course.id],
+        maxRedemptions: 1,
+        redemptionCount: 0,
+        status: CodeStatus.ACTIVE,
+      },
+    });
+
+  type JoinPart = { id: string; owned: boolean; ownedVia: string | null; purchasable: boolean };
+  const partFlags = (parts: JoinPart[]) =>
+    Object.fromEntries(parts.map((p) => [p.id, [p.owned, p.ownedVia, p.purchasable]]));
+
+  it('redeeming a Part 1 card today unlocks Part 1, live, and never Part 2', async () => {
+    const s = await scenario();
+    await freshCard(s, {
+      code: 'PARTCARD101',
+      targetType: CodeTargetType.PART,
+      coursePartId: s.part1.id,
+      grantedSectionIds: [s.preMid.id],
+    });
+    const buyer = await as(s, s.stranger);
+
+    const res = await redeem(s, buyer, 'PARTCARD101');
+    expect(res.status).toBeLessThan(300);
+    const ent = await prisma.coursePartEntitlement.findUniqueOrThrow({
+      where: { userId_coursePartId: { userId: s.stranger.user.id, coursePartId: s.part1.id } },
+    });
+    expect(ent.revokedAt).toBeNull();
+    const row = await prisma.enrollment.findUniqueOrThrow({
+      where: { userId_courseId: { userId: s.stranger.user.id, courseId: s.course.id } },
+    });
+    expect(row.coversAllSections).toBe(false);
+
+    const join = (await joinOptions(s, buyer).expect(200)).body.data;
+    expect(join.fullCourse).toMatchObject({ owned: false, purchasable: true });
+    expect(join.ownsAllParts).toBe(false);
+    expect(partFlags(join.parts)).toEqual({
+      [s.part1.id]: [true, 'PART_PURCHASE', false],
+      [s.part2.id]: [false, null, true],
+    });
+
+    // A section the admin assigns to Part 1 afterwards is part of what was bought.
+    await expectNewSectionRefused(s, buyer, 'NOT_ENROLLED');
+    await assignNewSectionToPart1(s);
+    await lesson(buyer, s.preMid.lessons[0]!.id).expect(200);
+    await expectNewSectionOpen(s, buyer, s.stranger.user.id);
+    expect(errorCode((await lesson(buyer, s.postMid.lessons[0]!.id)).body)).toBe('NOT_ENROLLED');
+  });
+
+  it('redeeming a section card today unlocks that section only, not what its part gains later', async () => {
+    const s = await scenario();
+    await freshCard(s, {
+      code: 'SECTIONCARD101',
+      targetType: CodeTargetType.SECTION,
+      sectionId: s.preMid.id,
+      grantedSectionIds: [s.preMid.id],
+    });
+    const buyer = await as(s, s.stranger);
+
+    expect((await redeem(s, buyer, 'SECTIONCARD101')).status).toBeLessThan(300);
+    expect(
+      await prisma.coursePartEntitlement.count({ where: { userId: s.stranger.user.id } }),
+    ).toBe(0);
+
+    await assignNewSectionToPart1(s);
+    await lesson(buyer, s.preMid.lessons[0]!.id).expect(200);
+    await expectNewSectionRefused(s, buyer, 'NOT_ENROLLED');
+    expect(errorCode((await lesson(buyer, s.postMid.lessons[0]!.id)).body)).toBe('NOT_ENROLLED');
+
+    const join = (await joinOptions(s, buyer).expect(200)).body.data;
+    expect(join.fullCourse).toMatchObject({ owned: false, purchasable: true });
+    expect(join.parts.every((p: JoinPart) => !p.owned && p.purchasable)).toBe(true);
+  });
+
+  it('the JOIN sheet agrees with the gates for every kind of student', async () => {
+    const s = await scenario();
+    await assignNewSectionToPart1(s);
+    const sheet = async (who: { user: { phone: string }; deviceKey: string }) =>
+      (await joinOptions(s, await as(s, who)).expect(200)).body.data;
+
+    // No enrollment: everything is on offer, nothing is owned.
+    const none = await sheet(s.stranger);
+    expect(none.fullCourse).toMatchObject({ owned: false, purchasable: true, price: 1000 });
+    expect(partFlags(none.parts)).toEqual({
+      [s.part1.id]: [false, null, true],
+      [s.part2.id]: [false, null, true],
+    });
+
+    // One part: that part is owned; the other part and the full course are on offer.
+    const p1 = await sheet(s.partHolder);
+    expect(p1.fullCourse).toMatchObject({ owned: false, purchasable: true });
+    expect(partFlags(p1.parts)).toEqual({
+      [s.part1.id]: [true, 'PART_PURCHASE', false],
+      [s.part2.id]: [false, null, true],
+    });
+
+    // Whole course, in both shapes: nothing left to buy.
+    for (const who of [s.fullCourse, s.courseCard]) {
+      const full = await sheet(who);
+      expect(full.fullCourse).toMatchObject({ owned: true, purchasable: false });
+      expect(full.ownsAllParts).toBe(true);
+      expect(partFlags(full.parts)).toEqual({
+        [s.part1.id]: [true, 'FULL_COURSE', false],
+        [s.part2.id]: [true, 'FULL_COURSE', false],
+      });
+    }
+
+    // A forged grant row buys nothing on the sheet either.
+    const forged = await sheet(s.forged);
+    expect(forged.fullCourse).toMatchObject({ owned: false, purchasable: true });
+    expect(forged.ownsAllParts).toBe(false);
+
+    // Never a checkout, never the wallet.
+    expect(none.methods).toEqual({ accessCode: true, wallet: false, onlinePayment: false });
+  });
+
+  it('removing a student from the course closes every gate, whatever shape their access had', async () => {
+    const s = await scenario();
+    await assignNewSectionToPart1(s);
+    const admin = await login(app, s.admin.phone, 'admin-device');
+    const fullRow = await prisma.enrollment.findUniqueOrThrow({
+      where: { userId_courseId: { userId: s.fullCourse.user.id, courseId: s.course.id } },
+    });
+
+    const removed = [
+      { who: s.partHolder, enrollmentId: s.holderEnrollment.id },
+      { who: s.courseCard, enrollmentId: s.courseCardEnrollment.id },
+      { who: s.fullCourse, enrollmentId: fullRow.id },
+    ];
+    for (const r of removed) {
+      await http(app)
+        .post(`${API}/admin/enrollments/${r.enrollmentId}/revoke`)
+        .set(admin.headers)
+        .send({ reason: 'integration test removal', courseId: s.course.id })
+        .expect(200);
+    }
+
+    for (const r of removed) {
+      const session = await as(s, r.who);
+      const view = await detail(s, session).expect(200);
+      expect(Object.values(lockMap(view.body.data.sections))).toEqual([true, true, true]);
+      for (const sec of [s.preMid, s.postMid]) {
+        expect(errorCode((await lesson(session, sec.lessons[0]!.id)).body)).toBe('NOT_ENROLLED');
+      }
+      await expectNewSectionRefused(s, session, 'NOT_ENROLLED');
+
+      const join = (await joinOptions(s, session).expect(200)).body.data;
+      expect(join.fullCourse).toMatchObject({ owned: false, purchasable: true });
+      expect(join.parts.every((p: JoinPart) => !p.owned && p.purchasable)).toBe(true);
+    }
+
+    // History is kept: the part entitlement is revoked, not deleted.
+    const ent = await prisma.coursePartEntitlement.findUniqueOrThrow({
+      where: { userId_coursePartId: { userId: s.partHolder.user.id, coursePartId: s.part1.id } },
+    });
+    expect(ent.revokedAt).not.toBeNull();
+  });
 });

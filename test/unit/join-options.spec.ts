@@ -28,6 +28,17 @@ interface Options {
   parts?: { id: string; sortOrder: number; pricePercent: string | null }[];
   ownedPartIds?: string[];
   coversAllSections?: boolean;
+  /**
+   * The student's enrollment state. `null` means no enrollment row at all.
+   * Defaults to ACTIVE, the shape of a student who holds part of the course.
+   */
+  enrollmentState?: string | null;
+  /**
+   * What the access engine's `holdsWholeCourse` answers: true for a student
+   * who bought a whole-course card under the old snapshot rule, whose row
+   * still reads `coversAllSections = false`.
+   */
+  wholeCourseCard?: boolean;
   /** What the course is configured to accept. */
   enrollmentMethods?: EnrollmentMethod[];
 }
@@ -86,10 +97,14 @@ function build(options: Options = {}) {
       ),
     },
     enrollment: {
-      findUnique: jest.fn(async (_args: { where: unknown; select: unknown }) => ({
-        coversAllSections: options.coversAllSections ?? false,
-        state: 'ACTIVE',
-      })),
+      findUnique: jest.fn(async (_args: { where: unknown; select?: unknown }) =>
+        options.enrollmentState === null
+          ? null
+          : {
+              coversAllSections: options.coversAllSections ?? false,
+              state: options.enrollmentState ?? 'ACTIVE',
+            },
+      ),
     },
   };
 
@@ -112,7 +127,15 @@ function build(options: Options = {}) {
   // the way the real service filters it since Phase 6 §4.1: unconditionally,
   // whatever `options.provider` says (online-payment-disabled.spec.ts pins
   // that on the real CourseAccessService).
+  //
+  // `holdsWholeCourse` is the engine's answer for the old course-card shape.
+  // `listForStudent` and `joinOptions` ask it whenever a LIVE enrollment is
+  // not already `coversAllSections`, so the stub must answer it rather than
+  // be missing it (which threw before 2026-11-11 and failed 13 tests here).
   const access = {
+    holdsWholeCourse: jest.fn(
+      async (_userId: string, _courseId: string) => options.wholeCourseCard ?? false,
+    ),
     decide: jest.fn((_status: unknown, _enrollment: unknown) => ({ state: 'NOT_ENROLLED' })),
     toCourseAccess: jest.fn(
       (
@@ -133,7 +156,7 @@ function build(options: Options = {}) {
     storage as never,
   );
 
-  return { service, prisma, config };
+  return { service, prisma, config, access };
 }
 
 describe('the whole-course option', () => {
@@ -290,5 +313,92 @@ describe('available mechanisms', () => {
     const out = await service.joinOptions('crs_1', 'usr_1');
 
     expect(out.methods.onlinePayment).toBe(false);
+  });
+});
+
+describe('join options for each kind of student', () => {
+  it('offer everything, and own nothing, to a student with no enrollment', async () => {
+    const { service, access } = build({ enrollmentState: null });
+    const out = await service.joinOptions('crs_1', 'usr_1');
+
+    expect(out.fullCourse).toMatchObject({ owned: false, purchasable: true, price: 1000 });
+    expect(out.ownsAllParts).toBe(false);
+    expect(out.parts.map((p) => [p.owned, p.ownedVia, p.purchasable])).toEqual([
+      [false, null, true],
+      [false, null, true],
+    ]);
+    // No enrollment, nothing for the engine to recognise.
+    expect(access.holdsWholeCourse).not.toHaveBeenCalled();
+  });
+
+  it('offer the other part and the full course to a student holding one part', async () => {
+    const { service } = build({ ownedPartIds: ['part_1'] });
+    const out = await service.joinOptions('crs_1', 'usr_1');
+
+    expect(out.fullCourse).toMatchObject({ owned: false, purchasable: true });
+    expect(out.ownsAllParts).toBe(false);
+    expect(out.parts.map((p) => [p.id, p.owned, p.purchasable])).toEqual([
+      ['part_1', true, false],
+      ['part_2', false, true],
+    ]);
+  });
+
+  it('treat coversAllSections as the whole course without asking the engine again', async () => {
+    const { service, access } = build({ coversAllSections: true });
+    const out = await service.joinOptions('crs_1', 'usr_1');
+
+    expect(out.fullCourse).toMatchObject({ owned: true, purchasable: false });
+    expect(out.parts.every((p) => p.owned && p.ownedVia === 'FULL_COURSE' && !p.purchasable)).toBe(true);
+    expect(access.holdsWholeCourse).not.toHaveBeenCalled();
+  });
+
+  it('read a whole-course card bought under the old snapshot rule as the whole course', async () => {
+    // 129 production students had this shape on 2026-11-11: an ACTIVE row with
+    // coversAllSections = false and grants written by a COURSE card. Without
+    // the engine's answer they would be invited to buy parts they already own.
+    const { service, access } = build({ coversAllSections: false, wholeCourseCard: true });
+    const out = await service.joinOptions('crs_1', 'usr_1');
+
+    expect(access.holdsWholeCourse).toHaveBeenCalledWith('usr_1', 'crs_1');
+    expect(out.fullCourse).toMatchObject({ owned: true, purchasable: false });
+    expect(out.ownsAllParts).toBe(true);
+    expect(out.parts.map((p) => [p.owned, p.ownedVia, p.purchasable])).toEqual([
+      [true, 'FULL_COURSE', false],
+      [true, 'FULL_COURSE', false],
+    ]);
+  });
+
+  it('keep a part bought separately labelled as a part purchase for a whole-course holder', async () => {
+    const { service } = build({ ownedPartIds: ['part_1'], wholeCourseCard: true });
+    const out = await service.joinOptions('crs_1', 'usr_1');
+
+    expect(out.parts.map((p) => p.ownedVia)).toEqual(['PART_PURCHASE', 'FULL_COURSE']);
+    expect(out.parts.every((p) => p.owned && !p.purchasable)).toBe(true);
+  });
+
+  it.each(['PENDING_APPROVAL', 'PENDING_PAYMENT', 'REVOKED', 'EXPIRED'])(
+    'never read a %s enrollment as owning the course, whatever its flags say',
+    async (state) => {
+      // coversAllSections defaults to true on a request row, and a revoked row
+      // could still cite a course card. Only a LIVE enrollment owns anything.
+      const { service, access } = build({
+        enrollmentState: state,
+        coversAllSections: true,
+        wholeCourseCard: true,
+      });
+      const out = await service.joinOptions('crs_1', 'usr_1');
+
+      expect(out.fullCourse).toMatchObject({ owned: false, purchasable: true });
+      expect(out.ownsAllParts).toBe(false);
+      expect(out.parts.every((p) => !p.owned && p.purchasable)).toBe(true);
+      expect(access.holdsWholeCourse).not.toHaveBeenCalled();
+    },
+  );
+
+  it('never offer a whole-course holder anything to buy, even for a free course', async () => {
+    const { service } = build({ isFree: true, wholeCourseCard: true });
+    const out = await service.joinOptions('crs_1', 'usr_1');
+
+    expect(out.fullCourse).toMatchObject({ owned: true, purchasable: false, price: 0 });
   });
 });
