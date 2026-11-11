@@ -189,6 +189,38 @@ and `lastDeferral`; `GET /videos/mobile/overview` shows them.
   binding, the play allowance and the ticket chain are identical either way.
   The overview reports `deliveryOverride`.
 
+### New uploads before historical work (`MobileEncodeScheduler`)
+
+Owner rule: a newly uploaded video always goes before historical mobile HLS
+work. The original upload queue and the mobile queue are separate BullMQ
+queues, so BullMQ priorities cannot order one against the other; the rule is
+enforced explicitly when a mobile job is about to start:
+
+- **Historical jobs yield.** A `migration` or `recovery` job is deferred 30 s
+  at a time (no attempt used, row untouched) while a fresh upload is
+  *waiting* in `video-processing`. An encode that is already running is never
+  interrupted; only the next historical job waits. If the original queue
+  cannot be read, the job defers rather than start blind.
+- **Inside the mobile queue,** `upload` and staff `retry` jobs carry no BullMQ
+  priority while `recovery` (5) and `migration` (10) do; BullMQ drains the
+  plain wait list first, so a new upload's mobile job always comes before any
+  historical one.
+- **One encode at a time across every worker process:** a Redis lease
+  (`mobile:transcode:slot`, 120 s, renewed every 30 s while encoding) is taken
+  before the video is claimed. A second container defers instead of encoding;
+  a crashed holder frees the slot within two minutes.
+- **No duplicate encodes:** the claim steps aside when another *live* job owns
+  the video, and is compare-and-set on the job id it read. A job re-claiming
+  its own row after a restart proceeds.
+- **Cannot starve:** the original queue's delayed retries, its active job, an
+  operator *pause* of the original queue (the two pause controls stay
+  independent) and a waiting job older than 3 h (no consumer running) never
+  hold mobile work back.
+
+Verified on real BullMQ queues against a local Redis by
+`test/unit/mobile-priority-real-queue.spec.ts` (run with
+`PRIORITY_TEST_REDIS_URL=redis://localhost:6379`).
+
 ### Running the worker on a Windows laptop (Docker Desktop)
 
 Use `deploy/laptop-worker/` (compose file, `.env.worker.example`,
