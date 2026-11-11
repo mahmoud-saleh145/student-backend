@@ -7,6 +7,7 @@ import { join } from 'node:path';
 
 import type { VideoConfig } from '../../config/configuration';
 import { describeDatabaseError, isTransientDatabaseError } from '../../database/transient-db-error';
+import { GumletCreationOutcomeUnknownError } from '../../modules/playback/gumlet-drm.service';
 import {
   GumletAdoptionNotRecordedError,
   GumletIngestService,
@@ -27,11 +28,23 @@ import { HlsTranscoder, TranscodeEnvironmentError } from './hls-transcoder';
  * upload queued behind it waited too (nine videos, until the worker was
  * restarted by hand). Whatever never settled, this queue must not depend on it.
  *
- * Racing the ingest against a deadline frees the slot. The row and its recorded
- * asset id are left exactly as they are, so nothing is lost: the queue's own
- * retry resumes the recorded asset (adopt() never creates a second one), and
- * the recovery sweep re-syncs a PROCESSING Gumlet row with an asset in any case.
- * The deadline sits well past the poll budget so it only ever fires on a hang.
+ * The cause was found on 2026-11-11 (see src/database/bounded-operations.ts):
+ * a Prisma query on a silently dead connection never settles. The worker now
+ * bounds every database operation, which removes that cause. This deadline is
+ * the backstop for anything else that might never settle.
+ *
+ * When it fires:
+ *   - the ingest is ABORTED (its signal), so if it ever resumes it writes
+ *     nothing - every write point checks the signal first;
+ *   - the job ends WITHOUT an automatic retry (UnrecoverableError). A retry is
+ *     the one path that could create a second billable Gumlet asset if the hang
+ *     sat between "Gumlet created it" and "the row recorded it";
+ *   - the row and any recorded asset are left untouched (not stamped FAILED:
+ *     the asset may be fine). The recovery sweep re-syncs a PROCESSING Gumlet
+ *     row with an asset within minutes - on 2026-11-10/11 it finished both hung
+ *     videos - and a row without an asset is surfaced for a staff retry.
+ * The deadline sits well past the 20-minute poll budget, so it only ever
+ * fires on a hang.
  */
 export const GUMLET_INGEST_JOB_DEADLINE_MS = 35 * 60_000;
 
@@ -40,11 +53,19 @@ export class GumletIngestStalledError extends Error {
   override readonly name = 'GumletIngestStalledError';
 }
 
-/** `work`, or a GumletIngestStalledError once `ms` have passed; the timer never outlives the race. */
-export function settleWithin<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
+/**
+ * `work`, or a GumletIngestStalledError once `ms` have passed. `onTimeout` runs
+ * first (the caller aborts the work there). The timer never outlives the race,
+ * and a rejection of the abandoned `work` is absorbed by the race, never left
+ * unhandled.
+ */
+export function settleWithin<T>(work: Promise<T>, ms: number, message: string, onTimeout?: () => void): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const deadline = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new GumletIngestStalledError(message)), ms);
+    timer = setTimeout(() => {
+      onTimeout?.();
+      reject(new GumletIngestStalledError(message));
+    }, ms);
   });
   return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
 }
@@ -80,6 +101,8 @@ export function settleWithin<T>(work: Promise<T>, ms: number, message: string): 
 export class VideoProcessor extends WorkerHost {
   private readonly logger = new Logger(VideoProcessor.name);
   private readonly cfg: VideoConfig;
+  /** GUMLET_INGEST_JOB_DEADLINE_MS; a field only so a real-queue test can shorten it. */
+  protected ingestDeadlineMs = GUMLET_INGEST_JOB_DEADLINE_MS;
 
   constructor(
     private readonly transcoder: HlsTranscoder,
@@ -112,11 +135,13 @@ export class VideoProcessor extends WorkerHost {
       // replayed job can never reroute a legacy R2/HLS video onto the Gumlet
       // path. Non-Gumlet videos return `handled: false` and fall through to the
       // ffmpeg path below.
+      const ingest = new AbortController();
       const gumlet = await settleWithin(
-        this.gumletIngest.processFromJob(videoId, sourceKey),
-        GUMLET_INGEST_JOB_DEADLINE_MS,
+        this.gumletIngest.processFromJob(videoId, sourceKey, { signal: ingest.signal }),
+        this.ingestDeadlineMs,
         `Gumlet ingest for video ${videoId} did not settle within ` +
-          `${GUMLET_INGEST_JOB_DEADLINE_MS / 60_000} minutes (job ${job.id})`,
+          `${Math.round(this.ingestDeadlineMs / 60_000)} minutes (job ${job.id})`,
+        () => ingest.abort(),
       );
       if (gumlet.handled) {
         this.logger.log(
@@ -162,16 +187,41 @@ export class VideoProcessor extends WorkerHost {
 
       // A HUNG INGEST IS NOT A VERDICT ON THE VIDEO EITHER.
       //
-      // The asset may well be fine (the 2026-11-10 one was ready and verified
-      // half an hour later). So, like a database outage below, the row is not
-      // stamped FAILED: it stays as the ingest left it, the slot is released,
-      // and the queue's retry or the recovery sweep finishes the video.
+      // The asset may well be fine (both hung videos of 2026-11-10/11 were
+      // ready and verified soon after). So the row is not stamped FAILED: it
+      // stays as the ingest left it, the ingest has been aborted so it can no
+      // longer write, and the slot is released. No automatic retry: the hang
+      // may have sat between Gumlet creating the asset and the row recording
+      // it, and a retry from there would create a second billable asset. The
+      // recovery sweep re-syncs a PROCESSING row that records its asset.
       if (error instanceof GumletIngestStalledError) {
         this.logger.error(
-          `${message}; releasing the queue slot (attempt ${job.attemptsMade + 1} of ${job.opts?.attempts ?? 1}). ` +
-            'The row and its recorded Gumlet asset are left unchanged; a queue retry or the recovery sweep resumes it.',
+          `${message}; ingest aborted and the queue slot released without an automatic retry. ` +
+            'The row and its recorded Gumlet asset are left unchanged; the recovery sweep resumes a recorded asset.',
         );
-        throw error;
+        throw new UnrecoverableError(message);
+      }
+
+      // GUMLET MAY OR MAY NOT HAVE CREATED THE ASSET.
+      //
+      // The create request was sent but its answer never arrived. Retrying
+      // could create a duplicate billable asset, so the job is not retried.
+      // The row records no asset, so nothing can resume it automatically; it
+      // is marked FAILED with a reason that names the Gumlet tag to check
+      // before a staff retry (otherwise the sweep would fail it hours later
+      // with a generic "retry" reason that invites the duplicate).
+      if (error instanceof GumletCreationOutcomeUnknownError) {
+        this.logger.error(`transcode for ${videoId} stopped without retry: ${message}`);
+        await this.videos.markFailed(videoId, message).catch((markError: unknown) =>
+          this.logger.error(
+            `video ${videoId}: could not record the unknown creation outcome (` +
+              (isTransientDatabaseError(markError)
+                ? describeDatabaseError(markError)
+                : (markError as Error)?.message ?? String(markError)) +
+              ')',
+          ),
+        );
+        throw new UnrecoverableError(message);
       }
 
       // A DATABASE OUTAGE IS NOT A VERDICT ON THE VIDEO.

@@ -12,7 +12,7 @@ import {
   withDatabaseRetry,
 } from '../../database/transient-db-error';
 import { StorageService } from '../storage/storage.service';
-import { GumletDrmService } from '../playback/gumlet-drm.service';
+import { GumletCreationOutcomeUnknownError, GumletDrmService } from '../playback/gumlet-drm.service';
 import {
   DrmVerificationService,
   isTransientProviderError,
@@ -109,6 +109,19 @@ const GUMLET_DB_BACKOFF_MAX_MS = 30_000;
  * job without retrying (BullMQ `UnrecoverableError`) and the error names the
  * asset, so an operator can record it or delete it before reprocessing.
  */
+/**
+ * The worker gave up on this ingest at its job deadline and aborted it. Thrown
+ * from the points where the abandoned call would otherwise act on the row, so a
+ * late-resuming ingest writes nothing. Nobody awaits it any more; it only ends
+ * the abandoned call quietly.
+ */
+export class GumletIngestAbandonedError extends Error {
+  constructor(readonly videoId: string) {
+    super(`Gumlet ingest for video ${videoId} was abandoned at the job deadline; writing nothing`);
+    this.name = 'GumletIngestAbandonedError';
+  }
+}
+
 export class GumletAdoptionNotRecordedError extends Error {
   constructor(
     readonly videoId: string,
@@ -197,8 +210,20 @@ export class GumletIngestService {
    * Idempotent: if the row already carries a Gumlet asset, the existing asset is
    * refreshed rather than a second one created, so a double-submitted job cannot
    * create duplicate (and duplicate-billed) assets.
+   *
+   * `signal` (the worker's job deadline): once aborted, no asset is created.
+   * The one write still allowed after it is recording an asset that Gumlet
+   * already created before the abort - that conditional write is the only
+   * record of a billable asset, and skipping it would orphan the asset and
+   * invite a duplicate on the next attempt.
    */
-  async adopt(videoId: string): Promise<{ assetId: string; status: string }> {
+  async adopt(
+    videoId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<{ assetId: string; status: string }> {
+    const stopIfAbandoned = () => {
+      if (options.signal?.aborted) throw new GumletIngestAbandonedError(videoId);
+    };
     const video = await this.prisma.video.findFirst({
       where: { id: videoId, ...notDeleted },
       select: {
@@ -218,7 +243,7 @@ export class GumletIngestService {
 
     // Already adopted: re-sync rather than create a duplicate asset.
     if (video.gumletAssetId) {
-      const state = await this.sync(videoId);
+      const state = await this.sync(videoId, { signal: options.signal });
       return { assetId: state.assetId, status: state.status };
     }
 
@@ -228,6 +253,8 @@ export class GumletIngestService {
       });
     }
 
+    // The last moment before a billable asset is created.
+    stopIfAbandoned();
     const created = await this.createGumletAsset(video);
 
     await this.markAdopted(videoId, created);
@@ -298,9 +325,10 @@ export class GumletIngestService {
   /**
    * Record a newly created asset on the row and move it into PROCESSING.
    *
-   * Written by `update` rather than `updateMany` because `adopt()` has already
-   * confirmed the row holds NO asset id - there is nothing to lose the race
-   * against, and `replaceFailedAsset()` uses the stricter guarded variant below.
+   * Guarded (`gumletAssetId: null`): `adopt()` confirmed the row held no asset
+   * id before creating one, but a job abandoned at its deadline can arrive
+   * here after a newer run recorded another asset, so the first recorded asset
+   * wins. `replaceFailedAsset()` uses its own guarded variant below.
    */
   private async markAdopted(
     videoId: string,
@@ -314,11 +342,18 @@ export class GumletIngestService {
     // values, so repeating it is safe), and if the database stays unreachable
     // the failure is escalated as non-retryable rather than handed to a retry
     // that would duplicate the asset.
+    //
+    // Guarded on "no asset recorded yet". `adopt()` checked that before it
+    // created the asset, but a job abandoned at its deadline can reach this
+    // write much later, after a newer run recorded a different asset. Writing
+    // unconditionally would then point the row at the stale asset. So the
+    // first recorded asset wins; a later one is reported as an orphan below.
+    let written = 0;
     try {
-      await withDatabaseRetry(
+      ({ count: written } = await withDatabaseRetry(
         () =>
-          this.prisma.video.update({
-            where: { id: videoId },
+          this.prisma.video.updateMany({
+            where: { id: videoId, gumletAssetId: null },
             data: this.buildAdoptionUpdate(created),
           }),
         {
@@ -328,7 +363,7 @@ export class GumletIngestService {
                 `(${describeDatabaseError(error)}, attempt ${attempt}); retrying in ${delayMs} ms`,
             ),
         },
-      );
+      ));
     } catch (error) {
       if (!isTransientDatabaseError(error)) throw error;
       this.logger.error(
@@ -337,6 +372,19 @@ export class GumletIngestService {
           'The job will not be retried automatically, because a retry would create a second asset.',
       );
       throw new GumletAdoptionNotRecordedError(videoId, created.assetId, error);
+    }
+
+    if (written === 0) {
+      this.logger.error(
+        `ORPHANED_GUMLET_ASSET video ${videoId}: Gumlet created asset ${created.assetId} ` +
+          `(tag edu-video:${videoId}) but the row already records another asset (or no longer exists); ` +
+          'keeping the recorded one. The new asset is unused and can be deleted in Gumlet.',
+      );
+      throw new GumletAdoptionNotRecordedError(
+        videoId,
+        created.assetId,
+        new Error('the row already records a different Gumlet asset'),
+      );
     }
 
     this.logger.log(
@@ -753,8 +801,19 @@ export class GumletIngestService {
    * The second check catches the case where DRM was not applied at processing
    * time - Gumlet would report `ready` while the content is unprotected, and
    * playing that through the DRM player would be a silent downgrade.
+   *
+   * `signal` is passed only by the worker's own poll. Once it is aborted (the
+   * job deadline gave up on this call) the call writes nothing: it stops before
+   * the DRM verification (which records its verdict) and before the row write.
+   * The sweep, which calls this without a signal, finishes the video instead.
    */
-  async sync(videoId: string): Promise<{ assetId: string; status: string; playable: boolean }> {
+  async sync(
+    videoId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<{ assetId: string; status: string; playable: boolean }> {
+    const stopIfAbandoned = () => {
+      if (options.signal?.aborted) throw new GumletIngestAbandonedError(videoId);
+    };
     const video = await this.prisma.video.findFirst({
       where: { id: videoId, ...notDeleted },
       select: {
@@ -841,6 +900,7 @@ export class GumletIngestService {
       // DrmVerificationService owns this decision and is the only writer of
       // `drmVerifiedAt`. Delegating keeps ONE definition of "DRM works", so the
       // ingest path and the playback path can never disagree about it.
+      stopIfAbandoned();
       const verdict = await this.drmVerification.verify(videoId);
 
       if (verdict.playable) {
@@ -970,14 +1030,30 @@ export class GumletIngestService {
      * result is about. A sync that lost the row to a replacement writes
      * nothing, so a stale verdict can never overwrite a newer attempt.
      */
+    //
+    // And an IN-PROGRESS observation (neither playable nor a terminal failure)
+    // never touches a row that is already READY on the Gumlet path. Such an
+    // answer can only be stale - Gumlet does not move a finished asset back to
+    // processing - and arrives when a slow or abandoned poll resumes after the
+    // sweep already verified the asset. Writing it would leave a READY video
+    // labelled "processing".
+    const inProgressObservation = !playable && !isTerminalGumletFailure(asset.status);
+    stopIfAbandoned();
     const written = await this.prisma.video.updateMany({
-      where: { id: videoId, gumletAssetId: observedAssetId },
+      where: {
+        id: videoId,
+        gumletAssetId: observedAssetId,
+        ...(inProgressObservation && onGumletPath ? { status: { not: VideoStatus.READY } } : {}),
+      },
       data: update,
     });
 
     if (written.count === 0) {
       this.logger.warn(
-        `video ${videoId}: the Gumlet asset was replaced while it was being read; keeping the newer state`,
+        inProgressObservation && onGumletPath
+          ? `video ${videoId}: ignoring a stale "${asset.status}" observation of asset ${observedAssetId}; ` +
+              'the row is already READY or the asset was replaced'
+          : `video ${videoId}: the Gumlet asset was replaced while it was being read; keeping the newer state`,
       );
     }
 
@@ -1022,11 +1098,22 @@ export class GumletIngestService {
    * assigned `drmProvider = 'gumlet'` takes this branch, and the row is read
    * from the database rather than trusted from the job payload, so a stale or
    * forged job cannot reroute a legacy video.
+   *
+   * `signal` is aborted by the worker when it gives up on this call at its job
+   * deadline. The call is not cancelled (an engine query cannot be), but from
+   * then on it writes nothing: every point where it would act on the row checks
+   * the signal first and stops with `GumletIngestAbandonedError`. That is what
+   * keeps a timed-out ingest from racing the retry or the recovery sweep.
    */
   async processFromJob(
     videoId: string,
     sourceKey: string,
+    options: { signal?: AbortSignal } = {},
   ): Promise<{ handled: boolean; status?: string; playable?: boolean }> {
+    const { signal } = options;
+    const stopIfAbandoned = () => {
+      if (signal?.aborted) throw new GumletIngestAbandonedError(videoId);
+    };
     const video = await this.prisma.video.findFirst({
       where: { id: videoId, ...notDeleted },
       select: { id: true, drmProvider: true, sourceKey: true, status: true },
@@ -1035,6 +1122,7 @@ export class GumletIngestService {
     if (!video || video.drmProvider !== 'gumlet') {
       return { handled: false };
     }
+    stopIfAbandoned();
 
     // A Gumlet video whose source changed under us is stale; refuse rather than
     // ship the wrong media to a paying student.
@@ -1065,16 +1153,23 @@ export class GumletIngestService {
      */
     let assetId: string;
     try {
-      ({ assetId } = await this.adopt(videoId));
+      ({ assetId } = await this.adopt(videoId, { signal }));
     } catch (error) {
       // Neither of these is the provider's answer. A database blip is retried by
       // the queue; an asset that exists but could not be recorded must NOT be
       // classified (its message would otherwise be read as a provider refusal)
       // and must not be retried. Both are re-thrown untouched for the worker.
-      if (isTransientDatabaseError(error) || error instanceof GumletAdoptionNotRecordedError) {
+      // So is a creation call that got no answer: an asset may exist, and the
+      // worker must not retry it either (see GumletCreationOutcomeUnknownError).
+      if (
+        isTransientDatabaseError(error) ||
+        error instanceof GumletAdoptionNotRecordedError ||
+        error instanceof GumletCreationOutcomeUnknownError
+      ) {
         throw error;
       }
       if (isRetryableProviderFailure(error)) throw error;
+      stopIfAbandoned();
 
       const failure = classifyGumletFailure({
         message: error instanceof Error ? error.message : String(error),
@@ -1108,10 +1203,11 @@ export class GumletIngestService {
     let dbStreak = 0;
 
     while (Date.now() < deadline) {
+      stopIfAbandoned();
       let state: { assetId: string; status: string; playable: boolean };
 
       try {
-        state = await this.sync(videoId);
+        state = await this.sync(videoId, { signal });
         transientStreak = 0;
         dbStreak = 0;
       } catch (error) {
@@ -1170,6 +1266,9 @@ export class GumletIngestService {
         continue;
       }
 
+      // A sync that only returned after the worker gave up must not steer
+      // anything: the retry or the sweep owns the row now.
+      stopIfAbandoned();
       last = state.status;
       if (state.playable) return { handled: true, status: state.status, playable: true };
       if (isTerminalGumletFailure(state.status)) {
@@ -1204,12 +1303,24 @@ export class GumletIngestService {
     // recovery sweep re-checks it. Never mark playable.
     // Retried in place: it sets fixed values, and losing it to a blip would
     // send an otherwise-healthy poll back through the queue for nothing.
+    //
+    // CONDITIONAL. This write used to be unconditional, so a poll that resumed
+    // late (after the sweep had already verified the asset and made the video
+    // READY) set a playable video back to PROCESSING. It now applies only while
+    // the row is still in flight and still points at the asset this poll watched.
+    stopIfAbandoned();
     await withDatabaseRetry(() =>
-      this.prisma.video.update({
-        where: { id: videoId },
+      this.prisma.video.updateMany({
+        where: {
+          id: videoId,
+          gumletAssetId: assetId,
+          status: { in: [VideoStatus.QUEUED, VideoStatus.PROCESSING] },
+        },
         data: {
           status: VideoStatus.PROCESSING,
-          gumletStatus: last,        gumletError: `Gumlet processing did not finish within the job budget (asset ${assetId}). It will be re-checked automatically.`,        gumletUpdatedAt: new Date(),
+          gumletStatus: last,
+          gumletError: `Gumlet processing did not finish within the job budget (asset ${assetId}). It will be re-checked automatically.`,
+          gumletUpdatedAt: new Date(),
         },
       }),
     );

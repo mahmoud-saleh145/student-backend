@@ -155,6 +155,31 @@ export class GumletRequestError extends AppException {
   }
 }
 
+/** How long asset creation may take before its outcome is declared unknown. */
+export const GUMLET_CREATE_TIMEOUT_MS = 30_000;
+
+/** Connection failures that prove the create request was never sent. */
+const GUMLET_NOT_SENT_CODES: ReadonlySet<string> = new Set(['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED']);
+
+/**
+ * Asset creation got no answer (timeout or network error after the request
+ * may have been sent). Gumlet may or may not have created the asset, so this
+ * must never be retried automatically: a retry is how a second billable asset
+ * gets made. An operator checks Gumlet for the `edu-video:<id>` tag first.
+ */
+export class GumletCreationOutcomeUnknownError extends Error {
+  override readonly name = 'GumletCreationOutcomeUnknownError';
+  constructor(
+    readonly tags: string[],
+    readonly reason: string,
+  ) {
+    super(
+      `Gumlet asset creation got no answer (${reason}); an asset may exist under tag ` +
+        `${tags.join(', ') || '(none)'}. Not retried automatically - check Gumlet before retrying.`,
+    );
+  }
+}
+
 /** True for HTTP statuses that describe the provider, not the asset. */
 export function isTransientHttpStatus(status: number): boolean {
   return status === 401 || status === 403 || status === 408 || status === 425 || status === 429 || status >= 500;
@@ -432,19 +457,52 @@ export class GumletDrmService {
     if (params.title) body.title = params.title;
     if (params.tag?.length) body.tag = params.tag;
 
-    const res = await fetch('https://api.gumlet.com/v1/video/assets', {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${this.cfg.apiKey}`,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify(body),
-    });
+    // Bounded, and a lost answer is reported as exactly that. Creation is the
+    // one Gumlet call that is not safe to repeat: if the request reached Gumlet
+    // and only the response was lost, an asset exists (tagged with the video
+    // id) and a retry would create a second, separately billed one. So no
+    // answer is NOT a transient provider error here - see
+    // GumletCreationOutcomeUnknownError.
+    const timeoutMs = GUMLET_CREATE_TIMEOUT_MS;
+    let res: Response;
+    try {
+      res = await fetch('https://api.gumlet.com/v1/video/assets', {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${this.cfg.apiKey}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (error) {
+      // The one failure that proves the request never left this machine: the
+      // name did not resolve or the connection was refused. Nothing can exist
+      // at Gumlet, so this one is safe to retry like any provider blip.
+      const causeCode = (error as { cause?: { code?: string } } | null)?.cause?.code;
+      if (causeCode && GUMLET_NOT_SENT_CODES.has(causeCode)) {
+        throw new GumletRequestError(`Gumlet asset creation could not connect (${causeCode})`, true, null);
+      }
+      const name = (error as { name?: string } | null)?.name;
+      const reason =
+        name === 'TimeoutError' || name === 'AbortError' ? `no answer within ${timeoutMs} ms` : 'network error';
+      throw new GumletCreationOutcomeUnknownError(params.tag ?? [], reason);
+    }
 
-    const json = (await res.json().catch(() => null)) as
+    // The body is read under the same deadline. A success status whose body
+    // could not be read means Gumlet accepted the request: outcome unknown.
+    let bodyUnreadable = false;
+    const json = (await res.json().catch(() => {
+      bodyUnreadable = true;
+      return null;
+    })) as
       | { asset_id?: string; status?: string; output?: { playback_url?: string } }
       | { error?: { code?: string; message?: string } }
       | null;
+
+    if (res.ok && (bodyUnreadable || !json || !('asset_id' in json) || !json.asset_id)) {
+      throw new GumletCreationOutcomeUnknownError(params.tag ?? [], `HTTP ${res.status} without a readable asset id`);
+    }
 
     if (!res.ok || !json || 'error' in json) {
       const err = (json as { error?: { message?: string } } | null)?.error;
