@@ -17,6 +17,7 @@ import type { VideoConfig } from '../../config/configuration';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import {
   DEFAULT_JOB_OPTIONS,
+  MOBILE_JOB_PRIORITY,
   MOBILE_VIDEO_JOBS,
   QUEUE_NAMES,
   VIDEO_JOBS,
@@ -879,6 +880,8 @@ export class VideosService {
             jitter: TRANSCODE_BACKOFF_JITTER,
           },
           jobId: `mobile-hls:${video.id}:${Date.now()}`,
+          // Historical work goes behind every upload/retry in this queue.
+          ...(MOBILE_JOB_PRIORITY[trigger] ? { priority: MOBILE_JOB_PRIORITY[trigger] } : {}),
         },
       );
       jobId = String(job.id);
@@ -1213,21 +1216,49 @@ export class VideosService {
 
   /**
    * Claims a video for mobile processing. False when the job is stale: the
-   * video was deleted, its source was replaced, or it is already READY from a
-   * newer job.
+   * video was deleted, its source was replaced, or ANOTHER live job owns it.
    */
   async markMobileProcessing(videoId: string, sourceKey: string, jobId: string): Promise<boolean> {
     // The source key is the staleness guard: a re-upload changes it, and a
-    // deleted row is excluded. The mobile state is deliberately NOT part of the
-    // claim. `enqueueMobileTranscode` writes QUEUED only after the job is in
-    // Redis, so a worker on the same network can pick the job up while the row
-    // still reads NONE (or READY, for a retry) - a status filter here made
-    // exactly that job "stale" and the video was never encoded.
+    // deleted row is excluded. The mobile state alone is deliberately NOT part
+    // of the claim. `enqueueMobileTranscode` writes QUEUED only after the job is
+    // in Redis, so a worker on the same network can pick the job up while the
+    // row still reads NONE (or READY, for a retry) - a plain status filter here
+    // made exactly that job "stale" and the video was never encoded.
+    const current = await this.prisma.video.findFirst({
+      where: { id: videoId, deletedAt: null, sourceKey },
+      select: { mobileStatus: true, mobileJobId: true },
+    });
+    if (!current) return false;
+
+    // NO DUPLICATE ENCODES. When the row is QUEUED/PROCESSING for a DIFFERENT
+    // job that is still live in the queue (waiting, delayed, or active - also
+    // after a worker restart, while the stalled check hands it back), that job
+    // owns the video and this one steps aside. A job re-claiming its own row
+    // after a restart, or one whose recorded job is gone, proceeds.
+    if (
+      current.mobileJobId &&
+      current.mobileJobId !== jobId &&
+      (current.mobileStatus === MobileVideoStatus.QUEUED ||
+        current.mobileStatus === MobileVideoStatus.PROCESSING) &&
+      (await this.mobileJobIsLive(current.mobileJobId))
+    ) {
+      this.logger.warn(
+        `mobile job ${jobId} for video ${videoId} steps aside: job ${current.mobileJobId} owns it and is still live`,
+      );
+      return false;
+    }
+
+    // Compare-and-set, so two DIFFERENT jobs racing past the check above
+    // cannot both win the claim. The row may hold the id just read, or THIS
+    // job's id: `enqueueMobileTranscode` records the id right after adding
+    // the job, and that write can land between the read above and this one.
     const claimed = await this.prisma.video.updateMany({
       where: {
         id: videoId,
         deletedAt: null,
         sourceKey,
+        OR: [{ mobileJobId: current.mobileJobId }, { mobileJobId: jobId }],
       },
       data: {
         mobileStatus: MobileVideoStatus.PROCESSING,

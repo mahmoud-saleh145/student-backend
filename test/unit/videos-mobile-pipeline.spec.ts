@@ -259,14 +259,89 @@ describe('markMobileReady', () => {
 
 describe('markMobileProcessing', () => {
   it('claims only a row whose source still matches the job', async () => {
-    const t = harness();
-    await t.svc.markMobileProcessing('v_1', 'source/v_1.mp4', 'job_1');
+    const t = harness({ rows: [{ id: 'v_1', mobileStatus: 'NONE', mobileJobId: null }] });
+    await expect(t.svc.markMobileProcessing('v_1', 'source/v_1.mp4', 'job_1')).resolves.toBe(true);
     expect(t.prisma.video.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({ id: 'v_1', sourceKey: 'source/v_1.mp4', deletedAt: null }),
         data: expect.objectContaining({ mobileStatus: 'PROCESSING', mobileJobId: 'job_1' }),
       }),
     );
+  });
+
+  it('refuses a deleted or re-uploaded video without writing', async () => {
+    const t = harness({ rows: [] });
+    await expect(t.svc.markMobileProcessing('v_1', 'source/v_1.mp4', 'job_1')).resolves.toBe(false);
+    expect(t.prisma.video.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('steps aside when ANOTHER live job owns the video (no duplicate encode)', async () => {
+    const t = harness({ rows: [{ id: 'v_1', mobileStatus: 'PROCESSING', mobileJobId: 'job_A' }], jobState: 'active' });
+    await expect(t.svc.markMobileProcessing('v_1', 'source/v_1.mp4', 'job_B')).resolves.toBe(false);
+    expect(t.prisma.video.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('lets the owning job re-claim its own row after a worker restart', async () => {
+    const t = harness({ rows: [{ id: 'v_1', mobileStatus: 'PROCESSING', mobileJobId: 'job_A' }], jobState: 'active' });
+    await expect(t.svc.markMobileProcessing('v_1', 'source/v_1.mp4', 'job_A')).resolves.toBe(true);
+  });
+
+  it('proceeds when the recorded job is gone (failed, completed or removed)', async () => {
+    for (const jobState of [null, 'failed', 'completed']) {
+      const t = harness({ rows: [{ id: 'v_1', mobileStatus: 'QUEUED', mobileJobId: 'job_A' }], jobState });
+      await expect(t.svc.markMobileProcessing('v_1', 'source/v_1.mp4', 'job_B')).resolves.toBe(true);
+    }
+  });
+
+  it('claims compare-and-set, so two racing jobs cannot both win', async () => {
+    const t = harness({ rows: [{ id: 'v_1', mobileStatus: 'READY', mobileJobId: 'job_old' }] });
+    (t.prisma.video.updateMany as jest.Mock).mockResolvedValueOnce({ count: 0 }); // the other job won the race
+    await expect(t.svc.markMobileProcessing('v_1', 'source/v_1.mp4', 'job_B')).resolves.toBe(false);
+    expect(t.prisma.video.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ OR: [{ mobileJobId: 'job_old' }, { mobileJobId: 'job_B' }] }),
+      }),
+    );
+  });
+
+  it('still wins when the enqueue records THIS job id between the read and the claim', async () => {
+    // A real row and a real compare-and-set: the queue add happens first, the
+    // row update a moment later - a fast worker can read the row in between.
+    const row: Record<string, unknown> = { id: 'v_1', mobileStatus: 'NONE', mobileJobId: null, sourceKey: 'source/v_1.mp4' };
+    const t = harness({ rows: [row] });
+    (t.prisma.video.findFirst as jest.Mock).mockImplementationOnce(async () => {
+      const seen = { ...row }; // the worker reads NONE / no job...
+      Object.assign(row, { mobileStatus: 'QUEUED', mobileJobId: 'job_B' }); // ...then the enqueue's write lands
+      return seen;
+    });
+    (t.prisma.video.updateMany as jest.Mock).mockImplementationOnce(
+      async ({ where }: { where: { OR: Array<{ mobileJobId: unknown }> } }) => ({
+        count: where.OR.some((c) => c.mobileJobId === row.mobileJobId) ? 1 : 0,
+      }),
+    );
+
+    await expect(t.svc.markMobileProcessing('v_1', 'source/v_1.mp4', 'job_B')).resolves.toBe(true);
+  });
+});
+
+describe('mobile queue priority', () => {
+  it('queues upload and staff-retry jobs with no priority, so they run before any historical job', async () => {
+    for (const trigger of ['upload', 'retry'] as const) {
+      const t = harness({ rows: [{ id: 'v_1', mobileStatus: 'NONE', mobileJobId: null }] });
+      await t.svc.enqueueMobileTranscode({ id: 'v_1', sourceKey: 'k' }, trigger);
+      const opts = (t.mobileQueue.add.mock.calls[0] as unknown[])[2] as Record<string, unknown>;
+      expect(opts).not.toHaveProperty('priority');
+    }
+  });
+
+  it('queues historical migration and recovery jobs behind them', async () => {
+    const seen: Record<string, unknown> = {};
+    for (const trigger of ['migration', 'recovery'] as const) {
+      const t = harness({ rows: [{ id: 'v_1', mobileStatus: 'NONE', mobileJobId: null }] });
+      await t.svc.enqueueMobileTranscode({ id: 'v_1', sourceKey: 'k' }, trigger);
+      seen[trigger] = ((t.mobileQueue.add.mock.calls[0] as unknown[])[2] as Record<string, unknown>).priority;
+    }
+    expect(seen).toEqual({ migration: 10, recovery: 5 });
   });
 });
 

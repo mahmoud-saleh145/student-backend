@@ -12,6 +12,7 @@ import { VideosModule } from '../modules/videos/videos.module';
 import { AnalyticsProcessor } from './processors/analytics.processor';
 import { HlsTranscoder } from './processors/hls-transcoder';
 import { MaintenanceProcessor } from './processors/maintenance.processor';
+import { MobileEncodeScheduler } from './processors/mobile-encode-scheduler';
 import { MobileVideoProcessor } from './processors/mobile-video.processor';
 import { PushProcessor } from './processors/push.processor';
 import { ScratchGuard } from './processors/scratch-guard';
@@ -119,6 +120,8 @@ if (!runWorkers && process.env.NODE_ENV !== 'test') {
     // Shared by the legacy and mobile video processors; harmless on the API.
     HlsTranscoder,
     ScratchGuard,
+    // Cross-queue rule: new uploads before historical mobile HLS work.
+    MobileEncodeScheduler,
     ...(runWorkers ? [...selectProcessors(process.env.WORKER_QUEUES), WorkerHeartbeat] : []),
   ],
   exports: [BullModule],
