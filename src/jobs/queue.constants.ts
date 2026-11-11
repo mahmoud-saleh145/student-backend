@@ -77,6 +77,24 @@ export interface MobileTranscodeJobData {
   requestedById?: string;
 }
 
+/**
+ * BullMQ priority of a mobile job by trigger. BullMQ 5 takes the plain wait
+ * list (no priority) before the prioritized set, so `upload` and staff `retry`
+ * jobs always run before historical `recovery` and `migration` work. Higher
+ * number = later. See MobileEncodeScheduler for the cross-queue half.
+ */
+export const MOBILE_JOB_PRIORITY: Record<MobileTranscodeJobData['trigger'], number | undefined> = {
+  upload: undefined,
+  retry: undefined,
+  recovery: 5,
+  migration: 10,
+};
+
+/** Historical mobile work: yields to new uploads waiting in the original queue. */
+export function isHistoricalMobileJob(trigger: MobileTranscodeJobData['trigger'] | undefined): boolean {
+  return trigger === 'migration' || trigger === 'recovery';
+}
+
 // ---------------------------------------------------------------------------
 // Push delivery
 // ---------------------------------------------------------------------------

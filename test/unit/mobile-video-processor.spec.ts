@@ -23,6 +23,9 @@ function build(
     runError?: Error;
     paused?: boolean;
     preflight?: { ok: boolean; shortfallBytes?: number } | 'missing';
+    trigger?: MobileTranscodeJobData['trigger'];
+    uploadsWaiting?: number | 'unreadable';
+    slotBusy?: boolean;
   } = {},
 ) {
   const videos = {
@@ -74,7 +77,21 @@ function build(
     noteFinished: jest.fn(),
     noteDeferred: jest.fn(),
   };
-  const processor = new MobileVideoProcessor(transcoder as never, videos as never, config as never, guard as never);
+  const slot = { holder: 'host:1:mobile-hls:v_1:1', release: jest.fn(async () => undefined) };
+  const scheduler = {
+    uploadPressure: jest.fn(async () => {
+      if (opts.uploadsWaiting === 'unreadable') throw new Error('redis down');
+      return { waiting: opts.uploadsWaiting ?? 0, ignoredStale: 0, originalQueuePaused: false };
+    }),
+    acquireEncodeSlot: jest.fn(async () => (opts.slotBusy ? null : slot)),
+  };
+  const processor = new MobileVideoProcessor(
+    transcoder as never,
+    videos as never,
+    config as never,
+    guard as never,
+    scheduler as never,
+  );
   const job = {
     id: 'mobile-hls:v_1:1',
     name: MOBILE_VIDEO_JOBS.transcode,
@@ -85,13 +102,13 @@ function build(
       sourceKey: 'source/videos/v_1.mp4',
       ladder: [360, 720],
       encrypt: true,
-      trigger: 'upload',
+      trigger: opts.trigger ?? 'upload',
       durationSeconds: 2654,
     },
     updateProgress: jest.fn(async () => undefined),
     moveToDelayed: jest.fn(async () => undefined),
   } as unknown as Job<MobileTranscodeJobData>;
-  return { processor, videos, transcoder, job, guard };
+  return { processor, videos, transcoder, job, guard, scheduler, slot };
 }
 
 describe('MobileVideoProcessor', () => {
@@ -243,6 +260,85 @@ describe('MobileVideoProcessor', () => {
     await t.processor.process(t.job);
     expect(t.guard.noteActive).toHaveBeenCalledWith(expect.objectContaining({ videoId: 'v_1', jobId: 'mobile-hls:v_1:1' }));
     expect(t.guard.noteFinished).toHaveBeenCalledWith('v_1');
+  });
+
+  describe('new uploads before historical HLS work', () => {
+    it('defers a migration job while a new upload waits in the original queue (no attempt, row untouched)', async () => {
+      const t = build({ trigger: 'migration', uploadsWaiting: 2 });
+
+      await expect(t.processor.process(t.job, 'tok')).rejects.toBeInstanceOf(DelayedError);
+      expect(t.job.moveToDelayed).toHaveBeenCalledWith(expect.any(Number), 'tok');
+      expect(t.transcoder.preflight).not.toHaveBeenCalled(); // nothing downloaded or sized
+      expect(t.scheduler.acquireEncodeSlot).not.toHaveBeenCalled();
+      expect(t.videos.markMobileProcessing).not.toHaveBeenCalled();
+      expect(t.guard.noteDeferred).toHaveBeenCalledWith('v_1', expect.stringContaining('upload priority'));
+    });
+
+    it('defers a recovery job the same way', async () => {
+      const t = build({ trigger: 'recovery', uploadsWaiting: 1 });
+      await expect(t.processor.process(t.job, 'tok')).rejects.toBeInstanceOf(DelayedError);
+      expect(t.transcoder.run).not.toHaveBeenCalled();
+    });
+
+    it('runs a migration job once no upload is waiting', async () => {
+      const t = build({ trigger: 'migration', uploadsWaiting: 0 });
+      await expect(t.processor.process(t.job, 'tok')).resolves.toEqual({ videoId: 'v_1', renditions: 2 });
+    });
+
+    it("never holds back a new upload's own mobile job, or a staff retry", async () => {
+      for (const trigger of ['upload', 'retry'] as const) {
+        const t = build({ trigger, uploadsWaiting: 5 });
+        await expect(t.processor.process(t.job, 'tok')).resolves.toEqual({ videoId: 'v_1', renditions: 2 });
+        expect(t.scheduler.uploadPressure).not.toHaveBeenCalled();
+      }
+    });
+
+    it('defers (never starts) a historical job when the original queue cannot be read', async () => {
+      const t = build({ trigger: 'migration', uploadsWaiting: 'unreadable' });
+      await expect(t.processor.process(t.job, 'tok')).rejects.toBeInstanceOf(DelayedError);
+      expect(t.transcoder.run).not.toHaveBeenCalled();
+    });
+
+    it('checks the operator pause first: a paused pipeline does not even look at the upload queue', async () => {
+      const t = build({ trigger: 'migration', paused: true });
+      await expect(t.processor.process(t.job, 'tok')).rejects.toBeInstanceOf(DelayedError);
+      expect(t.scheduler.uploadPressure).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('one mobile encode at a time, across processes', () => {
+    it('defers when another process holds the encode slot, before claiming the video', async () => {
+      const t = build({ slotBusy: true });
+
+      await expect(t.processor.process(t.job, 'tok')).rejects.toBeInstanceOf(DelayedError);
+      expect(t.videos.markMobileProcessing).not.toHaveBeenCalled();
+      expect(t.transcoder.run).not.toHaveBeenCalled();
+      expect(t.guard.noteDeferred).toHaveBeenCalledWith('v_1', expect.stringContaining('slot'));
+    });
+
+    it('takes the slot for this job and releases it on success', async () => {
+      const t = build();
+      await t.processor.process(t.job);
+      expect(t.scheduler.acquireEncodeSlot).toHaveBeenCalledWith('mobile-hls:v_1:1');
+      expect(t.slot.release).toHaveBeenCalledTimes(1);
+    });
+
+    it('releases the slot on failure, on a stale skip, and on a disk-pressure deferral', async () => {
+      for (const t of [
+        build({ runError: new Error('ffmpeg exited with 1') }),
+        build({ claimed: false }),
+        build({ runError: new TranscodeDiskPressureError('below the reserve') }),
+      ]) {
+        await t.processor.process(t.job, 'tok').catch(() => undefined);
+        expect(t.slot.release).toHaveBeenCalledTimes(1);
+      }
+    });
+
+    it('does not take the slot while the disk preflight defers the job', async () => {
+      const t = build({ preflight: { ok: false, shortfallBytes: 1e9 } });
+      await t.processor.process(t.job, 'tok').catch(() => undefined);
+      expect(t.scheduler.acquireEncodeSlot).not.toHaveBeenCalled();
+    });
   });
 
   it('keeps the original error when recording the failure itself fails', async () => {

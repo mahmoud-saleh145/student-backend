@@ -16,6 +16,13 @@ import {
   TranscodeEnvironmentError,
   TranscodeOutputError,
 } from './hls-transcoder';
+import {
+  DEFER_FOR_ENCODE_SLOT_MS,
+  DEFER_FOR_UPLOADS_MS,
+  isHistoricalMobileJob,
+  MobileEncodeScheduler,
+  type EncodeSlot,
+} from './mobile-encode-scheduler';
 import { formatBytes, ScratchGuard } from './scratch-guard';
 
 /** How long a deferred job waits before the worker looks at it again. */
@@ -36,8 +43,12 @@ export const DEFER_WHEN_DISK_LOW_MS = 5 * 60_000;
  * Before a job is CLAIMED it can be DEFERRED (moved back to the delayed set
  * without using an attempt and without touching the row's state):
  *  - the operator paused mobile processing (ScratchGuard pause flag);
+ *  - it is HISTORICAL work (`migration`/`recovery`) and a new upload is waiting
+ *    in the original queue (MobileEncodeScheduler: new uploads always first);
  *  - the scratch volume cannot hold this job's budget while keeping the
- *    configured reserve free (ScratchGuard.assess, before any download).
+ *    configured reserve free (ScratchGuard.assess, before any download);
+ *  - another process holds the single mobile encode slot (one ffmpeg ladder
+ *    at a time across every worker, not just within this one).
  * A running encode that trips the reserve is killed by the disk watchdog and
  * deferred the same way; the row goes back to QUEUED with a note.
  *
@@ -65,12 +76,20 @@ export const DEFER_WHEN_DISK_LOW_MS = 5 * 60_000;
 export class MobileVideoProcessor extends WorkerHost implements OnModuleInit {
   private readonly logger = new Logger(MobileVideoProcessor.name);
   private readonly cfg: VideoConfig;
+  /** Deferral intervals; a field only so a real-queue test can shorten them. */
+  protected deferMs = {
+    paused: DEFER_WHEN_PAUSED_MS,
+    uploads: DEFER_FOR_UPLOADS_MS,
+    disk: DEFER_WHEN_DISK_LOW_MS,
+    slot: DEFER_FOR_ENCODE_SLOT_MS,
+  };
 
   constructor(
     private readonly transcoder: HlsTranscoder,
     private readonly videos: VideosService,
     config: ConfigService,
     private readonly guard: ScratchGuard,
+    private readonly scheduler: MobileEncodeScheduler,
   ) {
     super();
     this.cfg = config.getOrThrow<VideoConfig>('video');
@@ -101,7 +120,21 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit {
     const pause = await this.guard.pauseState();
     if (pause.paused) {
       this.logger.log(`mobile processing is paused (${pause.reason ?? 'no reason given'}); deferring ${videoId}`);
-      return this.defer(job, token, DEFER_WHEN_PAUSED_MS, 'paused');
+      return this.defer(job, token, this.deferMs.paused, 'paused');
+    }
+
+    // New uploads first. Read failures defer too: a historical encode never
+    // starts on an unknown.
+    if (isHistoricalMobileJob(trigger)) {
+      const pressure = await this.scheduler.uploadPressure().catch((e: Error) => {
+        this.logger.warn(`could not read the original upload queue (${e.message}); deferring ${videoId}`);
+        return null;
+      });
+      if (!pressure || pressure.waiting > 0) {
+        const why = pressure ? `${pressure.waiting} new upload(s) waiting` : 'upload queue unreadable';
+        this.guard.noteDeferred(videoId, `upload priority: ${why}`);
+        return this.defer(job, token, this.deferMs.uploads, `upload priority: ${why}`);
+      }
     }
 
     const preflight = await this.transcoder.preflight({ workDir, sourceKey, durationSeconds, ladder, guardId: videoId });
@@ -113,7 +146,17 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit {
           `${formatBytes(a.minFreeBytes)} must stay free (short by ${formatBytes(a.shortfallBytes)})`,
       );
       this.guard.noteDeferred(videoId, `disk: short by ${formatBytes(a.shortfallBytes)}`);
-      return this.defer(job, token, DEFER_WHEN_DISK_LOW_MS, 'disk');
+      return this.defer(job, token, this.deferMs.disk, 'disk');
+    }
+
+    // One mobile encode at a time across every worker process.
+    const slot: EncodeSlot | null = await this.scheduler.acquireEncodeSlot(String(job.id)).catch((e: Error) => {
+      this.logger.warn(`could not take the mobile encode slot (${e.message}); deferring ${videoId}`);
+      return null;
+    });
+    if (!slot) {
+      this.guard.noteDeferred(videoId, 'another mobile encode holds the slot');
+      return this.defer(job, token, this.deferMs.slot, 'encode slot busy');
     }
 
     this.logger.log(`mobile transcode ${videoId} (job ${job.id}, ${trigger})`);
@@ -178,7 +221,7 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit {
           .markMobileDeferred(videoId, `Paused for disk space: ${message}`)
           .catch((e: Error) => this.logger.error(`video ${videoId}: could not record the deferral (${e.message})`));
         this.guard.noteDeferred(videoId, 'disk pressure during encode');
-        return this.defer(job, token, DEFER_WHEN_DISK_LOW_MS, 'disk pressure');
+        return this.defer(job, token, this.deferMs.disk, 'disk pressure');
       }
 
       const reason =
@@ -199,6 +242,7 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit {
     } finally {
       this.guard.noteFinished(videoId);
       await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+      await slot.release();
     }
   }
 
