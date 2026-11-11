@@ -136,7 +136,10 @@ describe('a legacy video (drmProvider null in the database)', () => {
 
     // `handled: false` means "not mine" - the ingest service declines and the
     // local path runs.
-    expect(t.gumletIngest.processFromJob).toHaveBeenCalledWith('v_1', 'uploads/v_1.bin');
+    // The only other argument is the job deadline's abort signal - no routing data.
+    expect(t.gumletIngest.processFromJob).toHaveBeenCalledWith('v_1', 'uploads/v_1.bin', {
+      signal: expect.any(AbortSignal),
+    });
     expect(t.transcoder.run).toHaveBeenCalledWith(
       expect.objectContaining({ videoId: 'v_1', sourceKey: 'uploads/v_1.bin', ladder: [720] }),
     );
@@ -223,7 +226,10 @@ describe('a Gumlet-backed video', () => {
 
     // The processor passed only the identifiers, so a payload claiming a
     // provider cannot influence the decision.
-    expect(t.gumletIngest.processFromJob).toHaveBeenCalledWith('v_1', 'uploads/v_1.bin');
+    // The only other argument is the job deadline's abort signal - no routing data.
+    expect(t.gumletIngest.processFromJob).toHaveBeenCalledWith('v_1', 'uploads/v_1.bin', {
+      signal: expect.any(AbortSignal),
+    });
     expect(t.gumletIngest.processFromJob).toHaveBeenCalledTimes(1);
   });
 });

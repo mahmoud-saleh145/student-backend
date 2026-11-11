@@ -221,6 +221,15 @@ export class EnvironmentVariables {
    */
   @IsOptional() @IsString() WORKER_QUEUES?: string;
 
+  /**
+   * Bounded database behaviour, set on the laptop worker only (unset = the
+   * previous unbounded behaviour, which the API keeps). See
+   * src/database/bounded-operations.ts for what each one does and does not bound.
+   */
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1000) @Max(600_000) DATABASE_OPERATION_TIMEOUT_MS?: number;
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(120) DATABASE_CONNECT_TIMEOUT_SECONDS?: number;
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(3600) DATABASE_SOCKET_TIMEOUT_SECONDS?: number;
+
   @IsString()
   @MinLength(32, { message: 'HLS_KEY_ROOT must be at least 32 characters' })
   HLS_KEY_ROOT!: string;

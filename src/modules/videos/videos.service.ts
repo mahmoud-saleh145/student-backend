@@ -789,11 +789,12 @@ export class VideosService {
       if (!video.sourceKey) continue;
 
       if (video.status === VideoStatus.PROCESSING) {
-        await this.markFailed(
+        // Conditional: a sync may have finished the video since it was read.
+        const recorded = await this.markFailed(
           video.id,
           `Processing was interrupted (job ${state}); retry to process the stored file again`,
         );
-        failed += 1;
+        if (recorded) failed += 1;
         continue;
       }
 
@@ -1906,12 +1907,25 @@ export class VideosService {
     this.logger.log(`video ${videoId} is READY (${result.renditions.length} renditions)`);
   }
 
-  async markFailed(videoId: string, error: string): Promise<void> {
-    await this.prisma.video.update({
-      where: { id: videoId },
+  /**
+   * Records a processing failure - unless the video is already READY.
+   *
+   * Conditional on purpose: the sweep and a failing job both decide from a row
+   * they read earlier, and meanwhile a provider sync (or a duplicate job) may
+   * have finished the video. A READY video is never turned back into FAILED.
+   * Returns whether the failure was recorded.
+   */
+  async markFailed(videoId: string, error: string): Promise<boolean> {
+    const { count } = await this.prisma.video.updateMany({
+      where: { id: videoId, status: { not: VideoStatus.READY } },
       data: { status: VideoStatus.FAILED, processingError: error.slice(0, 1000) },
     });
+    if (count === 0) {
+      this.logger.warn(`video ${videoId}: failure not recorded, the video is already READY (or gone): ${error}`);
+      return false;
+    }
     this.logger.error(`video ${videoId} processing failed: ${error}`);
+    return true;
   }
 
   // ---------------------------------------------------------------------------
