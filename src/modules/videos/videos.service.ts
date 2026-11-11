@@ -1249,14 +1249,16 @@ export class VideosService {
       return false;
     }
 
-    // Compare-and-set on the job id just read, so two jobs racing past the
-    // check above cannot both win the claim.
+    // Compare-and-set, so two DIFFERENT jobs racing past the check above
+    // cannot both win the claim. The row may hold the id just read, or THIS
+    // job's id: `enqueueMobileTranscode` records the id right after adding
+    // the job, and that write can land between the read above and this one.
     const claimed = await this.prisma.video.updateMany({
       where: {
         id: videoId,
         deletedAt: null,
         sourceKey,
-        mobileJobId: current.mobileJobId,
+        OR: [{ mobileJobId: current.mobileJobId }, { mobileJobId: jobId }],
       },
       data: {
         mobileStatus: MobileVideoStatus.PROCESSING,

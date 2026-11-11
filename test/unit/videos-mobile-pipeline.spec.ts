@@ -293,13 +293,34 @@ describe('markMobileProcessing', () => {
     }
   });
 
-  it('claims compare-and-set on the job id it read, so two racing jobs cannot both win', async () => {
+  it('claims compare-and-set, so two racing jobs cannot both win', async () => {
     const t = harness({ rows: [{ id: 'v_1', mobileStatus: 'READY', mobileJobId: 'job_old' }] });
     (t.prisma.video.updateMany as jest.Mock).mockResolvedValueOnce({ count: 0 }); // the other job won the race
     await expect(t.svc.markMobileProcessing('v_1', 'source/v_1.mp4', 'job_B')).resolves.toBe(false);
     expect(t.prisma.video.updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({ where: expect.objectContaining({ mobileJobId: 'job_old' }) }),
+      expect.objectContaining({
+        where: expect.objectContaining({ OR: [{ mobileJobId: 'job_old' }, { mobileJobId: 'job_B' }] }),
+      }),
     );
+  });
+
+  it('still wins when the enqueue records THIS job id between the read and the claim', async () => {
+    // A real row and a real compare-and-set: the queue add happens first, the
+    // row update a moment later - a fast worker can read the row in between.
+    const row: Record<string, unknown> = { id: 'v_1', mobileStatus: 'NONE', mobileJobId: null, sourceKey: 'source/v_1.mp4' };
+    const t = harness({ rows: [row] });
+    (t.prisma.video.findFirst as jest.Mock).mockImplementationOnce(async () => {
+      const seen = { ...row }; // the worker reads NONE / no job...
+      Object.assign(row, { mobileStatus: 'QUEUED', mobileJobId: 'job_B' }); // ...then the enqueue's write lands
+      return seen;
+    });
+    (t.prisma.video.updateMany as jest.Mock).mockImplementationOnce(
+      async ({ where }: { where: { OR: Array<{ mobileJobId: unknown }> } }) => ({
+        count: where.OR.some((c) => c.mobileJobId === row.mobileJobId) ? 1 : 0,
+      }),
+    );
+
+    await expect(t.svc.markMobileProcessing('v_1', 'source/v_1.mp4', 'job_B')).resolves.toBe(true);
   });
 });
 
