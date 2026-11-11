@@ -17,6 +17,39 @@ import { RESPONSIVE_WORKER } from '../queue.tuning';
 import { HlsTranscoder, TranscodeEnvironmentError } from './hls-transcoder';
 
 /**
+ * Hard ceiling on one Gumlet ingest inside a job.
+ *
+ * `processFromJob` has its own 20-minute poll budget and every provider call in
+ * it is time-bounded, so in theory it always returns. In production on
+ * 2026-11-10 one did not: a job went silent right after Gumlet accepted the
+ * asset and stayed `active` for 11.5 hours. The worker kept renewing its lock,
+ * so the stalled check never reclaimed it, and with `concurrency: 1` every
+ * upload queued behind it waited too (nine videos, until the worker was
+ * restarted by hand). Whatever never settled, this queue must not depend on it.
+ *
+ * Racing the ingest against a deadline frees the slot. The row and its recorded
+ * asset id are left exactly as they are, so nothing is lost: the queue's own
+ * retry resumes the recorded asset (adopt() never creates a second one), and
+ * the recovery sweep re-syncs a PROCESSING Gumlet row with an asset in any case.
+ * The deadline sits well past the poll budget so it only ever fires on a hang.
+ */
+export const GUMLET_INGEST_JOB_DEADLINE_MS = 35 * 60_000;
+
+/** The ingest promise did not settle within GUMLET_INGEST_JOB_DEADLINE_MS. */
+export class GumletIngestStalledError extends Error {
+  override readonly name = 'GumletIngestStalledError';
+}
+
+/** `work`, or a GumletIngestStalledError once `ms` have passed; the timer never outlives the race. */
+export function settleWithin<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new GumletIngestStalledError(message)), ms);
+  });
+  return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
+}
+
+/**
  * Primary (web) video processing.
  *
  * Runs in the worker process (`npm run worker`), never in the API.
@@ -79,7 +112,12 @@ export class VideoProcessor extends WorkerHost {
       // replayed job can never reroute a legacy R2/HLS video onto the Gumlet
       // path. Non-Gumlet videos return `handled: false` and fall through to the
       // ffmpeg path below.
-      const gumlet = await this.gumletIngest.processFromJob(videoId, sourceKey);
+      const gumlet = await settleWithin(
+        this.gumletIngest.processFromJob(videoId, sourceKey),
+        GUMLET_INGEST_JOB_DEADLINE_MS,
+        `Gumlet ingest for video ${videoId} did not settle within ` +
+          `${GUMLET_INGEST_JOB_DEADLINE_MS / 60_000} minutes (job ${job.id})`,
+      );
       if (gumlet.handled) {
         this.logger.log(
           `video ${videoId} handled by Gumlet ingest (status ${gumlet.status ?? 'n/a'}, playable ${gumlet.playable === true})`,
@@ -121,6 +159,20 @@ export class VideoProcessor extends WorkerHost {
       return { videoId, renditions: result.renditions.length };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+
+      // A HUNG INGEST IS NOT A VERDICT ON THE VIDEO EITHER.
+      //
+      // The asset may well be fine (the 2026-11-10 one was ready and verified
+      // half an hour later). So, like a database outage below, the row is not
+      // stamped FAILED: it stays as the ingest left it, the slot is released,
+      // and the queue's retry or the recovery sweep finishes the video.
+      if (error instanceof GumletIngestStalledError) {
+        this.logger.error(
+          `${message}; releasing the queue slot (attempt ${job.attemptsMade + 1} of ${job.opts?.attempts ?? 1}). ` +
+            'The row and its recorded Gumlet asset are left unchanged; a queue retry or the recovery sweep resumes it.',
+        );
+        throw error;
+      }
 
       // A DATABASE OUTAGE IS NOT A VERDICT ON THE VIDEO.
       //
