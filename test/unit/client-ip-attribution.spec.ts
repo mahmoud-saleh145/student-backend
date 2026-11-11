@@ -122,6 +122,67 @@ describe('what a WRONG hop count does (why D6 needs live evidence)', () => {
   });
 });
 
+describe('Render, as measured in production (2026-11-10): three appended hops', () => {
+  // GET /admin/diagnostics/client-ip on production returned this chain shape
+  // (addresses replaced by documentation ranges): Cloudflare appends the
+  // address it saw, Render's balancer appends Cloudflare's edge, and Render's
+  // internal hop appends the balancer. `cf-connecting-ip` equalled hop 3.
+  const CF_SAW = '198.51.100.10';
+  const CF_EDGE = '104.22.0.5';
+  const RENDER_BALANCER = '10.24.0.30';
+  const chain = (client: string, written = '') =>
+    [written, client, CF_EDGE, RENDER_BALANCER].filter(Boolean).join(', ');
+
+  it('with the default of 1, every visitor shares the balancer bucket (the production bug)', async () => {
+    const a = app(1);
+    const one = await tracker(a, { 'x-forwarded-for': chain(CF_SAW) });
+    const two = await tracker(a, { 'x-forwarded-for': chain('203.0.113.77') });
+    expect(one.tracker).toBe(`ip:${RENDER_BALANCER}`);
+    expect(two.tracker).toBe(one.tracker);
+  });
+
+  it('with 3, each visitor gets the address Cloudflare saw', async () => {
+    const a = app(3);
+    const one = await tracker(a, { 'x-forwarded-for': chain(CF_SAW) });
+    const two = await tracker(a, { 'x-forwarded-for': chain('203.0.113.77') });
+    expect(one.tracker).toBe(`ip:${CF_SAW}`);
+    expect(one.ip).toBe(CF_SAW);
+    expect(two.tracker).toBe('ip:203.0.113.77');
+  });
+
+  it('with 3, anything the client wrote into X-Forwarded-For is ignored', async () => {
+    const a = app(3);
+    const seen = new Set<string>();
+    for (const written of ['1.1.1.1', '2.2.2.2, 3.3.3.3', '10.0.0.1, 127.0.0.1', '6.6.6.6, 7.7.7.7, 8.8.8.8, 9.9.9.9']) {
+      seen.add((await tracker(a, { 'x-forwarded-for': chain(CF_SAW, written) })).tracker);
+    }
+    expect([...seen]).toEqual([`ip:${CF_SAW}`]);
+  });
+
+  it('the diagnostic reports hop 3 as the address Cloudflare saw', async () => {
+    const r = await tracker(app(3), { 'x-forwarded-for': chain(CF_SAW, '6.6.6.6') });
+    expect(r.chain.ipByHopCount['1']).toBe(RENDER_BALANCER);
+    expect(r.chain.ipByHopCount['2']).toBe(CF_EDGE);
+    expect(r.chain.ipByHopCount['3']).toBe(CF_SAW);
+  });
+
+  it('credential and signed-in traffic keep their own keys under 3 as well', async () => {
+    const login = await tracker(app(3), { 'x-forwarded-for': chain(CF_SAW) }, { phone: '010 0123 4567', password: 'x' });
+    expect(login.tracker).toBe('phone:01001234567');
+    const signedIn = await tracker(app(3, { user: 'usr_1' }), { 'x-forwarded-for': chain(CF_SAW) });
+    expect(signedIn.tracker).toBe('user:usr_1');
+  });
+
+  it('the trusted web server path still wins with the secret under 3', async () => {
+    const r = await tracker(app(3), {
+      'x-forwarded-for': chain('18.200.0.1'),
+      [WEB_CLIENT_IP_HEADER]: '41.33.1.2',
+      [WEB_PROXY_SECRET_HEADER]: SECRET,
+    });
+    expect(r.tracker).toBe('ip:41.33.1.2');
+  });
+});
+
 describe('the trusted web server (student web on Vercel)', () => {
   const VERCEL = '18.200.0.1';
 
