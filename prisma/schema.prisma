@@ -560,6 +560,9 @@ model LibraryMaterialDepartment {
   material   LibraryMaterial @relation(fields: [materialId, facultyId], references: [id, facultyId], onDelete: Cascade, onUpdate: Cascade)
   department Department      @relation(fields: [departmentId, facultyId], references: [id, facultyId], onDelete: Restrict, onUpdate: Restrict)
 
+  /// The years this department finds the material under (per-year audiences).
+  yearDepartments LibraryMaterialYearDepartment[]
+
   @@id([materialId, departmentId])
   @@index([departmentId])
   @@map("library_material_departments")
@@ -579,9 +582,39 @@ model LibraryMaterialAcademicYear {
   material     LibraryMaterial @relation(fields: [materialId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   academicYear AcademicYear    @relation(fields: [academicYearId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
+  /// For a DEPARTMENTS material: the departments that find it under this year.
+  departments LibraryMaterialYearDepartment[]
+
   @@id([materialId, academicYearId])
   @@index([academicYearId])
   @@map("library_material_academic_years")
+}
+
+/// Which departments find a material under which year/level.
+///
+/// Only a DEPARTMENTS material filed under specific years has rows, and then
+/// every year link and every department link has at least one. Each row says
+/// "a student of this department finds the material when browsing this
+/// year/level": a BROWSING rule. Eligibility still reads only
+/// `library_material_departments` (the union over the years), and a student's
+/// own registered year is never compared with anything here.
+///
+/// The two composite keys keep the shape in the database: the year must be one
+/// the material is filed under, and the department one it reaches (and so of
+/// its faculty). Removing either link removes its rows.
+model LibraryMaterialYearDepartment {
+  materialId     String
+  academicYearId String
+  departmentId   String
+  createdAt      DateTime @default(now())
+
+  yearLink       LibraryMaterialAcademicYear @relation(fields: [materialId, academicYearId], references: [materialId, academicYearId], onDelete: Cascade, onUpdate: Cascade)
+  departmentLink LibraryMaterialDepartment   @relation(fields: [materialId, departmentId], references: [materialId, departmentId], onDelete: Cascade, onUpdate: Cascade)
+
+  @@id([materialId, academicYearId, departmentId])
+  @@index([academicYearId, departmentId])
+  @@index([materialId, departmentId])
+  @@map("library_material_year_departments")
 }
 
 /// One sellable document within a material.

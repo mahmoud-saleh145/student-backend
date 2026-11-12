@@ -683,6 +683,27 @@ student's academic details, `coversAllSections`, `sectionIds` and `redemption`.
   and `hasCover`; the list accepts `academicYearId` and `facultyId` filters.
   The column `library_materials.academicYearId` stays and mirrors the first
   linked rung.
+- **Library departments per year/level (2026-11-12).** A `DEPARTMENTS`
+  material filed under specific years lists its departments per year
+  (`library_material_year_departments`). Admin `POST/PATCH
+  /admin/library/materials` accept `yearScope` (`ALL_YEARS` |
+  `SELECTED_YEARS`, optional, must agree with what else is sent) and
+  `audienceMappings: [{ academicYearId, departmentIds[] }]` (max 20 groups;
+  each group one year and at least one department; no year twice).
+  `audienceMappings` stands for `departmentIds` (the union) and
+  `academicYearIds`; if those are sent beside it they must agree. Without it,
+  the previous payload still works: `departmentIds` + years = the same
+  departments under every year. Refusals name
+  `audienceMappings.<i>.academicYearId` or `audienceMappings.<i>.departmentIds`
+  (422). Admin detail gained `yearScope`, `audienceMappings[]` and
+  `audience.yearScope` / `audience.mappings[{ academicYear, departments[] }]`;
+  `departmentIds` is the union. Admin list rows gained `yearScope`.
+  Students: `GET /library/materials?academicYearId=` now matches a
+  department-scoped material only when the student's department is listed
+  under THAT year (plus "all years" materials and whole-college materials
+  filed under it). Eligibility is unchanged: faculty + department (the union),
+  never the student's own year. Student `academicYears[]` lists only the years
+  the student finds the material under. No field was removed.
 - **Public images (2026-11-10).** `GET /assets/<key>` (public, no auth, no
   signature) serves `thumbnails/courses/…`, `thumbnails/library/…` and
   `avatars/…` from the media bucket with `Cache-Control: public, immutable`
