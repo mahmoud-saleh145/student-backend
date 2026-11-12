@@ -26,6 +26,18 @@ import {
 } from '../storage/storage.service';
 import { PlatformSettingsService } from '../settings/platform-settings.service';
 
+import { MAX_MATERIAL_ACADEMIC_YEARS } from './dto/library.dto';
+
+import {
+  type AudienceInput,
+  type LibraryYearScope,
+  type RawAudience,
+  academicYearIdsFrom,
+  normalizeAudience,
+  rungsForStudent,
+  studentYearFilter,
+  yearDepartmentRows,
+} from './library-audience';
 import {
   LibraryEligibilityService,
   MATERIAL_AUDIENCE_SELECT,
@@ -66,6 +78,8 @@ export type LibraryPackageAccess = 'OWNED' | 'PURCHASABLE' | 'UNAVAILABLE';
  * The years come as `academicYearIds` (the list) or, from a client that
  * predates the list, as the single `academicYearId`; either one satisfies the
  * "send the whole audience" rule, and the list wins when both are present.
+ * `audienceMappings` (departments per year) stands for both the departments
+ * and the years, and an explicit `yearScope` stands for the years.
  */
 const AUDIENCE_KEYS = [
   'universityId',
@@ -74,15 +88,6 @@ const AUDIENCE_KEYS = [
   'departmentIds',
   'academicYearIds',
 ] as const;
-
-interface AudienceInput {
-  universityId: string | null;
-  facultyId: string | null;
-  departmentScope: LibraryDepartmentScope;
-  departmentIds: string[];
-  /** De-duplicated. Empty means "all years". */
-  academicYearIds: string[];
-}
 
 /**
  * The year/level links as every read loads them: in ladder order, with the
@@ -102,6 +107,23 @@ const MATERIAL_YEARS_SELECT = {
     },
   },
 } as const;
+
+/**
+ * The same links for a STUDENT read: each rung also says whether it lists the
+ * student's own department, and nothing about any other department.
+ */
+function studentYearsSelect(departmentId: string | null) {
+  return {
+    orderBy: { academicYear: { order: 'asc' as const } },
+    select: {
+      ...MATERIAL_YEARS_SELECT.select,
+      departments: {
+        where: { departmentId: departmentId ?? '__no_department__' },
+        select: { departmentId: true },
+      },
+    },
+  };
+}
 
 interface MaterialYearLink {
   academicYear: {
@@ -131,7 +153,8 @@ function academicYearRefs(links: MaterialYearLink[] | undefined): AcademicYearRe
 }
 
 /**
- * The year/level browsing filter.
+ * The ADMIN year/level filter (students use `studentYearFilter`, which also
+ * reads the per-year departments).
  *
  * A material filed under the requested rung matches, and so does a material
  * filed under NO rung: "all years" means every year, this one included. The
@@ -145,22 +168,6 @@ export function academicYearFilter(academicYearId: string): Prisma.LibraryMateri
       { academicYears: { none: {} } },
     ],
   };
-}
-
-/**
- * Normalises the two ways a client can send the years into one list.
- *
- * `undefined` for both means "not sent" (an edit that leaves the audience
- * alone); the caller decides what that means. Otherwise the list wins, then
- * the legacy single id, and `null` for the legacy id is an explicit clear.
- */
-function academicYearIdsFrom(input: {
-  academicYearId?: string | null;
-  academicYearIds?: string[];
-}): string[] | undefined {
-  if (input.academicYearIds !== undefined) return [...new Set(input.academicYearIds)];
-  if (input.academicYearId !== undefined) return input.academicYearId ? [input.academicYearId] : [];
-  return undefined;
 }
 
 /** A published part, as the catalogue would show it. */
@@ -267,7 +274,12 @@ export class LibraryService {
       AND: [
         PUBLISHED_MATERIAL,
         this.eligibility.materialWhere(scope),
-        ...(params.academicYearId ? [academicYearFilter(params.academicYearId)] : []),
+        // The browsing year is matched against the departments listed under
+        // THAT year, for the student's own department. The student's own
+        // registered year is never read.
+        ...(params.academicYearId
+          ? [studentYearFilter(params.academicYearId, scope?.departmentId ?? null)]
+          : []),
         ...(params.subjectId ? [{ subjectId: params.subjectId }] : []),
         ...(params.q
           ? [
@@ -295,8 +307,9 @@ export class LibraryService {
           titleAr: true,
           description: true,
           coverKey: true,
+          departmentScope: true,
           subject: { select: { id: true, name: true } },
-          academicYears: MATERIAL_YEARS_SELECT,
+          academicYears: studentYearsSelect(scope?.departmentId ?? null),
           // Only what a student could actually buy is counted.
           _count: {
             select: {
@@ -324,7 +337,9 @@ export class LibraryService {
     const items = await Promise.all(
       rows.map(async (row) => {
         const prices = row.parts.map((p) => Number(p.price));
-        const academicYears = academicYearRefs(row.academicYears);
+        const academicYears = academicYearRefs(
+          rungsForStudent(row.academicYears, row.departmentScope),
+        );
         return {
           id: row.id,
           title: row.title,
@@ -363,6 +378,7 @@ export class LibraryService {
    *          response cannot be used to discover a hidden material.
    */
   async materialForStudent(materialId: string, userId: string) {
+    const scope = await this.eligibility.scopeFor(userId);
     const material = await this.prisma.libraryMaterial.findFirst({
       where: { id: materialId, ...PUBLISHED_MATERIAL },
       select: {
@@ -372,19 +388,20 @@ export class LibraryService {
         description: true,
         coverKey: true,
         subject: { select: { id: true, name: true } },
-        academicYears: MATERIAL_YEARS_SELECT,
+        academicYears: studentYearsSelect(scope?.departmentId ?? null),
         ...MATERIAL_AUDIENCE_SELECT,
       },
     });
 
     if (!material) throw AppException.notFound('Library material', materialId);
 
-    const scope = await this.eligibility.scopeFor(userId);
     const visible =
       this.eligibility.storefrontEnabled &&
       this.eligibility.isVisible(scope, toAudience(material));
 
-    const academicYears = academicYearRefs(material.academicYears);
+    const academicYears = academicYearRefs(
+      rungsForStudent(material.academicYears, material.departmentScope),
+    );
     const header = {
       id: material.id,
       title: material.title,
@@ -750,6 +767,7 @@ export class LibraryService {
         faculty: row.faculty,
         departmentScope: row.departmentScope,
         departmentCount: row._count.departments,
+        yearScope: (row.academicYears.length > 0 ? 'SELECTED_YEARS' : 'ALL_YEARS') as LibraryYearScope,
         academicYears: academicYearRefs(row.academicYears),
         hasCover: row.coverKey !== null,
         partCount: row._count.parts,
@@ -771,7 +789,13 @@ export class LibraryService {
         subject: { select: { id: true, name: true } },
         university: { select: { id: true, name: true, nameAr: true } },
         faculty: { select: { id: true, name: true, nameAr: true } },
-        academicYears: MATERIAL_YEARS_SELECT,
+        academicYears: {
+          ...MATERIAL_YEARS_SELECT,
+          select: {
+            ...MATERIAL_YEARS_SELECT.select,
+            departments: { select: { departmentId: true } },
+          },
+        },
         departments: {
           orderBy: { createdAt: 'asc' },
           select: {
@@ -798,6 +822,20 @@ export class LibraryService {
 
     const adminDefaultThumbnailKey = await this.settings.libraryDefaultThumbnailKey();
     const academicYears = academicYearRefs(material.academicYears);
+    const yearScope: LibraryYearScope = academicYears.length > 0 ? 'SELECTED_YEARS' : 'ALL_YEARS';
+    const departments = material.departments.map((d) => d.department);
+    // Departments per year, in ladder order, each group in the material's own
+    // department order. Only a DEPARTMENTS material filed under years has any.
+    const mappings =
+      material.departmentScope === LibraryDepartmentScope.DEPARTMENTS
+        ? material.academicYears.map((link, index) => {
+            const ids = new Set(link.departments.map((d) => d.departmentId));
+            return {
+              academicYear: academicYears[index]!,
+              departments: departments.filter((d) => ids.has(d.id)),
+            };
+          })
+        : [];
 
     return {
       id: material.id,
@@ -815,14 +853,23 @@ export class LibraryService {
       academicYearIds: academicYears.map((year) => year.id),
       subjectId: material.subjectId,
       departmentScope: material.departmentScope,
-      departmentIds: material.departments.map((d) => d.department.id),
+      // Every department the material reaches: the union over its years.
+      departmentIds: departments.map((d) => d.id),
+      yearScope,
+      // Departments per year/level (DEPARTMENTS filed under specific years).
+      audienceMappings: mappings.map((group) => ({
+        academicYearId: group.academicYear.id,
+        departmentIds: group.departments.map((d) => d.id),
+      })),
       audience: {
         university: material.university,
         faculty: material.faculty,
         departmentScope: material.departmentScope,
-        departments: material.departments.map((d) => d.department),
+        departments,
         academicYear: academicYears[0] ?? null,
         academicYears,
+        yearScope,
+        mappings,
       },
       // Never the object key itself; `hasCover` says whether one is set so the
       // editor can offer "Clear" without being told the key.
@@ -882,6 +929,13 @@ export class LibraryService {
    * the ladder that governs the faculty — or of every selected department.
    */
   private async assertAudience(audience: AudienceInput): Promise<void> {
+    if (audience.academicYearIds.length > MAX_MATERIAL_ACADEMIC_YEARS) {
+      throw AppException.validation({
+        [audience.perYear ? 'audienceMappings' : 'academicYearIds']: [
+          `at most ${MAX_MATERIAL_ACADEMIC_YEARS} years/levels`,
+        ],
+      });
+    }
     const fields: Record<string, string[]> = {};
     if (
       audience.departmentScope === LibraryDepartmentScope.FACULTY &&
@@ -897,20 +951,33 @@ export class LibraryService {
     }
     if (Object.keys(fields).length > 0) throw AppException.validation(fields);
 
-    await checkAcademicStructure(
-      this.prisma,
-      {
-        universityId: audience.universityId,
-        facultyId: audience.facultyId,
-        departmentIds: audience.departmentIds,
-      },
-      LIBRARY_PLACEMENT,
-    );
+    try {
+      await checkAcademicStructure(
+        this.prisma,
+        {
+          universityId: audience.universityId,
+          facultyId: audience.facultyId,
+          departmentIds: audience.departmentIds,
+        },
+        LIBRARY_PLACEMENT,
+      );
+    } catch (error) {
+      throw audience.perYear ? await this.perYearDepartmentError(audience, error) : error;
+    }
 
-    // Each rung on its own, against the same ladder resolution a single rung
-    // always had. A refusal is reported on `academicYearIds`, the field the
-    // client sent, rather than on the legacy name the shared check uses.
-    for (const academicYearId of audience.academicYearIds) {
+    // Each rung against the ladder of the departments listed under it (every
+    // department, for the legacy form; the college, for a whole-college
+    // material). A refusal is reported where the client sent the rung: beside
+    // its year group, or on `academicYearIds`.
+    const groups =
+      audience.yearDepartments.length > 0
+        ? audience.yearDepartments
+        : audience.academicYearIds.map((academicYearId) => ({
+            academicYearId,
+            departmentIds: audience.departmentIds,
+          }));
+    const refusals: Record<string, string[]> = {};
+    for (const [index, group] of groups.entries()) {
       try {
         await checkYearInLadder(
           this.prisma,
@@ -918,17 +985,48 @@ export class LibraryService {
           {
             universityId: audience.universityId,
             facultyId: audience.facultyId,
-            departmentIds: audience.departmentIds,
-            academicYearId,
+            departmentIds: group.departmentIds,
+            academicYearId: group.academicYearId,
           },
           LIBRARY_PLACEMENT,
         );
       } catch (error) {
         const refused = error instanceof AppException ? error.fields?.academicYearId : undefined;
-        if (refused) throw AppException.validation({ academicYearIds: refused });
-        throw error;
+        if (!refused) throw error;
+        if (!audience.perYear) throw AppException.validation({ academicYearIds: refused });
+        refusals[`audienceMappings.${index}.academicYearId`] = refused;
       }
     }
+    if (Object.keys(refusals).length > 0) throw AppException.validation(refusals);
+  }
+
+  /**
+   * A department refusal for a per-year audience, placed beside the year
+   * group(s) that hold the offending department. A problem no single group
+   * has on its own (General and Programs split across two groups) stays on
+   * `audienceMappings` as a whole. University and college refusals are kept.
+   */
+  private async perYearDepartmentError(audience: AudienceInput, error: unknown): Promise<unknown> {
+    if (!(error instanceof AppException) || !error.fields?.departmentIds) return error;
+    const { departmentIds: whole, ...others } = error.fields;
+    const fields: Record<string, string[]> = { ...others };
+    for (const [index, group] of audience.yearDepartments.entries()) {
+      try {
+        await checkAcademicStructure(
+          this.prisma,
+          { facultyId: audience.facultyId, departmentIds: group.departmentIds },
+          { ...LIBRARY_PLACEMENT, requireUniversityAndFaculty: false },
+        );
+      } catch (groupError) {
+        const refused =
+          groupError instanceof AppException ? groupError.fields?.departmentIds : undefined;
+        if (refused) fields[`audienceMappings.${index}.departmentIds`] = refused;
+      }
+    }
+    if (!Object.keys(fields).some((key) => key.startsWith('audienceMappings.'))) {
+      fields.audienceMappings = whole;
+    }
+    return AppException.validation(fields);
   }
 
   /**
@@ -1000,18 +1098,23 @@ export class LibraryService {
       departmentIds?: string[];
       academicYearId?: string | null;
       academicYearIds?: string[];
+      yearScope?: LibraryYearScope;
+      audienceMappings?: RawAudience['audienceMappings'];
       subjectId?: string | null;
       coverKey?: string;
     },
     actor: { id: string; role: UserRole },
   ) {
-    const audience: AudienceInput = {
+    const audience = normalizeAudience({
       universityId: input.universityId ?? null,
       facultyId: input.facultyId ?? null,
       departmentScope: input.departmentScope ?? LibraryDepartmentScope.FACULTY,
-      departmentIds: [...new Set(input.departmentIds ?? [])],
-      academicYearIds: academicYearIdsFrom(input) ?? [],
-    };
+      departmentIds: input.departmentIds,
+      academicYearId: input.academicYearId,
+      academicYearIds: input.academicYearIds,
+      yearScope: input.yearScope,
+      audienceMappings: input.audienceMappings,
+    });
     await this.assertAudience(audience);
 
     // A cover can only be filed under the library namespace here: the material
@@ -1054,6 +1157,9 @@ export class LibraryService {
           })),
         });
       }
+      // After both kinds of link: each row points at one of each.
+      const rows = yearDepartmentRows(created.id, audience);
+      if (rows.length > 0) await tx.libraryMaterialYearDepartment.createMany({ data: rows });
       return created;
     });
 
@@ -1084,6 +1190,8 @@ export class LibraryService {
       departmentIds: string[];
       academicYearId: string | null;
       academicYearIds: string[];
+      yearScope: LibraryYearScope;
+      audienceMappings: RawAudience['audienceMappings'];
       subjectId: string | null;
       coverKey: string | null;
     }>,
@@ -1093,7 +1201,9 @@ export class LibraryService {
       where: { id: materialId, ...notDeleted },
       include: {
         departments: { select: { departmentId: true } },
-        academicYears: { select: { academicYearId: true } },
+        academicYears: {
+          select: { academicYearId: true, departments: { select: { departmentId: true } } },
+        },
       },
     });
     if (!before) throw AppException.notFound('Library material', materialId);
@@ -1105,15 +1215,24 @@ export class LibraryService {
       departmentIds,
       academicYearId,
       academicYearIds,
+      yearScope,
+      audienceMappings,
       ...scalars
     } = input;
 
     // Atomic audience: touching any part of it means sending all of it, so an
     // edit can never widen or narrow the audience as a side effect. The years
-    // count as sent in either spelling.
+    // count as sent in either spelling, or as an explicit `yearScope`; the
+    // per-year mapping stands for both the years and the departments.
     const nextYearIds = academicYearIdsFrom({ academicYearId, academicYearIds });
-    const sent = (key: (typeof AUDIENCE_KEYS)[number]) =>
-      key === 'academicYearIds' ? nextYearIds !== undefined : input[key] !== undefined;
+    const mappingsSent = audienceMappings !== undefined;
+    const sent = (key: (typeof AUDIENCE_KEYS)[number]) => {
+      if (key === 'academicYearIds') {
+        return nextYearIds !== undefined || yearScope !== undefined || mappingsSent;
+      }
+      if (key === 'departmentIds') return departmentIds !== undefined || mappingsSent;
+      return input[key] !== undefined;
+    };
     const touched = AUDIENCE_KEYS.filter(sent);
     if (touched.length > 0 && touched.length < AUDIENCE_KEYS.length) {
       const missing = AUDIENCE_KEYS.filter((key) => !sent(key));
@@ -1127,28 +1246,47 @@ export class LibraryService {
     // The links are the audience; a row with none but a legacy column value —
     // written before the join table, or straight into the table — still means
     // that one year, so publishing re-validates it too.
-    const storedYearIds = (before.academicYears ?? []).map((y) => y.academicYearId);
-    const beforeAudience: AudienceInput = {
-      universityId: before.universityId,
-      facultyId: before.facultyId,
-      departmentScope: before.departmentScope,
-      departmentIds: before.departments.map((d) => d.departmentId),
-      academicYearIds:
-        storedYearIds.length > 0
-          ? storedYearIds
-          : before.academicYearId
-            ? [before.academicYearId]
-            : [],
-    };
+    const storedYears = before.academicYears ?? [];
+    const storedYearIds = storedYears.map((y) => y.academicYearId);
+    const storedPerYear =
+      before.departmentScope === LibraryDepartmentScope.DEPARTMENTS &&
+      storedYears.some((y) => (y.departments ?? []).length > 0);
+    // As sent by a client, so a broken stored row never blocks an unrelated
+    // edit; it is normalised (and refused) only when the material goes live.
+    const beforeAudience: RawAudience = storedPerYear
+      ? ({
+          universityId: before.universityId,
+          facultyId: before.facultyId,
+          departmentScope: before.departmentScope,
+          audienceMappings: storedYears.map((y) => ({
+            academicYearId: y.academicYearId,
+            departmentIds: (y.departments ?? []).map((d) => d.departmentId),
+          })),
+        })
+      : ({
+          universityId: before.universityId,
+          facultyId: before.facultyId,
+          departmentScope: before.departmentScope,
+          departmentIds: before.departments.map((d) => d.departmentId),
+          academicYearIds:
+            storedYearIds.length > 0
+              ? storedYearIds
+              : before.academicYearId
+                ? [before.academicYearId]
+                : [],
+        });
     const nextAudience: AudienceInput | null =
       touched.length > 0
-        ? {
+        ? normalizeAudience({
             universityId: universityId ?? null,
             facultyId: facultyId ?? null,
             departmentScope: departmentScope!,
-            departmentIds: [...new Set(departmentIds ?? [])],
-            academicYearIds: nextYearIds ?? [],
-          }
+            departmentIds,
+            academicYearId,
+            academicYearIds,
+            yearScope,
+            audienceMappings,
+          })
         : null;
 
     // A new audience is always validated. Publishing (or re-activating) also
@@ -1158,7 +1296,7 @@ export class LibraryService {
       (scalars.status === ContentStatus.PUBLISHED && before.status !== ContentStatus.PUBLISHED) ||
       (scalars.isActive === true && !before.isActive);
     if (nextAudience) await this.assertAudience(nextAudience);
-    else if (goingLive) await this.assertAudience(beforeAudience);
+    else if (goingLive) await this.assertAudience(normalizeAudience(beforeAudience));
 
     if (scalars.coverKey) {
       await this.assertCoverKey(
@@ -1174,6 +1312,10 @@ export class LibraryService {
 
     await this.prisma.$transaction(async (tx) => {
       if (nextAudience) {
+        // The per-year rows go first and are rewritten whole: they point at
+        // the links below, and a group edited in one year must leave every
+        // other year's departments exactly as sent.
+        await tx.libraryMaterialYearDepartment.deleteMany({ where: { materialId } });
         const keep =
           nextAudience.facultyId === before.facultyId
             ? nextAudience.departmentIds
@@ -1227,6 +1369,8 @@ export class LibraryService {
           skipDuplicates: true,
         });
       }
+      const rows = nextAudience ? yearDepartmentRows(materialId, nextAudience) : [];
+      if (rows.length > 0) await tx.libraryMaterialYearDepartment.createMany({ data: rows });
     });
 
     await this.discardReplacedCover(materialId, before.coverKey, scalars.coverKey);

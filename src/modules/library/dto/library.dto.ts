@@ -7,6 +7,7 @@ import {
   IsArray,
   IsBoolean,
   IsEnum,
+  IsIn,
   IsISO8601,
   IsInt,
   IsNumber,
@@ -16,10 +17,12 @@ import {
   MaxLength,
   Min,
   MinLength,
+  ValidateNested,
 } from 'class-validator';
 
 import { SearchablePaginationDto } from '../../../common/dto/pagination.dto';
 import { MAX_MONEY_EGP } from '../../wallet/money';
+import { LIBRARY_YEAR_SCOPES, type LibraryYearScope } from '../library-audience';
 
 /** More rungs than any ladder has; a material filed under all of them is "all years". */
 export const MAX_MATERIAL_ACADEMIC_YEARS = 20;
@@ -65,6 +68,17 @@ export class AdminListLibraryDto extends SearchablePaginationDto {
   @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(32) facultyId?: string;
 }
 
+/** One year/level and the departments that find the material under it. */
+export class AudienceMappingDto {
+  @ApiProperty() @IsString() @MaxLength(32) academicYearId!: string;
+  @ApiProperty({ type: [String] })
+  @IsArray()
+  @ArrayMaxSize(50)
+  @IsString({ each: true })
+  @MaxLength(32, { each: true })
+  departmentIds!: string[];
+}
+
 /**
  * A material and its audience.
  *
@@ -76,6 +90,12 @@ export class AdminListLibraryDto extends SearchablePaginationDto {
  * Years/levels: `academicYearIds` is the list (empty = all years). The legacy
  * single `academicYearId` is still accepted — a client that sends it and not
  * the list gets a one-year material — and when both are sent the list wins.
+ *
+ * Departments per year/level: `audienceMappings` lists, for a DEPARTMENTS
+ * material, each year with its own departments; it stands for
+ * `departmentIds` (the union) and `academicYearIds` (its years). Without it,
+ * a DEPARTMENTS material filed under years reaches the same departments under
+ * each of them. `yearScope` says "all years" or "selected years" explicitly.
  */
 export class CreateMaterialDto {
   @ApiProperty() @IsString() @MinLength(2) @MaxLength(200) title!: string;
@@ -102,6 +122,25 @@ export class CreateMaterialDto {
   @IsString({ each: true })
   @MaxLength(32, { each: true })
   academicYearIds?: string[];
+  @ApiPropertyOptional({
+    enum: LIBRARY_YEAR_SCOPES,
+    description:
+      'ALL_YEARS: no year/level list. SELECTED_YEARS: academicYearIds (whole college) or audienceMappings (departments per year).',
+  })
+  @IsOptional()
+  @IsIn(LIBRARY_YEAR_SCOPES)
+  yearScope?: LibraryYearScope;
+  @ApiPropertyOptional({
+    type: [AudienceMappingDto],
+    description:
+      'Departments per year/level, for a DEPARTMENTS material filed under specific years. Stands for departmentIds and academicYearIds.',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(MAX_MATERIAL_ACADEMIC_YEARS)
+  @ValidateNested({ each: true })
+  @Type(() => AudienceMappingDto)
+  audienceMappings?: AudienceMappingDto[];
   @ApiPropertyOptional({ nullable: true }) @IsOptional() @IsString() @MaxLength(32) subjectId?: string | null;
   /** Object key issued by POST /storage/uploads/library-cover/content. Never a URL. */
   @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(512) coverKey?: string;
@@ -110,8 +149,10 @@ export class CreateMaterialDto {
 /**
  * Editing a material. Sending ANY audience field means sending all of it
  * (universityId, facultyId, departmentScope, departmentIds and the years —
- * `academicYearIds`, or the legacy `academicYearId`); a partial audience is
- * refused, so an edit cannot change who sees a material as a side effect.
+ * `academicYearIds`, the legacy `academicYearId`, or `yearScope`;
+ * `audienceMappings` counts as both departments and years); a partial
+ * audience is refused, so an edit cannot change who sees a material as a side
+ * effect.
  */
 export class UpdateMaterialDto {
   @ApiPropertyOptional() @IsOptional() @IsString() @MinLength(2) @MaxLength(200) title?: string;
@@ -141,6 +182,25 @@ export class UpdateMaterialDto {
   @IsString({ each: true })
   @MaxLength(32, { each: true })
   academicYearIds?: string[];
+  @ApiPropertyOptional({
+    enum: LIBRARY_YEAR_SCOPES,
+    description:
+      'ALL_YEARS: no year/level list. SELECTED_YEARS: academicYearIds (whole college) or audienceMappings (departments per year).',
+  })
+  @IsOptional()
+  @IsIn(LIBRARY_YEAR_SCOPES)
+  yearScope?: LibraryYearScope;
+  @ApiPropertyOptional({
+    type: [AudienceMappingDto],
+    description:
+      'Departments per year/level, for a DEPARTMENTS material filed under specific years. Stands for departmentIds and academicYearIds.',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(MAX_MATERIAL_ACADEMIC_YEARS)
+  @ValidateNested({ each: true })
+  @Type(() => AudienceMappingDto)
+  audienceMappings?: AudienceMappingDto[];
   @ApiPropertyOptional({ nullable: true }) @IsOptional() @IsString() @MaxLength(32) subjectId?: string | null;
   /** Send null to remove the cover. A key must come from the library-cover upload route. */
   @ApiPropertyOptional({ nullable: true }) @IsOptional() @IsString() @MaxLength(512) coverKey?: string | null;

@@ -417,12 +417,20 @@ describe('browse', () => {
     expect(where.AND).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ universityId: UNI, facultyId: FAC }),
-        // The year/level filter: filed under that rung, or under none ("all
-        // years"). Its own AND branch, so it can only narrow the eligible list.
+        // The year/level filter: filed under no rung ("all years"), or a
+        // whole-college material filed under that rung, or THIS student's
+        // department listed under that rung. Its own AND branch, so it can
+        // only narrow the eligible list; the student's own year is not in it.
         {
           OR: [
-            { academicYears: { some: { academicYearId: 'y1' } } },
             { academicYears: { none: {} } },
+            { departmentScope: 'FACULTY', academicYears: { some: { academicYearId: 'y1' } } },
+            {
+              departmentScope: 'DEPARTMENTS',
+              academicYears: {
+                some: { academicYearId: 'y1', departments: { some: { departmentId: 'dep_prep' } } },
+              },
+            },
           ],
         },
         expect.objectContaining({ OR: expect.any(Array) }),

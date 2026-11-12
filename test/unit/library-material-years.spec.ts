@@ -83,6 +83,11 @@ function build(
       createMany: jest.fn(async () => ({ count: 0 })),
     },
     libraryMaterialAcademicYear: yearLinks,
+    // Per-year departments: rewritten whole with every audience change.
+    libraryMaterialYearDepartment: {
+      deleteMany: jest.fn(async (_args: unknown) => ({ count: 0 })),
+      createMany: jest.fn(async (_args: unknown) => ({ count: 0 })),
+    },
     university: { findFirst: jest.fn(async () => ({ id: 'uni_1', isActive: true })) },
     faculty: {
       findFirst: jest.fn(async () => ({ id: 'fac_1', universityId: 'uni_1', isActive: true })),
