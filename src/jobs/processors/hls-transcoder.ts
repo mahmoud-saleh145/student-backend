@@ -19,6 +19,12 @@ export interface ProbeResult {
   /** Rotation from the stream's display matrix or `rotate` tag, normalised to 0 / 90 / 180 / 270. */
   rotation: number;
   frameRate: number;
+  /**
+   * Set only for a VARIABLE-frame-rate source (see `detectVariableFrameRate`):
+   * the constant rate it is encoded at. Undefined for an ordinary source, whose
+   * encode is then exactly what it always was.
+   */
+  outputFrameRate?: number;
   videoCodec: string;
   audioCodec: string;
 }
@@ -121,6 +127,12 @@ const TS_OVERHEAD_MULTIPLIER = 1.08;
  */
 const DURATION_TOLERANCE_RATIO = 0.025;
 const DURATION_TOLERANCE_SECONDS = 3;
+
+/** Nominal vs average frame rate further apart than this marks a variable-frame-rate source. */
+const VFR_RATE_MISMATCH = 0.05;
+/** Bounds for the constant rate a variable-frame-rate source is encoded at. */
+const VFR_MIN_OUTPUT_FPS = 10;
+const VFR_MAX_OUTPUT_FPS = 60;
 
 /** Grace between SIGTERM and SIGKILL when the worker is asked to stop. */
 const CHILD_STOP_GRACE_MS = 5_000;
@@ -308,7 +320,8 @@ export class HlsTranscoder implements OnModuleDestroy {
     const probe = await this.probe(sourcePath);
     this.logger.log(
       `probe ${videoId}: ${probe.width}x${probe.height} ${Math.round(probe.durationSeconds)}s ` +
-        `${probe.frameRate}fps ${probe.videoCodec}/${probe.audioCodec}`,
+        `${probe.frameRate}fps ${probe.videoCodec}/${probe.audioCodec}` +
+        (probe.outputFrameRate ? ` (variable frame rate: encoding at a constant ${probe.outputFrameRate} fps)` : ''),
     );
 
     const planned = HlsTranscoder.planRenditions(params.ladder, probe.width, probe.height);
@@ -359,6 +372,7 @@ export class HlsTranscoder implements OnModuleDestroy {
           keyInfoPath,
           segmentSeconds: this.cfg.segmentSeconds,
           frameRate: probe.frameRate,
+          constantFrameRate: probe.outputFrameRate,
           threads: this.effectiveThreads(),
         }),
         {
@@ -480,6 +494,49 @@ export class HlsTranscoder implements OnModuleDestroy {
     return Math.max(2, Math.round((targetHeight * ratio) / 2) * 2);
   }
 
+  /**
+   * A VARIABLE-frame-rate source, and the constant rate to encode it at.
+   *
+   * Screen recorders write a frame only when the screen changes, so a static
+   * slide can leave 10-20 seconds with no video frame at all. During such a gap
+   * the video encoder emits nothing until the next real frame, and with the
+   * default interleaving the muxer writes the audio up to 10 s ahead: one HLS
+   * segment carries ~10 s of audio and the next none (silence after a seek
+   * there), and our output verifier's demuxer sees only audio in its probe
+   * window ("dimensions not set") and refuses the rendition. Seen on 3
+   * production lectures in Nov 2026; 12 of the library's sources have such gaps.
+   * The encode of such a source therefore interleaves strictly
+   * (`-max_interleave_delta 0`) and runs at a constant rate.
+   *
+   * The tell is in the stream header: `r_frame_rate` (the nominal/timebase
+   * rate, e.g. 60 or 90000/1) disagrees with `avg_frame_rate` (frames actually
+   * present / duration). An ordinary constant-rate file has the two equal (or
+   * within rounding, 30 vs 29.97), and gets `undefined` here, so its encode is
+   * unchanged.
+   *
+   * The output rate is the source's own average, rounded and bounded, so motion
+   * is not sped up or thinned out; ffmpeg's `-fps_mode cfr` repeats the last
+   * frame through each gap, on the source's timestamps, so audio stays in sync.
+   * Verified on the failed lecture cmv5oikhx: the old encode was refused, the
+   * new one passes the verifier with every segment carrying its own audio and
+   * video and decoding on its own.
+   */
+  static detectVariableFrameRate(rFrameRate?: string, avgFrameRate?: string): number | undefined {
+    const rate = (value?: string): number | null => {
+      if (!value) return null;
+      const [num, den] = value.split('/').map(Number);
+      if (!num || !den) return null;
+      const r = num / den;
+      return Number.isFinite(r) && r > 0 ? r : null;
+    };
+    const nominal = rate(rFrameRate);
+    const average = rate(avgFrameRate);
+    if (nominal === null || average === null || average > 120) return undefined;
+    const variable = nominal > 120 || Math.abs(nominal - average) / nominal > VFR_RATE_MISMATCH;
+    if (!variable) return undefined;
+    return Math.min(VFR_MAX_OUTPUT_FPS, Math.max(VFR_MIN_OUTPUT_FPS, Math.round(average)));
+  }
+
   static ffmpegArgs(params: {
     sourcePath: string;
     outDir: string;
@@ -491,10 +548,16 @@ export class HlsTranscoder implements OnModuleDestroy {
     keyInfoPath?: string;
     segmentSeconds: number;
     frameRate: number;
+    /** Only for a variable-frame-rate source (`ProbeResult.outputFrameRate`). */
+    constantFrameRate?: number;
     threads: number;
   }): string[] {
     const seg = params.segmentSeconds;
-    const fps = params.frameRate > 0 && params.frameRate <= 120 ? params.frameRate : 25;
+    const cfr =
+      params.constantFrameRate !== undefined && params.constantFrameRate > 0 && params.constantFrameRate <= 120
+        ? params.constantFrameRate
+        : undefined;
+    const fps = cfr ?? (params.frameRate > 0 && params.frameRate <= 120 ? params.frameRate : 25);
     const gop = Math.max(1, Math.round(seg * fps));
 
     const args = [
@@ -510,6 +573,11 @@ export class HlsTranscoder implements OnModuleDestroy {
       '-map', '0:v:0',
       '-map', '0:a:0?',
       '-sn', '-dn',
+      // Variable-frame-rate source only: an explicit constant output rate at the
+      // source's own average (otherwise ffmpeg derives one from a nominal rate
+      // such as 90000/1), keeping the GOP below aligned to the segments. Gaps
+      // are filled by repeating the last frame (see detectVariableFrameRate).
+      ...(cfr ? ['-fps_mode', 'cfr', '-r', String(cfr)] : []),
       // Video: H.264 High 4.1, 8-bit 4:2:0 - what every Android and iOS
       // hardware decoder accepts. `veryfast` is the right trade for lecture
       // content: slower presets buy maybe 8% bitrate for triple the CPU time.
@@ -534,6 +602,14 @@ export class HlsTranscoder implements OnModuleDestroy {
       '-ac', '2',
       '-ar', '48000',
       '-max_muxing_queue_size', '1024',
+      // Variable-frame-rate source only: interleave strictly by timestamp. During
+      // a source gap the video encoder emits nothing until the next real frame,
+      // and with the default 10 s interleave limit the muxer then writes audio
+      // up to 10 s AHEAD of the video: one segment carries ~10 s of audio, the
+      // next none (silence after a seek there), and the verifier's demuxer sees
+      // only audio in its probe window ("dimensions not set"). 0 = wait for both
+      // streams; the cost is buffering one gap's worth of audio.
+      ...(cfr ? ['-max_interleave_delta', '0'] : []),
       '-f', 'hls',
       '-hls_time', String(seg),
       '-hls_playlist_type', 'vod',
@@ -724,6 +800,7 @@ export class HlsTranscoder implements OnModuleDestroy {
       height: swapped ? codedWidth : codedHeight,
       rotation,
       frameRate: Math.round(frameRate * 100) / 100,
+      outputFrameRate: HlsTranscoder.detectVariableFrameRate(video.r_frame_rate, video.avg_frame_rate),
       videoCodec: video.codec_name ?? 'unknown',
       audioCodec: audio?.codec_name ?? 'none',
     };
