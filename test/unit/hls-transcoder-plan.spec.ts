@@ -180,12 +180,79 @@ describe('HlsTranscoder.ffmpegArgs', () => {
     expect(encrypted[encrypted.length - 1]).toMatch(/index\.m3u8$/);
   });
 
+  it('an ordinary source gets no frame-rate options at all (its encode is unchanged)', () => {
+    const args = HlsTranscoder.ffmpegArgs(base);
+    expect(args).not.toContain('-fps_mode');
+    expect(args).not.toContain('-r');
+    expect(args).not.toContain('-max_interleave_delta');
+    expect(HlsTranscoder.ffmpegArgs({ ...base, constantFrameRate: undefined })).toEqual(args);
+  });
+
+  it('a variable-frame-rate source is interleaved strictly, so audio cannot run ahead of a frame gap', () => {
+    const args = HlsTranscoder.ffmpegArgs({ ...base, constantFrameRate: 21 });
+    expect(args[args.indexOf('-max_interleave_delta') + 1]).toBe('0');
+    // An output option: before the HLS muxer and its playlist.
+    expect(args.indexOf('-max_interleave_delta')).toBeLessThan(args.indexOf('-f'));
+  });
+
+  it('a variable-frame-rate source is encoded at a constant rate, GOP following that rate', () => {
+    const args = HlsTranscoder.ffmpegArgs({ ...base, frameRate: 20.82, constantFrameRate: 21 });
+    expect(args.join(' ')).toContain('-sn -dn -fps_mode cfr -r 21 -c:v libx264');
+    expect(args[args.indexOf('-g') + 1]).toBe('126'); // 6 s × 21 fps
+    expect(args[args.indexOf('-keyint_min') + 1]).toBe('126');
+    expect(args[args.indexOf('-force_key_frames') + 1]).toBe('expr:gte(t,n_forced*6)');
+  });
+
+  it('ignores an unusable constant rate rather than passing it to ffmpeg', () => {
+    for (const constantFrameRate of [0, -5, 500, Number.NaN]) {
+      const args = HlsTranscoder.ffmpegArgs({ ...base, constantFrameRate });
+      expect(args).not.toContain('-fps_mode');
+      expect(args[args.indexOf('-g') + 1]).toBe('180');
+    }
+  });
+
   it('keeps the bitrate ladder the manifest service advertises', () => {
     const args = HlsTranscoder.ffmpegArgs(base);
     expect(args[args.indexOf('-b:v') + 1]).toBe('2200k');
     expect(args[args.indexOf('-maxrate') + 1]).toBe('2600k');
     expect(args[args.indexOf('-bufsize') + 1]).toBe('5200k');
     expect(args[args.indexOf('-b:a') + 1]).toBe('128k');
+  });
+});
+
+describe('HlsTranscoder.detectVariableFrameRate', () => {
+  it('leaves constant-frame-rate sources alone, including the 30 vs 29.97 rounding case', () => {
+    expect(HlsTranscoder.detectVariableFrameRate('30/1', '30/1')).toBeUndefined();
+    expect(HlsTranscoder.detectVariableFrameRate('30000/1001', '30000/1001')).toBeUndefined();
+    expect(HlsTranscoder.detectVariableFrameRate('25/1', '2500/100')).toBeUndefined();
+    expect(HlsTranscoder.detectVariableFrameRate('30/1', '30000/1001')).toBeUndefined();
+    expect(HlsTranscoder.detectVariableFrameRate('24/1', '23976/1000')).toBeUndefined();
+  });
+
+  // The stream headers of the production sources that failed or were flagged
+  // (Nov 2026), and the rate each would now be encoded at.
+  it.each([
+    ['cmv47p15l: nominal 25.83, average 20.82', '155/6', '9195499/441592', 21],
+    ['cmv5oikhx: timebase 90000/1, average 24.55', '90000/1', '1051932569/42843297', 25],
+    ['cmv72gpjh / cmvzq1r41 shape: timebase 90000/1, average 23.75', '90000/1', '2375/100', 24],
+    ['cmv9ju1yz: nominal 38, average 20.48', '38/1', '2048/100', 20],
+    ['cmw4ytuiz: nominal 60, average 23.05', '60/1', '2305/100', 23],
+    ['cmvsky5bs: nominal 60, average 29.71', '60/1', '2971/100', 30],
+  ])('detects %s', (_, r, avg, expected) => {
+    expect(HlsTranscoder.detectVariableFrameRate(r, avg)).toBe(expected);
+  });
+
+  it('bounds the output rate', () => {
+    expect(HlsTranscoder.detectVariableFrameRate('30/1', '3/1')).toBe(10); // a very sparse recording
+    expect(HlsTranscoder.detectVariableFrameRate('120/1', '90/1')).toBe(60);
+  });
+
+  it('cannot decide without both rates, or with a nonsense average', () => {
+    expect(HlsTranscoder.detectVariableFrameRate(undefined, '25/1')).toBeUndefined();
+    expect(HlsTranscoder.detectVariableFrameRate('25/1', undefined)).toBeUndefined();
+    expect(HlsTranscoder.detectVariableFrameRate('0/0', '25/1')).toBeUndefined();
+    expect(HlsTranscoder.detectVariableFrameRate('25/1', '0/0')).toBeUndefined();
+    expect(HlsTranscoder.detectVariableFrameRate('90000/1', '90000/1')).toBeUndefined();
   });
 });
 
