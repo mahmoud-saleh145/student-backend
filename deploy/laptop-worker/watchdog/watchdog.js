@@ -203,10 +203,14 @@ async function tick() {
 }
 function safeBy(json) { try { return JSON.parse(json).by; } catch { return 'unknown'; } }
 
+/** Liveness for the container health check: touched every tick, outage or not. */
+function alive() { try { fs.writeFileSync('/tmp/watchdog.alive', String(Date.now())); } catch { /* health check will notice */ } }
+
 (async () => {
   log('start', { cfg: { ...CFG, log: undefined }, pauseKey: PAUSE_KEY.replace(/^[^:]+/, '<prefix>') });
   for (;;) {
     try { await tick(); } catch (e) { log('tick_error', { error: short(e) }); }
+    alive();
     if (state.ticks >= CFG.maxTicks) break;
     await new Promise((r) => setTimeout(r, (state.outageSince ? CFG.outagePollSec : CFG.intervalSec) * 1000));
   }
