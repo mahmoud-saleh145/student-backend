@@ -128,7 +128,7 @@ const TS_OVERHEAD_MULTIPLIER = 1.08;
 const DURATION_TOLERANCE_RATIO = 0.025;
 const DURATION_TOLERANCE_SECONDS = 3;
 
-/** Nominal vs average frame rate further apart than this marks a variable-frame-rate source. */
+/** An average frame rate more than this far BELOW the nominal one marks a variable-frame-rate source. */
 const VFR_RATE_MISMATCH = 0.05;
 /** Bounds for the constant rate a variable-frame-rate source is encoded at. */
 const VFR_MIN_OUTPUT_FPS = 10;
@@ -532,7 +532,10 @@ export class HlsTranscoder implements OnModuleDestroy {
     const nominal = rate(rFrameRate);
     const average = rate(avgFrameRate);
     if (nominal === null || average === null || average > 120) return undefined;
-    const variable = nominal > 120 || Math.abs(nominal - average) / nominal > VFR_RATE_MISMATCH;
+    // Only frames MISSING relative to the nominal rate are gaps. An average
+    // ABOVE the nominal (seen as 15 vs ~19 on 24 library sources) is a header
+    // quirk, not a gap; those sources keep their existing encode.
+    const variable = nominal > 120 || average < nominal * (1 - VFR_RATE_MISMATCH);
     if (!variable) return undefined;
     return Math.min(VFR_MAX_OUTPUT_FPS, Math.max(VFR_MIN_OUTPUT_FPS, Math.round(average)));
   }
