@@ -242,6 +242,14 @@ describe('HlsTranscoder.detectVariableFrameRate', () => {
     expect(HlsTranscoder.detectVariableFrameRate(r, avg)).toBe(expected);
   });
 
+  it('leaves sources whose average is ABOVE the nominal rate alone (header quirk, not a gap)', () => {
+    // The 24 library sources of this shape (nominal 15 or 4-6, average 19-30)
+    // have no frame gaps and keep their existing encode.
+    expect(HlsTranscoder.detectVariableFrameRate('15/1', '1904/100')).toBeUndefined();
+    expect(HlsTranscoder.detectVariableFrameRate('4/1', '2993/100')).toBeUndefined();
+    expect(HlsTranscoder.detectVariableFrameRate('6/1', '2358/100')).toBeUndefined();
+  });
+
   it('bounds the output rate', () => {
     expect(HlsTranscoder.detectVariableFrameRate('30/1', '3/1')).toBe(10); // a very sparse recording
     expect(HlsTranscoder.detectVariableFrameRate('120/1', '90/1')).toBe(60);
