@@ -1,0 +1,48 @@
+# Historical mobile HLS safety watchdog (see watchdog.js for the policy).
+#
+# A SEPARATE compose project from the worker, so `up`/`down` here can never recreate
+# the worker container. Docker restarts it on its own (restart: unless-stopped), so it
+# survives Claude Code sessions, terminal closes and worker restarts; it stops only when
+# Docker Desktop stops (laptop off / signed out) or someone runs `down`.
+#
+#   docker compose -p edu-watchdog -f docker-compose.watchdog.yml --env-file watchdog.env up -d
+#   docker compose -p edu-watchdog -f docker-compose.watchdog.yml --env-file watchdog.env logs -f
+#   docker compose -p edu-watchdog -f docker-compose.watchdog.yml --env-file watchdog.env down
+#
+# watchdog.env (not committed) sets WORKER_ENV_FILE to the worker's .env.worker path:
+# the watchdog needs the same DATABASE_URL / REDIS_URL / R2_* / REDIS_PREFIX the worker uses.
+services:
+  watchdog:
+    # Only the Node runtime and client libraries are used; no Nest app starts.
+    image: ${WATCHDOG_IMAGE:-edu-worker:30a21fa-priority-r2}
+    container_name: edu-hls-watchdog
+    command: ['node', '/watchdog/watchdog.js']
+    restart: unless-stopped
+    env_file:
+      - ${WORKER_ENV_FILE:?set WORKER_ENV_FILE to the worker .env.worker}
+    environment:
+      RUN_WORKERS: 'false'
+      WATCHDOG_INTERVAL_SEC: ${WATCHDOG_INTERVAL_SEC:-30}
+      WATCHDOG_OUTAGE_POLL_SEC: ${WATCHDOG_OUTAGE_POLL_SEC:-10}
+      WATCHDOG_OUTAGE_PAUSE_SEC: ${WATCHDOG_OUTAGE_PAUSE_SEC:-600}
+      WATCHDOG_NETFAIL_WINDOW_MIN: ${WATCHDOG_NETFAIL_WINDOW_MIN:-120}
+      WATCHDOG_NETFAIL_THRESHOLD: ${WATCHDOG_NETFAIL_THRESHOLD:-3}
+      WATCHDOG_DRY_RUN: ${WATCHDOG_DRY_RUN:-false}
+    volumes:
+      - ./watchdog.js:/watchdog/watchdog.js:ro
+      - ${WATCHDOG_LOG_DIR:-C:/edu-watchdog/logs}:/var/log/edu-watchdog
+    # Its own liveness, not the worker image's health script: the loop touches
+    # /tmp/watchdog.alive every tick (outage or not); stale for 3 min = unhealthy.
+    healthcheck:
+      test: ['CMD', 'node', '-e', "process.exit(Date.now() - require('fs').statSync('/tmp/watchdog.alive').mtimeMs < 180000 ? 0 : 1)"]
+      interval: 60s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    cpus: 0.5
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'

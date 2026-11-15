@@ -27,3 +27,4 @@ _mirror-*.tgz
 # pattern would not), which is how one was once committed by accident.
 node_modules
 deploy/laptop-worker/.env.worker
+deploy/laptop-worker/watchdog/watchdog.env
