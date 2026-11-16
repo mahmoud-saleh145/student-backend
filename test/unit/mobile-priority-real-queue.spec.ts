@@ -120,9 +120,15 @@ type Encode = { videoId: string; trigger: string; start: number; end?: number };
     const w = new Worker(
       QUEUE_NAMES.video,
       async (job: Job) => {
-        const startedAt = Date.now();
+        // Recorded the moment the upload is TAKEN, which is the event the rule
+        // is about. It used to be recorded only when the job FINISHED, so a
+        // historical encode that started (correctly) once the upload was taken
+        // and finished sooner than it found nothing here: the assertion then
+        // threw on `originalDone[0]` being undefined, about one run in four.
+        const taken = { id: String(job.id), startedAt: Date.now(), at: 0 };
+        originalDone.push(taken);
         await sleep(ms);
-        originalDone.push({ id: String(job.id), startedAt, at: Date.now() });
+        taken.at = Date.now();
         return { ok: true };
       },
       { ...bull, concurrency: 1 },
