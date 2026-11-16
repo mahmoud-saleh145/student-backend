@@ -1,5 +1,9 @@
 # Video upload: two independent processing pipelines
 
+> Pre-release validation, the GO / NO-GO assessment and the release checklist
+> are in `docs/DUAL_PIPELINE_PRERELEASE_VALIDATION.md` (2026-11-17). Where the
+> two differ (reconciler timing, test totals), that document is the later one.
+
 Engineering report for branch `fix/dual-pipeline-independence` (backend, based on
 `origin/main` 164ae72) and `feat/dual-pipeline-status` (dashboard, based on
 `origin/main` 12dcda7). Written 2026-11-17.
@@ -135,7 +139,8 @@ Dashboard ──PUT──▶ R2 (original)
 video-processing queue ──▶ VideoProcessor ──▶ Gumlet      writes: status, gumlet*, drm*
 mobile-video-processing ──▶ MobileVideoProcessor ─ ffmpeg ─▶ R2   writes: mobile*, hlsPrefix, renditions
 
-VideoPipelineReconciler (in-process, every 120 s, API + worker):
+VideoPipelineReconciler (in-process, API + worker: at boot, every 30 s while a
+delivery is known to be pending, every 600 s in the background):
     rows with an intent and no job  ──▶ add the same deterministic job
 ```
 
