@@ -38,6 +38,7 @@ import { orderSharedLectureCandidates } from '../videos/shared-lecture-order';
 import { ManifestService } from './manifest.service';
 import { GumletDrmService } from './gumlet-drm.service';
 import { effectiveMobileDelivery, MOBILE_DELIVERY_OVERRIDE_KEY, type MobileDeliveryOverride } from './mobile-delivery-override';
+import { mobileLadderCanCarry } from '../videos/pipeline-state';
 import { DrmVerificationService } from './drm-verification.service';
 
 /**
@@ -301,27 +302,26 @@ export class PlaybackService {
       throw new AppException(ErrorCode.VIDEO_UNAVAILABLE);
     }
 
-    if (video.status === VideoStatus.PROCESSING || video.status === VideoStatus.QUEUED || video.status === VideoStatus.UPLOADING) {
-      throw new AppException(ErrorCode.VIDEO_NOT_READY, {
-        details: { status: video.status },
-      });
-    }
-
-    // A failed transcode is its own answer. Folded into VIDEO_UNAVAILABLE the
-    // app could only say "unavailable", which reads to a student as "try
-    // later" — and no amount of waiting fixes a failed encode.
-    if (video.status === VideoStatus.FAILED) {
-      await this.denied(user, videoId, video.courseId, 'video processing failed');
-      throw new AppException(ErrorCode.VIDEO_PROCESSING_FAILED, {
-        details: { status: video.status },
-      });
-    }
-
-    if (video.status !== VideoStatus.READY) {
-      await this.denied(user, videoId, video.courseId, `video status ${video.status}`);
-      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
-        details: { status: video.status },
-      });
+    // `video.status` is the GUMLET/web pipeline's state. It used to be an
+    // unconditional gate here, ahead of everything else, which made the mobile
+    // pipeline depend on Gumlet after all: a lecture whose Gumlet asset was
+    // rejected (or was still being packaged) could not be played on a phone
+    // even though its own, independently produced ladder was READY.
+    //
+    // Now exactly one case is DEFERRED rather than refused: Gumlet is not
+    // READY for a reason that is Gumlet's own (FAILED / QUEUED / PROCESSING)
+    // AND the mobile ladder is complete. Whether THIS request can be served
+    // from that ladder depends on the bound device, which is only known after
+    // device authorisation below - so the decision is finished there, and if
+    // the answer is no, the refusal is the same one as before.
+    //
+    // Nothing is waived. UPLOADING, ARCHIVED and every state without a READY
+    // ladder are refused right here, as always; and the deferred case still
+    // passes every lesson, entitlement, device, concurrency and play-limit
+    // check before a grant exists.
+    const mobileMayCarry = video.status !== VideoStatus.READY && mobileLadderCanCarry(video);
+    if (video.status !== VideoStatus.READY && !mobileMayCarry) {
+      await this.refuseForVideoStatus(user, video);
     }
 
     // --- 4b. WHICH lecture is this being played as? --------------------------
@@ -418,6 +418,17 @@ export class PlaybackService {
       ip: params.ip,
       userAgent: params.userAgent,
     });
+
+    // --- 6b. the deferred pipeline decision ----------------------------------
+    // Before the stream slot and the play allowance, so a request that is
+    // refused here has consumed neither.
+    if (mobileMayCarry) {
+      const servedFromMobile = await this.mobileHlsApplies(
+        deviceId,
+        params.capabilities?.includes('hls-aes128') === true,
+      );
+      if (!servedFromMobile) await this.refuseForVideoStatus(user, video);
+    }
 
     // --- 7. concurrency ------------------------------------------------------
     await this.acquireStreamSlot(user, video.courseId, videoId, params.ip);
@@ -965,6 +976,60 @@ export class PlaybackService {
       message: 'This video is still being prepared for mobile playback',
       details: { mobileStatus: video.mobileStatus ?? 'NONE' },
     });
+  }
+
+  /**
+   * Refuses a ticket because of the Gumlet/web pipeline's state. Always throws.
+   * The three answers are the ones this endpoint has always given.
+   */
+  private async refuseForVideoStatus(
+    user: AuthenticatedUser,
+    video: { id: string; courseId: string; status: VideoStatus },
+  ): Promise<never> {
+    if (
+      video.status === VideoStatus.PROCESSING ||
+      video.status === VideoStatus.QUEUED ||
+      video.status === VideoStatus.UPLOADING
+    ) {
+      throw new AppException(ErrorCode.VIDEO_NOT_READY, {
+        details: { status: video.status },
+      });
+    }
+
+    // A failed transcode is its own answer. Folded into VIDEO_UNAVAILABLE the
+    // app could only say "unavailable", which reads to a student as "try
+    // later" — and no amount of waiting fixes a failed encode.
+    if (video.status === VideoStatus.FAILED) {
+      await this.denied(user, video.id, video.courseId, 'video processing failed');
+      throw new AppException(ErrorCode.VIDEO_PROCESSING_FAILED, {
+        details: { status: video.status },
+      });
+    }
+
+    await this.denied(user, video.id, video.courseId, `video status ${video.status}`);
+    throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
+      details: { status: video.status },
+    });
+  }
+
+  /**
+   * Whether a first ticket for this device would be minted on the mobile HLS
+   * pipeline, given a READY ladder: mobile delivery is `hls` (configuration,
+   * or the operator's runtime override), the session is bound to an ACTIVE
+   * Android/iOS device, and the build declared `hls-aes128`.
+   *
+   * The same three conditions `planDelivery` applies, in the same order, so
+   * the answer here and the plan made at mint time cannot disagree.
+   */
+  private async mobileHlsApplies(deviceId: string | null, clientSupportsHls: boolean): Promise<boolean> {
+    const configured = this.videoCfg.mobile;
+    if (!configured) return false;
+    const override = await this.redis
+      .getJson<MobileDeliveryOverride>(MOBILE_DELIVERY_OVERRIDE_KEY)
+      .catch(() => null);
+    if (effectiveMobileDelivery(configured, override).delivery !== 'hls') return false;
+    if (!clientSupportsHls) return false;
+    return this.isBoundMobileDevice(deviceId);
   }
 
   /** READY, with a prefix and at least one rendition: what ManifestService needs. */

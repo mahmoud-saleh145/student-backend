@@ -13,6 +13,7 @@ import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { CourseAccessService } from '../courses/course-access.service';
 import { CoursesService } from '../courses/courses.service';
+import { studentFacingVideoStatus } from '../videos/pipeline-state';
 import { orderSharedLectureCandidates } from '../videos/shared-lecture-order';
 import {
   toAttachment,
@@ -43,7 +44,12 @@ export class LessonsService {
   // Student read
   // ---------------------------------------------------------------------------
 
-  async detail(lessonId: string, userId: string, role: UserRole) {
+  /**
+   * `client.mobileHls` says the caller is a native app that the mobile HLS
+   * pipeline serves. It changes exactly one thing: which `video.status` is
+   * reported (see `studentFacingVideoStatus`). Access is not affected.
+   */
+  async detail(lessonId: string, userId: string, role: UserRole, client: { mobileHls: boolean } = { mobileHls: false }) {
     const lesson = await this.prisma.lesson.findFirst({
       where: { id: lessonId, ...notDeleted },
       include: {
@@ -169,7 +175,10 @@ export class LessonsService {
             availableQualities: video.renditions.map((r) => `${r.height}p`),
             hasCaptions: video.captions.length > 0,
             captionLanguages: video.captions.map((c) => c.language),
-            status: video.status,
+            // The apps show "Watch" only when this is READY. A native app is
+            // told READY when its own ladder can play the lecture even though
+            // the Gumlet asset cannot; everyone else gets the raw state.
+            status: studentFacingVideoStatus(video, client),
             /**
              * True when this lecture is showing a file uploaded elsewhere. The
              * SAME asset, not a copy: the id above is the real video id, so the
@@ -248,7 +257,13 @@ export class LessonsService {
    * returning the wrong lesson would hand back another course's metadata and
    * completion rules.
    */
-  async byVideoId(videoId: string, userId: string, role: UserRole, lessonId?: string) {
+  async byVideoId(
+    videoId: string,
+    userId: string,
+    role: UserRole,
+    lessonId?: string,
+    client: { mobileHls: boolean } = { mobileHls: false },
+  ) {
     const video = await this.prisma.video.findFirst({
       where: { id: videoId, ...notDeleted },
       select: {
@@ -271,7 +286,7 @@ export class LessonsService {
           message: 'This video is not attached to the requested lesson',
         });
       }
-      return this.detail(lessonId, userId, role);
+      return this.detail(lessonId, userId, role, client);
     }
 
     if (attached.size === 0) {
@@ -281,7 +296,7 @@ export class LessonsService {
     }
 
     if (attached.size === 1) {
-      return this.detail([...attached][0], userId, role);
+      return this.detail([...attached][0], userId, role, client);
     }
 
     // Shared asset and no hint (the native app and older web builds never send
@@ -302,7 +317,7 @@ export class LessonsService {
     let firstError: unknown = null;
     for (const { id: candidate } of ordered) {
       try {
-        return await this.detail(candidate, userId, role);
+        return await this.detail(candidate, userId, role, client);
       } catch (error) {
         firstError ??= error;
       }

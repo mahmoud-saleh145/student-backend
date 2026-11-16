@@ -1,4 +1,5 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Optional, Param, Patch, Post, Query } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
   ApiBearerAuth,
   ApiOperation,
@@ -24,9 +25,10 @@ import {
   MinLength,
 } from 'class-validator';
 
-import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { CurrentUser, DeviceInfo } from '../../common/decorators/current-user.decorator';
 import { StaffOnly } from '../../common/decorators/roles.decorator';
-import type { AuthenticatedUser } from '../../common/types/request-context';
+import type { VideoConfig } from '../../config/configuration';
+import type { AuthenticatedUser, DeviceContext } from '../../common/types/request-context';
 
 import { LessonsService } from './lessons.service';
 
@@ -68,7 +70,22 @@ class ReorderLessonsDto {
 @ApiBearerAuth('access-token')
 @Controller()
 export class LessonsController {
-  constructor(private readonly lessons: LessonsService) {}
+  constructor(
+    private readonly lessons: LessonsService,
+    @Optional() private readonly config?: ConfigService,
+  ) {}
+
+  /**
+   * Whether the caller is a native app that the mobile HLS pipeline serves.
+   * Decides only which video status is DISPLAYED (see LessonsService.detail);
+   * the ticket endpoint makes the real decision from the bound device.
+   */
+  private clientOf(device: DeviceContext | null): { mobileHls: boolean } {
+    const platform = device?.platform?.trim().toLowerCase();
+    const native = platform === 'android' || platform === 'ios';
+    const delivery = this.config?.get<VideoConfig>('video')?.mobile?.delivery;
+    return { mobileHls: native && delivery === 'hls' };
+  }
 
   // --- student ---------------------------------------------------------------
 
@@ -80,8 +97,12 @@ export class LessonsController {
   })
   @ApiResponse({ status: 403, description: 'NOT_ENROLLED' })
   @ApiResponse({ status: 410, description: 'ACCESS_EXPIRED | COURSE_ARCHIVED' })
-  detail(@Param('lessonId') lessonId: string, @CurrentUser() user: AuthenticatedUser) {
-    return this.lessons.detail(lessonId, user.id, user.role);
+  detail(
+    @Param('lessonId') lessonId: string,
+    @CurrentUser() user: AuthenticatedUser,
+    @DeviceInfo() device: DeviceContext | null,
+  ) {
+    return this.lessons.detail(lessonId, user.id, user.role, this.clientOf(device));
   }
 
   @Get('lessons/by-video/:videoId')
@@ -95,9 +116,10 @@ export class LessonsController {
   byVideo(
     @Param('videoId') videoId: string,
     @CurrentUser() user: AuthenticatedUser,
+    @DeviceInfo() device: DeviceContext | null,
     @Query('lessonId') lessonId?: string,
   ) {
-    return this.lessons.byVideoId(videoId, user.id, user.role, lessonId);
+    return this.lessons.byVideoId(videoId, user.id, user.role, lessonId, this.clientOf(device));
   }
 
   @Post('lessons/:lessonId/complete')
