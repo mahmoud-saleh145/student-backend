@@ -212,11 +212,15 @@ describe('upload completion triggers ingestion', () => {
           status: 'UPLOADING', lessonId: 'l_1', drmProvider: 'gumlet',
         })),
         update: jest.fn(async (a: { data: Record<string, unknown> }) => { updates.push(a.data); return {}; }),
+        updateMany: jest.fn(async (a: { data: Record<string, unknown> }) => { updates.push(a.data); return { count: 1 }; }),
       },
       playbackTicket: { updateMany: jest.fn(async () => ({})) },
     };
-    const storage = { objectSize: jest.fn(async () => 1234) };
-    const queue = { add: jest.fn(async (_n: string, data: unknown) => { enqueued.push(data); return { id: 'job_1' }; }) };
+    const storage = { objectSizeStrict: jest.fn(async () => 1234) };
+    const queue = {
+      add: jest.fn(async (_n: string, data: unknown) => { enqueued.push(data); return { id: 'job_1' }; }),
+      getJob: jest.fn(async () => null),
+    };
     const access = { assertCanManageCourse: jest.fn(async () => undefined) };
     const cfg = {
       ladder: [360, 720, 1080],

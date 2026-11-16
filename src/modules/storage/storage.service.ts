@@ -12,9 +12,9 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHmac, randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { rm, stat } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
-import type { Readable } from 'node:stream';
+import { Transform, type Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
 import { AppException } from '../../common/errors/app.exception';
@@ -22,6 +22,45 @@ import { ErrorCode } from '../../common/errors/error-codes';
 import type { StorageConfig } from '../../config/configuration';
 
 import { CloudinaryService } from './cloudinary.service';
+
+/** Consecutive download attempts that may deliver nothing before giving up. */
+export const DOWNLOAD_MAX_STALLED_ATTEMPTS = 6;
+export const DOWNLOAD_RETRY_BASE_MS = 2_000;
+export const DOWNLOAD_RETRY_MAX_MS = 60_000;
+
+/** S3/R2 "there is no such object" (as opposed to a transport failure). */
+export function isObjectMissing(error: unknown): boolean {
+  const e = error as { name?: string; Code?: string; $metadata?: { httpStatusCode?: number } } | null;
+  if (!e) return false;
+  return (
+    e.name === 'NoSuchKey' ||
+    e.name === 'NotFound' ||
+    e.Code === 'NoSuchKey' ||
+    e.$metadata?.httpStatusCode === 404
+  );
+}
+
+function isPreconditionFailed(error: unknown): boolean {
+  const e = error as { name?: string; $metadata?: { httpStatusCode?: number } } | null;
+  return e?.name === 'PreconditionFailed' || e?.$metadata?.httpStatusCode === 412;
+}
+
+/**
+ * Full object length from the first response: `Content-Range: bytes a-b/total`
+ * on a ranged read, otherwise `Content-Length` (plus what was already read).
+ */
+function totalLengthOf(
+  contentRange: string | undefined,
+  contentLength: number | undefined,
+  alreadyReceived: number,
+): number | null {
+  const slash = contentRange ? contentRange.lastIndexOf('/') : -1;
+  if (contentRange && slash >= 0) {
+    const total = Number(contentRange.slice(slash + 1).trim());
+    if (Number.isFinite(total) && total > 0) return total;
+  }
+  return typeof contentLength === 'number' ? alreadyReceived + contentLength : null;
+}
 
 /**
  * The three object stores this platform uses.
@@ -515,19 +554,115 @@ export class StorageService {
     return Buffer.from(bytes);
   }
 
-  /** Streams an object to a local file without holding it in memory. */
-  async downloadToFile(bucket: Bucket, objectKey: string, destination: string): Promise<void> {
+  /**
+   * Downloads an object to a local file, RESUMING after an interrupted read.
+   *
+   * This used to be one streamed GET. A lecture source is hundreds of
+   * megabytes and the transcode worker sits on a home connection, so a single
+   * dropped packet anywhere in a ten-minute read ended the whole job with
+   * "aborted" or "socket hang up" - the cause of most failed mobile encodes in
+   * November 2026 - and the retry started again from byte zero.
+   *
+   * Now the object is read as a sequence of ranged GETs appended to the same
+   * file. When a read breaks, the bytes already on disk are kept and the next
+   * request asks only for the rest (`Range: bytes=<have>-`), with a bounded,
+   * growing pause between attempts. The attempt budget resets whenever a read
+   * made progress, so a long download over a flaky link still completes, while
+   * a link that delivers nothing gives up after `maxStalledAttempts`.
+   *
+   * The result is verified against the object's length, and the ETag is pinned
+   * with `If-Match`, so an object replaced mid-download fails instead of
+   * producing a file stitched from two different uploads. A missing object is
+   * not retried.
+   */
+  async downloadToFile(
+    bucket: Bucket,
+    objectKey: string,
+    destination: string,
+    options: { maxStalledAttempts?: number; baseDelayMs?: number; maxDelayMs?: number } = {},
+  ): Promise<void> {
     this.assertConfigured();
-    const response = await this.client.send(
-      new GetObjectCommand({ Bucket: this.bucketName(bucket), Key: objectKey }),
-    );
-    const body = response.Body as NodeJS.ReadableStream | undefined;
-    if (!body || typeof (body as { pipe?: unknown }).pipe !== 'function') {
-      throw new AppException(ErrorCode.STORAGE_UNAVAILABLE, {
-        message: `Could not stream ${objectKey} from storage`,
-      });
+    const maxStalledAttempts = Math.max(1, options.maxStalledAttempts ?? DOWNLOAD_MAX_STALLED_ATTEMPTS);
+    const baseDelayMs = options.baseDelayMs ?? DOWNLOAD_RETRY_BASE_MS;
+    const maxDelayMs = options.maxDelayMs ?? DOWNLOAD_RETRY_MAX_MS;
+
+    // Never append to something a previous run left behind.
+    await rm(destination, { force: true });
+
+    let total: number | null = null;
+    let etag: string | undefined;
+    let received = 0;
+    let stalled = 0;
+
+    for (;;) {
+      // Everything arrived but the last read ended in an error: nothing is
+      // left to ask for (a range starting at the end would be refused).
+      if (total !== null && received >= total) break;
+      const before = received;
+      try {
+        const response = await this.client.send(
+          new GetObjectCommand({
+            Bucket: this.bucketName(bucket),
+            Key: objectKey,
+            ...(received > 0 ? { Range: `bytes=${received}-` } : {}),
+            ...(received > 0 && etag ? { IfMatch: etag } : {}),
+          }),
+        );
+        const body = response.Body as NodeJS.ReadableStream | undefined;
+        if (!body || typeof (body as { pipe?: unknown }).pipe !== 'function') {
+          throw new AppException(ErrorCode.STORAGE_UNAVAILABLE, {
+            message: `Could not stream ${objectKey} from storage`,
+          });
+        }
+        if (total === null) {
+          total = totalLengthOf(response.ContentRange, response.ContentLength, received);
+          etag = response.ETag;
+        }
+        const counter = new Transform({
+          transform(chunk: Buffer, _encoding, done) {
+            received += chunk.length;
+            done(null, chunk);
+          },
+        });
+        await pipeline(body, counter, createWriteStream(destination, { flags: before > 0 ? 'a' : 'w' }));
+
+        if (total === null || received >= total) break;
+        // The stream ended cleanly but short: treat it as an interrupted read.
+        throw new Error(`storage closed the stream after ${received} of ${total} bytes`);
+      } catch (error) {
+        if (isObjectMissing(error) || error instanceof AppException) throw error;
+        if (isPreconditionFailed(error)) {
+          throw new AppException(ErrorCode.STORAGE_UNAVAILABLE, {
+            message: `${objectKey} changed in storage while it was being downloaded`,
+          });
+        }
+        // What is on disk is the truth, not the counter: a write that failed
+        // after the chunk was counted must not leave a hole in the file.
+        received = await stat(destination).then(
+          (info) => info.size,
+          () => 0,
+        );
+        stalled = received > before ? 0 : stalled + 1;
+        const message = error instanceof Error ? error.message : String(error);
+        if (stalled >= maxStalledAttempts) {
+          throw new Error(
+            `download of ${objectKey} failed after ${maxStalledAttempts} attempts without progress ` +
+              `(${received} of ${total ?? 'unknown'} bytes): ${message}`,
+          );
+        }
+        const delay = Math.min(maxDelayMs, baseDelayMs * 2 ** Math.max(0, stalled - 1));
+        this.logger.warn(
+          `download of ${objectKey} interrupted at ${received} of ${total ?? 'unknown'} bytes (${message}); ` +
+            `resuming in ${Math.round(delay / 1000)} s`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
     }
-    await pipeline(body, createWriteStream(destination));
+
+    const onDisk = await stat(destination).then((info) => info.size);
+    if (total !== null && onDisk !== total) {
+      throw new Error(`download of ${objectKey} is ${onDisk} bytes on disk but the object is ${total} bytes`);
+    }
   }
 
   async exists(bucket: Bucket, objectKey: string): Promise<boolean> {
@@ -549,6 +684,29 @@ export class StorageService {
       return head.ContentLength ?? null;
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * The object's size, distinguishing "it is not there" from "storage could
+   * not be asked".
+   *
+   * `objectSize` answers null for both, which is right for a best-effort probe
+   * and wrong for confirming an upload: telling an administrator "the file was
+   * not found, upload it again" because of a network blip makes them re-send
+   * hundreds of megabytes that are sitting safely in the bucket. Here null
+   * means the object is definitely absent; anything else that goes wrong is
+   * thrown.
+   */
+  async objectSizeStrict(bucket: Bucket, objectKey: string): Promise<number | null> {
+    try {
+      const head = await this.client.send(
+        new HeadObjectCommand({ Bucket: this.bucketName(bucket), Key: objectKey }),
+      );
+      return head.ContentLength ?? null;
+    } catch (error) {
+      if (isObjectMissing(error)) return null;
+      throw error;
     }
   }
 

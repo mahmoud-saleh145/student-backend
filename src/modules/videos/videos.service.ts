@@ -17,6 +17,7 @@ import type { VideoConfig } from '../../config/configuration';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import {
   DEFAULT_JOB_OPTIONS,
+  MOBILE_JOB_ATTEMPTS,
   MOBILE_JOB_PRIORITY,
   MOBILE_VIDEO_JOBS,
   QUEUE_NAMES,
@@ -24,8 +25,18 @@ import {
   type MobileTranscodeJobData,
   type TranscodeJobData,
 } from '../../jobs/queue.constants';
-import { readWorkerHeartbeat, type WorkerHeartbeatPayload } from '../../jobs/worker-heartbeat';
-import { readPauseState, writePauseState, type PauseState } from '../../jobs/processors/scratch-guard';
+import {
+  readMobileWorkerHeartbeat,
+  readWorkerHeartbeat,
+  type WorkerHeartbeatPayload,
+} from '../../jobs/worker-heartbeat';
+import {
+  pauseHolds,
+  readPauseState,
+  writePauseState,
+  type PauseScope,
+  type PauseState,
+} from '../../jobs/processors/scratch-guard';
 import {
   MOBILE_DELIVERY_OVERRIDE_KEY,
   type MobileDeliveryOverride,
@@ -37,9 +48,85 @@ import { CourseAccessService } from '../courses/course-access.service';
 import { CoursesService } from '../courses/courses.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { assertObjectKeyInNamespace, StorageService } from '../storage/storage.service';
-import { isTerminalGumletFailure } from './gumlet-failure';
+import { isTerminalGumletFailure, sanitizeProviderText } from './gumlet-failure';
 import { GumletIngestService } from './gumlet-ingest.service';
 import { LessonVideoService } from './lesson-video.service';
+import {
+  gumletStateOf,
+  isLiveJobState,
+  mobileJobIdFor,
+  sourceStateOf,
+  uploadTranscodeJobIdFor,
+} from './pipeline-state';
+
+/**
+ * How long one queue operation may take before it is treated as "Redis is not
+ * answering".
+ *
+ * BullMQ's connection is configured (as BullMQ requires) to retry a command
+ * forever, so while Redis is unreachable `queue.add()` does not fail - it
+ * simply never returns. Unbounded, that turned a Redis outage into an upload
+ * request that hung until the browser gave up, for a file that was already
+ * safely stored. Bounded, the request records its intent in the database and
+ * answers; the reconciler enqueues when Redis is back.
+ *
+ * A command that timed out here may still be delivered when the connection
+ * returns. Every job this file adds with a bound has a deterministic id, so a
+ * late delivery is the same job, not a second one.
+ */
+export const QUEUE_OPERATION_TIMEOUT_MS = 5_000;
+
+/** A queue operation exceeded QUEUE_OPERATION_TIMEOUT_MS. */
+export class QueueTimeoutError extends Error {
+  override readonly name = 'QueueTimeoutError';
+}
+
+export function withinQueueTimeout<T>(work: Promise<T>, what: string, ms = QUEUE_OPERATION_TIMEOUT_MS): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new QueueTimeoutError(`${what} did not answer within ${ms} ms`)), ms);
+  });
+  // The abandoned operation may reject later; that must not become an
+  // unhandled rejection.
+  work.catch(() => undefined);
+  return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * How long a freshly recorded intent is left to the request that recorded it
+ * before the reconciler considers it stranded.
+ */
+export const INTENT_RECONCILE_GRACE_MS = 45_000;
+
+/**
+ * A mobile row is PROCESSING but its job is no longer in the queue. After this
+ * long the sweep treats it as orphaned. Only rows whose job is NOT live are
+ * touched, so a long encode that is genuinely running is never interrupted.
+ */
+export const MOBILE_ORPHAN_AFTER_MS = 20 * 60_000;
+
+/** Web/Gumlet states from which a video may be processed for mobile: all but UPLOADING. */
+const MOBILE_MIGRATABLE_STATUSES: VideoStatus[] = [
+  VideoStatus.READY,
+  VideoStatus.ARCHIVED,
+  VideoStatus.FAILED,
+  VideoStatus.QUEUED,
+  VideoStatus.PROCESSING,
+];
+
+/** Shown on the row while its intent is waiting for Redis. No infrastructure detail. */
+export const WAITING_FOR_QUEUE_NOTE =
+  'Waiting for the processing queue. It will be queued automatically - no action is needed.';
+
+export type QueueJobPresence = 'live' | 'finished' | 'missing' | 'unknown';
+
+export interface MobileEnqueueResult {
+  jobId: string | null;
+  /** True when an existing intent already covered this request. */
+  alreadyQueued: boolean;
+  /** False when the intent is recorded but Redis has not accepted the job yet. */
+  enqueued: boolean;
+}
 
 const ALLOWED_VIDEO_TYPES = new Set([
   'video/mp4',
@@ -302,6 +389,28 @@ export class VideosService {
               gumletStatus: null,
               gumletError: null,
               gumletUpdatedAt: null,
+              // THE SOURCE IS NEW, SO NOTHING DERIVED FROM THE OLD ONE STANDS.
+              //
+              // `sourceSizeBytes` is the proof that the file reached storage,
+              // and it described the previous file: left in place, the row
+              // claimed a confirmed upload for bytes that have not been sent.
+              //
+              // The mobile ladder is the same problem with consequences. It
+              // was encoded from the PREVIOUS recording, and a row that stayed
+              // mobile-READY kept handing students that old recording over HLS
+              // while the web played the new one. The mobile state is reset
+              // exactly as the Gumlet asset is; `completeUpload` records a
+              // fresh intent for the new file, and a job still queued for the
+              // old source is recognised as stale by its source key.
+              sourceSizeBytes: null,
+              mobileStatus: MobileVideoStatus.NONE,
+              mobileError: null,
+              mobileJobId: null,
+              mobileProcessingStartedAt: null,
+              mobileProcessedAt: null,
+              mobileRequestedAt: null,
+              mobileEnqueuedAt: null,
+              mobileTrigger: null,
               // A LEGACY row carrying NEW content must not keep its old provider:
               // that would send the new recording down the legacy ffmpeg/AES-128
               // pipeline on a DRM platform. A row already on Gumlet keeps it, with
@@ -452,7 +561,21 @@ export class VideosService {
       throw new AppException(ErrorCode.INVALID_STATE, { message: 'No upload was initialised' });
     }
 
-    const size = await this.storage.objectSize('uploads', video.sourceKey);
+    // "Not there" and "could not ask" are different answers. Only the first
+    // one means the file has to be sent again.
+    let size: number | null;
+    try {
+      size = await this.storage.objectSizeStrict('uploads', video.sourceKey);
+    } catch (error) {
+      this.logger.warn(
+        `video ${videoId}: storage could not be asked about ${video.sourceKey}: ${(error as Error).message}`,
+      );
+      throw new AppException(ErrorCode.STORAGE_UNAVAILABLE, {
+        message:
+          'Storage could not be reached to confirm the upload. Nothing was lost - ' +
+          'check again in a moment; do not upload the file again yet.',
+      });
+    }
     if (size === null) {
       // The bytes are not there. The message has to say what to do about it,
       // because the reader is looking at a failed upload and needs to know
@@ -498,17 +621,26 @@ export class VideosService {
     // is GONE: the video is stranded between "queued" and "running", and that
     // is exactly what a repeated `complete` should repair.
     if (video.status === VideoStatus.QUEUED || video.status === VideoStatus.PROCESSING) {
-      if (await this.localJobIsLive(video.processingJobId)) {
+      const presence = await this.jobPresence(this.queue, video.processingJobId);
+      // `unknown` = Redis did not answer. That is not evidence that the job is
+      // gone, so nothing is re-queued on it: the intent is already durable and
+      // the reconciler / sweep act once Redis can be read.
+      if (presence === 'live' || presence === 'unknown') {
         this.logger.log(
           `video ${videoId}: complete called again on a video that is already ${video.status}; ` +
             'no second job was enqueued',
         );
+        // An intent this video already has is made sure of; none is created.
+        const mobile = await this.settleMobileIntentOnComplete(video, { accepting: false }, actor.id);
         return {
           videoId,
           status: video.status,
           jobId: video.processingJobId,
           sourceSizeBytes: size,
           alreadyQueued: true,
+          upload: { state: 'VERIFIED' as const, sizeBytes: size },
+          gumlet: { queued: presence === 'live' },
+          mobile,
           ...(await this.workerStatus()),
         };
       }
@@ -521,15 +653,31 @@ export class VideosService {
     // A video that is already READY has been through this endpoint. Queueing
     // it again would transcode a finished lecture for nothing.
     if (video.status === VideoStatus.READY || video.status === VideoStatus.ARCHIVED) {
+      const mobile = await this.settleMobileIntentOnComplete(video, { accepting: false }, actor.id);
       return {
         videoId,
         status: video.status,
         jobId: video.processingJobId,
         sourceSizeBytes: size,
         alreadyQueued: true,
+        upload: { state: 'VERIFIED' as const, sizeBytes: size },
+        gumlet: { queued: true },
+        mobile,
         ...(await this.workerStatus()),
       };
     }
+
+    // -------------------------------------------------------------------------
+    // THE MOBILE INTENT COMES FIRST, AND DEPENDS ON NOTHING BELOW.
+    //
+    // The source is verified. From this line on the video must be processed
+    // for mobile whatever happens to the Gumlet side: a rejected asset, a
+    // provider outage, an unreachable queue, a crash of this process. So the
+    // intent is written to the database BEFORE the Gumlet job is even
+    // attempted - it used to be queued last, and only if everything before it
+    // had succeeded.
+    // -------------------------------------------------------------------------
+    const mobile = await this.settleMobileIntentOnComplete(video, { accepting: true }, actor.id);
 
     // The confirmed file is the one that stays. Anything an earlier attempt
     // left behind is removed, so a retried upload does not accumulate
@@ -558,39 +706,184 @@ export class VideosService {
     // keeps a single, already-idempotent path: a duplicate job re-syncs the
     // existing asset instead of creating a second one.
     //
-    // Asynchronous by construction - the admin's upload returns as soon as this
-    // enqueue succeeds, and any Gumlet slowness or failure is recorded on the row
-    // rather than blocking or rolling back the upload the student will later need.
+    // Asynchronous by construction - the admin's upload returns as soon as the
+    // acceptance is durable, and any Gumlet slowness or failure is recorded on
+    // the row rather than blocking or rolling back the upload the student will
+    // later need.
+    //
+    // THE UPLOAD SUCCEEDS HERE EVEN IF THE QUEUE DOES NOT ANSWER. The source is
+    // verified and the row says QUEUED, which is a durable instruction: the
+    // reconciler enqueues the job as soon as Redis is reachable. Answering
+    // "upload failed" for a file that is safely stored made administrators
+    // send it again.
     // -------------------------------------------------------------------------
 
-    const jobId = await this.enqueueTranscode(
+    const web = await this.queueUploadTranscode(
       { id: videoId, sourceKey: video.sourceKey, lessonId: video.lessonId, courseId: video.courseId },
       actor.id,
     );
 
-    this.logger.log(`queued transcode job ${jobId} for video ${videoId} (${size} bytes)`);
-
-    // The independent mobile pipeline runs beside the primary one for every
-    // upload. Best effort here: the upload is already confirmed and queued for
-    // web, and a mobile queue failure is recorded on the row (FAILED, with the
-    // reason) where the dashboard and the recovery sweep can see it.
-    if (this.cfg.mobile?.autoProcess !== false) {
-      await this.enqueueMobileTranscode(
-        { id: videoId, sourceKey: video.sourceKey },
-        'upload',
-        actor.id,
-      ).catch((error) =>
-        this.logger.warn(`video ${videoId}: mobile transcode not queued: ${(error as Error).message}`),
-      );
-    }
+    this.logger.log(
+      web.queued
+        ? `queued transcode job ${web.jobId} for video ${videoId} (${size} bytes)`
+        : `video ${videoId} accepted (${size} bytes); its transcode job will be queued by the reconciler`,
+    );
 
     return {
       videoId,
       status: VideoStatus.QUEUED,
-      jobId,
+      jobId: web.jobId,
       sourceSizeBytes: size,
+      upload: { state: 'VERIFIED' as const, sizeBytes: size },
+      gumlet: { queued: web.queued },
+      mobile,
       ...(await this.workerStatus()),
     };
+  }
+
+  /**
+   * The mobile half of finishing an upload.
+   *
+   * `accepting` is true only on the call that actually accepts the upload (the
+   * row was not yet in the pipeline). Only that call may create an intent, and
+   * only for a video that has never been processed for mobile from this
+   * source: a stray `complete` on an old lecture must never start encoding
+   * the back catalogue, and a FAILED ladder is retried by an explicit staff
+   * action, not as a side effect.
+   *
+   * Every call, accepting or not, makes sure an intent that ALREADY exists has
+   * its job - which is what lets a retried `complete` repair an enqueue that
+   * Redis refused the first time.
+   *
+   * Never throws: nothing about the mobile pipeline may fail an upload.
+   */
+  private async settleMobileIntentOnComplete(
+    video: { id: string; sourceKey: string | null },
+    mode: { accepting: boolean },
+    actorId: string,
+  ): Promise<{ status: MobileVideoStatus; jobId: string | null; queued: boolean; automatic: boolean }> {
+    const automatic = Boolean(this.mobileQueue) && this.cfg.mobile?.autoProcess !== false;
+    try {
+      const row = await this.prisma.video.findFirst({
+        where: { id: video.id, ...notDeleted },
+        select: { mobileStatus: true, mobileJobId: true, mobileEnqueuedAt: true },
+      });
+      const status = row?.mobileStatus ?? MobileVideoStatus.NONE;
+      const current = { status, jobId: row?.mobileJobId ?? null, queued: Boolean(row?.mobileEnqueuedAt), automatic };
+      if (!row || !video.sourceKey || !this.mobileQueue) return current;
+
+      const createIntent = mode.accepting && automatic && status === MobileVideoStatus.NONE;
+      const repairIntent = status === MobileVideoStatus.QUEUED && !row.mobileEnqueuedAt;
+      if (!createIntent && !repairIntent) return current;
+
+      const result = await this.enqueueMobileTranscode({ id: video.id, sourceKey: video.sourceKey }, 'upload', actorId);
+      return { status: MobileVideoStatus.QUEUED, jobId: result.jobId, queued: result.enqueued, automatic };
+    } catch (error) {
+      this.logger.warn(`video ${video.id}: mobile intent not settled: ${(error as Error).message}`);
+      return { status: MobileVideoStatus.NONE, jobId: null, queued: false, automatic };
+    }
+  }
+
+  /**
+   * Accepts a verified upload for web/Gumlet processing and queues its job.
+   *
+   * DURABLE FIRST. The row becomes QUEUED in the database before Redis is
+   * touched, so the instruction survives whatever happens next. `processingJobId`
+   * stays NULL until the job is really in Redis; "QUEUED with no job id" is
+   * the outbox state the reconciler looks for.
+   *
+   * IDEMPOTENT. The job id is derived from the video and its source key, so a
+   * finalisation request that is retried, doubled or raced maps to one job.
+   * A finished job with the same id (the video failed and `complete` is being
+   * used to recover it) is cleared first, because BullMQ would otherwise treat
+   * the new request as a duplicate of the dead one.
+   *
+   * Never throws for a queue problem.
+   */
+  private async queueUploadTranscode(
+    video: { id: string; sourceKey: string; lessonId: string | null; courseId: string },
+    requestedById?: string,
+  ): Promise<{ jobId: string | null; queued: boolean }> {
+    const jobId = uploadTranscodeJobIdFor(video.id, video.sourceKey);
+
+    await this.prisma.video.updateMany({
+      where: { id: video.id, deletedAt: null, sourceKey: video.sourceKey },
+      data: { status: VideoStatus.QUEUED, processingJobId: null, processingError: null },
+    });
+
+    try {
+      const presence = await this.jobPresence(this.queue, jobId);
+      if (presence === 'unknown') throw new QueueTimeoutError('the processing queue did not answer');
+      if (presence === 'finished') {
+        const stale = await withinQueueTimeout(this.queue.getJob(jobId), 'queue read');
+        await withinQueueTimeout(Promise.resolve(stale?.remove()), 'queue cleanup');
+      }
+      if (presence !== 'live') {
+        await withinQueueTimeout(
+          this.queue.add(
+            VIDEO_JOBS.transcode,
+            {
+              videoId: video.id,
+              sourceKey: video.sourceKey,
+              lessonId: video.lessonId,
+              courseId: video.courseId,
+              ladder: this.cfg.ladder,
+              encrypt: this.cfg.encryptionEnabled,
+              requestedById,
+            },
+            {
+              ...DEFAULT_JOB_OPTIONS,
+              attempts: 2,
+              backoff: {
+                type: 'exponential',
+                delay: TRANSCODE_BACKOFF_BASE_MS,
+                jitter: TRANSCODE_BACKOFF_JITTER,
+              },
+              jobId,
+            },
+          ),
+          'queue write',
+        );
+      }
+    } catch (error) {
+      this.logger.error(
+        `video ${video.id}: accepted, but its transcode job is not in the queue yet (${(error as Error).message}); ` +
+          'the reconciler will queue it',
+      );
+      return { jobId: null, queued: false };
+    }
+
+    // Conditional on the source: a re-upload that started in the meantime owns
+    // the row now, and its own completion will record its own job.
+    await this.prisma.video.updateMany({
+      where: { id: video.id, deletedAt: null, sourceKey: video.sourceKey, status: VideoStatus.QUEUED },
+      data: { processingJobId: jobId },
+    });
+    return { jobId, queued: true };
+  }
+
+  /**
+   * Whether a job is still in its queue.
+   *
+   *   live      waiting / delayed / prioritized / active: it will run or is running
+   *   finished  completed or failed and still retained
+   *   missing   not in Redis at all
+   *   unknown   Redis did not answer in time - NOT evidence that the job is gone
+   */
+  private async jobPresence(
+    queue: Queue<never> | Queue<TranscodeJobData> | Queue<MobileTranscodeJobData> | undefined,
+    jobId: string | null,
+  ): Promise<QueueJobPresence> {
+    if (!jobId || !queue) return 'missing';
+    try {
+      const job = await withinQueueTimeout((queue as Queue).getJob(jobId), 'queue read');
+      if (!job) return 'missing';
+      const state = await withinQueueTimeout(job.getState(), 'queue read');
+      if (isLiveJobState(state)) return 'live';
+      return state === 'unknown' ? 'missing' : 'finished';
+    } catch {
+      return 'unknown';
+    }
   }
 
   /**
@@ -616,7 +909,8 @@ export class VideosService {
   ): Promise<string> {
     let jobId: string;
     try {
-      const job = await this.queue.add(
+      // Bounded: an unreachable Redis makes `add` wait forever, not fail.
+      const job = await withinQueueTimeout(this.queue.add(
         VIDEO_JOBS.transcode,
         {
           videoId: video.id,
@@ -647,7 +941,7 @@ export class VideosService {
           },
           jobId: `transcode:${video.id}:${Date.now()}`,
         },
-      );
+      ), 'queue write');
       jobId = String(job.id);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -825,18 +1119,43 @@ export class VideosService {
   // ---------------------------------------------------------------------------
 
   /**
-   * Puts a mobile transcode on its queue and records it on the row.
+   * Records that a video must be processed for mobile, then makes sure the
+   * job for that instruction is in the queue.
    *
-   * Mirrors `enqueueTranscode`: QUEUED is written only once the job is really
-   * in Redis, and a refused write leaves FAILED with the reason so nothing sits
-   * "queued" with no job behind it. A video already QUEUED/PROCESSING with a
-   * live job is left alone; a stale one is re-queued.
+   * TWO STEPS, IN THIS ORDER, AND THE ORDER IS THE POINT.
+   *
+   *   1. THE INTENT, in the database. One conditional write turns the row
+   *      QUEUED, bumps `mobileGeneration` and stores the job id derived from
+   *      it. From that moment "this video must be processed" is durable: it
+   *      survives Redis being down, this process crashing, a deploy.
+   *   2. THE JOB, in Redis, under that deterministic id. `mobileEnqueuedAt` is
+   *      stamped only when Redis has really accepted it.
+   *
+   * The previous order was the reverse (job first, QUEUED after, FAILED when
+   * the job could not be added). That lost the instruction whenever the
+   * process stopped between the two, and reported a healthy video as FAILED
+   * because of a queue outage that had nothing to do with it.
+   *
+   * IDEMPOTENT at both steps:
+   *   - the intent is a compare-and-set on the generation, so two concurrent
+   *     requests produce one intent, not two;
+   *   - the job id is a function of the intent, so adding it again - by a
+   *     retried request, another API process or the reconciler - is the same
+   *     job. BullMQ ignores an `add` whose id already exists.
+   *
+   * A video that is already QUEUED or PROCESSING with a live job is left
+   * alone. One whose job never reached Redis gets the SAME job added again.
+   * One whose job finished or vanished without the row learning of it gets a
+   * new intent.
+   *
+   * A queue outage does not throw and does not fail the video: the result says
+   * `enqueued: false` and `reconcilePendingIntents` finishes the work.
    */
   async enqueueMobileTranscode(
     video: { id: string; sourceKey: string },
     trigger: MobileTranscodeJobData['trigger'],
     requestedById?: string,
-  ): Promise<{ jobId: string | null; alreadyQueued: boolean }> {
+  ): Promise<MobileEnqueueResult> {
     if (!this.mobileQueue) {
       throw new AppException(ErrorCode.QUEUE_UNAVAILABLE, {
         message: 'The mobile processing queue is not configured on this process',
@@ -845,69 +1164,185 @@ export class VideosService {
 
     const current = await this.prisma.video.findFirst({
       where: { id: video.id, ...notDeleted },
-      select: { mobileStatus: true, mobileJobId: true, durationSeconds: true },
+      select: {
+        mobileStatus: true,
+        mobileJobId: true,
+        mobileGeneration: true,
+        mobileEnqueuedAt: true,
+        mobileTrigger: true,
+        durationSeconds: true,
+      },
     });
     if (!current) throw AppException.notFound('Video', video.id);
-    if (
-      (current.mobileStatus === MobileVideoStatus.QUEUED ||
-        current.mobileStatus === MobileVideoStatus.PROCESSING) &&
-      (await this.mobileJobIsLive(current.mobileJobId))
-    ) {
-      return { jobId: current.mobileJobId, alreadyQueued: true };
-    }
+    const generation = current.mobileGeneration ?? 0;
+    const durationSeconds = current.durationSeconds > 0 ? current.durationSeconds : undefined;
 
-    let jobId: string;
-    try {
-      const job = await this.mobileQueue.add(
-        MOBILE_VIDEO_JOBS.transcode,
-        {
+    if (
+      current.mobileStatus === MobileVideoStatus.QUEUED ||
+      current.mobileStatus === MobileVideoStatus.PROCESSING
+    ) {
+      const presence = await this.jobPresence(this.mobileQueue, current.mobileJobId);
+      if (presence === 'live') {
+        if (!current.mobileEnqueuedAt) await this.stampMobileEnqueued(video.id, current.mobileJobId!);
+        return { jobId: current.mobileJobId, alreadyQueued: true, enqueued: true };
+      }
+      if (presence === 'unknown') {
+        // Redis did not answer. The intent stands; nothing is duplicated on a guess.
+        return { jobId: current.mobileJobId, alreadyQueued: true, enqueued: false };
+      }
+      if (
+        presence === 'missing' &&
+        current.mobileStatus === MobileVideoStatus.QUEUED &&
+        current.mobileJobId === mobileJobIdFor(video.id, generation)
+      ) {
+        // The same intent, whose job is not in Redis (the first add was
+        // refused, or Redis lost it before a worker took it): the SAME job
+        // again. No new generation, so a concurrent caller adds this very id.
+        const added = await this.addMobileJob({
           videoId: video.id,
           sourceKey: video.sourceKey,
-          ladder: this.cfg.ladder,
-          encrypt: this.cfg.encryptionEnabled,
-          // Known for every Gumlet-processed row; lets the worker size its
-          // scratch preflight before it downloads anything.
-          durationSeconds: current.durationSeconds > 0 ? current.durationSeconds : undefined,
-          trigger,
+          jobId: current.mobileJobId,
+          trigger: (current.mobileTrigger as MobileTranscodeJobData['trigger'] | null) ?? trigger,
           requestedById,
-        },
-        {
-          ...DEFAULT_JOB_OPTIONS,
-          attempts: 2,
-          backoff: {
-            type: 'exponential',
-            delay: TRANSCODE_BACKOFF_BASE_MS,
-            jitter: TRANSCODE_BACKOFF_JITTER,
-          },
-          jobId: `mobile-hls:${video.id}:${Date.now()}`,
-          // Historical work goes behind every upload/retry in this queue.
-          ...(MOBILE_JOB_PRIORITY[trigger] ? { priority: MOBILE_JOB_PRIORITY[trigger] } : {}),
-        },
-      );
-      jobId = String(job.id);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      await this.prisma.video.update({
-        where: { id: video.id },
-        data: {
-          mobileStatus: MobileVideoStatus.FAILED,
-          mobileError: `Could not queue mobile processing: ${message}`.slice(0, 1000),
-        },
-      });
-      throw new AppException(ErrorCode.QUEUE_UNAVAILABLE, {
-        message: 'The mobile processing queue is unavailable; try again shortly.',
-      });
+          durationSeconds,
+        });
+        return { jobId: current.mobileJobId, alreadyQueued: true, enqueued: added };
+      }
+      // The job finished or vanished and the row never heard (a worker killed
+      // mid-encode, a job that exhausted its attempts): a new intent, below.
     }
 
-    await this.prisma.video.update({
-      where: { id: video.id },
-      data: { mobileStatus: MobileVideoStatus.QUEUED, mobileJobId: jobId, mobileError: null },
+    const nextGeneration = generation + 1;
+    const jobId = mobileJobIdFor(video.id, nextGeneration);
+    const claimed = await this.prisma.video.updateMany({
+      where: { id: video.id, deletedAt: null, mobileGeneration: generation },
+      data: {
+        mobileStatus: MobileVideoStatus.QUEUED,
+        mobileJobId: jobId,
+        mobileGeneration: nextGeneration,
+        mobileRequestedAt: new Date(),
+        mobileEnqueuedAt: null,
+        mobileTrigger: trigger,
+        mobileError: null,
+      },
     });
-    return { jobId, alreadyQueued: false };
+    if (claimed.count === 0) {
+      // Another request recorded an intent between the read and this write.
+      // Theirs stands, and they are adding its job.
+      const latest = await this.prisma.video.findFirst({
+        where: { id: video.id, ...notDeleted },
+        select: { mobileJobId: true, mobileEnqueuedAt: true },
+      });
+      return {
+        jobId: latest?.mobileJobId ?? null,
+        alreadyQueued: true,
+        enqueued: Boolean(latest?.mobileEnqueuedAt),
+      };
+    }
+
+    const added = await this.addMobileJob({
+      videoId: video.id,
+      sourceKey: video.sourceKey,
+      jobId,
+      trigger,
+      requestedById,
+      durationSeconds,
+    });
+    return { jobId, alreadyQueued: false, enqueued: added };
   }
 
-  /** Staff action: run (or re-run) the mobile transcode for one video. */
-  async retryMobileProcessing(videoId: string, actor: { id: string; role: UserRole }) {
+  /**
+   * Step 2 of `enqueueMobileTranscode`: the job, under the intent's id.
+   * Returns whether Redis accepted it. Never throws for a queue problem and
+   * never marks the video FAILED - the intent is already safe in the database.
+   */
+  private async addMobileJob(params: {
+    videoId: string;
+    sourceKey: string;
+    jobId: string;
+    trigger: MobileTranscodeJobData['trigger'];
+    requestedById?: string;
+    durationSeconds?: number;
+  }): Promise<boolean> {
+    const priority = MOBILE_JOB_PRIORITY[params.trigger];
+    try {
+      await withinQueueTimeout(
+        this.mobileQueue!.add(
+          MOBILE_VIDEO_JOBS.transcode,
+          {
+            videoId: params.videoId,
+            sourceKey: params.sourceKey,
+            ladder: this.cfg.ladder,
+            encrypt: this.cfg.encryptionEnabled,
+            // Known for every Gumlet-processed row; lets the worker size its
+            // scratch preflight before it downloads anything.
+            durationSeconds: params.durationSeconds,
+            trigger: params.trigger,
+            requestedById: params.requestedById,
+          },
+          {
+            ...DEFAULT_JOB_OPTIONS,
+            attempts: MOBILE_JOB_ATTEMPTS,
+            backoff: {
+              type: 'exponential',
+              delay: TRANSCODE_BACKOFF_BASE_MS,
+              jitter: TRANSCODE_BACKOFF_JITTER,
+            },
+            jobId: params.jobId,
+            // Historical work goes behind every upload/retry in this queue.
+            ...(priority ? { priority } : {}),
+          },
+        ),
+        'mobile queue write',
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(
+        `video ${params.videoId}: mobile intent ${params.jobId} is recorded but its job is not in the queue yet ` +
+          `(${message}); the reconciler will queue it`,
+      );
+      await this.prisma.video
+        .updateMany({
+          where: { id: params.videoId, mobileJobId: params.jobId, mobileStatus: MobileVideoStatus.QUEUED },
+          data: { mobileError: WAITING_FOR_QUEUE_NOTE },
+        })
+        .catch(() => undefined);
+      return false;
+    }
+    await this.stampMobileEnqueued(params.videoId, params.jobId);
+    return true;
+  }
+
+  /**
+   * Marks the intent as delivered to Redis. Conditional on the job id, so a
+   * newer intent is never stamped by an older one, and the "waiting for the
+   * queue" note is cleared only where it was the thing being shown.
+   */
+  private async stampMobileEnqueued(videoId: string, jobId: string): Promise<void> {
+    await this.prisma.video
+      .updateMany({ where: { id: videoId, mobileJobId: jobId, mobileEnqueuedAt: null }, data: { mobileEnqueuedAt: new Date() } })
+      .catch((e: Error) => this.logger.warn(`video ${videoId}: could not stamp the mobile enqueue (${e.message})`));
+    await this.prisma.video
+      .updateMany({ where: { id: videoId, mobileJobId: jobId, mobileError: WAITING_FOR_QUEUE_NOTE }, data: { mobileError: null } })
+      .catch(() => undefined);
+  }
+
+  /**
+   * Staff action: run (or re-run) the mobile transcode for one video.
+   *
+   * Touches the mobile pipeline only. Nothing here reads or writes `status`
+   * or any Gumlet field, so retrying mobile can never reset, restart or fail
+   * the Gumlet side.
+   *
+   * Refused when it would duplicate work: a video that is already queued or
+   * being encoded keeps the job it has, and a READY ladder is not thrown away
+   * and re-encoded unless an administrator explicitly forces it.
+   */
+  async retryMobileProcessing(
+    videoId: string,
+    actor: { id: string; role: UserRole },
+    options: { force?: boolean } = {},
+  ) {
     const video = await this.prisma.video.findFirst({
       where: { id: videoId, ...notDeleted },
       select: { id: true, courseId: true, sourceKey: true, mobileStatus: true },
@@ -918,6 +1353,18 @@ export class VideosService {
       throw new AppException(ErrorCode.INVALID_STATE, {
         message: 'No source file to process for mobile — re-upload the video',
       });
+    }
+    if (video.mobileStatus === MobileVideoStatus.READY) {
+      if (!options.force) {
+        throw new AppException(ErrorCode.INVALID_STATE, {
+          message: 'This video is already processed for mobile. There is nothing to retry.',
+        });
+      }
+      if (actor.role !== 'ADMIN' && actor.role !== 'MASTER') {
+        throw new AppException(ErrorCode.FORBIDDEN, {
+          message: 'Only an administrator can re-encode a video that is already ready for mobile',
+        });
+      }
     }
     if (!(await this.storage.exists('uploads', video.sourceKey))) {
       throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
@@ -939,7 +1386,7 @@ export class VideosService {
       entityId: videoId,
       after: { mobileRetry: true, ...result },
     });
-    return { videoId, ...result, ...(await this.workerStatus()) };
+    return { videoId, ...result, ...(await this.mobileWorkerStatus()) };
   }
 
   /**
@@ -956,9 +1403,13 @@ export class VideosService {
     limit: number;
     actorId: string;
   }): Promise<MobileMigrationReport> {
+    // Eligibility is about the SOURCE, not about Gumlet. Any video whose
+    // upload was accepted qualifies, whatever Gumlet made of it: a lecture
+    // Gumlet rejected is exactly the one mobile most needs. Only UPLOADING is
+    // left out - there is no confirmed file to encode yet.
     const pending = {
       ...notDeleted,
-      status: { in: [VideoStatus.READY, VideoStatus.ARCHIVED] },
+      status: { in: MOBILE_MIGRATABLE_STATUSES },
       mobileStatus: { in: [MobileVideoStatus.NONE, MobileVideoStatus.FAILED] },
     };
     const candidates = await this.prisma.video.findMany({
@@ -993,12 +1444,18 @@ export class VideosService {
         continue;
       }
       try {
-        await this.enqueueMobileTranscode(
+        const result = await this.enqueueMobileTranscode(
           { id: video.id, sourceKey: video.sourceKey },
           'migration',
           params.actorId,
         );
         report.queued.push(video.id);
+        if (!result.enqueued) {
+          report.queueErrors.push({
+            videoId: video.id,
+            error: 'intent recorded; the queue did not answer, so the reconciler will deliver the job',
+          });
+        }
       } catch (error) {
         report.queueErrors.push({ videoId: video.id, error: (error as Error).message });
       }
@@ -1056,7 +1513,7 @@ export class VideosService {
   }> {
     const migratableWhere = {
       ...notDeleted,
-      status: { in: [VideoStatus.READY, VideoStatus.ARCHIVED] },
+      status: { in: MOBILE_MIGRATABLE_STATUSES },
     };
     const pendingWhere = {
       ...migratableWhere,
@@ -1170,15 +1627,16 @@ export class VideosService {
     paused: boolean,
     actor: { id: string; role: UserRole },
     reason?: string,
+    scope?: PauseScope,
   ): Promise<PauseState> {
-    const state = await writePauseState(this.redis, paused, actor.id, reason);
+    const state = await writePauseState(this.redis, paused, actor.id, reason, scope);
     await this.audit.record({
       action: AuditAction.UPDATE,
       actorId: actor.id,
       actorRole: actor.role,
       entity: 'video',
       entityId: 'mobile-pipeline',
-      after: { paused: state.paused, reason: state.reason },
+      after: { paused: state.paused, reason: state.reason, scope: state.scope },
     });
     return state;
   }
@@ -1223,13 +1681,28 @@ export class VideosService {
     // deleted row is excluded. The mobile state alone is deliberately NOT part
     // of the claim. `enqueueMobileTranscode` writes QUEUED only after the job is
     // in Redis, so a worker on the same network can pick the job up while the
-    // row still reads NONE (or READY, for a retry) - a plain status filter here
-    // made exactly that job "stale" and the video was never encoded.
+    // row still reads NONE - a plain status filter here made exactly that job
+    // "stale" and the video was never encoded. (The API now records the intent
+    // BEFORE adding the job, so this window only exists against an older API.)
     const current = await this.prisma.video.findFirst({
       where: { id: videoId, deletedAt: null, sourceKey },
       select: { mobileStatus: true, mobileJobId: true },
     });
     if (!current) return false;
+
+    // A FINISHED LADDER IS NOT RE-ENCODED BY A JOB THAT DOES NOT OWN THE ROW.
+    // Re-encoding a READY video is a deliberate act, and a deliberate act
+    // records its intent first (QUEUED, with this job's id). A job that finds
+    // the row READY under somebody else's id is therefore a leftover - a
+    // pending retry of an attempt the row has since moved past, a duplicate
+    // from an older build - and running it would throw away a good ladder to
+    // produce the same one again.
+    if (current.mobileStatus === MobileVideoStatus.READY && current.mobileJobId !== jobId) {
+      this.logger.warn(
+        `mobile job ${jobId} for video ${videoId} steps aside: the video is already mobile-READY (job ${current.mobileJobId ?? 'unknown'})`,
+      );
+      return false;
+    }
 
     // NO DUPLICATE ENCODES. When the row is QUEUED/PROCESSING for a DIFFERENT
     // job that is still live in the queue (waiting, delayed, or active - also
@@ -1330,6 +1803,29 @@ export class VideosService {
     this.logger.warn(`video ${videoId} mobile processing deferred: ${note}`);
   }
 
+  /**
+   * An attempt failed and the queue is going to run the job again. The row
+   * goes back to QUEUED with the reason - the job is still in Redis (delayed
+   * for its backoff), so QUEUED is simply what is true - and it is written
+   * only while this job still owns the row.
+   */
+  async markMobileRetrying(
+    videoId: string,
+    jobId: string,
+    error: string,
+    attempt: number,
+    attempts: number,
+  ): Promise<void> {
+    await this.prisma.video.updateMany({
+      where: { id: videoId, mobileJobId: jobId, mobileStatus: MobileVideoStatus.PROCESSING },
+      data: {
+        mobileStatus: MobileVideoStatus.QUEUED,
+        mobileError: `Attempt ${attempt} of ${attempts} failed (${error}). It will be retried automatically.`.slice(0, 1000),
+      },
+    });
+    this.logger.warn(`video ${videoId} mobile attempt ${attempt} of ${attempts} failed, retry pending: ${error}`);
+  }
+
   async markMobileFailed(videoId: string, error: string): Promise<void> {
     await this.prisma.video.update({
       where: { id: videoId },
@@ -1338,11 +1834,27 @@ export class VideosService {
     this.logger.error(`video ${videoId} mobile processing failed: ${error}`);
   }
 
-  /** Same contract as the legacy sweep, for the mobile queue. */
+  /**
+   * Repairs mobile rows whose job is gone.
+   *
+   *   QUEUED, job not in the queue      -> its job is added again (same intent)
+   *                                        or a new intent when the old job
+   *                                        finished without the row knowing;
+   *   PROCESSING, job not in the queue  -> an orphan: the worker died (or the
+   *                                        job exhausted its stalled budget)
+   *                                        mid-encode. Marked FAILED with the
+   *                                        reason and re-queued in one pass, so
+   *                                        nothing stays PROCESSING for ever.
+   *
+   * A job that is waiting, delayed (paused, deferred) or active is LIVE and is
+   * never touched, however long it has been there: an hour-long encode and a
+   * job parked behind an operator pause are both exactly where they should be.
+   * When Redis does not answer, nothing is decided at all.
+   */
   async recoverStrandedMobileVideos(now = new Date()): Promise<{ requeued: number; failed: number }> {
     if (!this.mobileQueue) return { requeued: 0, failed: 0 };
     const queuedCutoff = new Date(now.getTime() - 10 * 60_000);
-    const processingCutoff = new Date(now.getTime() - 4 * 3600_000);
+    const processingCutoff = new Date(now.getTime() - MOBILE_ORPHAN_AFTER_MS);
 
     const stranded = await this.prisma.video.findMany({
       where: {
@@ -1355,14 +1867,15 @@ export class VideosService {
           },
         ],
       },
-      select: { id: true, sourceKey: true, mobileStatus: true, mobileJobId: true },
+      select: { id: true, sourceKey: true, mobileStatus: true, mobileJobId: true, mobileTrigger: true },
       take: 50,
     });
 
     let requeued = 0;
     let failed = 0;
     for (const video of stranded) {
-      if (await this.mobileJobIsLive(video.mobileJobId)) continue;
+      const presence = await this.jobPresence(this.mobileQueue, video.mobileJobId);
+      if (presence === 'live' || presence === 'unknown') continue;
       if (!video.sourceKey) continue;
       if (video.mobileStatus === MobileVideoStatus.PROCESSING) {
         await this.markMobileFailed(
@@ -1372,7 +1885,9 @@ export class VideosService {
         failed += 1;
       }
       try {
-        await this.enqueueMobileTranscode({ id: video.id, sourceKey: video.sourceKey }, 'recovery');
+        // An interrupted upload keeps its place in front of historical work.
+        const trigger = video.mobileTrigger === 'upload' || video.mobileTrigger === 'retry' ? video.mobileTrigger : 'recovery';
+        await this.enqueueMobileTranscode({ id: video.id, sourceKey: video.sourceKey }, trigger);
         requeued += 1;
       } catch (error) {
         this.logger.warn(`video ${video.id}: mobile re-queue failed: ${(error as Error).message}`);
@@ -1384,18 +1899,142 @@ export class VideosService {
     return { requeued, failed };
   }
 
+  /**
+   * THE OUTBOX DRAIN: enqueues every durable instruction that has no job yet.
+   *
+   * Two kinds of row, both written by `completeUpload` before Redis is touched:
+   *
+   *   mobile  `mobileStatus = QUEUED` and `mobileEnqueuedAt IS NULL`
+   *   web     `status = QUEUED` and `processingJobId IS NULL`
+   *
+   * In normal operation neither exists for more than a moment, because the
+   * request that records the intent also delivers it. They persist only when
+   * that delivery did not happen: Redis was unreachable, or the process stopped
+   * between the database commit and the enqueue. This is what turns those
+   * cases from "the video is lost until somebody notices" into "the video is
+   * queued a couple of minutes late".
+   *
+   * COST. One indexed database query per run and NO Redis traffic at all when
+   * there is nothing to deliver, which is nearly always - deliberately, because
+   * Redis here is billed per request.
+   *
+   * SAFE TO RUN ANYWHERE, CONCURRENTLY. Both enqueues are idempotent by job
+   * id, so the API and a worker (or two API instances) running this at the
+   * same moment produce one job per intent. It runs in-process on a timer
+   * (VideoPipelineReconciler) rather than as a queued job precisely so that it
+   * does not depend on a worker - or on Redis - to get started.
+   */
+  async reconcilePendingIntents(now = new Date()): Promise<{
+    mobile: { pending: number; queued: number };
+    web: { pending: number; queued: number };
+  }> {
+    const cutoff = new Date(now.getTime() - INTENT_RECONCILE_GRACE_MS);
+    const pending = await this.prisma.video.findMany({
+      where: {
+        ...notDeleted,
+        sourceKey: { not: null },
+        OR: [
+          {
+            mobileStatus: MobileVideoStatus.QUEUED,
+            mobileEnqueuedAt: null,
+            mobileRequestedAt: { lt: cutoff },
+          },
+          {
+            status: VideoStatus.QUEUED,
+            processingJobId: null,
+            sourceSizeBytes: { not: null },
+            updatedAt: { lt: cutoff },
+          },
+        ],
+      },
+      select: {
+        id: true,
+        sourceKey: true,
+        lessonId: true,
+        courseId: true,
+        status: true,
+        processingJobId: true,
+        sourceSizeBytes: true,
+        mobileStatus: true,
+        mobileEnqueuedAt: true,
+        mobileRequestedAt: true,
+        mobileTrigger: true,
+        updatedAt: true,
+      },
+      orderBy: { updatedAt: 'asc' },
+      take: 25,
+    });
+
+    const report = { mobile: { pending: 0, queued: 0 }, web: { pending: 0, queued: 0 } };
+    for (const video of pending) {
+      if (!video.sourceKey) continue;
+
+      const mobilePending =
+        Boolean(this.mobileQueue) &&
+        video.mobileStatus === MobileVideoStatus.QUEUED &&
+        !video.mobileEnqueuedAt &&
+        video.mobileRequestedAt !== null &&
+        video.mobileRequestedAt < cutoff;
+      if (mobilePending) {
+        report.mobile.pending += 1;
+        try {
+          const trigger = (video.mobileTrigger as MobileTranscodeJobData['trigger'] | null) ?? 'recovery';
+          const result = await this.enqueueMobileTranscode({ id: video.id, sourceKey: video.sourceKey }, trigger);
+          if (result.enqueued) report.mobile.queued += 1;
+        } catch (error) {
+          this.logger.warn(`video ${video.id}: mobile intent not delivered: ${(error as Error).message}`);
+        }
+      }
+
+      const webPending =
+        video.status === VideoStatus.QUEUED &&
+        !video.processingJobId &&
+        video.sourceSizeBytes !== null &&
+        video.updatedAt < cutoff;
+      if (webPending) {
+        report.web.pending += 1;
+        try {
+          const result = await this.queueUploadTranscode({
+            id: video.id,
+            sourceKey: video.sourceKey,
+            lessonId: video.lessonId,
+            courseId: video.courseId,
+          });
+          if (result.queued) report.web.queued += 1;
+        } catch (error) {
+          this.logger.warn(`video ${video.id}: transcode intent not delivered: ${(error as Error).message}`);
+        }
+      }
+    }
+
+    if (report.mobile.pending || report.web.pending) {
+      this.logger.warn(
+        `pending intents: mobile ${report.mobile.queued}/${report.mobile.pending} queued, ` +
+          `web ${report.web.queued}/${report.web.pending} queued`,
+      );
+    }
+    return report;
+  }
+
   private async mobileJobIsLive(jobId: string | null): Promise<boolean> {
-    if (!jobId || !this.mobileQueue) return false;
-    const job = await this.mobileQueue.getJob(jobId).catch(() => null);
-    if (!job) return false;
-    const state = await job.getState().catch(() => 'missing');
-    return (
-      state === 'waiting' ||
-      state === 'active' ||
-      state === 'delayed' ||
-      state === 'prioritized' ||
-      state === 'waiting-children'
-    );
+    return (await this.jobPresence(this.mobileQueue, jobId)) === 'live';
+  }
+
+  /**
+   * Liveness of whichever worker consumes the MOBILE queue, which is not
+   * necessarily the one that handles Gumlet ingests.
+   */
+  async mobileWorkerStatus(): Promise<{
+    workerOnline: boolean;
+    workerLastSeenAt: string | null;
+    workerCanTranscode: boolean | null;
+  }> {
+    const beat = await readMobileWorkerHeartbeat(this.redis);
+    return {
+      workerOnline: Boolean(beat),
+      workerLastSeenAt: beat?.at ?? null,
+      workerCanTranscode: beat ? beat.ffmpeg && beat.ffprobe : null,
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -1453,10 +2092,57 @@ export class VideosService {
 
     await this.access.assertCanManageCourse(actor.id, actor.role, video.courseId, 'content');
 
+    // --- the mobile pipeline's live context ---------------------------------
+    // Read only while the answer can explain a wait, and from the worker's
+    // heartbeat (one key it already publishes) rather than from the queue:
+    // the panel polls this endpoint every few seconds and Redis is billed per
+    // request. The heartbeat carries the active encode's progress and the
+    // pause flag, so a waiting video costs one GET per poll.
+    const mobileWaiting =
+      video.mobileStatus === MobileVideoStatus.QUEUED || video.mobileStatus === MobileVideoStatus.PROCESSING;
+    const mobileBeat = mobileWaiting ? await readMobileWorkerHeartbeat(this.redis) : null;
+    const mobileActive = mobileBeat?.activeJobs?.find((job) => job.videoId === video.id) ?? null;
+    const pause: PauseState | null = mobileWaiting
+      ? (mobileBeat?.pause ?? (await readPauseState(this.redis).catch(() => null)))
+      : null;
+    const heldByPause =
+      video.mobileStatus === MobileVideoStatus.QUEUED &&
+      Boolean(pause && pauseHolds(pause, video.mobileTrigger as MobileTranscodeJobData['trigger'] | null));
+    const isAdmin = actor.role === 'ADMIN' || actor.role === 'MASTER';
+    const sourceState = sourceStateOf(video);
+    const gumletState = gumletStateOf(video);
+    const mobileAutomatic = Boolean(this.mobileQueue) && this.cfg.mobile?.autoProcess !== false;
+
     return {
       id: video.id,
       lessonId: video.lessonId,
       courseId: video.courseId,
+      /**
+       * THE ORIGINAL FILE. Independent of both processing pipelines: VERIFIED
+       * means the bytes are in storage and their length is recorded, whatever
+       * Gumlet or the mobile worker go on to do with them.
+       */
+      source: {
+        state: sourceState,
+        sizeBytes: video.sourceSizeBytes ? Number(video.sourceSizeBytes) : null,
+      },
+      /**
+       * THE GUMLET PIPELINE, as one normalised state. `status` /
+       * `gumletStatus` / `processingError` below remain for existing clients;
+       * this is the same information without having to combine them.
+       */
+      gumlet: {
+        state: gumletState,
+        providerStatus: video.gumletStatus,
+        hasAsset: Boolean(video.gumletAssetId),
+        /** False while the accepted upload is still waiting to reach the queue. */
+        queued: video.status === VideoStatus.QUEUED ? video.processingJobId !== null : null,
+        error:
+          gumletState === 'FAILED' ? (video.gumletError ?? video.processingError ?? null) : null,
+        updatedAt: video.gumletUpdatedAt?.toISOString() ?? null,
+        drmVerified: Boolean(video.drmVerifiedAt),
+        canRetry: gumletState === 'FAILED' && sourceState === 'VERIFIED',
+      },
       /**
        * Live lectures attached to this asset, including the owning one.
        * 1 = an ordinary single-course video. >1 = shared/reused.
@@ -1486,11 +2172,46 @@ export class VideosService {
       /** The independent mobile pipeline, separate from `status` (web/Gumlet). */
       mobile: {
         status: video.mobileStatus,
-        error: video.mobileError,
+        // Sanitised: an encode error can quote a URL, and this is shown to teachers.
+        error: video.mobileError ? sanitizeProviderText(video.mobileError) : null,
         jobId: video.mobileJobId,
+        /** When the current processing intent was recorded (queued since). */
+        requestedAt: video.mobileRequestedAt?.toISOString() ?? null,
+        /**
+         * False while the intent is recorded but the queue has not accepted
+         * the job yet (it is delivered automatically). Null when not queued.
+         */
+        queued: video.mobileStatus === MobileVideoStatus.QUEUED ? video.mobileEnqueuedAt !== null : null,
+        /** How many times processing has been requested for this video. */
+        attempts: video.mobileGeneration ?? 0,
+        trigger: video.mobileTrigger ?? null,
         processingStartedAt: video.mobileProcessingStartedAt?.toISOString() ?? null,
         processedAt: video.mobileProcessedAt?.toISOString() ?? null,
         renditions: video.mobileStatus === MobileVideoStatus.READY ? video.renditions.length : 0,
+        /** 0-100 while a worker is encoding this video; null otherwise. Up to a minute old. */
+        progress: mobileActive ? mobileActive.progress : null,
+        /** A worker has this video on its bench right now. */
+        active: Boolean(mobileActive),
+        /** Mobile encoding is paused by an operator and this video is waiting for it. */
+        paused: heldByPause,
+        // The reason can name the operator's network or machine: administrators only.
+        pauseReason: heldByPause && isAdmin ? (pause?.reason ?? null) : null,
+        /** Whether new uploads are queued for mobile automatically on this deployment. */
+        automatic: mobileAutomatic,
+        ...(mobileWaiting
+          ? {
+              workerOnline: Boolean(mobileBeat),
+              workerLastSeenAt: mobileBeat?.at ?? null,
+              workerCanTranscode: mobileBeat ? mobileBeat.ffmpeg && mobileBeat.ffprobe : null,
+            }
+          : {}),
+        /**
+         * Whether "Retry mobile" would do something: a failed ladder, or a
+         * verified source that was never processed. Never while a job exists.
+         */
+        canRetry:
+          sourceState === 'VERIFIED' &&
+          (video.mobileStatus === MobileVideoStatus.FAILED || video.mobileStatus === MobileVideoStatus.NONE),
       },
       captions: video.captions.map((c) => ({
         language: c.language,

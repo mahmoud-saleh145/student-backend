@@ -56,11 +56,35 @@ export interface ScratchSnapshot {
   safe: boolean | null;
 }
 
+/**
+ * What an operator pause holds back.
+ *
+ *   all         every mobile encode, including new uploads. For when the
+ *               worker itself must not run: a metered connection, a failing
+ *               network, a machine that is needed for something else. This is
+ *               what a pause without a scope has always meant, and what the
+ *               safety watchdog sets.
+ *   historical  only the back catalogue (`migration` / `recovery` jobs). New
+ *               uploads and staff retries keep flowing. For pausing BETWEEN
+ *               backlog batches, which used to hold every new lecture hostage
+ *               to the next batch as well.
+ */
+export type PauseScope = 'all' | 'historical';
+
 export interface PauseState {
   paused: boolean;
   reason: string | null;
   by: string | null;
   at: string | null;
+  /** Absent on a flag written before scopes existed, which means `all`. */
+  scope: PauseScope;
+}
+
+/** Whether the pause holds a job with this trigger back. */
+export function pauseHolds(pause: PauseState, trigger: string | null | undefined): boolean {
+  if (!pause.paused) return false;
+  if (pause.scope !== 'historical') return true;
+  return trigger === 'migration' || trigger === 'recovery';
 }
 
 export interface ActiveJobNote {
@@ -72,10 +96,16 @@ export interface ActiveJobNote {
 
 /** Pause flag readers/writers for processes that do not host the guard (the API). */
 export async function readPauseState(redis: RedisService): Promise<PauseState> {
-  const stored = await redis.getJson<Omit<PauseState, 'paused'>>(SCRATCH_PAUSE_KEY);
+  const stored = await redis.getJson<Partial<Omit<PauseState, 'paused'>>>(SCRATCH_PAUSE_KEY);
   return stored
-    ? { paused: true, reason: stored.reason ?? null, by: stored.by ?? null, at: stored.at ?? null }
-    : { paused: false, reason: null, by: null, at: null };
+    ? {
+        paused: true,
+        reason: stored.reason ?? null,
+        by: stored.by ?? null,
+        at: stored.at ?? null,
+        scope: stored.scope === 'historical' ? 'historical' : 'all',
+      }
+    : { paused: false, reason: null, by: null, at: null, scope: 'all' };
 }
 
 export async function writePauseState(
@@ -83,12 +113,14 @@ export async function writePauseState(
   paused: boolean,
   by: string,
   reason?: string,
+  scope: PauseScope = 'all',
 ): Promise<PauseState> {
   if (paused) {
     await redis.setJsonPersistent(SCRATCH_PAUSE_KEY, {
       reason: reason?.slice(0, 200) ?? null,
       by,
       at: new Date().toISOString(),
+      scope,
     });
   } else {
     await redis.del(SCRATCH_PAUSE_KEY);
@@ -246,8 +278,8 @@ export class ScratchGuard {
    * is left behind. Stopping the container is the way to interrupt that one.
    * No TTL: a pause survives restarts until someone resumes.
    */
-  async setPaused(paused: boolean, by: string, reason?: string): Promise<PauseState> {
-    return writePauseState(this.redis, paused, by, reason);
+  async setPaused(paused: boolean, by: string, reason?: string, scope?: PauseScope): Promise<PauseState> {
+    return writePauseState(this.redis, paused, by, reason, scope);
   }
 }
 

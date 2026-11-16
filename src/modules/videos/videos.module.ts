@@ -12,6 +12,7 @@ import { VideosController } from './videos.controller';
 import { VideosService } from './videos.service';
 import { GumletMigrationService } from './gumlet-migration.service';
 import { LessonVideoService } from './lesson-video.service';
+import { VideoPipelineReconciler } from './video-pipeline-reconciler.service';
 
 @Module({
   imports: [
@@ -28,6 +29,10 @@ import { LessonVideoService } from './lesson-video.service';
     GumletWebhookService,
     GumletMigrationService,
     LessonVideoService,
+    // Delivers processing intents that never reached the queue (Redis down,
+    // a restart between the commit and the enqueue). In-process, so it does
+    // not need a worker to be running.
+    VideoPipelineReconciler,
   ],
   exports: [
     VideosService,

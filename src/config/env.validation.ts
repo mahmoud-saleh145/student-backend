@@ -214,6 +214,12 @@ export class EnvironmentVariables {
   @toBool() @IsBoolean() MOBILE_HLS_GUMLET_FALLBACK = true;
   @toBool() @IsBoolean() MOBILE_PIPELINE_ENABLED = true;
   /**
+   * How often each process delivers processing intents that never reached the
+   * queue (seconds; default 120, minimum 30, 0 disables). One indexed database
+   * query per tick and no Redis traffic unless something is pending.
+   */
+  @IsOptional() @Type(() => Number) @IsInt() @Min(0) @Max(86_400) VIDEO_PIPELINE_RECONCILE_SECONDS?: number;
+  /**
    * Which queues THIS worker process consumes, comma-separated
    * (`video-processing,mobile-video-processing,push-delivery,maintenance,analytics`).
    * Empty = all of them. Lets the CPU-bound mobile transcode run on its own host
