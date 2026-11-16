@@ -1,5 +1,14 @@
 # Independent mobile video pipeline
 
+> **Read with `docs/DUAL_PIPELINE_INDEPENDENCE.md`** (2026-11-17), which
+> supersedes the enqueue and recovery details below: the processing intent is
+> now written to the database BEFORE Redis (`mobileRequestedAt`,
+> `mobileEnqueuedAt`, `mobileGeneration`, `mobileTrigger`), job ids are
+> deterministic (`mobile-hls:<videoId>:p<profile>g<generation>`), an in-process
+> reconciler delivers intents that never reached the queue, playback of a READY
+> ladder no longer depends on the Gumlet state, and the operator pause has a
+> scope (`all` | `historical`).
+
 The native apps (Android, iOS) play lecture video from this platform's own
 AES-128 HLS ladder on R2, served through the API's per-ticket manifests and
 the media edge. Nothing on that path touches Gumlet, so mobile playback keeps
