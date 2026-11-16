@@ -1,9 +1,12 @@
 import { Queue, UnrecoverableError, Worker, type Job } from 'bullmq';
+import IORedis from 'ioredis';
 
 import { MobileVideoProcessor } from '../../src/jobs/processors/mobile-video.processor';
+import { ScratchGuard, writePauseState } from '../../src/jobs/processors/scratch-guard';
 import { QUEUE_NAMES, type MobileTranscodeJobData, type TranscodeJobData } from '../../src/jobs/queue.constants';
 import { mobileJobIdFor, uploadTranscodeJobIdFor } from '../../src/modules/videos/pipeline-state';
 import { QUEUE_OPERATION_TIMEOUT_MS, VideosService } from '../../src/modules/videos/videos.service';
+import { RedisService } from '../../src/redis/redis.service';
 
 import { FakeDb, FakeRedis, FakeStorage, STAFF, videoRow } from './support/pipeline-fakes';
 
@@ -58,8 +61,8 @@ async function until(check: () => boolean | Promise<boolean>, what: string, time
   let mobileQueue: Queue<MobileTranscodeJobData>;
   const workers: Worker[] = [];
 
-  function world(rows: Parameters<typeof videoRow>[0][], queues?: { web?: Queue; mobile?: Queue }) {
-    const db = new FakeDb(rows.map((r) => videoRow(r)));
+  function world(rows: Parameters<typeof videoRow>[0][], queues?: { web?: Queue; mobile?: Queue }, sharedDb?: FakeDb) {
+    const db = sharedDb ?? new FakeDb(rows.map((r) => videoRow(r)));
     const storage = new FakeStorage();
     for (const row of db.rows.values()) if (row.sourceKey) storage.objects.set(row.sourceKey as string, 1_000_000);
     const videos = new VideosService(
@@ -92,6 +95,7 @@ async function until(check: () => boolean | Promise<boolean>, what: string, time
     videos: VideosService,
     encode: (videoId: string) => Promise<void> = async () => undefined,
     workerOptions: Record<string, unknown> = {},
+    realGuard?: ScratchGuard,
   ): Worker {
     const transcoder = {
       preflight: async () => ({
@@ -127,9 +131,11 @@ async function until(check: () => boolean | Promise<boolean>, what: string, time
       transcoder as never,
       videos as never,
       { getOrThrow: () => ({ workDir: `/tmp/${prefix}` }) } as never,
-      guard as never,
+      (realGuard ?? guard) as never,
       scheduler as never,
     );
+    // A deferred job comes back quickly, so the tests do not wait a minute per deferral.
+    (processor as unknown as { deferMs: Record<string, number> }).deferMs = { paused: 250, uploads: 250, disk: 250, slot: 250 };
     const worker = new Worker(
       QUEUE_NAMES.mobileVideo,
       (job: Job<MobileTranscodeJobData>, token?: string) => processor.process(job, token),
@@ -280,11 +286,11 @@ async function until(check: () => boolean | Promise<boolean>, what: string, time
       const recovered = world([], {});
       recovered.db.rows.set('v_noredis', w.db.get('v_noredis'));
       recovered.storage.objects.set('source/videos/v_noredis/a.mp4', 1_000_000);
-      await expect(recovered.videos.reconcilePendingIntents(new Date(Date.now() + 120_000))).resolves.toEqual({
+      await expect(recovered.videos.reconcilePendingIntents()).resolves.toEqual({
         mobile: { pending: 1, queued: 1 },
         web: { pending: 1, queued: 1 },
       });
-      await recovered.videos.reconcilePendingIntents(new Date(Date.now() + 240_000));
+      await recovered.videos.reconcilePendingIntents();
       expect(await mobileQueue.getJobCounts('waiting')).toMatchObject({ waiting: 1 });
       expect(await webQueue.getJobCounts('waiting')).toMatchObject({ waiting: 1 });
     } finally {
@@ -293,6 +299,158 @@ async function until(check: () => boolean | Promise<boolean>, what: string, time
         Promise.all([deadWeb.close().catch(() => undefined), deadMobile.close().catch(() => undefined)]),
         sleep(2000),
       ]);
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Pre-release audit: cost, concurrency and the pause, measured on real Redis
+  // ---------------------------------------------------------------------------
+
+  /** Every command Redis executes for this run's prefix while `work` runs. */
+  async function redisCommandsDuring(work: () => Promise<unknown>): Promise<string[]> {
+    const tap = new IORedis({ host: connection.host, port: connection.port, maxRetriesPerRequest: null });
+    const monitor = await tap.monitor();
+    const seen: string[] = [];
+    monitor.on('monitor', (_time: string, args: string[]) => {
+      if (args.some((a) => typeof a === 'string' && a.includes(prefix))) seen.push(String(args[0]).toLowerCase());
+    });
+    await sleep(100);
+    await work();
+    await sleep(300);
+    monitor.disconnect();
+    tap.disconnect();
+    return seen;
+  }
+
+  it('an idle reconcile scan issues ZERO Redis commands; a scan with work issues a handful', async () => {
+    // A library at rest: finished videos, a queued one whose job is live.
+    const w = world([
+      { id: 'idle_ready', sourceKey: 'source/videos/idle_ready/a.mp4', status: 'READY', sourceSizeBytes: BigInt(1), mobileStatus: 'READY' },
+      { id: 'idle_none', sourceKey: 'source/videos/idle_none/a.mp4', status: 'READY', sourceSizeBytes: BigInt(1) },
+      { id: 'idle_new', sourceKey: 'source/videos/idle_new/a.mp4' },
+    ]);
+    await w.videos.completeUpload('idle_new', STAFF);
+
+    const idle = await redisCommandsDuring(async () => {
+      for (let i = 0; i < 10; i += 1) await w.videos.reconcilePendingIntents();
+    });
+    expect(idle).toEqual([]);
+
+    // The same scan when one intent is genuinely undelivered.
+    Object.assign(w.db.get('idle_none'), {
+      mobileStatus: 'QUEUED',
+      mobileGeneration: 1,
+      mobileJobId: mobileJobIdFor('idle_none', 1),
+      mobileRequestedAt: new Date(),
+      mobileEnqueuedAt: null,
+      mobileTrigger: 'retry',
+    });
+    const busy = await redisCommandsDuring(() => w.videos.reconcilePendingIntents());
+    expect(busy.length).toBeGreaterThan(0);
+    expect(busy.length).toBeLessThanOrEqual(20);
+    expect(await (await mobileQueue.getJob(mobileJobIdFor('idle_none', 1)))!.getState()).toBe('waiting');
+
+    // And what one accepted upload costs, for the record.
+    const upload = world([{ id: 'cost_probe', sourceKey: 'source/videos/cost_probe/a.mp4' }]);
+    const perUpload = await redisCommandsDuring(() => upload.videos.completeUpload('cost_probe', STAFF));
+    const tally = (commands: string[]) =>
+      Object.entries(commands.reduce<Record<string, number>>((acc, c) => ({ ...acc, [c]: (acc[c] ?? 0) + 1 }), {}))
+        .map(([c, n]) => `${c}x${n}`)
+        .join(' ');
+    console.info(
+      `[audit] redis commands - idle reconcile x10: ${idle.length} | reconcile with 1 pending: ${busy.length} (${tally(busy)}) | ` +
+        `one accepted upload: ${perUpload.length} (${tally(perUpload)})`,
+    );
+    // Two job lookups and two adds (each a BullMQ script). Uploads are a few a day.
+    expect(perUpload.length).toBeLessThan(40);
+  });
+
+  it('five instances reconciling the same six stranded intents at once produce six jobs per queue, not thirty', async () => {
+    const ids = ['m1', 'm2', 'm3', 'm4', 'm5', 'm6'];
+    const first = world(
+      ids.map((id) => ({
+        id,
+        sourceKey: `source/videos/${id}/a.mp4`,
+        // Accepted, committed, never delivered: what a crash or an outage leaves.
+        status: 'QUEUED',
+        sourceSizeBytes: BigInt(1_000_000),
+        processingJobId: null,
+        mobileStatus: 'QUEUED',
+        mobileGeneration: 1,
+        mobileJobId: mobileJobIdFor(id, 1),
+        mobileRequestedAt: new Date(Date.now() - 60_000),
+        mobileEnqueuedAt: null,
+        mobileTrigger: 'upload',
+      })),
+    );
+    const instances = [first, ...Array.from({ length: 4 }, () => world([], undefined, first.db))];
+
+    const reports = await Promise.all(instances.map((i) => i.videos.reconcilePendingIntents()));
+
+    expect(reports).toHaveLength(5);
+    const mobile = await mobileQueue.getJobs(['waiting', 'prioritized', 'delayed', 'active', 'completed', 'failed']);
+    const web = await webQueue.getJobs(['waiting', 'prioritized', 'delayed', 'active', 'completed', 'failed']);
+    expect(mobile.map((j) => j.id).sort()).toEqual(ids.map((id) => mobileJobIdFor(id, 1)).sort());
+    expect(web.map((j) => j.id).sort()).toEqual(ids.map((id) => uploadTranscodeJobIdFor(id, `source/videos/${id}/a.mp4`)).sort());
+    for (const id of ids) {
+      expect(first.db.get(id)).toMatchObject({
+        mobileGeneration: 1,
+        status: 'QUEUED',
+        processingJobId: uploadTranscodeJobIdFor(id, `source/videos/${id}/a.mp4`),
+      });
+      expect(first.db.get(id).mobileEnqueuedAt).toBeInstanceOf(Date);
+    }
+    // Nothing left to do for anyone.
+    for (const instance of instances) expect(instance.videos.hasUndeliveredIntents()).toBe(false);
+  });
+
+  it('the real pause flag: a backlog pause never holds a new upload; a full pause holds everything; resume releases', async () => {
+    const redis = new RedisService({ getOrThrow: () => ({ url: REDIS_URL, prefix }) } as never);
+    await redis.onModuleInit();
+    try {
+      const guard = new ScratchGuard(redis, { getOrThrow: () => ({ workDir: `/tmp/${prefix}`, minFreeBytes: 0, diskCheckSeconds: 15 }) } as never);
+      const w = world([
+        { id: 'old_lecture', sourceKey: 'source/videos/old_lecture/a.mp4', status: 'READY', sourceSizeBytes: BigInt(1_000_000) },
+        { id: 'new_lecture', sourceKey: 'source/videos/new_lecture/a.mp4' },
+        { id: 'next_lecture', sourceKey: 'source/videos/next_lecture/a.mp4' },
+      ]);
+
+      // The operator pauses the BACKLOG, as between batches.
+      await writePauseState(redis, true, 'admin_1', 'between backlog batches', 'historical');
+      await w.videos.enqueueMobileTranscode({ id: 'old_lecture', sourceKey: 'source/videos/old_lecture/a.mp4' }, 'migration');
+      await w.videos.completeUpload('new_lecture', STAFF);
+      const encoded: string[] = [];
+      startEncoder(w.videos, async (videoId) => void encoded.push(videoId), {}, guard);
+
+      await until(() => w.db.get('new_lecture').mobileStatus === 'READY', 'the new upload to be encoded during a backlog pause');
+      await sleep(1200);
+      // The backlog job is still in the queue (it is looked at and deferred
+      // again every few hundred milliseconds here) and was never encoded.
+      expect(w.db.get('old_lecture')).toMatchObject({ mobileStatus: 'QUEUED' });
+      expect(encoded).toEqual(['new_lecture']);
+      expect(['delayed', 'active', 'prioritized', 'waiting']).toContain(
+        await (await mobileQueue.getJob(w.db.get('old_lecture').mobileJobId as string))!.getState(),
+      );
+
+      // A full pause (the metered-connection case) holds a new upload too - and says so truthfully.
+      await writePauseState(redis, true, 'admin_1', 'laptop on a metered connection', 'all');
+      await w.videos.completeUpload('next_lecture', STAFF);
+      await sleep(1500);
+      expect(w.db.get('next_lecture')).toMatchObject({ mobileStatus: 'QUEUED', mobileError: null });
+      expect(encoded).toEqual(['new_lecture']);
+
+      // Resume: both waiting jobs run, the upload first.
+      await writePauseState(redis, false, 'admin_1');
+      await until(
+        () => w.db.get('next_lecture').mobileStatus === 'READY' && w.db.get('old_lecture').mobileStatus === 'READY',
+        'both jobs to run after resume',
+        30_000,
+      );
+      const done = (id: string) => (w.db.get(id).mobileProcessedAt as Date).getTime();
+      expect(done('next_lecture')).toBeLessThanOrEqual(done('old_lecture'));
+    } finally {
+      await redis.delByPattern('*');
+      await redis.onModuleDestroy();
     }
   });
 });

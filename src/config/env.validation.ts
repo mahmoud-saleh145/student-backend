@@ -214,9 +214,9 @@ export class EnvironmentVariables {
   @toBool() @IsBoolean() MOBILE_HLS_GUMLET_FALLBACK = true;
   @toBool() @IsBoolean() MOBILE_PIPELINE_ENABLED = true;
   /**
-   * How often each process delivers processing intents that never reached the
-   * queue (seconds; default 120, minimum 30, 0 disables). One indexed database
-   * query per tick and no Redis traffic unless something is pending.
+   * Background interval of the pipeline reconciler (seconds; default 600,
+   * minimum 60, 0 disables it). It also scans at boot and every 30 s while a
+   * delivery is known to have failed. See video-pipeline-reconciler.service.ts.
    */
   @IsOptional() @Type(() => Number) @IsInt() @Min(0) @Max(86_400) VIDEO_PIPELINE_RECONCILE_SECONDS?: number;
   /**

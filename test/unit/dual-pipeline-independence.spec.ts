@@ -159,7 +159,7 @@ describe('Scenario C - the Docker worker is offline', () => {
     // Hours pass. The sweep and the reconciler both run; the job is live in
     // Redis, so neither duplicates it nor fails it.
     await w.videos.recoverStrandedMobileVideos(later(6 * 60 * MIN));
-    await w.videos.reconcilePendingIntents(later(6 * 60 * MIN));
+    await w.videos.reconcilePendingIntents();
     expect(w.mobileQueue.jobs.size).toBe(1);
     expect(w.db.get(V)).toMatchObject({ mobileStatus: 'QUEUED', mobileGeneration: 1, mobileError: null });
 
@@ -214,7 +214,7 @@ describe('Scenario D - Redis is unavailable', () => {
     expect(w.webQueue.jobs.size + w.mobileQueue.jobs.size).toBe(0);
 
     // Redis still down: the reconciler tries, delivers nothing, changes nothing.
-    await expect(w.videos.reconcilePendingIntents(later(2 * MIN))).resolves.toEqual({
+    await expect(w.videos.reconcilePendingIntents()).resolves.toEqual({
       mobile: { pending: 1, queued: 0 },
       web: { pending: 1, queued: 0 },
     });
@@ -223,7 +223,7 @@ describe('Scenario D - Redis is unavailable', () => {
     // Redis is back.
     w.webQueue.outage = null;
     w.mobileQueue.outage = null;
-    await expect(w.videos.reconcilePendingIntents(later(4 * MIN))).resolves.toEqual({
+    await expect(w.videos.reconcilePendingIntents()).resolves.toEqual({
       mobile: { pending: 1, queued: 1 },
       web: { pending: 1, queued: 1 },
     });
@@ -235,7 +235,7 @@ describe('Scenario D - Redis is unavailable', () => {
     expect(w.mobileQueue.live()[0]).toMatchObject({ state: 'waiting', data: { trigger: 'upload' } });
 
     // Further passes find nothing to do and touch nothing.
-    await expect(w.videos.reconcilePendingIntents(later(6 * MIN))).resolves.toEqual({
+    await expect(w.videos.reconcilePendingIntents()).resolves.toEqual({
       mobile: { pending: 0, queued: 0 },
       web: { pending: 0, queued: 0 },
     });
@@ -276,7 +276,7 @@ describe('Scenario D - Redis is unavailable', () => {
     const getJob = jest.spyOn(w.mobileQueue, 'getJob');
     const getWebJob = jest.spyOn(w.webQueue, 'getJob');
 
-    await w.videos.reconcilePendingIntents(later(10 * MIN));
+    await w.videos.reconcilePendingIntents();
 
     expect(getJob).not.toHaveBeenCalled();
     expect(getWebJob).not.toHaveBeenCalled();
@@ -309,21 +309,13 @@ describe('Scenario E - the API stops between the database commit and the enqueue
     const second = apiProcess({ db: first.db, storage: first.storage, webQueue: first.webQueue, mobileQueue: first.mobileQueue });
     const reconciler = new VideoPipelineReconciler(second.videos);
 
-    // Inside the grace window the intent is left to the request that made it.
-    await expect(second.videos.reconcilePendingIntents(new Date())).resolves.toEqual({
-      mobile: { pending: 0, queued: 0 },
-      web: { pending: 0, queued: 0 },
+    // The new process knows nothing in memory about the stranded intents...
+    expect(second.videos.hasUndeliveredIntents()).toBe(false);
+    // ...and finds them in the database on its boot scan.
+    await expect(reconciler.tick()).resolves.toEqual({
+      mobile: { pending: 1, queued: 1 },
+      web: { pending: 1, queued: 1 },
     });
-
-    jest.useFakeTimers({ now: Date.now() + 2 * MIN });
-    try {
-      await expect(reconciler.tick()).resolves.toEqual({
-        mobile: { pending: 1, queued: 1 },
-        web: { pending: 1, queued: 1 },
-      });
-    } finally {
-      jest.useRealTimers();
-    }
 
     expect(second.mobileQueue.live().map((j) => j.id)).toEqual([mobileJobIdFor(V, 1)]);
     expect(second.webQueue.live().map((j) => j.id)).toEqual([uploadTranscodeJobIdFor(V, SRC)]);
@@ -348,8 +340,8 @@ describe('Scenario E - the API stops between the database commit and the enqueue
     const second = apiProcess({ db: first.db, storage: first.storage, webQueue: first.webQueue, mobileQueue: first.mobileQueue });
 
     await Promise.all([
-      first.videos.reconcilePendingIntents(later(2 * MIN)),
-      second.videos.reconcilePendingIntents(later(2 * MIN)),
+      first.videos.reconcilePendingIntents(),
+      second.videos.reconcilePendingIntents(),
     ]);
 
     expect(first.mobileQueue.jobs.size).toBe(1);
@@ -713,7 +705,7 @@ describe('Scenario J - existing videos are not disturbed', () => {
     const before = JSON.stringify([...db.rows.values()], (_k, v) => (typeof v === 'bigint' ? `${v}n` : v));
     const adds = w.mobileQueue.addCalls;
 
-    await w.videos.reconcilePendingIntents(later(24 * 60 * MIN));
+    await w.videos.reconcilePendingIntents();
     await w.videos.recoverStrandedMobileVideos(later(24 * 60 * MIN));
     await w.videos.recoverStrandedVideos(later(24 * 60 * MIN));
 
@@ -942,5 +934,201 @@ describe('operator pause', () => {
 
     expect(w.db.get(V).mobileStatus).toBe('READY');
     expect(w.db.get('old').mobileStatus).toBe('QUEUED');
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('turning automatic mobile processing ON does not start the back catalogue', () => {
+  /** The shape of the production library on 2026-11-16: 200 finished lectures never processed for mobile. */
+  const backCatalogue = () => {
+    const rows = Array.from({ length: 200 }, (_v, i) =>
+      videoRow({
+        id: `old_${i}`,
+        lessonId: `lesson_old_${i}`,
+        sourceKey: `source/videos/old_${i}/a.mp4`,
+        sourceSizeBytes: BigInt(300_000_000),
+        status: 'READY',
+        gumletAssetId: `asset_${i}`,
+        gumletStatus: 'ready',
+        durationSeconds: 2800,
+        createdAt: new Date('2026-10-20T10:00:00Z'),
+        updatedAt: new Date('2026-10-20T11:00:00Z'),
+      }),
+    );
+    // Plus what else is in the table today.
+    rows.push(videoRow({ id: 'abandoned', sourceKey: 'source/videos/abandoned/a.mp4', status: 'UPLOADING' }));
+    rows.push(
+      videoRow({ id: 'archived', sourceKey: 'source/videos/archived/a.mp4', status: 'ARCHIVED', sourceSizeBytes: BigInt(1) }),
+    );
+    return rows;
+  };
+  const frozen = (db: FakeDb) => JSON.stringify([...db.rows.values()], (_k, v) => (typeof v === 'bigint' ? `${v}n` : v));
+  const withSources = (db: FakeDb) => {
+    const w = apiProcess({ db, autoProcess: true });
+    for (const row of db.rows.values()) w.storage.objects.set(row.sourceKey as string, 300_000_000);
+    return w;
+  };
+
+  it('no timer, sweep or restart queues any of the 200: every automatic mechanism finds nothing to do', async () => {
+    const db = new FakeDb(backCatalogue());
+    const w = withSources(db);
+    const before = frozen(db);
+
+    // Everything that runs without a person asking for it, as on a fresh deploy
+    // with the flag on, then again a day and a week later.
+    const reconciler = new VideoPipelineReconciler(w.videos);
+    await reconciler.tick();
+    for (const ahead of [0, 24 * 60 * MIN, 7 * 24 * 60 * MIN]) {
+      await w.videos.reconcilePendingIntents();
+      await w.videos.recoverStrandedVideos(later(ahead));
+      await w.videos.recoverStrandedMobileVideos(later(ahead));
+    }
+
+    expect(w.mobileQueue.addCalls).toBe(0);
+    expect(w.webQueue.addCalls).toBe(0);
+    expect(db.writes).toEqual([]);
+    expect(frozen(db)).toBe(before);
+  });
+
+  it('a stray finalisation call on every old lecture queues none of them either', async () => {
+    const db = new FakeDb(backCatalogue());
+    const w = withSources(db);
+
+    for (let i = 0; i < 200; i += 1) {
+      await expect(w.videos.completeUpload(`old_${i}`, STAFF)).resolves.toMatchObject({
+        status: 'READY',
+        alreadyQueued: true,
+        mobile: { status: 'NONE', queued: false },
+      });
+    }
+
+    expect(w.mobileQueue.addCalls).toBe(0);
+    expect([...db.rows.values()].filter((r) => r.mobileStatus !== 'NONE')).toEqual([]);
+  });
+
+  it('only a NEW upload is queued, and it runs before backlog work an operator queues explicitly', async () => {
+    const db = new FakeDb(backCatalogue());
+    db.rows.set(V, videoRow());
+    const w = withSources(db);
+
+    // The operator deliberately queues a batch of three old lectures...
+    const batch = await w.videos.migrateLibraryToMobile({ dryRun: false, limit: 3, actorId: 'admin_1' });
+    expect(batch.queued).toHaveLength(3);
+    // ...and then a teacher uploads a new one.
+    await w.videos.completeUpload(V, STAFF);
+
+    expect(w.mobileQueue.jobs.size).toBe(4);
+    expect([...db.rows.values()].filter((r) => r.mobileStatus === 'QUEUED')).toHaveLength(4);
+    // The backlog is explicit, bounded and prioritised BEHIND uploads.
+    expect(w.mobileQueue.inState('prioritized').map((j) => j.data.trigger)).toEqual(['migration', 'migration', 'migration']);
+    expect(w.mobileQueue.inState('waiting').map((j) => j.data.videoId)).toEqual([V]);
+    expect((await mobileWorker(w).runNext())?.job.data.videoId).toBe(V);
+  });
+
+  it('the migration tool is the only bulk path, and a dry run queues nothing', async () => {
+    const db = new FakeDb(backCatalogue());
+    const w = withSources(db);
+
+    const report = await w.videos.migrateLibraryToMobile({ dryRun: true, limit: 500, actorId: 'admin_1' });
+
+    expect(report.wouldQueue).toHaveLength(201); // 200 READY + the ARCHIVED one with a source
+    expect(report.queued).toEqual([]);
+    expect(w.mobileQueue.addCalls).toBe(0);
+    expect(db.writes).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('the reconciler only works when there is a reason to', () => {
+  it('an idle system is not scanned on the short timer, only at boot and on the slow background interval', async () => {
+    const w = uploadedWorld();
+    const scan = jest.spyOn(w.videos, 'reconcilePendingIntents');
+    const reconciler = new VideoPipelineReconciler(w.videos);
+    const t0 = Date.now();
+
+    await reconciler.tick(); // the boot scan
+    expect(scan).toHaveBeenCalledTimes(1);
+
+    // Nineteen wake-ups over the next ten minutes: nothing is known to be pending.
+    for (let i = 1; i < 20; i += 1) await expect(reconciler.wake(t0 + i * 30_000)).resolves.toBe(false);
+    expect(scan).toHaveBeenCalledTimes(1);
+
+    // The background interval elapses: one scan.
+    await expect(reconciler.wake(t0 + reconciler.intervalSeconds * 1000 + 1_000)).resolves.toBe(true);
+    expect(scan).toHaveBeenCalledTimes(2);
+  });
+
+  it('a delivery this process failed to make is retried on the short timer until it succeeds, then it goes quiet', async () => {
+    const w = uploadedWorld();
+    w.webQueue.outage = 'reject';
+    w.mobileQueue.outage = 'reject';
+    const reconciler = new VideoPipelineReconciler(w.videos);
+    await reconciler.tick();
+    expect(w.videos.hasUndeliveredIntents()).toBe(false);
+
+    await w.videos.completeUpload(V, STAFF);
+    expect(w.videos.hasUndeliveredIntents()).toBe(true);
+
+    jest.useFakeTimers({ now: Date.now() + 2 * MIN });
+    try {
+      // Redis still down, past the grace period: the scan runs and the debt remains.
+      await expect(reconciler.wake()).resolves.toBe(true);
+      expect(w.videos.hasUndeliveredIntents()).toBe(true);
+
+      // Redis returns: the very next wake delivers both jobs...
+      w.webQueue.outage = null;
+      w.mobileQueue.outage = null;
+      await expect(reconciler.wake()).resolves.toBe(true);
+      expect(w.videos.hasUndeliveredIntents()).toBe(false);
+      expect(w.mobileQueue.jobs.size).toBe(1);
+      expect(w.webQueue.jobs.size).toBe(1);
+
+      // ...and the short timer stops touching the database.
+      const scan = jest.spyOn(w.videos, 'reconcilePendingIntents');
+      await expect(reconciler.wake(Date.now() + 30_000)).resolves.toBe(false);
+      expect(scan).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('VIDEO_PIPELINE_RECONCILE_SECONDS: default ten minutes, a floor of one, and 0 switches it off', async () => {
+    const { normalizeReconcileIntervalSeconds } = await import(
+      '../../src/modules/videos/video-pipeline-reconciler.service'
+    );
+    expect(normalizeReconcileIntervalSeconds(undefined)).toBe(600);
+    expect(normalizeReconcileIntervalSeconds('5')).toBe(60);
+    expect(normalizeReconcileIntervalSeconds('900')).toBe(900);
+    expect(normalizeReconcileIntervalSeconds('0')).toBe(0);
+    expect(normalizeReconcileIntervalSeconds('nonsense')).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('a worker without ffmpeg (Gumlet handled on an always-on host)', () => {
+  const lightWorker = () => ({
+    at: new Date().toISOString(),
+    ffmpeg: false,
+    ffprobe: false,
+    queues: ['video-processing', 'push-delivery', 'maintenance', 'analytics'],
+  });
+
+  it('is not reported as "cannot transcode" for a Gumlet video, which it does not transcode', async () => {
+    const w = uploadedWorld();
+    w.redis.store.set('worker:heartbeat', lightWorker());
+
+    const accepted = await w.videos.completeUpload(V, STAFF);
+    expect(accepted).toMatchObject({ workerOnline: true, workerCanTranscode: null });
+
+    const status = await w.videos.status(V, STAFF);
+    expect(status).toMatchObject({ workerOnline: true, workerCanTranscode: null });
+    // The mobile side asks a different question, of a different worker: none is online.
+    expect(status.mobile).toMatchObject({ status: 'QUEUED', workerOnline: false });
+  });
+
+  it('is still reported for a legacy (ffmpeg-transcoded) video', async () => {
+    const w = uploadedWorld({ drmProvider: null, status: 'QUEUED', sourceSizeBytes: BigInt(5) });
+    w.redis.store.set('worker:heartbeat', lightWorker());
+    expect(await w.videos.status(V, STAFF)).toMatchObject({ workerOnline: true, workerCanTranscode: false });
   });
 });

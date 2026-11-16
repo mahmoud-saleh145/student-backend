@@ -93,12 +93,6 @@ export function withinQueueTimeout<T>(work: Promise<T>, what: string, ms = QUEUE
 }
 
 /**
- * How long a freshly recorded intent is left to the request that recorded it
- * before the reconciler considers it stranded.
- */
-export const INTENT_RECONCILE_GRACE_MS = 45_000;
-
-/**
  * A mobile row is PROCESSING but its job is no longer in the queue. After this
  * long the sweep treats it as orphaned. Only rows whose job is NOT live are
  * touched, so a long encode that is genuinely running is never interrupted.
@@ -113,6 +107,9 @@ const MOBILE_MIGRATABLE_STATUSES: VideoStatus[] = [
   VideoStatus.QUEUED,
   VideoStatus.PROCESSING,
 ];
+
+/** Intents delivered per reconcile scan; a full page asks for another scan soon. */
+const RECONCILE_PAGE_SIZE = 25;
 
 /** Shown on the row while its intent is waiting for Redis. No infrastructure detail. */
 export const WAITING_FOR_QUEUE_NOTE =
@@ -183,6 +180,18 @@ export interface MobileMigrationReport {
 export class VideosService {
   private readonly logger = new Logger(VideosService.name);
   private readonly cfg: VideoConfig;
+  /**
+   * True while THIS process knows it recorded an intent it could not deliver
+   * to the queue. Memory only: it is what lets the reconciler retry quickly
+   * after a Redis outage without scanning the database on a short timer when
+   * nothing is wrong. Anything this flag cannot know about (a process that
+   * died) is covered by the reconciler's boot and background scans.
+   */
+  private undelivered = false;
+
+  hasUndeliveredIntents(): boolean {
+    return this.undelivered;
+  }
 
   constructor(
     private readonly prisma: PrismaService,
@@ -551,6 +560,7 @@ export class VideosService {
         lessonId: true,
         processingJobId: true,
         gumletAssetId: true,
+        drmProvider: true,
       },
     });
     if (!video) throw AppException.notFound('Video', videoId);
@@ -641,7 +651,7 @@ export class VideosService {
           upload: { state: 'VERIFIED' as const, sizeBytes: size },
           gumlet: { queued: presence === 'live' },
           mobile,
-          ...(await this.workerStatus()),
+          ...(await this.workerStatus(video.drmProvider)),
         };
       }
 
@@ -663,7 +673,7 @@ export class VideosService {
         upload: { state: 'VERIFIED' as const, sizeBytes: size },
         gumlet: { queued: true },
         mobile,
-        ...(await this.workerStatus()),
+        ...(await this.workerStatus(video.drmProvider)),
       };
     }
 
@@ -737,7 +747,7 @@ export class VideosService {
       upload: { state: 'VERIFIED' as const, sizeBytes: size },
       gumlet: { queued: web.queued },
       mobile,
-      ...(await this.workerStatus()),
+      ...(await this.workerStatus(video.drmProvider)),
     };
   }
 
@@ -803,13 +813,33 @@ export class VideosService {
   private async queueUploadTranscode(
     video: { id: string; sourceKey: string; lessonId: string | null; courseId: string },
     requestedById?: string,
-  ): Promise<{ jobId: string | null; queued: boolean }> {
+    options: { onlyIfUndelivered?: boolean } = {},
+  ): Promise<{ jobId: string | null; queued: boolean; delivered?: boolean }> {
     const jobId = uploadTranscodeJobIdFor(video.id, video.sourceKey);
 
-    await this.prisma.video.updateMany({
-      where: { id: video.id, deletedAt: null, sourceKey: video.sourceKey },
-      data: { status: VideoStatus.QUEUED, processingJobId: null, processingError: null },
-    });
+    if (options.onlyIfUndelivered) {
+      // The reconciler read this row a moment ago; by now the request that
+      // recorded the intent may have delivered it and a worker may be well
+      // into the job. Writing QUEUED over that would be a lie about a video
+      // that is PROCESSING or READY. So here the row is only touched while it
+      // is still exactly "accepted, not delivered".
+      const still = await this.prisma.video.updateMany({
+        where: {
+          id: video.id,
+          deletedAt: null,
+          sourceKey: video.sourceKey,
+          status: VideoStatus.QUEUED,
+          processingJobId: null,
+        },
+        data: { processingError: null },
+      });
+      if (still.count === 0) return { jobId: null, queued: false, delivered: true };
+    } else {
+      await this.prisma.video.updateMany({
+        where: { id: video.id, deletedAt: null, sourceKey: video.sourceKey },
+        data: { status: VideoStatus.QUEUED, processingJobId: null, processingError: null },
+      });
+    }
 
     try {
       const presence = await this.jobPresence(this.queue, jobId);
@@ -850,6 +880,7 @@ export class VideosService {
         `video ${video.id}: accepted, but its transcode job is not in the queue yet (${(error as Error).message}); ` +
           'the reconciler will queue it',
       );
+      this.undelivered = true;
       return { jobId: null, queued: false };
     }
 
@@ -970,8 +1001,16 @@ export class VideosService {
    * Whether any queue consumer has checked in recently. Returned with every
    * enqueue so the dashboard can say "no worker is running" instead of
    * showing QUEUED forever with no explanation.
+   *
+   * `drmProvider` is the video's. A Gumlet video is transcoded BY GUMLET: the
+   * worker only submits it and polls, so whether that worker has ffmpeg is not
+   * a fact about this video, and `workerCanTranscode` is null for it. Without
+   * this, running the Gumlet queue on an always-on host that has no ffmpeg
+   * (the split deployment) made the dashboard announce "the worker cannot
+   * execute ffmpeg, so processing will fail" for uploads that were processing
+   * normally.
    */
-  async workerStatus(): Promise<{
+  async workerStatus(drmProvider?: string | null): Promise<{
     workerOnline: boolean;
     workerLastSeenAt: string | null;
     workerCanTranscode: boolean | null;
@@ -980,7 +1019,7 @@ export class VideosService {
     return {
       workerOnline: Boolean(beat),
       workerLastSeenAt: beat?.at ?? null,
-      workerCanTranscode: beat ? beat.ffmpeg && beat.ffprobe : null,
+      workerCanTranscode: beat && drmProvider !== 'gumlet' ? beat.ffmpeg && beat.ffprobe : null,
     };
   }
 
@@ -1301,9 +1340,17 @@ export class VideosService {
         `video ${params.videoId}: mobile intent ${params.jobId} is recorded but its job is not in the queue yet ` +
           `(${message}); the reconciler will queue it`,
       );
+      this.undelivered = true;
+      // Written once: a retry every thirty seconds during an outage has no
+      // reason to write the same sentence to the row each time.
       await this.prisma.video
         .updateMany({
-          where: { id: params.videoId, mobileJobId: params.jobId, mobileStatus: MobileVideoStatus.QUEUED },
+          where: {
+            id: params.videoId,
+            mobileJobId: params.jobId,
+            mobileStatus: MobileVideoStatus.QUEUED,
+            OR: [{ mobileError: null }, { mobileError: { not: WAITING_FOR_QUEUE_NOTE } }],
+          },
           data: { mobileError: WAITING_FOR_QUEUE_NOTE },
         })
         .catch(() => undefined);
@@ -1924,11 +1971,19 @@ export class VideosService {
    * (VideoPipelineReconciler) rather than as a queued job precisely so that it
    * does not depend on a worker - or on Redis - to get started.
    */
-  async reconcilePendingIntents(now = new Date()): Promise<{
+  async reconcilePendingIntents(): Promise<{
     mobile: { pending: number; queued: number };
     web: { pending: number; queued: number };
   }> {
-    const cutoff = new Date(now.getTime() - INTENT_RECONCILE_GRACE_MS);
+    // NO GRACE WINDOW. An intent recorded a moment ago by a request that is
+    // still delivering it may be picked up here too, and that is harmless:
+    // both add the same job id, which is one job. A window keyed on a
+    // timestamp was worse than none - `updatedAt` moves with every write to
+    // the row, so a struggling mobile delivery kept postponing the web one.
+    //
+    // `mobileRequestedAt IS NOT NULL` is what keeps rows queued by a build
+    // from before intents existed (clock-based job ids, no timestamps) out of
+    // this: those are the old sweep's business, and their jobs are live.
     const pending = await this.prisma.video.findMany({
       where: {
         ...notDeleted,
@@ -1937,13 +1992,12 @@ export class VideosService {
           {
             mobileStatus: MobileVideoStatus.QUEUED,
             mobileEnqueuedAt: null,
-            mobileRequestedAt: { lt: cutoff },
+            mobileRequestedAt: { not: null },
           },
           {
             status: VideoStatus.QUEUED,
             processingJobId: null,
             sourceSizeBytes: { not: null },
-            updatedAt: { lt: cutoff },
           },
         ],
       },
@@ -1962,7 +2016,7 @@ export class VideosService {
         updatedAt: true,
       },
       orderBy: { updatedAt: 'asc' },
-      take: 25,
+      take: RECONCILE_PAGE_SIZE,
     });
 
     const report = { mobile: { pending: 0, queued: 0 }, web: { pending: 0, queued: 0 } };
@@ -1973,8 +2027,7 @@ export class VideosService {
         Boolean(this.mobileQueue) &&
         video.mobileStatus === MobileVideoStatus.QUEUED &&
         !video.mobileEnqueuedAt &&
-        video.mobileRequestedAt !== null &&
-        video.mobileRequestedAt < cutoff;
+        video.mobileRequestedAt !== null;
       if (mobilePending) {
         report.mobile.pending += 1;
         try {
@@ -1987,20 +2040,17 @@ export class VideosService {
       }
 
       const webPending =
-        video.status === VideoStatus.QUEUED &&
-        !video.processingJobId &&
-        video.sourceSizeBytes !== null &&
-        video.updatedAt < cutoff;
+        video.status === VideoStatus.QUEUED && !video.processingJobId && video.sourceSizeBytes !== null;
       if (webPending) {
         report.web.pending += 1;
         try {
-          const result = await this.queueUploadTranscode({
-            id: video.id,
-            sourceKey: video.sourceKey,
-            lessonId: video.lessonId,
-            courseId: video.courseId,
-          });
-          if (result.queued) report.web.queued += 1;
+          const result = await this.queueUploadTranscode(
+            { id: video.id, sourceKey: video.sourceKey, lessonId: video.lessonId, courseId: video.courseId },
+            undefined,
+            { onlyIfUndelivered: true },
+          );
+          // `delivered` covers "somebody else got there first": not a debt.
+          if (result.queued || result.delivered) report.web.queued += 1;
         } catch (error) {
           this.logger.warn(`video ${video.id}: transcode intent not delivered: ${(error as Error).message}`);
         }
@@ -2013,6 +2063,13 @@ export class VideosService {
           `web ${report.web.queued}/${report.web.pending} queued`,
       );
     }
+    // Everything this scan found was delivered (or there was nothing): this
+    // process has no known debt. A failed delivery above has set the flag
+    // again, and a full page means there may be more behind it.
+    this.undelivered =
+      report.mobile.queued < report.mobile.pending ||
+      report.web.queued < report.web.pending ||
+      pending.length >= RECONCILE_PAGE_SIZE;
     return report;
   }
 
@@ -2240,7 +2297,7 @@ export class VideosService {
       deleted: Boolean(video.deletedAt),
       // Only worth a Redis read while the answer can explain a wait.
       ...(video.status === VideoStatus.QUEUED || video.status === VideoStatus.PROCESSING
-        ? await this.workerStatus()
+        ? await this.workerStatus(video.drmProvider)
         : {}),
     };
   }
@@ -2471,7 +2528,7 @@ export class VideosService {
         provider: 'gumlet',
         assetId: replaced.assetId,
         recovered: true,
-        ...(await this.workerStatus()),
+        ...(await this.workerStatus('gumlet')),
       };
     }
 
@@ -2512,7 +2569,7 @@ export class VideosService {
       jobId,
       provider: 'gumlet',
       recovered: false,
-      ...(await this.workerStatus()),
+      ...(await this.workerStatus('gumlet')),
     };
   }
 
