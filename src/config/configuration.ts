@@ -235,6 +235,12 @@ export const videoConfig = registerAs('video', () => ({
     /** Queue a mobile transcode for every completed upload automatically. */
     autoProcess: bool(process.env.MOBILE_PIPELINE_ENABLED, true),
   },
+  /**
+   * Tell enrolled students when a lecture first becomes playable. Off = the
+   * lecture is still recorded as announced, so switching this back on does not
+   * announce everything that became playable in the meantime.
+   */
+  newVideoNotifications: bool(process.env.NEW_VIDEO_NOTIFICATIONS_ENABLED, true),
   drm: {
     enabled: bool(process.env.DRM_ENABLED),
     provider: (process.env.DRM_PROVIDER ?? 'none') as 'none' | 'gumlet',

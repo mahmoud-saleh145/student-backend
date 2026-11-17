@@ -1673,6 +1673,12 @@ model Video {
   /// a re-enqueue after a Redis outage keeps the job's priority.
   mobileTrigger             String?
 
+  /// When enrolled students were told this lecture can be watched ("new
+  /// video"). Claimed with a compare-and-set by whichever pipeline makes the
+  /// lecture playable FIRST, so the second one to finish sends nothing. Cleared
+  /// when the file is replaced. See new-video-announcer.service.ts.
+  newVideoAnnouncedAt DateTime?
+
   processingJobId String?
   processingError String?
   processingStartedAt DateTime?

@@ -1,5 +1,7 @@
 import { MobileVideoProcessor } from '../../../src/jobs/processors/mobile-video.processor';
 import { VideoProcessor } from '../../../src/jobs/processors/video.processor';
+import { NotificationsService } from '../../../src/modules/notifications/notifications.service';
+import { LessonVideoService } from '../../../src/modules/videos/lesson-video.service';
 import { VideosService } from '../../../src/modules/videos/videos.service';
 
 /**
@@ -89,6 +91,7 @@ export function videoRow(overrides: Partial<Row> = {}): Row {
     mobileEnqueuedAt: null,
     mobileGeneration: 0,
     mobileTrigger: null,
+    newVideoAnnouncedAt: null,
     deletedAt: null,
     createdAt: new Date('2026-11-16T10:00:00Z'),
     updatedAt: new Date('2026-11-16T10:00:00Z'),
@@ -108,8 +111,29 @@ export class FakeDb {
   down = false;
   now = () => new Date();
 
+  /** Lectures, by id: what the course list actually shows a duration from. */
+  readonly lessons = new Map<string, { id: string; courseId: string; title: string; durationSeconds: number }>();
+  /** Course enrolments, with the account each belongs to. */
+  enrollments: { userId: string; courseId: string; state: string; user: { status: string; deletedAt: Date | null } }[] = [];
+  /** Every notification row written, in order. */
+  readonly notifications: Row[] = [];
+  /** Set to make the notification insert fail (and only that). */
+  notificationsDown = false;
+
   constructor(rows: Row[] = []) {
-    for (const row of rows) this.rows.set(row.id, row);
+    for (const row of rows) {
+      this.rows.set(row.id, row);
+      for (const link of (row.lessonLinks as { lessonId: string }[] | undefined) ?? []) {
+        if (!this.lessons.has(link.lessonId)) {
+          this.lessons.set(link.lessonId, {
+            id: link.lessonId,
+            courseId: String(row.courseId),
+            title: (row.lesson as { title?: string } | null)?.title ?? link.lessonId,
+            durationSeconds: 0,
+          });
+        }
+      }
+    }
   }
 
   get(id: string): Row {
@@ -156,6 +180,11 @@ export class FakeDb {
       this.guard();
       return { ...this.get(args.where.id) };
     },
+    findUnique: async (args: { where: { id: string } }) => {
+      this.guard();
+      const row = this.rows.get(args.where.id);
+      return row ? { ...row } : null;
+    },
     findMany: async (args: { where?: Record<string, unknown>; take?: number }) => {
       this.guard();
       const found = [...this.rows.values()].filter((row) => matches(row, args.where)).map((row) => ({ ...row }));
@@ -193,10 +222,55 @@ export class FakeDb {
   };
 
   readonly lessonVideo = {
-    findMany: async () => [],
+    findMany: async (args: { where?: { videoId?: string } } = {}) => {
+      this.guard();
+      const row = args.where?.videoId ? this.rows.get(args.where.videoId) : undefined;
+      const links = (row?.lessonLinks as { lessonId: string }[] | undefined) ?? [];
+      return links.map((link) => ({
+        lessonId: link.lessonId,
+        videoId: row!.id,
+        lesson: { courseId: this.lessons.get(link.lessonId)?.courseId ?? String(row!.courseId) },
+      }));
+    },
   };
   readonly lesson = {
-    updateMany: async () => ({ count: 0 }),
+    updateMany: async (args: { where: { id: { in: string[] } }; data: { durationSeconds?: number } }) => {
+      this.guard();
+      let count = 0;
+      for (const id of args.where.id.in) {
+        const lesson = this.lessons.get(id);
+        if (!lesson) continue;
+        Object.assign(lesson, args.data);
+        count += 1;
+      }
+      return { count };
+    },
+  };
+  readonly enrollment = {
+    // The one query `notifyCourseStudents` makes, evaluated for real: an
+    // ACTIVE enrolment of an ACTIVE, undeleted account.
+    findMany: async (args: {
+      where: { courseId: string; state: string; user: { status: string; deletedAt: null } };
+    }) => {
+      this.guard();
+      return this.enrollments
+        .filter(
+          (e) =>
+            e.courseId === args.where.courseId &&
+            e.state === args.where.state &&
+            e.user.status === args.where.user.status &&
+            e.user.deletedAt === null,
+        )
+        .map((e) => ({ userId: e.userId }));
+    },
+  };
+  readonly notification = {
+    createMany: async (args: { data: Row[] }) => {
+      this.guard();
+      if (this.notificationsDown) throw new Error('notifications insert failed');
+      this.notifications.push(...args.data.map((row) => ({ ...row })));
+      return { count: args.data.length };
+    },
   };
 
   $transaction = async <T>(fn: (tx: FakeDb) => Promise<T>): Promise<T> => fn(this);
@@ -345,6 +419,9 @@ export interface World {
   videos: VideosService;
   gumlet: { replaceFailedAsset: jest.Mock; sync: jest.Mock };
   audit: { record: jest.Mock };
+  /** The push-delivery queue the real NotificationsService adds to. */
+  pushQueue: FakeQueue;
+  courses: { recountCourse: jest.Mock };
 }
 
 /**
@@ -353,9 +430,11 @@ export interface World {
  * models two processes, or the same service after a restart.
  */
 export function apiProcess(
-  parts: Partial<Pick<World, 'db' | 'storage' | 'redis' | 'webQueue' | 'mobileQueue'>> & {
+  parts: Partial<Pick<World, 'db' | 'storage' | 'redis' | 'webQueue' | 'mobileQueue' | 'pushQueue'>> & {
     autoProcess?: boolean;
     withMobileQueue?: boolean;
+    /** NEW_VIDEO_NOTIFICATIONS_ENABLED for this process (default on). */
+    newVideoNotifications?: boolean;
   } = {},
 ): World {
   const db = parts.db ?? new FakeDb();
@@ -383,6 +462,7 @@ export function apiProcess(
       encryptionEnabled: true,
       workDir: '/tmp/edu-transcode',
       mobile: { delivery: 'hls', gumletFallback: true, autoProcess: parts.autoProcess ?? true },
+      newVideoNotifications: parts.newVideoNotifications ?? true,
       drm: {
         enabled: true,
         provider: 'gumlet',
@@ -390,21 +470,28 @@ export function apiProcess(
       },
     }),
   };
+  // The REAL notification and lecture-duration services over the same fake
+  // database, so "who is told" and "which lecture shows which duration" are
+  // decided by production code, not by a mock that agrees with the test.
+  const pushQueue = parts.pushQueue ?? new FakeQueue('push-delivery');
+  const courses = { recountCourse: jest.fn(async (_courseId: string) => undefined) };
+  const notifications = new NotificationsService(db as never, pushQueue as never, { get: () => undefined } as never);
+  const lessonVideos = new LessonVideoService(db as never, courses as never);
   const videos = new VideosService(
     db as never,
     storage as never,
     { assertCanManageCourse: jest.fn(async () => undefined), assertTeacherCapability: jest.fn(async () => undefined) } as never,
-    { recountCourse: jest.fn(async () => undefined) } as never,
-    { notifyCourseStudents: jest.fn(async () => undefined) } as never,
+    courses as never,
+    notifications as never,
     audit as never,
     redis as never,
     webQueue as never,
     config as never,
-    {} as never,
+    lessonVideos as never,
     gumlet as never,
     parts.withMobileQueue === false ? undefined : (mobileQueue as never),
   );
-  return { db, storage, redis, webQueue, mobileQueue, videos, gumlet, audit };
+  return { db, storage, redis, webQueue, mobileQueue, videos, gumlet, audit, pushQueue, courses };
 }
 
 /** A confirmed upload sitting in the bucket, ready for `completeUpload`. */

@@ -12,6 +12,7 @@ import { VideosController } from './videos.controller';
 import { VideosService } from './videos.service';
 import { GumletMigrationService } from './gumlet-migration.service';
 import { LessonVideoService } from './lesson-video.service';
+import { NewVideoAnnouncer } from './new-video-announcer.service';
 import { VideoPipelineReconciler } from './video-pipeline-reconciler.service';
 
 @Module({
@@ -29,6 +30,8 @@ import { VideoPipelineReconciler } from './video-pipeline-reconciler.service';
     GumletWebhookService,
     GumletMigrationService,
     LessonVideoService,
+    // The once-only "new video" notification, shared by both pipelines.
+    NewVideoAnnouncer,
     // Delivers processing intents that never reached the queue (Redis down,
     // a restart between the commit and the enqueue). In-process, so it does
     // not need a worker to be running.

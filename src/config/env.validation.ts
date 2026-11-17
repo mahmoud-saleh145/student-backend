@@ -214,6 +214,11 @@ export class EnvironmentVariables {
   @toBool() @IsBoolean() MOBILE_HLS_GUMLET_FALLBACK = true;
   @toBool() @IsBoolean() MOBILE_PIPELINE_ENABLED = true;
   /**
+   * The "new video" notification, sent once when a lecture first becomes
+   * playable through either pipeline. Read by the API and by the worker.
+   */
+  @toBool() @IsBoolean() NEW_VIDEO_NOTIFICATIONS_ENABLED = true;
+  /**
    * Background interval of the pipeline reconciler (seconds; default 600,
    * minimum 60, 0 disables it). It also scans at boot and every 30 s while a
    * delivery is known to have failed. See video-pipeline-reconciler.service.ts.

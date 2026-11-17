@@ -1,10 +1,9 @@
 import { InjectQueue } from '@nestjs/bullmq';
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   AuditAction,
   MobileVideoStatus,
-  NotificationKind,
   type Prisma,
   type UserRole,
   VideoStatus,
@@ -51,6 +50,8 @@ import { assertObjectKeyInNamespace, StorageService } from '../storage/storage.s
 import { isTerminalGumletFailure, sanitizeProviderText } from './gumlet-failure';
 import { GumletIngestService } from './gumlet-ingest.service';
 import { LessonVideoService } from './lesson-video.service';
+import { NewVideoAnnouncer } from './new-video-announcer.service';
+import { normalizeProviderDurationSeconds } from './provider-duration.util';
 import {
   gumletStateOf,
   isLiveJobState,
@@ -215,9 +216,18 @@ export class VideosService {
      */
     @InjectQueue(QUEUE_NAMES.mobileVideo)
     private readonly mobileQueue?: Queue<MobileTranscodeJobData>,
+    /**
+     * The once-only "new video" notification, shared with the Gumlet ingest.
+     * Optional for the same positional-construction reason: without one, an
+     * equivalent is built from the collaborators this service already holds.
+     */
+    @Optional() announcer?: NewVideoAnnouncer,
   ) {
     this.cfg = config.getOrThrow<VideoConfig>('video');
+    this.announcer = announcer ?? new NewVideoAnnouncer(this.prisma, this.notifications, config);
   }
+
+  private readonly announcer: NewVideoAnnouncer;
 
   // ---------------------------------------------------------------------------
   // Upload
@@ -412,6 +422,15 @@ export class VideosService {
               // fresh intent for the new file, and a job still queued for the
               // old source is recognised as stale by its source key.
               sourceSizeBytes: null,
+              // The stored duration measured the PREVIOUS file. Left in place
+              // it would be shown for the new recording whenever the pipeline
+              // that finishes is one that only fills a missing duration. The
+              // lecture keeps its old figure until a pipeline measures the new
+              // file, so nothing reads 0 in the meantime.
+              durationSeconds: 0,
+              // A replacement is new content: it is announced when it becomes
+              // playable, as a re-transcode always was.
+              newVideoAnnouncedAt: null,
               mobileStatus: MobileVideoStatus.NONE,
               mobileError: null,
               mobileJobId: null,
@@ -1800,10 +1819,15 @@ export class VideosService {
     videoId: string,
     result: Parameters<VideosService['markReady']>[1],
   ): Promise<void> {
-    await this.prisma.$transaction(async (tx) => {
+    // The worker's ffprobe measurement of the source it just encoded (and
+    // whose segment durations the transcoder verified against it). Zero or
+    // unparseable is UNKNOWN, never a duration.
+    const measuredSeconds = normalizeProviderDurationSeconds(result.durationSeconds);
+
+    const before = await this.prisma.$transaction(async (tx) => {
       const current = await tx.video.findUniqueOrThrow({
         where: { id: videoId },
-        select: { durationSeconds: true, width: true, height: true, thumbnailKey: true },
+        select: { durationSeconds: true, width: true, height: true, thumbnailKey: true, status: true },
       });
       await tx.videoRendition.deleteMany({ where: { videoId } });
       await tx.video.update({
@@ -1813,7 +1837,7 @@ export class VideosService {
           masterPlaylistKey: result.masterPlaylistKey,
           isEncrypted: result.isEncrypted,
           encryptionKeyId: result.encryptionKeyId,
-          ...(current.durationSeconds > 0 ? {} : { durationSeconds: result.durationSeconds }),
+          ...(current.durationSeconds > 0 || measuredSeconds === null ? {} : { durationSeconds: measuredSeconds }),
           ...(current.width ? {} : { width: result.width, height: result.height }),
           ...(current.thumbnailKey || !result.thumbnailKey ? {} : { thumbnailKey: result.thumbnailKey }),
           frameRate: result.frameRate,
@@ -1833,8 +1857,43 @@ export class VideosService {
           },
         },
       });
+      return current;
     });
     this.logger.log(`video ${videoId} is mobile-READY (${result.renditions.length} renditions)`);
+
+    // FROM HERE ON NOTHING MAY THROW. The ladder is recorded; an error now
+    // would fail the job, and the queue would encode the whole lecture again
+    // to retry a duration or a notification.
+
+    // THE LECTURE'S DURATION, when this pipeline is the one that measured it.
+    //
+    // The video row's duration was just filled in above, but every reader a
+    // student or a teacher sees - the lecture row, the course list, the course
+    // total - shows `Lesson.durationSeconds`, which only the Gumlet sync (and
+    // the legacy transcode) ever wrote. So a lecture whose Gumlet side failed
+    // played perfectly on mobile and was listed as "0m".
+    //
+    // Only when the video had NO duration: one that Gumlet (or anything else)
+    // already measured is left exactly as it is, lectures included, and a
+    // Gumlet sync that finishes later still writes the provider's figure over
+    // this one, as it always has.
+    if (before.durationSeconds <= 0 && measuredSeconds !== null) {
+      try {
+        await this.lessonVideos.propagateDurationToAttachedLessons(videoId, measuredSeconds);
+      } catch (e) {
+        this.logger.warn(
+          `video ${videoId}: could not copy the measured duration to its lectures: ${(e as Error).message}`,
+        );
+      }
+    }
+
+    // "NEW VIDEO", when this pipeline is the FIRST to make the lecture
+    // playable. If the Gumlet side is already READY it was first: it announced
+    // the lecture, or the lecture predates the announcement - which is what
+    // keeps a backfill of old lectures from notifying anyone.
+    if (before.status !== VideoStatus.READY) {
+      await this.announcer.announce(videoId, 'mobile');
+    }
   }
 
   /**
@@ -2700,17 +2759,11 @@ export class VideosService {
     // Skipped when the asset has no origin lecture (a reused asset whose author
     // lesson was removed). There is no lesson to link to, and a notification
     // pointing at the wrong lecture would be worse than none.
+    //
+    // Sent through the announcer both pipelines share, so it goes out once per
+    // uploaded file however many times this runs (a re-transcode, a retry).
     if (video.lesson && video.lessonId) {
-      await this.notifications
-        .notifyCourseStudents(video.courseId, {
-          kind: NotificationKind.NEW_VIDEO,
-          title: 'New video available',
-          titleAr: 'فيديو جديد متاح',
-          body: `${video.lesson.title} is ready to watch.`,
-          bodyAr: `${video.lesson.title} أصبح جاهزًا للمشاهدة.`,
-          route: `/lesson/${video.lessonId}`,
-        })
-        .catch((e) => this.logger.warn(`new-video notification failed: ${e.message}`));
+      await this.announcer.announce(videoId, 'local');
     }
 
     this.logger.log(`video ${videoId} is READY (${result.renditions.length} renditions)`);
