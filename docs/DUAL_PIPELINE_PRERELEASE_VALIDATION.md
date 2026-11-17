@@ -1,24 +1,29 @@
-# Dual pipeline: pre-release validation and release checklist
+# Dual pipeline: pre-release validation (test evidence)
 
-Written 2026-11-17, after `docs/DUAL_PIPELINE_INDEPENDENCE.md`, and revised
-three times the same day: when the two functional gaps of the first version
-were closed (section 2.10), when the owner's notification policy was applied,
-and when publication became the trigger and the app-only audience stopped
-depending on past playback (both in section 2.11). The release checklist
-(section 3) reflects the final state.
+Written 2026-11-17 and revised the same day as the work went on. **The
+release itself is run from `DUAL_PIPELINE_RELEASE_PLAN.md`**, which holds the
+verified app build numbers, the audit of the final source revision and image,
+the checklist and the smoke tests. This document keeps the test evidence
+behind it.
 
-Release artefacts: backend branch `fix/dual-pipeline-independence` at code
-commit **a292083**; dashboard branch `feat/dual-pipeline-status` at
-**8d8e06e** (unchanged); worker image **`edu-worker:dual-pipeline-a292083`**
-(id `sha256:b992dc1a6ece…`, built locally). Every earlier `dual-pipeline-*`
-image is superseded and has been removed from the laptop.
+Two things changed after the sections below were written, in commit 4de70a4,
+and are described in the release plan rather than here:
+
+- `NEW_VIDEO_NOTIFICATIONS_ENABLED` now defaults to **false** (sections 1 and
+  2.11 below still describe the earlier default);
+- `MOBILE_HLS_MIN_BUILD_ANDROID` / `_IOS` also decide **delivery**: a build
+  below the configured minimum keeps Gumlet even if it declares `hls-aes128`.
+
+Final artefacts: backend code commit **4de70a4**, dashboard **8d8e06e**,
+worker image **`edu-worker:dual-pipeline-4de70a4`**
+(`sha256:97e5db73b1b8…`). Every other `dual-pipeline-*` image named below is
+superseded and has been removed from the laptop.
 
 Nothing was pushed, deployed or migrated in production, no production
 environment variable or row was changed, and no production job was started.
-Production was touched only by read-only checks (`READ ONLY` database
-transactions, `GET` requests to Gumlet). Every write-capable test ran against
-a scratch database, a local Redis and local S3-compatible storage, all removed
-afterwards.
+Production was touched only by read-only checks. Every write-capable test ran
+against a scratch database, a local Redis and local S3-compatible storage, all
+removed afterwards.
 
 ---
 
@@ -515,220 +520,6 @@ the REVOKED enrolment received nothing.
 
 ## 3. Release checklist
 
-Final version, 2026-11-17. Changes from the previous version: the image tag
-and commit; a third, one-column migration; the two optional minimum-build
-settings; a section-publish check in smoke test #2; the rollback table.
-
-Release artefacts: backend `fix/dual-pipeline-independence` at **a292083**
-(later commits are documentation only), dashboard `feat/dual-pipeline-status`
-8d8e06e, image `edu-worker:dual-pipeline-a292083`
-(`sha256:b992dc1a6ece9924579b83a9e27e7b35e205c220103fa1045411a40a100f0e43`).
-`origin/main` had not moved in either repository when this was written
-(backend 164ae72, dashboard 12dcda7). **Each numbered step is an approval
-gate.**
-
-### Step 0 - before anything
-
-- [ ] Review and merge both pull requests. Then
-      `git diff a292083 <merge commit> -- . ":!docs"` must be empty. If it is
-      not (main moved, a conflict was resolved), rebuild the image from the
-      merge commit - with nothing else touching the checkout - and repeat the
-      image checks of section 2.1 before going on.
-- [ ] On the laptop: `docker image inspect edu-worker:dual-pipeline-a292083
-      --format "{{.Id}}"` → the id above. Keep `edu-worker:30a21fa-priority-vfr`
-      (rollback) and `edu-worker:30a21fa-priority-r2` (the watchdog runs on
-      it); no `docker image prune`.
-- [ ] Laptop on home Wi-Fi and AC power, lid open; Docker healthy.
-- [ ] Note the current Render deploy id (for rollback) and Vercel deployment.
-- [ ] **Choose the smoke-test course: one with no real students.** Several
-      courses have no active enrolment. Check:
-      `select count(*) from enrollments where "courseId" = '<id>' and state = 'ACTIVE'`
-      → 0, or only the test account. Both smoke tests upload there.
-- [ ] **Decide the notification** (condition 4): live with this release
-      (nothing to set), or held back (`NEW_VIDEO_NOTIFICATIONS_ENABLED=false`
-      on Render in step 2 **and** in `.env.worker` in step 5).
-- [ ] **Optional - the first app builds that play mobile HLS.** Look them up
-      in the Play Console (versionCode) and App Store Connect (build number)
-      and set `MOBILE_HLS_MIN_BUILD_ANDROID` / `MOBILE_HLS_MIN_BUILD_IOS` to
-      the same values on Render (step 2) **and** in `.env.worker` (step 5).
-      Leaving them unset is safe: in the Gumlet-failed case fewer students are
-      told at once, and the rest when Gumlet recovers. A platform whose build
-      numbers are not plain whole numbers should be left unset.
-
-### Step 1 - database
-
-- [ ] Neon: create backup branch `pre-dual-pipeline-<date>` from production.
-- [ ] From the release commit, with the production `DIRECT_URL`:
-      `npx prisma migrate deploy` → applies **exactly three** migrations:
-      `20261116120000_video_pipeline_intents` (four columns on `videos`),
-      `20261117090000_video_new_video_announcement` (two columns and one index
-      on `videos`, and the `UPDATE` that marks already-processed videos DONE:
-      264 of 272 at the 17 November reading), and
-      `20261117100000_device_app_build` (one column on `devices`).
-- [ ] Verify:
-      `select count(*) from videos where "mobileGeneration" <> 0` → 0;
-      `select "newVideoAnnounceState", count(*) from videos group by 1` → only
-      `DONE` and NULL (no `PENDING`, `SENDING` or `MOBILE`);
-      `select status, count(*) from videos where "newVideoAnnounceState" is null group by 1`
-      → only rows not yet playable (`UPLOADING`, and anything in flight at
-      that moment);
-      `select count(*) from devices where "appBuild" is not null` → 0.
-- Effect on running code: none. The columns are additive and the old API and
-  worker never read them. The `UPDATE` touches two new columns on ~264 rows;
-  no existing device row is touched.
-
-### Step 2 - API (Render), flag still OFF
-
-- [ ] Environment: `MOBILE_PIPELINE_ENABLED` stays `false`. Nothing else is
-      required. Optional, as decided in step 0: `MOBILE_HLS_MIN_BUILD_ANDROID`,
-      `MOBILE_HLS_MIN_BUILD_IOS`, `NEW_VIDEO_NOTIFICATIONS_ENABLED=false`;
-      `VIDEO_PIPELINE_RECONCILE_SECONDS` (default 600).
-- [ ] Manual deploy of the merged commit.
-- [ ] Verify: log lines `NewVideoAnnouncerModule dependencies initialized` and
-      `video pipeline reconciler: scan at boot…`; no `pending intents:` line;
-      `GET /videos/<any id>/status` returns `source`, `gumlet`, `mobile`
-      blocks; `/meta/health/deep` unchanged; a student can sign in and stay
-      signed in (the token refresh now also records the app build).
-
-### Step 3 - dashboard (Vercel)
-
-- [ ] Deploy the merged commit. Open a lecture: three chips are shown.
-
-### Step 4 - smoke test #1 (one video, flag OFF, old worker)
-
-- [ ] Upload one short test lecture to a published lesson of the
-      **smoke-test course**.
-- [ ] Expect: upload accepted; chips `Uploaded · Gumlet Pending→Ready ·
-      Mobile HLS Not started`; exactly one row; nothing in the mobile queue.
-- This proves the new acceptance path on production without any mobile work.
-  The notification is not asserted here: the old worker is still the one that
-  finishes Gumlet, and it does not create the announcement.
-
-### Step 5 - worker and watchdog (laptop)
-
-- [ ] In `deploy/laptop-worker/.env.worker`: back it up, then set
-      `WORKER_IMAGE=edu-worker:dual-pipeline-a292083` and
-      `BUILD_COMMIT=a29208349eeb6e498e22486a1f8ad962a03588f4`. Nothing else is
-      required (plus, only as decided in step 0, the same
-      `MOBILE_HLS_MIN_BUILD_*` values as on Render and/or
-      `NEW_VIDEO_NOTIFICATIONS_ENABLED=false`).
-- [ ] Confirm nothing is running (`GET /videos/mobile/overview` →
-      `worker.detail.activeJobs: []`, and no lecture mid-upload), then
-      `docker compose --env-file .env.worker up -d`.
-- [ ] Verify: `docker inspect edu-worker --format "{{.Image}}"` → the image id
-      of step 0; container healthy; heartbeat build `a29208349eeb`; the
-      delayed backlog jobs are still delayed (the pause is still on).
-- [ ] Watchdog: back up `C:\edu-watchdog\watchdog.js`, copy
-      `deploy/laptop-worker/watchdog/watchdog.js` over it,
-      `docker restart edu-hls-watchdog`, confirm its start log shows
-      `pauseScope: historical`.
-
-### Step 6 - pause scope
-
-- [ ] `POST /videos/mobile/pause` with
-      `{ "reason": "backlog paused between batches", "scope": "historical" }`.
-- [ ] Verify `GET /videos/mobile/overview` → `pause.scope = historical`, and
-      the mobile queue counts are what they were (8 delayed at the last
-      reading).
-- From here a backlog pause no longer holds new uploads. Do not go to step 7
-  before this reads `historical`.
-
-### Step 7 - turn automatic mobile processing ON
-
-- [ ] Render: `MOBILE_PIPELINE_ENABLED=true`, save, redeploy.
-- [ ] Verify immediately: mobile queue counts unchanged (no new jobs); no
-      `pending intents:` log line.
-
-### Step 8 - smoke test #2 (flag ON, new worker)
-
-**8a - a published lesson**
-
-- [ ] Upload one short test lecture to a published lesson of the smoke-test
-      course.
-- [ ] Expect within a minute: `Uploaded · Gumlet Pending · Mobile HLS Queued`;
-      one new job `mobile-hls:<videoId>:p1g1` in the mobile queue, **without**
-      a priority; the 8 backlog jobs untouched.
-- [ ] Expect within a few minutes: `Mobile HLS Processing nn%` then `Ready`;
-      Gumlet `Ready` independently.
-- [ ] `select "mobileStatus", "mobileGeneration", "mobileEnqueuedAt" is not null, "durationSeconds" > 0, "newVideoAnnounceState" from videos where id = '<videoId>'`
-      → `READY, 1, true, true, DONE`. The lecture row in the dashboard shows
-      the duration.
-- [ ] `select count(*) from notifications where kind = 'NEW_VIDEO' and route = '/lesson/<lessonId>'`
-      → the course's eligible enrolments (0 for an empty course, 1 if only the
-      test account is enrolled), and **the same number again** after both
-      chips read Ready. Worker log: `became playable via gumlet|mobile:
-      announcement owed`, then one line `announced (every platform): n
-      eligible, n notified, 0 already had it`. With the switch off: 0 rows and
-      the line `new-video notifications are switched off`.
-
-**8b - a draft lesson, released by publishing**
-
-- [ ] Set a second lesson of the smoke-test course to Draft and upload a
-      short lecture to it. When both chips read Ready:
-      `select "newVideoAnnounceState" from videos where id = '<videoId>'` →
-      `PENDING`; no notification row for that lesson.
-- [ ] Publish the lesson in the dashboard. **Immediately**, without waiting:
-      state `DONE`; the notification count for that lesson equals the
-      course's eligible enrolments.
-- [ ] Optional, same idea one level up: repeat with the lesson published and
-      its *section* set to Draft, then publish the section - the state turns
-      `DONE` in that request.
-
-**Then**
-
-- [ ] `select route, count(*) from notifications where kind = 'NEW_VIDEO' group by 1`
-      → only the lectures uploaded in this step; no old lecture.
-- [ ] `select platform, "appBuild", count(*) from devices where "appBuild" is not null group by 1, 2`
-      → builds start to appear as students sign in or the app refreshes.
-- [ ] On a phone with the HLS-capable app (once it is live): the lecture plays;
-      the ticket row has `delivery = hls`.
-- [ ] Remove the test videos from the dashboard. (Their Gumlet assets remain
-      at Gumlet; delete them there by hand if wanted.)
-
-The app-only announcement (Gumlet failed, mobile ready) cannot be produced on
-demand in production without breaking a Gumlet upload on purpose, so it is not
-part of the smoke test. It is covered by the local end-to-end run of section
-2.11.
-
-### Step 9 - backfill (separate approval)
-
-- [ ] List A (32 ids, `backfill-A.txt`) in batches of about 8, with the usual
-      watcher. `POST /videos/mobile/resume` only when a batch should run.
-- [ ] After the first batch:
-      `select count(*) from notifications where kind = 'NEW_VIDEO'` is what it
-      was before the batch, and
-      `select count(*) from videos where "newVideoAnnounceState" = 'PENDING'`
-      did not grow because of it. A backfill announces nothing.
-
-### Step 10 - optional, later: Gumlet off the laptop (section 2.7)
-
-### Afterwards - two things worth looking at
-
-`select "newVideoAnnounceState", count(*), min("newVideoAnnounceStateAt") from videos where "newVideoAnnounceState" in ('PENDING','SENDING','MOBILE') group by 1`
-- `PENDING`: lectures waiting for their lesson, section or course to be
-  published, for a release date, or for Gumlet to finish. `SENDING` older than
-  a few minutes: an interrupted attempt; the reconciler takes it over by
-  itself after 5 minutes. `MOBILE`: lectures announced app-only because Gumlet
-  failed - "Retry Gumlet" on them tells everyone else.
-
-The worker's log line for an app-only announcement states who was told and
-who was held back and why (`… compatible by app build, … by declared HLS
-support; … held back (… app build unknown or no minimum configured, … below
-the minimum build)`).
-
-### Rollback
-
-| What | How | Leaves behind |
-|---|---|---|
-| Stop new mobile jobs | `MOBILE_PIPELINE_ENABLED=false` on Render | queued jobs stay and run |
-| Stop encoding | `POST /videos/mobile/pause` (no scope = everything) | nothing lost |
-| Stop notifications | `NEW_VIDEO_NOTIFICATIONS_ENABLED=false` on Render (redeploy) and in `.env.worker` (`up -d`) | notifications already sent cannot be recalled; lectures that become playable while it is off are not announced later |
-| App-only notifications reach too many or too few | change or remove `MOBILE_HLS_MIN_BUILD_ANDROID` / `_IOS` (Render and `.env.worker`) | unset = only apps that declared HLS support are told app-only |
-| Worker | restore the `.env.worker` backup (image `30a21fa-priority-vfr`), `docker compose --env-file .env.worker up -d` | jobs keep their ids; the old image runs them; it does not announce or copy durations |
-| Watchdog | restore the `watchdog.js` backup and `docker restart edu-hls-watchdog`, or set `WATCHDOG_PAUSE_SCOPE=all` | its pauses hold new uploads again |
-| API | Render → roll back to the noted deploy | new columns ignored; a row left "accepted, not delivered" is re-queued by the old 30-minute sweep; `PENDING` announcements stay as they are and are sent if the new build returns |
-| Dashboard | Vercel → promote the previous deployment | - |
-| Mobile playback | `POST /videos/mobile/delivery` `mode=gumlet` | unchanged emergency switch |
-| Migrations | not needed for any rollback; if wanted, drop the index and the seven columns (six on `videos`, one on `devices`) after the API and worker rollback | - |
-
-No rollback step deletes a video, a Gumlet asset, an R2 object or a queue.
+Moved to `DUAL_PIPELINE_RELEASE_PLAN.md` (sections 7 to 9), which is written
+for the final revision 4de70a4: notifications off, the minimum Android build
+set, three migrations, and the two smoke tests in the hidden test course.
