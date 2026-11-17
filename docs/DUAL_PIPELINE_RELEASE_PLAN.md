@@ -157,8 +157,8 @@ nobody today.
 | Item | Value | Checked |
 |---|---|---|
 | Backend branch | `fix/dual-pipeline-independence`, on `origin/main` 164ae72 (13 commits up to the code commit) | working tree clean, no stash, `origin/main` has not moved, branch not on the remote |
-| Backend code commit | **4de70a4** (`4de70a40097d2e301664a700af90b23c901ffb7f`) | every later commit touches `docs/` only |
-| Worker image | **`edu-worker:dual-pipeline-4de70a4`**, `sha256:97e5db73b1b8ea3c07850b367ade7c7d82438546b8472cd65a82865d77a2ccea` | `BUILD_COMMIT` baked in = the commit above; **all 214 compiled files in the image are identical** to a fresh build of that commit; `schema.prisma` identical; the three migrations are inside; the real `.env.worker` validates in it with networking off (135 keys; notifications resolve to `false`) |
+| Backend code commit | **1aecb4a** (`1aecb4ab407f63dea62952ad5b4d733b7db8dca2`) = 4de70a4 plus three fixes from the pre-merge review (below) | verified from a clean checkout of exactly that commit: typecheck clean, 184 suites, 3,683 tests, 0 failed |
+| Worker image | **not needed in Stage 1.** `edu-worker:dual-pipeline-4de70a4` (`sha256:97e5db73b1b8…`) predates the review fixes and is superseded: **rebuild from a clean checkout of the merge commit before Stage 2**, and repeat the checks in this row. For 4de70a4 they were: | `BUILD_COMMIT` baked in = the commit above; **all 214 compiled files in the image are identical** to a fresh build of that commit; `schema.prisma` identical; the three migrations are inside; the real `.env.worker` validates in it with networking off (135 keys; notifications resolve to `false`) |
 | Migrations | `20261116120000_video_pipeline_intents`, `20261117090000_video_new_video_announcement`, `20261117100000_device_app_build` | additive; applied in order on a scratch database shaped like production; one `UPDATE` (marks 264 of 272 videos as already announced) |
 | Dashboard branch | `feat/dual-pipeline-status`, 1 commit **8d8e06e** on `origin/main` 12dcda7 | working tree clean, `origin/main` has not moved, typechecks; the status response it reads has not changed in the backend since it was built |
 
@@ -168,6 +168,48 @@ were test artefacts and have been removed from the laptop. Kept:
 
 Tests at 4de70a4: 184 suites, 3,679 tests passed, 0 failed (two runs); the
 build-gate and default-off rules each fail a test when removed.
+
+### Pre-merge review (pull requests #21 and #10)
+
+Both pull requests are open and mergeable; neither has been merged. An
+independent review of the whole backend diff found **no defect that affects
+Stage 1** (nothing that queues an old video, fails a healthy one, submits to
+Gumlet twice, loses an upload, refuses a ticket that works today, or breaks
+with the old worker as the consumer). Three of its findings were fixed in
+1aecb4a, each with tests:
+
+- A process with notifications **off** marked any waiting announcement DONE on
+  its next pass - so with the API and the worker switched on at different
+  moments, a draft's announcement could be lost. A process that is off now
+  closes only a debt it recorded itself. (Affects only the later stage that
+  enables notifications.)
+- A mobile encode's result is now recorded only for the file it read.
+  Replacing a lecture's file while its encode was running used to end with
+  the previous recording's ladder marked READY. (The old worker has the same
+  gap; it is closed when the worker is swapped in Stage 2.)
+- `VIDEO_PIPELINE_RECONCILE_SECONDS` present but empty means "not set", not
+  "reconciler disabled".
+
+Noted, not changed:
+
+- **Do not leave `MOBILE_HLS_MIN_BUILD_ANDROID` / `_IOS` present but empty.**
+  The API (and later the worker) refuses to start with an empty value. On
+  Render that fails the deploy and the previous one stays live. The Stage 1
+  values were checked against the release build: accepted.
+- Lectures the **old** worker finishes during Stage 1 are not marked as
+  already announced. Before notifications are ever enabled, the marking
+  `UPDATE` from the migration is run once more (it is idempotent). This is
+  part of that later stage, not of Stage 1.
+- The four rows left queued by the paused batch show `queued: false` in the
+  new status response although their jobs exist. Cosmetic.
+- `scope: historical` is not understood by the old worker, which treats any
+  pause as "hold everything". It is used only after the worker swap (step 6).
+
+The worktree `edu-backend-dual-pipeline` is also being edited by another
+session (uncommitted changes to `deploy/laptop-worker/watchdog/watchdog.js`
+and two new watchdog test files). They are not part of this release and are
+not in commit 1aecb4a. Release builds are made from the clean checkout
+`edu-backend-dual-pipeline-release`, never from that folder.
 
 ---
 
@@ -217,12 +259,11 @@ on.
 
 ### Step 0 - prepare
 
-- [ ] Push both branches, open and merge both pull requests.
-      `git diff 4de70a4 <merge commit> -- . ":!docs"` must be empty; if not,
-      rebuild the image from the merge commit (nothing else touching the
-      checkout) and repeat the checks of section 4.
-- [ ] Laptop: `docker image inspect edu-worker:dual-pipeline-4de70a4 --format "{{.Id}}"`
-      → `sha256:97e5db73b1b8…`. No `docker image prune`.
+- [ ] Merge the backend pull request (#21). `git diff 1aecb4a <merge commit> -- . ":!docs"`
+      must be empty. The dashboard pull request (#10) is merged in step 3:
+      merging it deploys to production on Vercel.
+- [ ] No worker image is needed until step 5; it is rebuilt then from a clean
+      checkout of the merge commit. No `docker image prune`.
 - [ ] Laptop on home Wi-Fi and AC power, lid open; Docker healthy.
 - [ ] Note the current Render deploy id and Vercel deployment (rollback).
 - [ ] Prepare the smoke-test course (section 8).
@@ -258,15 +299,19 @@ on.
 
 ### Step 3 - dashboard (Vercel)
 
-- [ ] Deploy the merged commit. Open a lecture: three chips are shown.
+- [ ] Merge the dashboard pull request (#10): Vercel deploys `main` to
+      production by itself. Open a lecture: three chips are shown. (The new
+      dashboard also works against the old API; the new blocks are optional.)
 
 ### Step 4 - smoke test #1 (section 8)
 
 ### Step 5 - worker and watchdog (laptop)
 
+- [ ] Build the image from a clean checkout of the merge commit, tag it
+      `edu-worker:dual-pipeline-<short sha>`, and repeat the image checks of
+      section 4.
 - [ ] `deploy/laptop-worker/.env.worker`: back it up, then set
-      `WORKER_IMAGE=edu-worker:dual-pipeline-4de70a4`,
-      `BUILD_COMMIT=4de70a40097d2e301664a700af90b23c901ffb7f`,
+      `WORKER_IMAGE` to that tag, `BUILD_COMMIT` to the full merge commit,
       `NEW_VIDEO_NOTIFICATIONS_ENABLED=false`,
       `MOBILE_HLS_MIN_BUILD_ANDROID=12`, and the same
       `MOBILE_HLS_MIN_BUILD_IOS` as on Render.
@@ -274,7 +319,8 @@ on.
       `worker.detail.activeJobs: []`, no lecture mid-upload), then
       `docker compose --env-file .env.worker up -d`.
 - [ ] Verify: `docker inspect edu-worker --format "{{.Image}}"` → the image id;
-      healthy; heartbeat build `4de70a40097d`; the 8 backlog jobs still delayed.
+      healthy; heartbeat build = the first 12 characters of the merge commit;
+      the 8 backlog jobs still delayed.
 - [ ] Watchdog: back up `C:\edu-watchdog\watchdog.js`, copy
       `deploy/laptop-worker/watchdog/watchdog.js` over it,
       `docker restart edu-hls-watchdog`; its start log shows
