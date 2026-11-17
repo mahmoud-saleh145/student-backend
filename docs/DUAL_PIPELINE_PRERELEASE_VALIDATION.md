@@ -1,19 +1,17 @@
 # Dual pipeline: pre-release validation and release checklist
 
 Written 2026-11-17, after `docs/DUAL_PIPELINE_INDEPENDENCE.md`, and revised
-twice the same day: first when the two functional gaps of the first version
-were closed (section 2.10), then when the owner's notification policy was
-applied (section 2.11). The release checklist (section 3) reflects the final
-state.
+three times the same day: when the two functional gaps of the first version
+were closed (section 2.10), when the owner's notification policy was applied,
+and when publication became the trigger and the app-only audience stopped
+depending on past playback (both in section 2.11). The release checklist
+(section 3) reflects the final state.
 
 Release artefacts: backend branch `fix/dual-pipeline-independence` at code
-commit **f363a8f**; dashboard branch `feat/dual-pipeline-status` at
-**8d8e06e** (unchanged); worker image **`edu-worker:dual-pipeline-f363a8f`**
-(id `sha256:fa6756550b41…`, built locally). The earlier images
-`dual-pipeline-9e19d4a` and `dual-pipeline-798f639` are superseded and must
-not be deployed: the first lacks the duration and notification fixes, the
-second has the notification without its policy and expects a database column
-that no longer exists.
+commit **a292083**; dashboard branch `feat/dual-pipeline-status` at
+**8d8e06e** (unchanged); worker image **`edu-worker:dual-pipeline-a292083`**
+(id `sha256:b992dc1a6ece…`, built locally). Every earlier `dual-pipeline-*`
+image is superseded and has been removed from the laptop.
 
 Nothing was pushed, deployed or migrated in production, no production
 environment variable or row was changed, and no production job was started.
@@ -40,10 +38,15 @@ checklist below, none is a code change):
 4. **A decision on the "new video" notification.** It has never been sent in
    production (zero rows of that kind against 241 finished Gumlet lectures;
    section 2.10), so students see it for the first time with this release.
-   The policy of section 2.11 makes it conservative - published lessons only,
-   only students who can open and play the lecture, once, nothing for old
-   lectures or replaced files - but it is still new, so it needs a deliberate
-   yes. `NEW_VIDEO_NOTIFICATIONS_ENABLED=false` (API and worker) holds it back.
+   The policy of section 2.11 makes it conservative, but it is still new, so
+   it needs a deliberate yes. `NEW_VIDEO_NOTIFICATIONS_ENABLED=false` (API and
+   worker) holds it back.
+
+One setting is optional and safe to leave unset: the first app build that
+plays mobile HLS, per platform (`MOBILE_HLS_MIN_BUILD_ANDROID`,
+`MOBILE_HLS_MIN_BUILD_IOS`). It only affects who is told when a lecture is
+playable in the app alone; unset means fewer students are told then, never
+the wrong ones (section 2.11).
 
 **Not validated, and not claimed:** iOS (no iOS runtime exists on this
 machine); a production release build on a physical Android phone (the
@@ -51,14 +54,15 @@ emulator can only run the development build against a local API); real Gumlet
 asset *creation* (billable write; only read-only calls were made); delivery of
 the push itself to a phone (the notification row, the inbox API and the push
 job were verified; no push provider was called, and the push is best effort by
-design - section 2.11). The Android emulator run of section 2.2 was made on
-commit 9e19d4a and not repeated: the later commits do not change playback,
-tickets or the app (one constant in `playback.service.ts` moved to a shared
-file).
+design); which Play / App Store build numbers first play mobile HLS (they are
+assigned by the build service and are not in the repository - the owner's
+consoles have them). The Android emulator run of section 2.2 was made on
+commit 9e19d4a and not repeated: the later commits do not change playback or
+tickets (one constant in `playback.service.ts` moved to a shared file).
 
 | # | Requirement | Result |
 |---|---|---|
-| 1 | Worker image builds and starts with the existing configuration | **GO** (rebuilt at f363a8f) |
+| 1 | Worker image builds and starts with the existing configuration | **GO** (rebuilt at a292083) |
 | 2 | Android emulator: playback, authorisation, encryption | **GO** (dev build, local stack, at 9e19d4a) |
 | 3 | Real Gumlet integration | **GO** (read-only) |
 | 4 | `mobile-priority-real-queue` failure | **GO** - defect in the test, fixed |
@@ -69,6 +73,8 @@ file).
 | 9 | Release checklist | Section 3 (final) |
 | 10 | Duration when only the mobile pipeline succeeds | **GO** (section 2.10) |
 | 11 | Notification policy: published only, playable, no re-announcement on replacement, once, historical silence | **GO** (section 2.11; condition 4) |
+| 12 | Publishing a lesson, section or course sends at once; bounded for bulk | **GO** (section 2.11) |
+| 13 | App-only eligibility without past playback | **GO**, with the limits stated in section 2.11 |
 
 ---
 
@@ -99,15 +105,19 @@ file).
 - Finding: `.env.worker` contains `BUILD_COMMIT=7c23265…`, which overrides the
   image's own value, so the heartbeat reported the old build. → checklist.
 
-- **Rebuilt for the final code:** `edu-worker:dual-pipeline-f363a8f`
-  (`sha256:fa6756550b41b337b12ca39bf4fe3338f15c27ea8350190476c96d8087633f80`,
-  1.46 GB, `BUILD_COMMIT=f363a8f1…` baked in, both new migrations inside). The
-  real `.env.worker` validates inside it with networking disabled (133 keys;
-  `MOBILE_PIPELINE_ENABLED=false` and `NEW_VIDEO_NOTIFICATIONS_ENABLED=true`
-  as resolved values). Started again through the real compose file and the
-  real `.env.worker` with the local override: `Up (healthy)`, and it processed
-  the uploads of section 2.11 (4 mobile encodes, 4 Gumlet ingests and the one
-  expected Gumlet rejection, 3 push jobs, no other error).
+- **Rebuilt for the final code:** `edu-worker:dual-pipeline-a292083`
+  (`sha256:b992dc1a6ece9924579b83a9e27e7b35e205c220103fa1045411a40a100f0e43`,
+  1.46 GB, `BUILD_COMMIT=a2920834…` baked in, all three new migrations
+  inside). The real `.env.worker` validates inside it with networking disabled
+  (135 keys; `MOBILE_PIPELINE_ENABLED=false`,
+  `NEW_VIDEO_NOTIFICATIONS_ENABLED=true`, minimum HLS builds unset, as
+  resolved values). Started again through the real compose file and the real
+  `.env.worker` with the local override: `Up (healthy)`, and it processed the
+  uploads of section 2.11 (4 mobile encodes, 4 Gumlet ingests and the one
+  expected Gumlet rejection, 4 push jobs, no other error). A first build of
+  this tag was discarded: it was made while a migration rehearsal had the
+  three new migration folders moved aside, so it lacked them. The image above
+  was built from an untouched checkout and checked for all five.
 
 ### 2.2 Android emulator
 
@@ -272,14 +282,14 @@ returns zero rows for the jobs already queued by the old build.
 
 | Suite | Result |
 |---|---|
-| Backend, full unit run incl. both real-BullMQ suites, at f363a8f | **184 suites passed; 3,614 tests passed, 0 failed**, 5 skipped (opt-in); three consecutive runs |
-| `first-playable-pipeline` (duration and notification policy) | 58 / 58 |
-| Mutation check of that suite | 20 rules removed one at a time; every removal makes at least one test fail |
+| Backend, full unit run incl. both real-BullMQ suites, at a292083 | **184 suites passed; 3,661 tests passed, 0 failed**, 5 skipped (opt-in); two consecutive runs |
+| `first-playable-pipeline` (duration, notification policy, publication, app-only eligibility, build recording) | 103 / 103 |
+| Mutation check of that suite | 41 rules removed one at a time; every removal makes at least one test fail |
 | `dual-pipeline-real-queue`, `mobile-priority-real-queue` (real BullMQ) | 8 / 8 each |
 | `tsc`, `eslint` on changed files | clean |
 | Dashboard | unchanged (25 / 25 Playwright at 8d8e06e) |
 
-Two things found while running them, both in tests, both fixed:
+Things found while running them, all in tests, all fixed:
 
 - A full run with jest's default worker count ran the laptop out of memory
   (54 MB free) and produced six false timeouts. The suite is now run with
@@ -290,6 +300,9 @@ Two things found while running them, both in tests, both fixed:
   size the file really had, and the test's exact offsets no longer matched.
   The double now breaks the connection once the bytes are on disk. The
   product code was right and is unchanged.
+- The mutation check found one assertion of mine that could not fail (two
+  timestamps taken within the same millisecond). The test now uses a
+  timestamp an hour old.
 
 ### 2.10 Duration, and what the notification actually did before
 
@@ -319,11 +332,10 @@ check, 2026-11-17: **0** notifications of kind `NEW_VIDEO` have ever been
 written, against 241 Gumlet lectures that became READY (136 in October, 105
 in November).
 
-### 2.11 Notification policy (f363a8f)
+### 2.11 Notification policy (a292083)
 
-The notification is no longer a one-shot claim. What is owed is a small state
-on the video row, and sending it is a separate step that anything may trigger
-and that is safe to repeat:
+What is owed is a small state on the video row, and sending it is a separate
+step that anything may trigger and that is safe to repeat:
 
 ```
 NULL --first playable--> PENDING --claim--> SENDING --written--> DONE
@@ -333,99 +345,168 @@ NULL --first playable--> PENDING --claim--> SENDING --written--> DONE
 
 | Policy | How it is implemented |
 |---|---|
-| **1. Published lessons only** | It goes out only when the lesson and its section are PUBLISHED and the course is one enrolled students are served (PUBLISHED or HIDDEN - the two states `CourseAccessService.decide()` serves). Otherwise the row stays PENDING. Publishing the lesson (`LessonsService.update`) sends it in the same request; a section or course being published is picked up by the reconciler's next pass (at most `VIDEO_PIPELINE_RECONCILE_SECONDS`, default 10 minutes). An archived or deleted lecture stops being owed. |
-| **Recipients** | The original rule (ACTIVE enrolment of an ACTIVE, undeleted account on the course), narrowed by the two gates the lesson endpoint applies to a student: `assertContentAccess` (course state, access window, academic targeting) and `assertSectionAccessible` (section- and part-scoped enrolments). A database error during the check is a failure to retry, never "nobody is eligible". |
-| **2. Playback availability** | *Every platform* = Gumlet READY and the app can play it (its own ladder, or the Gumlet fallback): everyone is told, standard wording. *Mobile ladder READY, Gumlet still working*: nothing is sent; it waits for Gumlet to end one way or the other. *Gumlet FAILED, ladder READY and mobile HLS delivery on*: only students with an active phone that has already been issued an HLS ticket are told, and the text says "is ready to watch in the mobile app"; if Gumlet recovers, the students who were not told are told then. *Playable nowhere* (for example mobile delivery switched to Gumlet and Gumlet failed): nothing. |
-| **3. Replacement** | `initUpload` no longer resets anything about the announcement. An announced lecture (or one the migration marked) is never announced again; a draft that was never announced stays owed and is announced once on publish. |
-| **4. Exactly once** | Three layers. The dispatch is claimed with a compare-and-set on the row, so two processes cannot both send. Each notification row carries `dedupeKey = new-video:<video>:<student>`, unique in the database, so a retry, a takeover or a second audience cannot write a second row for the same student. A failed attempt goes back to PENDING and the reconciler retries it (30 s after a failure this process knows about, otherwise on its background pass); a claim held by a process that died is taken over after 5 minutes. |
-| **Durable vs. push** | The in-app notification row is the durable part and is what "once" is guaranteed for. The push is queued for the rows a pass newly wrote and is **best effort**: if the process dies, or Redis does not answer, between writing the rows and queueing the push, the retry finds the rows and queues nothing - that push is lost, never doubled. Delivery to a phone then depends on the queue and the push provider. No exactly-once claim is made for the push. |
-| **5. Historical videos** | Unchanged in effect: the migration marks every already-processed video DONE, and a debt can only be created by a first-playable transition (Gumlet becoming READY; the mobile ladder finishing while Gumlet is not READY). Encoding an old Gumlet-READY lecture for mobile creates none. |
+| **Published lessons only** | It goes out only when the lesson and its section are PUBLISHED, the section's release date (`unlocksAt`) has passed, and the course is one enrolled students are served (PUBLISHED or HIDDEN - the two states `CourseAccessService.decide()` serves). Otherwise the row stays PENDING. An archived or deleted lecture stops being owed. |
+| **Publication is the trigger** | A lesson, a section or a course going from not-published to published settles its waiting lectures **inside that request**: `LessonsService.update`, `SectionsService.update`, and `CoursesAdminService.publish` / `unpublish` (DRAFT or SUSPENDED to HIDDEN also starts serving students). An edit that does not change the status, and a course that was already being served, trigger nothing. Every lecture is still checked on its own, so publishing a section does not release a lecture whose lesson is a draft. |
+| **Bounded for bulk** | One publish settles at most 25 lectures and for at most 3 seconds, newest first, and asks the access gate once per student for the whole pass rather than once per lecture. What is left stays PENDING and is flagged, and the reconciler takes it on its next wake (30 s). |
+| **The reconciler is recovery** | It retries a failed attempt, takes over the claim of a process that died, finishes what a bounded publish left, and handles the one event nothing announces: a section's release date passing. With nothing owed it costs two indexed queries per pass. |
+| **Recipients** | The original rule (ACTIVE enrolment of an ACTIVE, undeleted account on the course), narrowed by the gates the lesson endpoint applies to a student: `assertContentAccess` (course state, access window, academic targeting) and `assertSectionAccessible` (section- and part-scoped enrolments; a free preview is exempt there and here). A database error during the check is a failure to retry, never "nobody is eligible". |
+| **Playback availability** | *Every platform* = Gumlet READY and the app can play it (its own ladder, or the Gumlet fallback): everyone is told, standard wording. *Mobile ladder READY, Gumlet still working*: nothing is sent; it waits for Gumlet to end one way or the other. *Gumlet FAILED, ladder READY and mobile HLS delivery on*: the app-only audience below. *Playable nowhere*: nothing. |
+| **Replacement** | `initUpload` does not reset anything about the announcement. An announced lecture (or one the migration marked) is never announced again; a draft that was never announced stays owed and is announced once on publish. |
+| **Exactly once** | The dispatch is claimed with a compare-and-set on the row. Each notification row carries `dedupeKey = new-video:<video>:<student>`, unique in the database. A failed attempt goes back to PENDING and is retried; a claim held by a dead process is taken over after 5 minutes. |
+| **Durable vs. push** | The in-app notification row is the durable part and is what "once" is guaranteed for. The push is queued for the rows a pass newly wrote and is **best effort**: if the process dies, or Redis does not answer, between writing the rows and queueing the push, the retry finds the rows and queues nothing - that push is lost, never doubled. No exactly-once claim is made for the push. |
+| **Historical videos** | The migration marks every already-processed video DONE, and a debt can only be created by a first-playable transition (Gumlet becoming READY; the mobile ladder finishing while Gumlet is not READY). Encoding an old Gumlet-READY lecture for mobile creates none. |
 | **Failure isolation** | Nothing after a pipeline has recorded its result can fail the job; the announcer never throws. |
-| **Switch** | `NEW_VIDEO_NOTIFICATIONS_ENABLED=false` sends nothing and records the lecture as DONE, so switching it back on does not announce what became playable meanwhile. |
+| **Switch** | `NEW_VIDEO_NOTIFICATIONS_ENABLED=false` sends nothing and records the lecture as DONE. |
 
-Footprint: one new service and module (`NewVideoAnnouncer`), one hook in
-`LessonsService.update`, one pass added to the existing pipeline reconciler
-(one indexed query when nothing is owed), one constant moved to a shared
-file. The existing notification service is used as it is (`createOnce`, which
-the reminder jobs already rely on). `gumlet-ingest.service.ts` differs from
-`origin/main` by one constructor parameter and one block of two calls; asset
-creation, status sync, DRM verification and duration handling are unchanged.
+#### The app-only audience: which signals exist, and the rule
 
-Migration `20261117090000_video_new_video_announcement` (revised; it had
-never been applied anywhere): two nullable columns
-(`newVideoAnnounceState`, `newVideoAnnounceStateAt`), one index, and one
-`UPDATE` that marks already-processed videos DONE - the only statement in the
-release that writes to existing rows.
+When Gumlet has failed and only the mobile ladder is ready, the question is
+which students have a phone that will actually play it. What the server can
+know, checked against the code and against production (read-only,
+2026-11-17):
+
+| Signal | What it shows | Verdict |
+|---|---|---|
+| An account, or an active enrolment | nothing about a device | not used |
+| An ACTIVE bound Android/iOS device (`devices`) | the student uses the app on an approved phone | necessary, not sufficient |
+| The app **version** the device reports (`devices.appVersion`) | **nothing**: every Android build reports `1.0.0`, the ones from before mobile HLS included (all 7 active Android devices in production) | not usable |
+| The native **build number** (`X-App-Build`: Android versionCode, iOS build number) | which install it is. The app sends it on every request; the server read it and **did not store it** | **now stored** (`devices.appBuild`), at sign-in and on every token refresh |
+| The app declaring `hls-aes128` itself | authoritative - but it is declared only on a ticket request, i.e. when a video is played | kept as a second, positive signal |
+| The forced-upgrade setting (`minimumAppVersion`) | not set in production, and version-based | not usable |
+| A push token | notifications are enabled on a phone | says nothing about the build |
+
+Production today: 1,186 active web devices against 8 students with an active
+phone (7 Android, 1 iOS), and one HLS ticket ever issued. The app is at the
+very start of its rollout, which is exactly when "has played HLS before"
+excludes almost everyone.
+
+**The rule.** A student is in the app-only audience when they pass the access
+gates and have an ACTIVE Android/iOS device for which either holds:
+
+- **by build** - the build that phone last reported is at or above the first
+  build of its platform that plays mobile HLS (`MOBILE_HLS_MIN_BUILD_ANDROID`,
+  `MOBILE_HLS_MIN_BUILD_IOS`). No playback is needed: signing in, or simply
+  having the app open long enough to refresh its tokens (the access-token
+  lifetime, 15 minutes by default), records the build; or
+- **by declaration** - the app on that phone has declared HLS support to this
+  server (it was issued an HLS ticket).
+
+A browser, a revoked phone and a phone on an older build are not a compatible
+phone. A build that is missing or is not a plain number is *unknown*, never
+assumed.
+
+**When it cannot be determined** (the phone has not reported a build yet, or
+no minimum is configured for its platform) the student is **held back, not
+dropped**: not notified by the app-only announcement; counted, with the
+reason, in that announcement's log line; looked at again on every reconciler
+pass for 72 hours, so a student who opens an updated app is told then; and
+told with everyone else the moment Gumlet recovers. Nobody on an unsupported
+or unknown build is notified, and nobody is excluded silently or for good.
+
+The wording says where the lecture can be watched, in the title and in the
+body, and claims nothing about anywhere else: "New video available in the
+mobile app" / "<lecture> is now available to watch in the mobile app."
+(Arabic: "فيديو جديد متاح في تطبيق الهاتف").
+
+**Limits, stated plainly.**
+
+- The minimum build numbers are the owner's to supply. They are assigned by
+  the build service and are not in the repository. Until they are set, only
+  the declaration signal qualifies anyone. (My release notes say the first
+  Android build with working mobile HLS is versionCode 12; that needs
+  confirming in the Play Console. I have no figure for iOS.)
+- A build number is what the app reports. It is trusted for one purpose -
+  sending or withholding a notification - and nothing else reads it.
+- The capability is declared by the app's JavaScript; an over-the-air update
+  could in principle change what a given native build can play. The minimum
+  is therefore a statement about the builds actually shipped, to be kept true.
+- Existing devices have no build recorded until they next sign in or refresh
+  their tokens after this release.
+- The clean long-term signal is the app declaring its capabilities when it
+  starts, not only when it plays. That is a mobile-app change and is not part
+  of this release.
+
+Footprint: the `NewVideoAnnouncer` service and module; one hook each in
+`LessonsService.update`, `SectionsService.update` and
+`CoursesAdminService.publish` / `unpublish`; one pass in the existing pipeline
+reconciler; `devices.appBuild` written where the device descriptor already
+was, plus one fire-and-forget conditional write after a successful token
+refresh (outside the rotation, not awaited, unable to delay or fail it). The
+existing notification service is used as it is. `gumlet-ingest.service.ts`
+differs from `origin/main` by one constructor parameter and one block of two
+calls.
+
+Migrations: `20261117090000_video_new_video_announcement` (two columns, an
+index, and the `UPDATE` that marks already-processed videos DONE - the only
+statement in the release that writes to existing rows) and
+`20261117100000_device_app_build` (one nullable column).
 
 #### Evidence
 
-**Unit tests** (real services over a stateful fake database; 47 of the 58 are
-about the notification). The nine cases asked for, and where each is pinned:
+**Unit tests** (real services over a stateful fake database).
 
-| Asked for | Test |
+| Asked for | Pinned by |
 |---|---|
-| Draft video becomes READY, no notification | "a DRAFT lecture becomes playable: nobody is told, and the announcement stays owed" (also after two reconciler passes) |
-| Draft is later published, one notification | "the draft is published later: the notification goes out then, once" (unpublish + publish again adds nothing) |
+| Draft video becomes READY, no notification | "a DRAFT lecture becomes playable: nobody is told, and the announcement stays owed" |
+| Draft is later published, one notification | "the draft is published later: the notification goes out then, once" |
 | Published video becomes playable, one notification | "a published lecture becomes playable: every eligible student is told, once" |
 | Both pipelines become READY, no duplicate | Gumlet-first, mobile-first, and the same instant in two processes |
-| Replacing an announced video's file, no new notification | "an announced lecture is NOT announced again when its file is replaced"; also for a migration-marked lecture and a never-announced draft |
-| Processing fails, no notification | "processing fails on both sides: no notification, nothing owed"; "a Gumlet failure alone tells nobody" |
-| Dispatch fails and retries safely | rows not written; rows written but not recorded; process died holding the claim (two of four rows written); Redis not answering; database outage |
-| Historical backfill, zero notifications | 200 old lectures (half marked by the migration, half not): 0 notifications, 0 push jobs, 0 rows examined by the reconciler |
-| Authorised / enrolled recipients only | 4 students told; 9 not (other section, expired state, revoked, pending payment, window over, window not open, suspended account, deleted account, other course); academic targeting; reused lecture |
+| Replacing an announced video's file, no new notification | three cases: announced, migration-marked, never-announced draft |
+| Processing fails, no notification | both sides failing; Gumlet failing alone |
+| Dispatch fails and retries safely | rows not written; written but not recorded; dead process's claim; Redis not answering; database outage |
+| Historical backfill, zero notifications | 200 old lectures: 0 notifications, 0 push jobs |
+| Authorised / enrolled recipients only | 5 told, 9 not; targeting; reused lecture; preview |
+| **Immediate on publication** | section published; course published; DRAFT/SUSPENDED to HIDDEN; lesson published while its section is a draft; a draft lesson inside a newly published section stays held; a rename or an already-served course triggers nothing |
+| **Bulk is bounded** | 40 waiting lectures: exactly 25 in the request, the access gate asked once per student, the rest by the reconciler, 200 distinct notification keys; the time budget; a publish, the reconciler and a second process at once |
+| **Release date** | a section not yet released waits; sent after the date; a free preview is not held |
+| **App-only without past playback** | a student with no ticket of any kind is told by build; older build and unknown build are not; browser and revoked phone are not; declaration counts with no minimum configured; no minimum means no phone is vouched for; non-numeric builds; nobody compatible means nothing sent and everyone still owed |
+| **Held back, not dropped** | told when a compatible build is reported, once, without restarting the 72 h; a re-look with nobody new writes nothing; closed after 72 h; everyone told when Gumlet recovers |
+| **Wording** | title and body, English and Arabic |
+| **Build recording** | recorded on token refresh; unchanged build writes nothing; malformed header neither stored nor queried; only the caller's own device; never throws; cannot delay or fail the refresh |
 
-**Mutation check.** Twenty rules were removed one at a time (published check,
-section check, course check, waiting for Gumlet, the app-only audience, the
-access gate, the section gate, the claim, the per-student key, fresh and
-stale claims, handing a failed attempt back, the switch, the mobile wording,
-no reset on replacement, the two "who creates a debt" rules, the two Gumlet
-failure hooks, the lesson publish hook). Each removal fails at least one test.
+**Mutation check.** 41 rules were removed one at a time; each removal fails at
+least one test.
 
-**Migration on a seeded scratch database** (one row per state production
-holds): 9 already-processed rows marked DONE (dated from `processedAt`, else
-`mobileProcessedAt`, else `updatedAt`), the 3 not-yet-playable ones left
-NULL, `updatedAt` unchanged on every row, the index created, second run
-`UPDATE 0`, `migrate status` clean. Read-only production count: it will mark
-**264 of 272** videos; the 8 left are the abandoned `UPLOADING` rows.
+**Migrations on a scratch database** shaped like production: the three apply
+in order; 9 already-processed videos marked DONE, 3 not-yet-playable left
+NULL, `updatedAt` unchanged, second run of the `UPDATE` changes 0 rows,
+`migrate status` clean. Read-only production count: the `UPDATE` will mark
+**264 of 272** videos.
 
 **End to end, with the new image as the worker** (local API from the same
-commit, real BullMQ, real ffmpeg, Gumlet answered by the local stub; the
-course has one eligible student and one REVOKED enrolment):
+commit, real BullMQ, real ffmpeg, Gumlet answered by the local stub, minimum
+Android build 12; the course has one eligible student and one REVOKED
+enrolment; **no playback ticket was issued at any point**):
 
 | Lecture | What happened | Notifications |
 |---|---|---|
-| A, published | Gumlet READY, mobile READY 9 s later | 1, "…is ready to watch.", written 0.3 s after Gumlet became READY; still 1 after mobile READY and three more Gumlet syncs |
-| B, published | Gumlet rejected the source; mobile READY (the student's phone had played A over HLS) | 1, "…is ready to watch in the mobile app."; state `MOBILE` |
-| B, later | "Retry Gumlet", accepted, READY 8 s later | still 1 (log: `1 eligible, 0 notified, 1 already had it`); state `DONE` |
-| C, lesson DRAFT | Gumlet READY and mobile READY; then 75 s (longer than that stack's reconciler interval) | **0**; state `PENDING` |
-| C, published | `PATCH /admin/lessons/:id` `status=PUBLISHED` (answered in 128 ms) | 1, written inside that request; state `DONE` |
-| A, file replaced | both pipelines READY again for the new file | still 1; state `DONE` unchanged since the first announcement |
+| B, published | The student's phone had signed in on build 10. Gumlet rejected the source; mobile READY. | **0** - log: `0 notified (of 1 enrolled, 1 with an active phone: 0 compatible by app build, 0 by declared HLS support); 1 held back (… 1 below the minimum build)`; state `MOBILE` |
+| B, later | The app refreshed its tokens on build 12 (no sign-in, no playback); the server recorded build 12. | 1 on the next reconciler pass, 43 s after the first attempt: "New video available in the mobile app" / "…is now available to watch in the mobile app."; state still `MOBILE`, its timestamp unchanged |
+| B, later still | "Retry Gumlet", accepted, READY | still 1; state `DONE` |
+| C, lesson DRAFT | both pipelines READY; then the section set to DRAFT and the lesson published | 0; state `PENDING` |
+| C | the **section** published (`PATCH /admin/sections/:id`, answered in 394 ms) | 1, written inside that request |
+| D, lesson DRAFT | both pipelines READY; then the course set to DRAFT and the lesson published | 0; state `PENDING` |
+| D | the **course** published (`POST /admin/courses/:id/publish`, answered in 101 ms) | 1, written inside that request |
+| A, published | both pipelines succeed | 1, standard wording |
 
-Totals: 3 lectures, 3 notification rows, 3 push jobs completed and 0 failed;
-the REVOKED enrolment received nothing; duration 24 s on video, lesson and
-student API for all three.
+Totals: 4 lectures, 4 notification rows, 4 push jobs completed and 0 failed;
+the REVOKED enrolment received nothing.
 
 #### What the owner should know (behaviour, not defects)
 
 - **It is still new to students** (condition 4). Read-only production
   figures: 31 courses, largest 48 active enrolments, 12 on average; 4 active
   push tokens in total, so today it is mostly the in-app inbox entry.
-- **Section and course publishing is not instant.** Publishing a lesson sends
-  at once; publishing a section or a course that contains a waiting lecture
-  sends on the reconciler's next pass, up to 10 minutes later by default.
 - **While Gumlet is still working, nobody is told**, even if the app could
-  already play the lecture. That is the conservative reading of "do not imply
-  it is available on every platform"; the wait ends when Gumlet finishes or
-  fails.
-- **The app-only audience is decided by evidence.** In the Gumlet-failed case
-  a student is told only if an active phone of theirs has already been issued
-  an HLS ticket. A student who has the right app but has not watched anything
-  with it yet is not told then; they are told if Gumlet recovers.
+  already play the lecture. The wait ends when Gumlet finishes or fails.
+- **A section's release date** is the one thing that is not instant: nothing
+  happens at that moment, so the reconciler sends it within 10 minutes of the
+  date (`VIDEO_PIPELINE_RECONCILE_SECONDS`).
+- **Publishing a very large course** sends the first 25 waiting lectures in
+  the request and the rest within about half a minute.
 - **With the Gumlet fallback switched off**, a Gumlet-READY lecture waits for
-  its mobile ladder; if that ladder never succeeds it is not announced until
-  someone repairs it. Production runs with the fallback on.
-- **A draft can wait indefinitely**, and is announced whenever it is
-  published - also weeks later.
+  its mobile ladder. Production runs with the fallback on.
+- **A draft can wait indefinitely**, and is announced whenever it is published.
 - A lecture that the OLD worker finishes between the API deploy and the
   worker swap (a matter of minutes) is not announced, then or later.
 - A student who enrols after a lecture was announced does not receive it.
@@ -435,13 +516,13 @@ student API for all three.
 ## 3. Release checklist
 
 Final version, 2026-11-17. Changes from the previous version: the image tag
-and commit; the second migration's shape and its verification queries; a
-draft-lesson check in smoke test #2; the rollback table.
+and commit; a third, one-column migration; the two optional minimum-build
+settings; a section-publish check in smoke test #2; the rollback table.
 
-Release artefacts: backend `fix/dual-pipeline-independence` at **f363a8f**
+Release artefacts: backend `fix/dual-pipeline-independence` at **a292083**
 (later commits are documentation only), dashboard `feat/dual-pipeline-status`
-8d8e06e, image `edu-worker:dual-pipeline-f363a8f`
-(`sha256:fa6756550b41b337b12ca39bf4fe3338f15c27ea8350190476c96d8087633f80`).
+8d8e06e, image `edu-worker:dual-pipeline-a292083`
+(`sha256:b992dc1a6ece9924579b83a9e27e7b35e205c220103fa1045411a40a100f0e43`).
 `origin/main` had not moved in either repository when this was written
 (backend 164ae72, dashboard 12dcda7). **Each numbered step is an approval
 gate.**
@@ -449,14 +530,14 @@ gate.**
 ### Step 0 - before anything
 
 - [ ] Review and merge both pull requests. Then
-      `git diff f363a8f <merge commit> -- . ":!docs"` must be empty. If it is
+      `git diff a292083 <merge commit> -- . ":!docs"` must be empty. If it is
       not (main moved, a conflict was resolved), rebuild the image from the
-      merge commit and repeat the image checks of section 2.1 before going on.
-- [ ] On the laptop: `docker image inspect edu-worker:dual-pipeline-f363a8f
+      merge commit - with nothing else touching the checkout - and repeat the
+      image checks of section 2.1 before going on.
+- [ ] On the laptop: `docker image inspect edu-worker:dual-pipeline-a292083
       --format "{{.Id}}"` → the id above. Keep `edu-worker:30a21fa-priority-vfr`
       (rollback) and `edu-worker:30a21fa-priority-r2` (the watchdog runs on
-      it); no `docker image prune`. The two superseded `dual-pipeline-*`
-      images may be removed.
+      it); no `docker image prune`.
 - [ ] Laptop on home Wi-Fi and AC power, lid open; Docker healthy.
 - [ ] Note the current Render deploy id (for rollback) and Vercel deployment.
 - [ ] **Choose the smoke-test course: one with no real students.** Several
@@ -466,16 +547,24 @@ gate.**
 - [ ] **Decide the notification** (condition 4): live with this release
       (nothing to set), or held back (`NEW_VIDEO_NOTIFICATIONS_ENABLED=false`
       on Render in step 2 **and** in `.env.worker` in step 5).
+- [ ] **Optional - the first app builds that play mobile HLS.** Look them up
+      in the Play Console (versionCode) and App Store Connect (build number)
+      and set `MOBILE_HLS_MIN_BUILD_ANDROID` / `MOBILE_HLS_MIN_BUILD_IOS` to
+      the same values on Render (step 2) **and** in `.env.worker` (step 5).
+      Leaving them unset is safe: in the Gumlet-failed case fewer students are
+      told at once, and the rest when Gumlet recovers. A platform whose build
+      numbers are not plain whole numbers should be left unset.
 
 ### Step 1 - database
 
 - [ ] Neon: create backup branch `pre-dual-pipeline-<date>` from production.
 - [ ] From the release commit, with the production `DIRECT_URL`:
-      `npx prisma migrate deploy` → applies **exactly two** migrations:
-      `20261116120000_video_pipeline_intents` (four columns) and
-      `20261117090000_video_new_video_announcement` (two columns, one index,
-      and the `UPDATE` that marks already-processed videos DONE: 264 of 272 at
-      the 17 November reading).
+      `npx prisma migrate deploy` → applies **exactly three** migrations:
+      `20261116120000_video_pipeline_intents` (four columns on `videos`),
+      `20261117090000_video_new_video_announcement` (two columns and one index
+      on `videos`, and the `UPDATE` that marks already-processed videos DONE:
+      264 of 272 at the 17 November reading), and
+      `20261117100000_device_app_build` (one column on `devices`).
 - [ ] Verify:
       `select count(*) from videos where "mobileGeneration" <> 0` → 0;
       `select "newVideoAnnounceState", count(*) from videos group by 1` → only
@@ -483,20 +572,23 @@ gate.**
       `select status, count(*) from videos where "newVideoAnnounceState" is null group by 1`
       → only rows not yet playable (`UPLOADING`, and anything in flight at
       that moment);
-      `select count(*) from videos where "newVideoAnnounceState" is null and (status in ('READY','ARCHIVED') or "mobileStatus" = 'READY')` → 0.
+      `select count(*) from devices where "appBuild" is not null` → 0.
 - Effect on running code: none. The columns are additive and the old API and
-  worker never read them. The `UPDATE` touches two new columns on ~264 rows.
+  worker never read them. The `UPDATE` touches two new columns on ~264 rows;
+  no existing device row is touched.
 
 ### Step 2 - API (Render), flag still OFF
 
-- [ ] Environment: **no change**. `MOBILE_PIPELINE_ENABLED` stays `false`.
-      Optional: `VIDEO_PIPELINE_RECONCILE_SECONDS` (default 600);
-      `NEW_VIDEO_NOTIFICATIONS_ENABLED=false` only if step 0 decided so.
+- [ ] Environment: `MOBILE_PIPELINE_ENABLED` stays `false`. Nothing else is
+      required. Optional, as decided in step 0: `MOBILE_HLS_MIN_BUILD_ANDROID`,
+      `MOBILE_HLS_MIN_BUILD_IOS`, `NEW_VIDEO_NOTIFICATIONS_ENABLED=false`;
+      `VIDEO_PIPELINE_RECONCILE_SECONDS` (default 600).
 - [ ] Manual deploy of the merged commit.
 - [ ] Verify: log lines `NewVideoAnnouncerModule dependencies initialized` and
       `video pipeline reconciler: scan at boot…`; no `pending intents:` line;
       `GET /videos/<any id>/status` returns `source`, `gumlet`, `mobile`
-      blocks; `/meta/health/deep` unchanged.
+      blocks; `/meta/health/deep` unchanged; a student can sign in and stay
+      signed in (the token refresh now also records the app build).
 
 ### Step 3 - dashboard (Vercel)
 
@@ -515,14 +607,16 @@ gate.**
 ### Step 5 - worker and watchdog (laptop)
 
 - [ ] In `deploy/laptop-worker/.env.worker`: back it up, then set
-      `WORKER_IMAGE=edu-worker:dual-pipeline-f363a8f` and
-      `BUILD_COMMIT=f363a8f1f2c6792645578742f0a320f88216ead7`. Nothing else
-      (plus `NEW_VIDEO_NOTIFICATIONS_ENABLED=false` only if step 0 decided so).
+      `WORKER_IMAGE=edu-worker:dual-pipeline-a292083` and
+      `BUILD_COMMIT=a29208349eeb6e498e22486a1f8ad962a03588f4`. Nothing else is
+      required (plus, only as decided in step 0, the same
+      `MOBILE_HLS_MIN_BUILD_*` values as on Render and/or
+      `NEW_VIDEO_NOTIFICATIONS_ENABLED=false`).
 - [ ] Confirm nothing is running (`GET /videos/mobile/overview` →
       `worker.detail.activeJobs: []`, and no lecture mid-upload), then
       `docker compose --env-file .env.worker up -d`.
 - [ ] Verify: `docker inspect edu-worker --format "{{.Image}}"` → the image id
-      of step 0; container healthy; heartbeat build `f363a8f1f2c6`; the
+      of step 0; container healthy; heartbeat build `a29208349eeb`; the
       delayed backlog jobs are still delayed (the pause is still on).
 - [ ] Watchdog: back up `C:\edu-watchdog\watchdog.js`, copy
       `deploy/laptop-worker/watchdog/watchdog.js` over it,
@@ -567,24 +661,34 @@ gate.**
       eligible, n notified, 0 already had it`. With the switch off: 0 rows and
       the line `new-video notifications are switched off`.
 
-**8b - a draft lesson** (the policy that matters most to students)
+**8b - a draft lesson, released by publishing**
 
 - [ ] Set a second lesson of the smoke-test course to Draft and upload a
       short lecture to it. When both chips read Ready:
       `select "newVideoAnnounceState" from videos where id = '<videoId>'` →
       `PENDING`; no notification row for that lesson.
-- [ ] Publish the lesson in the dashboard. Immediately:
+- [ ] Publish the lesson in the dashboard. **Immediately**, without waiting:
       state `DONE`; the notification count for that lesson equals the
       course's eligible enrolments.
+- [ ] Optional, same idea one level up: repeat with the lesson published and
+      its *section* set to Draft, then publish the section - the state turns
+      `DONE` in that request.
 
 **Then**
 
 - [ ] `select route, count(*) from notifications where kind = 'NEW_VIDEO' group by 1`
       → only the lectures uploaded in this step; no old lecture.
+- [ ] `select platform, "appBuild", count(*) from devices where "appBuild" is not null group by 1, 2`
+      → builds start to appear as students sign in or the app refreshes.
 - [ ] On a phone with the HLS-capable app (once it is live): the lecture plays;
       the ticket row has `delivery = hls`.
 - [ ] Remove the test videos from the dashboard. (Their Gumlet assets remain
       at Gumlet; delete them there by hand if wanted.)
+
+The app-only announcement (Gumlet failed, mobile ready) cannot be produced on
+demand in production without breaking a Gumlet upload on purpose, so it is not
+part of the smoke test. It is covered by the local end-to-end run of section
+2.11.
 
 ### Step 9 - backfill (separate approval)
 
@@ -598,12 +702,19 @@ gate.**
 
 ### Step 10 - optional, later: Gumlet off the laptop (section 2.7)
 
-### Afterwards - one query worth keeping
+### Afterwards - two things worth looking at
 
-`select "newVideoAnnounceState", count(*), min("newVideoAnnounceStateAt") from videos where "newVideoAnnounceState" in ('PENDING','SENDING') group by 1`
-- `PENDING` rows are lectures waiting for their lesson to be published (or for
-  Gumlet to finish). A `SENDING` row older than a few minutes means an attempt
-  was interrupted; the reconciler takes it over by itself after 5 minutes.
+`select "newVideoAnnounceState", count(*), min("newVideoAnnounceStateAt") from videos where "newVideoAnnounceState" in ('PENDING','SENDING','MOBILE') group by 1`
+- `PENDING`: lectures waiting for their lesson, section or course to be
+  published, for a release date, or for Gumlet to finish. `SENDING` older than
+  a few minutes: an interrupted attempt; the reconciler takes it over by
+  itself after 5 minutes. `MOBILE`: lectures announced app-only because Gumlet
+  failed - "Retry Gumlet" on them tells everyone else.
+
+The worker's log line for an app-only announcement states who was told and
+who was held back and why (`… compatible by app build, … by declared HLS
+support; … held back (… app build unknown or no minimum configured, … below
+the minimum build)`).
 
 ### Rollback
 
@@ -612,11 +723,12 @@ gate.**
 | Stop new mobile jobs | `MOBILE_PIPELINE_ENABLED=false` on Render | queued jobs stay and run |
 | Stop encoding | `POST /videos/mobile/pause` (no scope = everything) | nothing lost |
 | Stop notifications | `NEW_VIDEO_NOTIFICATIONS_ENABLED=false` on Render (redeploy) and in `.env.worker` (`up -d`) | notifications already sent cannot be recalled; lectures that become playable while it is off are not announced later |
+| App-only notifications reach too many or too few | change or remove `MOBILE_HLS_MIN_BUILD_ANDROID` / `_IOS` (Render and `.env.worker`) | unset = only apps that declared HLS support are told app-only |
 | Worker | restore the `.env.worker` backup (image `30a21fa-priority-vfr`), `docker compose --env-file .env.worker up -d` | jobs keep their ids; the old image runs them; it does not announce or copy durations |
 | Watchdog | restore the `watchdog.js` backup and `docker restart edu-hls-watchdog`, or set `WATCHDOG_PAUSE_SCOPE=all` | its pauses hold new uploads again |
 | API | Render → roll back to the noted deploy | new columns ignored; a row left "accepted, not delivered" is re-queued by the old 30-minute sweep; `PENDING` announcements stay as they are and are sent if the new build returns |
 | Dashboard | Vercel → promote the previous deployment | - |
 | Mobile playback | `POST /videos/mobile/delivery` `mode=gumlet` | unchanged emergency switch |
-| Migration | not needed for any rollback; if wanted, drop the index and the six columns after the API and worker rollback | - |
+| Migrations | not needed for any rollback; if wanted, drop the index and the seven columns (six on `videos`, one on `devices`) after the API and worker rollback | - |
 
 No rollback step deletes a video, a Gumlet asset, an R2 object or a queue.
