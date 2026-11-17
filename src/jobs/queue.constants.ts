@@ -90,6 +90,13 @@ export const MOBILE_JOB_PRIORITY: Record<MobileTranscodeJobData['trigger'], numb
   migration: 10,
 };
 
+/**
+ * Attempts of one mobile job. A failed encode is retried once by the queue;
+ * after that the video is FAILED and needs an explicit retry, because a source
+ * that fails twice is usually a source that cannot be encoded.
+ */
+export const MOBILE_JOB_ATTEMPTS = 2;
+
 /** Historical mobile work: yields to new uploads waiting in the original queue. */
 export function isHistoricalMobileJob(trigger: MobileTranscodeJobData['trigger'] | undefined): boolean {
   return trigger === 'migration' || trigger === 'recovery';

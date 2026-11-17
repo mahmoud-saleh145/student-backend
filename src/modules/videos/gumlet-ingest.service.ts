@@ -19,6 +19,7 @@ import {
 } from '../playback/drm-verification.service';
 import { AuditService } from '../audit/audit.service';
 import { LessonVideoService } from './lesson-video.service';
+import { NewVideoAnnouncer } from './new-video-announcer.service';
 import { resolveGumletIngestUrlTtlSeconds } from './gumlet-ingest-url-ttl';
 import {
   GUMLET_ASSET_DELETED_MESSAGE,
@@ -193,6 +194,8 @@ export class GumletIngestService {
     // without AuditModule still works. AuditModule is @Global, so in the real
     // app this resolves.
     @Optional() @Inject(AuditService) audit?: AuditService,
+    // Optional for the same reason. In the application VideosModule provides it.
+    @Optional() private readonly announcer?: NewVideoAnnouncer,
   ) {
     this.audit = audit;
     const videoCfg = config.getOrThrow<VideoConfig>('video');
@@ -1071,6 +1074,22 @@ export class GumletIngestService {
     // other way to learn its length, and their own worker will never run again.
     if (typeof update.durationSeconds === 'number' && update.durationSeconds > 0) {
       await this.lessonVideos.propagateDurationToAttachedLessons(videoId, update.durationSeconds as number);
+    }
+
+    // THE "NEW VIDEO" NOTIFICATION. Neither call throws.
+    //
+    // The lecture has just BECOME playable here (it was not READY when this
+    // call read it, and this call's write is the one that landed): an
+    // announcement is owed, and goes out if the lesson is published. A re-sync
+    // of a video that already was READY is not a transition and owes nothing.
+    //
+    // Any other change of status only SETTLES what is already owed: a lecture
+    // whose mobile ladder finished first has been waiting for Gumlet to end
+    // one way or the other, and this is that moment.
+    if (written.count > 0 && update.status === VideoStatus.READY && video.status !== VideoStatus.READY) {
+      await this.announcer?.onFirstPlayable(videoId, 'gumlet');
+    } else if (written.count > 0 && update.status !== undefined && update.status !== video.status) {
+      await this.announcer?.settle(videoId);
     }
 
     const final = await this.prisma.video.findUniqueOrThrow({

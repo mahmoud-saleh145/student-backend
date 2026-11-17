@@ -21,6 +21,8 @@ function build(
   opts: {
     claimed?: boolean;
     runError?: Error;
+    /** Attempts already used. 1 (of 2) = this is the job's LAST attempt. */
+    attemptsMade?: number;
     paused?: boolean;
     preflight?: { ok: boolean; shortfallBytes?: number } | 'missing';
     trigger?: MobileTranscodeJobData['trigger'];
@@ -32,6 +34,7 @@ function build(
     markMobileProcessing: jest.fn(async () => opts.claimed ?? true),
     markMobileReady: jest.fn(async () => undefined),
     markMobileFailed: jest.fn(async () => undefined),
+    markMobileRetrying: jest.fn(async () => undefined),
     markMobileDeferred: jest.fn(async () => undefined),
     markProcessing: jest.fn(),
     markReady: jest.fn(),
@@ -95,7 +98,7 @@ function build(
   const job = {
     id: 'mobile-hls:v_1:1',
     name: MOBILE_VIDEO_JOBS.transcode,
-    attemptsMade: 0,
+    attemptsMade: opts.attemptsMade ?? 0,
     opts: { attempts: 2 },
     data: {
       videoId: 'v_1',
@@ -136,6 +139,9 @@ describe('MobileVideoProcessor', () => {
         encryptionKeyId: 'derived:v_1',
         renditions: expect.arrayContaining([expect.objectContaining({ height: 720 })]),
       }),
+      // ...together with the file the encode read, so a result for a file
+      // that was replaced meanwhile is not recorded.
+      { sourceKey: 'source/videos/v_1.mp4' },
     );
     // The primary pipeline's bookkeeping is never touched.
     expect(t.videos.markProcessing).not.toHaveBeenCalled();
@@ -158,20 +164,34 @@ describe('MobileVideoProcessor', () => {
     expect(t.videos.markMobileProcessing).not.toHaveBeenCalled();
   });
 
-  it('records a genuine encode failure on the row and rethrows for the queue', async () => {
-    const t = build({ runError: new Error('ffmpeg exited with 1: Invalid data found') });
+  it('on the LAST attempt, records a genuine encode failure on the row and rethrows for the queue', async () => {
+    const t = build({ runError: new Error('ffmpeg exited with 1: Invalid data found'), attemptsMade: 1 });
 
     await expect(t.processor.process(t.job)).rejects.toThrow(/ffmpeg exited/);
-    expect(t.videos.markMobileFailed).toHaveBeenCalledWith('v_1', expect.stringContaining('ffmpeg exited'));
+    expect(t.videos.markMobileFailed).toHaveBeenCalledWith('v_1', expect.stringContaining('ffmpeg exited'), { sourceKey: 'source/videos/v_1.mp4' });
+    expect(t.videos.markMobileRetrying).not.toHaveBeenCalled();
+  });
+
+  it('while the queue still has an attempt left, the row is NOT marked FAILED - a retry is pending', async () => {
+    // FAILED means nothing more will happen on its own. Saying it early showed
+    // a failure for a video about to be retried, and a staff retry pressed in
+    // that window queued a second job beside the pending one.
+    const t = build({ runError: new Error('socket hang up') });
+
+    await expect(t.processor.process(t.job)).rejects.toThrow(/socket hang up/);
+
+    expect(t.videos.markMobileFailed).not.toHaveBeenCalled();
+    expect(t.videos.markMobileRetrying).toHaveBeenCalledWith('v_1', 'mobile-hls:v_1:1', 'socket hang up', 1, 2);
   });
 
   it('describes a host problem (no scratch space, no ffmpeg) as retryable', async () => {
-    const t = build({ runError: new TranscodeEnvironmentError('Not enough scratch space') });
+    const t = build({ runError: new TranscodeEnvironmentError('Not enough scratch space'), attemptsMade: 1 });
 
     await expect(t.processor.process(t.job)).rejects.toThrow(/scratch/);
     expect(t.videos.markMobileFailed).toHaveBeenCalledWith(
       'v_1',
       expect.stringMatching(/could not run the encode .*scratch.*retried/),
+      { sourceKey: 'source/videos/v_1.mp4' },
     );
   });
 
@@ -187,13 +207,17 @@ describe('MobileVideoProcessor', () => {
   });
 
   it('records a rung that failed verification as not published, and rethrows', async () => {
-    const t = build({ runError: new TranscodeOutputError('720p: rendition is 1200.0 s but the source is 2654.4 s') });
+    const t = build({
+      runError: new TranscodeOutputError('720p: rendition is 1200.0 s but the source is 2654.4 s'),
+      attemptsMade: 1,
+    });
 
     await expect(t.processor.process(t.job)).rejects.toThrow(/rendition is/);
     expect(t.videos.markMobileReady).not.toHaveBeenCalled();
     expect(t.videos.markMobileFailed).toHaveBeenCalledWith(
       'v_1',
       expect.stringMatching(/failed verification and was not published/),
+      { sourceKey: 'source/videos/v_1.mp4' },
     );
   });
 
@@ -238,11 +262,15 @@ describe('MobileVideoProcessor', () => {
   });
 
   it('lets the claim path report a missing source rather than deferring forever', async () => {
-    const t = build({ preflight: 'missing', runError: new Error('Source object source/videos/v_1.mp4 is missing from storage') });
+    const t = build({
+      preflight: 'missing',
+      runError: new Error('Source object source/videos/v_1.mp4 is missing from storage'),
+      attemptsMade: 1,
+    });
 
     await expect(t.processor.process(t.job, 'tok')).rejects.toThrow(/missing from storage/);
     expect(t.job.moveToDelayed).not.toHaveBeenCalled();
-    expect(t.videos.markMobileFailed).toHaveBeenCalledWith('v_1', expect.stringContaining('missing from storage'));
+    expect(t.videos.markMobileFailed).toHaveBeenCalledWith('v_1', expect.stringContaining('missing from storage'), { sourceKey: 'source/videos/v_1.mp4' });
   });
 
   it('puts the row back to QUEUED and defers when the disk watchdog killed the encode', async () => {

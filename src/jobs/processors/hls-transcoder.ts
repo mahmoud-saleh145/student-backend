@@ -104,6 +104,43 @@ export const BITRATES: Record<number, { video: number; audio: number; maxrate: n
 const UPLOAD_CONCURRENCY = 4;
 
 /**
+ * Attempts of ONE output upload (a segment, a playlist) before the encode is
+ * given up.
+ *
+ * A ladder is hundreds of small PUTs made at the end of an encode that took
+ * the better part of an hour. The SDK cannot retry them itself - a file stream
+ * cannot be rewound - so a single dropped connection used to throw away the
+ * whole encode. Each attempt here opens the file again. The pauses add up to
+ * about a minute, which rides out a Wi-Fi reconnect without holding a
+ * genuinely broken job for long.
+ */
+export const OUTPUT_UPLOAD_ATTEMPTS = 5;
+export const OUTPUT_UPLOAD_BASE_DELAY_MS = 2_000;
+/** How many times a read-after-write size check looks before it believes a mismatch. */
+const OUTPUT_VERIFY_LOOKS = 3;
+
+export async function withOutputRetry<T>(
+  what: string,
+  work: () => Promise<T>,
+  options: { attempts?: number; baseDelayMs?: number; onRetry?: (message: string) => void } = {},
+): Promise<T> {
+  const attempts = Math.max(1, options.attempts ?? OUTPUT_UPLOAD_ATTEMPTS);
+  const baseDelayMs = options.baseDelayMs ?? OUTPUT_UPLOAD_BASE_DELAY_MS;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await work();
+    } catch (error) {
+      if (attempt >= attempts) throw error;
+      const delay = Math.min(30_000, baseDelayMs * 2 ** (attempt - 1));
+      options.onRetry?.(
+        `${what} failed (${(error as Error)?.message ?? error}); attempt ${attempt + 1} of ${attempts} in ${Math.round(delay / 1000)} s`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
+
+/**
  * Scratch budget.
  *
  * Peak disk during a run is the source plus ONE rendition (each rendition's
@@ -411,13 +448,15 @@ export class HlsTranscoder implements OnModuleDestroy {
     // The API serves a per-session master (ManifestService); this one is for
     // diagnostics and any future direct-CDN path.
     const masterPlaylistKey = StorageService.keys.hlsMaster(videoId);
-    await this.storage.putObject({
-      bucket: 'media',
-      objectKey: masterPlaylistKey,
-      body: HlsTranscoder.buildStaticMaster(renditions),
-      contentType: 'application/vnd.apple.mpegurl',
-      cacheControl: 'no-store',
-    });
+    await this.uploadWithRetry(masterPlaylistKey, () =>
+      this.storage.putObject({
+        bucket: 'media',
+        objectKey: masterPlaylistKey,
+        body: HlsTranscoder.buildStaticMaster(renditions),
+        contentType: 'application/vnd.apple.mpegurl',
+        cacheControl: 'no-store',
+      }),
+    );
 
     // 6. poster frame ---------------------------------------------------------
     await progress(90);
@@ -895,6 +934,16 @@ export class HlsTranscoder implements OnModuleDestroy {
     }
   }
 
+  /** A field only so a test can shorten the pauses. */
+  protected outputRetryBaseDelayMs = OUTPUT_UPLOAD_BASE_DELAY_MS;
+
+  private uploadWithRetry<T>(objectKey: string, work: () => Promise<T>): Promise<T> {
+    return withOutputRetry(`upload of ${objectKey}`, work, {
+      baseDelayMs: this.outputRetryBaseDelayMs,
+      onRetry: (message) => this.logger.warn(message),
+    });
+  }
+
   private async uploadRendition(
     outDir: string,
     hlsPrefix: string,
@@ -916,25 +965,25 @@ export class HlsTranscoder implements OnModuleDestroy {
         const info = await stat(path);
         totalBytes += info.size;
         sizes.set(file, info.size);
-        await this.storage.putFile({
-          bucket: 'media',
-          objectKey: `${hlsPrefix}${height}p/${file}`,
-          filePath: path,
-          contentType: 'video/mp2t',
-        });
+        const objectKey = `${hlsPrefix}${height}p/${file}`;
+        await this.uploadWithRetry(objectKey, () =>
+          this.storage.putFile({ bucket: 'media', objectKey, filePath: path, contentType: 'video/mp2t' }),
+        );
       }
     };
     await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, segments.length) }, worker));
 
     const playlistKey = `${hlsPrefix}${height}p/index.m3u8`;
     const body = await readFile(join(outDir, 'index.m3u8'));
-    await this.storage.putObject({
-      bucket: 'media',
-      objectKey: playlistKey,
-      body,
-      contentType: 'application/vnd.apple.mpegurl',
-      cacheControl: 'no-store',
-    });
+    await this.uploadWithRetry(playlistKey, () =>
+      this.storage.putObject({
+        bucket: 'media',
+        objectKey: playlistKey,
+        body,
+        contentType: 'application/vnd.apple.mpegurl',
+        cacheControl: 'no-store',
+      }),
+    );
 
     // Read-after-write check on the objects a player touches first and last:
     // the playlist, the first and the last segment. A truncated multipart or a
@@ -948,7 +997,14 @@ export class HlsTranscoder implements OnModuleDestroy {
       if (last !== first) probeKeys.push([`${hlsPrefix}${height}p/${last}`, sizes.get(last)!]);
     }
     for (const [key, expected] of probeKeys) {
-      const stored = await this.storage.objectSize('media', key);
+      // `objectSize` answers null for "could not ask" as well as "not there".
+      // One unanswered HEAD must not condemn a finished ladder, so a mismatch
+      // is looked at again before it is believed.
+      let stored = await this.storage.objectSize('media', key);
+      for (let look = 1; stored !== expected && look < OUTPUT_VERIFY_LOOKS; look += 1) {
+        await new Promise((resolve) => setTimeout(resolve, this.outputRetryBaseDelayMs * look));
+        stored = await this.storage.objectSize('media', key);
+      }
       if (stored !== expected) {
         throw new TranscodeOutputError(
           `${key}: stored ${stored ?? 'nothing'} but ${expected} bytes were uploaded`,

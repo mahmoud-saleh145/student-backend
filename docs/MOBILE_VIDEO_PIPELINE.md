@@ -1,5 +1,14 @@
 # Independent mobile video pipeline
 
+> **Read with `docs/DUAL_PIPELINE_INDEPENDENCE.md`** (2026-11-17), which
+> supersedes the enqueue and recovery details below: the processing intent is
+> now written to the database BEFORE Redis (`mobileRequestedAt`,
+> `mobileEnqueuedAt`, `mobileGeneration`, `mobileTrigger`), job ids are
+> deterministic (`mobile-hls:<videoId>:p<profile>g<generation>`), an in-process
+> reconciler delivers intents that never reached the queue, playback of a READY
+> ladder no longer depends on the Gumlet state, and the operator pause has a
+> scope (`all` | `historical`).
+
 The native apps (Android, iOS) play lecture video from this platform's own
 AES-128 HLS ladder on R2, served through the API's per-ticket manifests and
 the media edge. Nothing on that path touches Gumlet, so mobile playback keeps
@@ -99,6 +108,8 @@ A 44-minute lecture is therefore about 1.5–2 core-hours; see the hosting note.
 | `MOBILE_VIDEO_DELIVERY` | `hls` | `gumlet` keeps every platform on Gumlet (pre-migration behaviour) |
 | `MOBILE_HLS_GUMLET_FALLBACK` | `true` | Serve Gumlet to mobile while a video's ladder is not ready |
 | `MOBILE_PIPELINE_ENABLED` | `true` | Queue a mobile transcode for every completed upload |
+| `NEW_VIDEO_NOTIFICATIONS_ENABLED` | `false` | Tell the students who can open a lecture, once, when it is playable and its lesson is published. Off unless `true` on the API **and** the worker. While off, lectures that become playable are recorded as dealt with and are not announced later |
+| `MOBILE_HLS_MIN_BUILD_ANDROID`, `MOBILE_HLS_MIN_BUILD_IOS` | unset | First native build (versionCode / iOS build number) whose app plays the mobile HLS stream properly. When set: an older build, or one that does not report its build, is served Gumlet even if it declares `hls-aes128`, and is not told about a lecture playable in the app alone. Unset = the declaration alone decides. Same values on the API and the worker. Android: 12 (11 declares the capability but loses the stream at ticket rotation) |
 | `TRANSCODE_THREADS` | `0` | ffmpeg thread cap; `0` = every core but one |
 | `TRANSCODE_WORK_DIR` | `/tmp/edu-transcode` | Scratch; bind-mount it to a host folder in Docker (see below) |
 | `WORKER_QUEUES` | all | Which queues this worker consumes, e.g. `mobile-video-processing` alone |

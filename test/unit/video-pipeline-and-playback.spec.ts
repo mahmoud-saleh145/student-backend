@@ -5,11 +5,11 @@ import { ValidationPipe } from '@nestjs/common';
 import { VideoStatus } from '@prisma/client';
 
 import { AppException } from '../../src/common/errors/app.exception';
-import { ErrorCode } from '../../src/common/errors/error-codes';
 import { resolvePublicApiUrl } from '../../src/config/env.validation';
 import { SignedQueryDto } from '../../src/modules/playback/manifest.controller';
 import { HLS_CODECS, ManifestService } from '../../src/modules/playback/manifest.service';
 import { VideosService } from '../../src/modules/videos/videos.service';
+import { uploadTranscodeJobIdFor } from '../../src/modules/videos/pipeline-state';
 
 /**
  * The two production failures this file pins:
@@ -179,6 +179,7 @@ function videosService(overrides: { queue?: Record<string, jest.Mock>; heartbeat
   };
   const storage = {
     objectSize: jest.fn(async () => 1234),
+    objectSizeStrict: jest.fn(async () => 1234),
     deletePrefix: jest.fn(async () => undefined),
     deleteObject: jest.fn(async () => undefined),
   };
@@ -225,36 +226,59 @@ describe('VideosService.completeUpload', () => {
     lessonId: 'les_1',
   };
 
-  it('marks QUEUED only after the job is in the queue, and records the job id', async () => {
-    const { svc, prisma, queue, updates } = videosService();
+  const acceptanceWrites = (prisma: { video: { updateMany: jest.Mock } }) =>
+    prisma.video.updateMany.mock.calls.map((call) => (call[0] as { data: Record<string, unknown> }).data);
+
+  it('accepts the upload durably BEFORE touching the queue, then records the job id', async () => {
+    const { svc, prisma, queue } = videosService();
     prisma.video.findFirst.mockResolvedValue(row);
+    const expectedJob = uploadTranscodeJobIdFor('vid_1', row.sourceKey);
 
     const result = await svc.completeUpload('vid_1', ACTOR);
 
     expect(queue.add).toHaveBeenCalledTimes(1);
-    expect(result).toMatchObject({ status: 'QUEUED', jobId: 'job-1', workerOnline: false });
-    const statuses = updates
-      .map((u) => (u as { data: { status?: string } }).data.status)
-      .filter(Boolean);
-    expect(statuses).toEqual(['QUEUED']);
-    expect(updates.at(-1)).toMatchObject({ data: { status: 'QUEUED', processingJobId: 'job-1' } });
+    expect(queue.add).toHaveBeenCalledWith(
+      'transcode',
+      expect.objectContaining({ videoId: 'vid_1' }),
+      expect.objectContaining({ jobId: expectedJob }),
+    );
+    expect(result).toMatchObject({
+      status: 'QUEUED',
+      jobId: expectedJob,
+      workerOnline: false,
+      upload: { state: 'VERIFIED', sizeBytes: 1234 },
+      gumlet: { queued: true },
+    });
+
+    // QUEUED without a job id first (the durable instruction), the job id only
+    // once Redis has the job - and the first of those precedes the `add`.
+    const writes = acceptanceWrites(prisma);
+    expect(writes[0]).toMatchObject({ status: 'QUEUED', processingJobId: null });
+    expect(writes.at(-1)).toEqual({ processingJobId: expectedJob });
+    expect(prisma.video.updateMany.mock.invocationCallOrder[0]).toBeLessThan(
+      queue.add.mock.invocationCallOrder[0],
+    );
   });
 
-  it('does not strand the video QUEUED when Redis refuses the job', async () => {
-    const { svc, prisma, updates } = videosService({
+  it('keeps the upload ACCEPTED when Redis refuses the job: no error, no lost instruction', async () => {
+    const { svc, prisma } = videosService({
       queue: { add: jest.fn(async () => Promise.reject(new Error('max requests limit exceeded'))) },
     });
     prisma.video.findFirst.mockResolvedValue(row);
 
-    await expect(svc.completeUpload('vid_1', ACTOR)).rejects.toMatchObject({
-      code: ErrorCode.QUEUE_UNAVAILABLE,
+    // The file is verified in storage. A queue outage is not an upload failure.
+    const result = await svc.completeUpload('vid_1', ACTOR);
+
+    expect(result).toMatchObject({
+      status: 'QUEUED',
+      jobId: null,
+      upload: { state: 'VERIFIED' },
+      gumlet: { queued: false },
     });
-    expect(updates.at(-1)).toMatchObject({
-      data: { status: 'UPLOADING', processingError: expect.stringContaining('max requests') },
-    });
-    expect(
-      updates.some((u) => (u as { data: { status?: string } }).data.status === 'QUEUED'),
-    ).toBe(false);
+    // The row is QUEUED with NO job id: exactly what the reconciler looks for.
+    const writes = acceptanceWrites(prisma);
+    expect(writes).toEqual([expect.objectContaining({ status: 'QUEUED', processingJobId: null })]);
+    expect(writes.some((w) => w.status === 'UPLOADING' || w.status === 'FAILED')).toBe(false);
   });
 
   it('reports a live worker from its heartbeat', async () => {

@@ -23,11 +23,13 @@ import {
   MobileEncodeScheduler,
   type EncodeSlot,
 } from './mobile-encode-scheduler';
-import { formatBytes, ScratchGuard } from './scratch-guard';
+import { formatBytes, pauseHolds, ScratchGuard } from './scratch-guard';
 
 /** How long a deferred job waits before the worker looks at it again. */
 export const DEFER_WHEN_PAUSED_MS = 60_000;
 export const DEFER_WHEN_DISK_LOW_MS = 5 * 60_000;
+/** See the processor options: interruptions of the host are routine here. */
+export const MOBILE_MAX_STALLED_COUNT = 5;
 
 /**
  * The independent mobile pipeline.
@@ -71,6 +73,13 @@ export const DEFER_WHEN_DISK_LOW_MS = 5 * 60_000;
   // stays "active" before the stalled check hands it back. Five minutes, so a
   // laptop reboot costs minutes, not the half hour it did.
   lockDuration: 5 * 60_000,
+  // How many times a job may be found abandoned (its worker stopped renewing
+  // the lock) before BullMQ fails it outright. The library default is 1, which
+  // suits a server and not this host: the encoder is a laptop that sleeps when
+  // its lid closes, and a lecture that was interrupted by two sleeps was
+  // failed permanently ("job stalled more than allowable limit") although
+  // nothing was wrong with it. Each stall only costs a re-run of that video.
+  maxStalledCount: MOBILE_MAX_STALLED_COUNT,
   ...RESPONSIVE_WORKER,
 })
 export class MobileVideoProcessor extends WorkerHost implements OnModuleInit {
@@ -117,9 +126,13 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit {
     const workDir = join(this.cfg.workDir, 'mobile', videoId);
 
     // --- gates that defer rather than fail ----------------------------------
+    // A `historical` pause holds only the back catalogue; a new upload or a
+    // staff retry goes through it. A pause without a scope holds everything.
     const pause = await this.guard.pauseState();
-    if (pause.paused) {
-      this.logger.log(`mobile processing is paused (${pause.reason ?? 'no reason given'}); deferring ${videoId}`);
+    if (pauseHolds(pause, trigger)) {
+      this.logger.log(
+        `mobile processing is paused (${pause.scope}; ${pause.reason ?? 'no reason given'}); deferring ${videoId}`,
+      );
       return this.defer(job, token, this.deferMs.paused, 'paused');
     }
 
@@ -182,20 +195,30 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit {
         },
       });
 
-      await this.videos.markMobileReady(videoId, {
-        durationSeconds: Math.round(result.probe.durationSeconds),
-        width: result.probe.width,
-        height: result.probe.height,
-        frameRate: result.probe.frameRate,
-        videoCodec: result.probe.videoCodec,
-        audioCodec: result.probe.audioCodec,
-        hlsPrefix: result.hlsPrefix,
-        masterPlaylistKey: result.masterPlaylistKey,
-        thumbnailKey: result.thumbnailKey,
-        isEncrypted: result.isEncrypted,
-        encryptionKeyId: result.isEncrypted ? `derived:${videoId}` : undefined,
-        renditions: result.renditions,
-      });
+      const recorded = await this.videos.markMobileReady(
+        videoId,
+        {
+          durationSeconds: Math.round(result.probe.durationSeconds),
+          width: result.probe.width,
+          height: result.probe.height,
+          frameRate: result.probe.frameRate,
+          videoCodec: result.probe.videoCodec,
+          audioCodec: result.probe.audioCodec,
+          hlsPrefix: result.hlsPrefix,
+          masterPlaylistKey: result.masterPlaylistKey,
+          thumbnailKey: result.thumbnailKey,
+          isEncrypted: result.isEncrypted,
+          encryptionKeyId: result.isEncrypted ? `derived:${videoId}` : undefined,
+          renditions: result.renditions,
+        },
+        // The file this encode read: a result for a file that was replaced
+        // while it ran is not recorded.
+        { sourceKey },
+      );
+      if (recorded === false) {
+        this.logger.warn(`mobile job ${job.id} for video ${videoId} finished for a replaced file; nothing recorded`);
+        return { videoId, skipped: true };
+      }
 
       this.logger.log(`video ${videoId} mobile READY (${result.renditions.length} renditions)`);
       return { videoId, renditions: result.renditions.length };
@@ -231,8 +254,21 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit {
             ? `Output failed verification and was not published (${message})`
             : message;
       this.logger.error(`mobile transcode failed for ${videoId}: ${message}`);
+      // FAILED means "nothing more will happen on its own". While the queue
+      // still has an attempt left for this job that is not true, and saying it
+      // had two costs: the dashboard showed a failure for a video that was
+      // about to be retried, and a staff "retry" pressed in that window queued
+      // a SECOND job beside the one still pending. So an attempt that will be
+      // retried leaves the row QUEUED with the reason, and only the last one
+      // records FAILED.
+      const attempt = job.attemptsMade + 1;
+      const attempts = job.opts?.attempts ?? 1;
       try {
-        await this.videos.markMobileFailed(videoId, reason);
+        if (attempt < attempts) {
+          await this.videos.markMobileRetrying(videoId, String(job.id), reason, attempt, attempts);
+        } else {
+          await this.videos.markMobileFailed(videoId, reason, { sourceKey });
+        }
       } catch (markError) {
         this.logger.error(
           `video ${videoId}: could not record the mobile failure (${(markError as Error)?.message ?? markError})`,

@@ -61,6 +61,25 @@ class MobilePauseDto {
   @IsString()
   @MaxLength(200)
   reason?: string;
+
+  @ApiPropertyOptional({
+    enum: ['all', 'historical'],
+    description:
+      'all (default): hold every mobile encode, new uploads included. ' +
+      'historical: hold only the back catalogue; new uploads and staff retries keep running.',
+  })
+  @IsOptional()
+  @IsIn(['all', 'historical'])
+  scope?: 'all' | 'historical';
+}
+
+class MobileRetryDto {
+  @ApiPropertyOptional({
+    description: 'Administrators only: re-encode a video whose mobile ladder is already READY.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  force?: boolean;
 }
 
 class MobileDeliveryDto {
@@ -210,7 +229,7 @@ export class VideosController {
     summary: 'Pause mobile encodes (the running one finishes; queued ones wait until resumed)',
   })
   mobilePause(@Body() body: MobilePauseDto, @CurrentUser() actor: AuthenticatedUser) {
-    return this.videos.setMobileProcessingPaused(true, actor, body.reason);
+    return this.videos.setMobileProcessingPaused(true, actor, body.reason, body.scope);
   }
 
   @Post('mobile/resume')
@@ -238,9 +257,19 @@ export class VideosController {
 
   @Post(':videoId/mobile/retry')
   @StaffOnly()
-  @ApiOperation({ summary: 'Run (or re-run) the mobile transcode for one video' })
-  mobileRetry(@Param('videoId') videoId: string, @CurrentUser() actor: AuthenticatedUser) {
-    return this.videos.retryMobileProcessing(videoId, actor);
+  @ApiOperation({
+    summary: 'Retry the mobile transcode for one video',
+    description:
+      'Touches the mobile pipeline only; the Gumlet side is not reset or restarted. A video that is ' +
+      'already queued or encoding keeps its existing job (no duplicate), and a READY ladder is ' +
+      'refused unless an administrator sends force=true.',
+  })
+  mobileRetry(
+    @Param('videoId') videoId: string,
+    @CurrentUser() actor: AuthenticatedUser,
+    @Body() body?: MobileRetryDto,
+  ) {
+    return this.videos.retryMobileProcessing(videoId, actor, { force: body?.force === true });
   }
 
   @Post(':videoId/captions')

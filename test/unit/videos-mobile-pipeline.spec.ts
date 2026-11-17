@@ -1,5 +1,5 @@
-import { ErrorCode } from '../../src/common/errors/error-codes';
-import { VideosService } from '../../src/modules/videos/videos.service';
+import { mobileJobIdFor } from '../../src/modules/videos/pipeline-state';
+import { VideosService, WAITING_FOR_QUEUE_NOTE } from '../../src/modules/videos/videos.service';
 
 /**
  * VideosService's side of the independent mobile pipeline: queueing, the
@@ -93,43 +93,65 @@ function harness(opts: {
 }
 
 describe('enqueueMobileTranscode', () => {
-  it('writes QUEUED only after the job is really in Redis, and records the job id', async () => {
-    const t = harness({ rows: [{ id: 'v_1', mobileStatus: 'NONE', mobileJobId: null }] });
+  it('records the intent in the database FIRST, then adds the job under the id derived from it', async () => {
+    const t = harness({ rows: [{ id: 'v_1', mobileStatus: 'NONE', mobileJobId: null, mobileGeneration: 0, durationSeconds: 0 }] });
+    const jobId = mobileJobIdFor('v_1', 1);
 
     await expect(t.svc.enqueueMobileTranscode({ id: 'v_1', sourceKey: 'k' }, 'upload')).resolves.toEqual({
-      jobId: 'mobile-hls:v_1:1',
+      jobId,
       alreadyQueued: false,
+      enqueued: true,
     });
 
     expect(t.mobileQueue.add).toHaveBeenCalledWith(
       'mobile-hls',
       expect.objectContaining({ videoId: 'v_1', sourceKey: 'k', ladder: [360, 720], encrypt: true, trigger: 'upload' }),
-      expect.objectContaining({ attempts: 2 }),
+      expect.objectContaining({ attempts: 2, jobId }),
     );
-    expect(t.writes.at(-1)?.data).toEqual({ mobileStatus: 'QUEUED', mobileJobId: 'mobile-hls:v_1:1', mobileError: null });
+    // The intent: QUEUED, a new generation, its job id, not yet delivered.
+    expect(t.writes[0]).toMatchObject({
+      where: { id: 'v_1', mobileGeneration: 0 },
+      data: { mobileStatus: 'QUEUED', mobileJobId: jobId, mobileGeneration: 1, mobileEnqueuedAt: null, mobileTrigger: 'upload' },
+    });
+    // ...written before Redis was touched...
+    expect(t.prisma.video.updateMany.mock.invocationCallOrder[0]).toBeLessThan(t.mobileQueue.add.mock.invocationCallOrder[0]);
+    // ...and stamped as delivered only after the add.
+    expect(t.writes.some((w) => w.data.mobileEnqueuedAt instanceof Date)).toBe(true);
   });
 
-  it('records FAILED with the reason when Redis refuses the job, instead of a phantom QUEUED', async () => {
-    const t = harness({ rows: [{ id: 'v_1', mobileStatus: 'NONE', mobileJobId: null }], queueAddFails: true });
-
-    await expect(t.svc.enqueueMobileTranscode({ id: 'v_1', sourceKey: 'k' }, 'upload')).rejects.toMatchObject({
-      code: ErrorCode.QUEUE_UNAVAILABLE,
+  it('keeps the intent QUEUED when Redis refuses the job: nothing is thrown and nothing is marked FAILED', async () => {
+    const t = harness({
+      rows: [{ id: 'v_1', mobileStatus: 'NONE', mobileJobId: null, mobileGeneration: 0, durationSeconds: 0 }],
+      queueAddFails: true,
     });
-    expect(t.writes.at(-1)?.data).toMatchObject({ mobileStatus: 'FAILED' });
-    expect(String(t.writes.at(-1)?.data.mobileError)).toContain('redis unavailable');
+
+    await expect(t.svc.enqueueMobileTranscode({ id: 'v_1', sourceKey: 'k' }, 'upload')).resolves.toEqual({
+      jobId: mobileJobIdFor('v_1', 1),
+      alreadyQueued: false,
+      enqueued: false,
+    });
+
+    expect(t.writes.some((w) => w.data.mobileStatus === 'FAILED')).toBe(false);
+    expect(t.writes.some((w) => w.data.mobileEnqueuedAt instanceof Date)).toBe(false);
+    // The dashboard is told why it is waiting, without the Redis error text.
+    const note = t.writes.find((w) => 'mobileError' in w.data && w.data.mobileError !== null);
+    expect(note?.data.mobileError).toBe(WAITING_FOR_QUEUE_NOTE);
+    expect(JSON.stringify(t.writes)).not.toContain('redis unavailable');
   });
 
   it('leaves a video alone while its job is still live', async () => {
     const t = harness({
-      rows: [{ id: 'v_1', mobileStatus: 'QUEUED', mobileJobId: 'mobile-hls:v_1:0' }],
+      rows: [{ id: 'v_1', mobileStatus: 'QUEUED', mobileJobId: 'mobile-hls:v_1:0', mobileEnqueuedAt: new Date() }],
       jobState: 'waiting',
     });
 
     await expect(t.svc.enqueueMobileTranscode({ id: 'v_1', sourceKey: 'k' }, 'retry')).resolves.toEqual({
       jobId: 'mobile-hls:v_1:0',
       alreadyQueued: true,
+      enqueued: true,
     });
     expect(t.mobileQueue.add).not.toHaveBeenCalled();
+    expect(t.writes).toHaveLength(0);
   });
 
   it('re-queues a video whose recorded job has vanished', async () => {
@@ -180,7 +202,7 @@ describe('migrateLibraryToMobile', () => {
     expect(t.mobileQueue.add).toHaveBeenCalledTimes(1);
     // Every write names v_ok; v_gone and v_nokey are untouched.
     for (const write of t.writes) {
-      expect(write.where).toEqual({ id: 'v_ok' });
+      expect(write.where).toMatchObject({ id: 'v_ok' });
     }
     expect(t.audit.record).toHaveBeenCalledWith(
       expect.objectContaining({ entityId: 'mobile-migration', after: expect.objectContaining({ queued: 1, missingSource: 1 }) }),
@@ -237,7 +259,9 @@ describe('markMobileReady', () => {
     await t.svc.markMobileReady('v_1', result);
 
     expect(t.prisma.videoRendition.deleteMany).toHaveBeenCalledWith({ where: { videoId: 'v_1' } });
-    const data = t.writes.at(-1)?.data as Record<string, unknown>;
+    // The write that records the ladder (the "new video" bookkeeping that
+    // follows it writes to its own two columns and is not what this is about).
+    const data = t.writes.find((w) => (w.data as Record<string, unknown>).mobileStatus === 'READY')?.data as Record<string, unknown>;
     expect(data).toMatchObject({ mobileStatus: 'READY', mobileError: null, hlsPrefix: 'hls/v_1/', isEncrypted: true });
     expect(data).not.toHaveProperty('status');
     expect(data).not.toHaveProperty('gumletStatus');
@@ -253,7 +277,8 @@ describe('markMobileReady', () => {
 
     await t.svc.markMobileReady('v_1', result);
 
-    expect(t.writes.at(-1)?.data).toMatchObject({ durationSeconds: 100, width: 1280, height: 720, thumbnailKey: 'thumbnails/videos/v_1.jpg' });
+    const ladderWrite = t.writes.find((w) => (w.data as Record<string, unknown>).mobileStatus === 'READY');
+    expect(ladderWrite?.data).toMatchObject({ durationSeconds: 100, width: 1280, height: 720, thumbnailKey: 'thumbnails/videos/v_1.jpg' });
   });
 });
 
@@ -293,8 +318,22 @@ describe('markMobileProcessing', () => {
     }
   });
 
+  it('a leftover job does not re-encode a ladder that is already READY', async () => {
+    // A pending retry of an attempt the row has moved past, or a duplicate from
+    // an older build: the video is READY under another job's id.
+    const t = harness({ rows: [{ id: 'v_1', mobileStatus: 'READY', mobileJobId: 'job_done' }] });
+
+    await expect(t.svc.markMobileProcessing('v_1', 'source/v_1.mp4', 'job_leftover')).resolves.toBe(false);
+    expect(t.prisma.video.updateMany).not.toHaveBeenCalled();
+
+    // The job that OWNS the row (a deliberate re-encode records its intent,
+    // and with it this id, before the job runs) is not stopped by this.
+    const own = harness({ rows: [{ id: 'v_1', mobileStatus: 'READY', mobileJobId: 'job_own' }] });
+    await expect(own.svc.markMobileProcessing('v_1', 'source/v_1.mp4', 'job_own')).resolves.toBe(true);
+  });
+
   it('claims compare-and-set, so two racing jobs cannot both win', async () => {
-    const t = harness({ rows: [{ id: 'v_1', mobileStatus: 'READY', mobileJobId: 'job_old' }] });
+    const t = harness({ rows: [{ id: 'v_1', mobileStatus: 'FAILED', mobileJobId: 'job_old' }] });
     (t.prisma.video.updateMany as jest.Mock).mockResolvedValueOnce({ count: 0 }); // the other job won the race
     await expect(t.svc.markMobileProcessing('v_1', 'source/v_1.mp4', 'job_B')).resolves.toBe(false);
     expect(t.prisma.video.updateMany).toHaveBeenCalledWith(

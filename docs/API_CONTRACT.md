@@ -757,3 +757,76 @@ attachment tickets. Access is only ever widened by a new grant, never narrowed.
 **Teacher capability switches** are checked *in addition to* the per-course
 `CourseTeacher` flags: both must allow an action. Admin and master are never
 subject to them.
+
+## Video processing: three independent states (2026-11-17)
+
+Additive. Existing fields keep their meaning; clients that ignore the new ones
+behave as before. Background and rationale: `docs/DUAL_PIPELINE_INDEPENDENCE.md`.
+
+### `POST /videos/:videoId/complete`
+
+Answers **201 as soon as the source is verified in storage and the acceptance is
+committed** - it no longer fails because the processing queue is unreachable.
+Idempotent: a repeated call returns the same job ids and starts nothing.
+
+```jsonc
+{
+  "videoId": "…", "status": "QUEUED", "jobId": "transcode:<videoId>:src<hash>", // null while undelivered
+  "sourceSizeBytes": 8595609,
+  "alreadyQueued": true,                       // only on a repeated call
+  "upload": { "state": "VERIFIED", "sizeBytes": 8595609 },
+  "gumlet": { "queued": true },                // false = accepted; queued automatically shortly
+  "mobile": { "status": "QUEUED", "jobId": "mobile-hls:<videoId>:p1g1", "queued": true, "automatic": true },
+  "workerOnline": false, "workerLastSeenAt": null, "workerCanTranscode": null
+}
+```
+
+Errors: `400 UPLOAD_FAILED` (object missing, or its length differs from
+`sizeBytes`) means the file must be sent again. `503 STORAGE_UNAVAILABLE` means
+storage could not be asked - **do not re-upload**, call `complete` again.
+
+### `GET /videos/:videoId/status`
+
+Three new blocks beside the existing fields:
+
+| Block | Fields |
+|---|---|
+| `source` | `state` (`NONE` \| `UPLOADING` \| `VERIFIED`), `sizeBytes` |
+| `gumlet` | `state` (`NOT_APPLICABLE` \| `WAITING_UPLOAD` \| `PENDING` \| `SUBMITTED` \| `PROCESSING` \| `READY` \| `FAILED`), `providerStatus`, `hasAsset`, `queued`, `error`, `updatedAt`, `drmVerified`, `canRetry` |
+| `mobile` | existing `status`, `error`, `jobId`, `processingStartedAt`, `processedAt`, `renditions`; new `requestedAt`, `queued`, `attempts`, `trigger`, `progress` (0-100, up to a minute old), `active`, `paused`, `pauseReason` (administrators only), `automatic`, `canRetry`, and while waiting `workerOnline`, `workerLastSeenAt`, `workerCanTranscode` (the worker that runs MOBILE encodes) |
+
+`status` (top level) remains the Gumlet/web lifecycle.
+
+### `POST /videos/:videoId/retry` - retry Gumlet
+
+Unchanged. Never reads or writes a mobile field.
+
+### `POST /videos/:videoId/mobile/retry` - retry Mobile HLS
+
+Body (optional): `{ "force": true }` - administrators only, to re-encode a
+ladder that is already READY. Without it a READY video answers
+`409 INVALID_STATE`. A video that is already queued or encoding keeps its job:
+`{ "alreadyQueued": true }`. Response: `{ videoId, jobId, alreadyQueued, enqueued, workerOnline, … }`
+where `enqueued: false` means the request is recorded and the job reaches the
+queue on its own. Never reads or writes a Gumlet field.
+
+### `POST /videos/mobile/pause`
+
+Body: `{ "reason"?: string, "scope"?: "all" | "historical" }`. `all` (default,
+and what a pause without a scope has always meant) holds every mobile encode.
+`historical` holds only `migration` / `recovery` jobs; new uploads and staff
+retries keep running.
+
+### `GET /lessons/:id`, `GET /lessons/by-video/:videoId`
+
+`video.status` is the Gumlet/web state, except for a native app
+(`X-Device-Platform: android|ios`) when mobile delivery is `hls`: there it reads
+`READY` if Gumlet's state is `FAILED` / `QUEUED` / `PROCESSING` **and** the
+mobile ladder is READY - the lecture is playable by that client.
+
+### `POST /playback/videos/:videoId/ticket`
+
+A bound, `hls-aes128`-capable mobile device is now issued an HLS ticket for a
+video whose mobile ladder is READY even when the Gumlet state is `FAILED`,
+`QUEUED` or `PROCESSING`. Every other client and state is answered as before
+(`VIDEO_NOT_READY`, `VIDEO_PROCESSING_FAILED`, `VIDEO_UNAVAILABLE`).

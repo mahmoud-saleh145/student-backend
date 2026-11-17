@@ -12,11 +12,16 @@ import { VideosController } from './videos.controller';
 import { VideosService } from './videos.service';
 import { GumletMigrationService } from './gumlet-migration.service';
 import { LessonVideoService } from './lesson-video.service';
+import { NewVideoAnnouncerModule } from './new-video-announcer.module';
+import { VideoPipelineReconciler } from './video-pipeline-reconciler.service';
 
 @Module({
   imports: [
     BullModule.registerQueue({ name: QUEUE_NAMES.video }, { name: QUEUE_NAMES.mobileVideo }),
     NotificationsModule,
+    // The once-only "new video" notification, shared by both pipelines and
+    // by the lesson module (a draft's announcement goes out on publish).
+    NewVideoAnnouncerModule,
     // Exports GumletDrmService (asset API + licensing), DrmVerificationService
     // (the DRM proof authority) and Prisma/Storage wiring.
     PlaybackModule,
@@ -28,6 +33,10 @@ import { LessonVideoService } from './lesson-video.service';
     GumletWebhookService,
     GumletMigrationService,
     LessonVideoService,
+    // Delivers processing intents that never reached the queue (Redis down,
+    // a restart between the commit and the enqueue). In-process, so it does
+    // not need a worker to be running.
+    VideoPipelineReconciler,
   ],
   exports: [
     VideosService,

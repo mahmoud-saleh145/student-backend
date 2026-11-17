@@ -146,10 +146,12 @@ describe('ScratchGuard.snapshot', () => {
 describe('pause flag', () => {
   it('is absent by default, persists with who and why, and clears on resume', async () => {
     const { guard, redis } = build();
-    expect(await guard.pauseState()).toEqual({ paused: false, reason: null, by: null, at: null });
+    expect(await guard.pauseState()).toEqual({ paused: false, reason: null, by: null, at: null, scope: 'all' });
 
     const paused = await guard.setPaused(true, 'admin_1', 'laptop in use');
     expect(paused.paused).toBe(true);
+    // A pause without a scope holds everything, as it always has.
+    expect(paused.scope).toBe('all');
     expect(paused.reason).toBe('laptop in use');
     expect(paused.by).toBe('admin_1');
     expect(redis.setJsonPersistent).toHaveBeenCalled(); // no TTL: survives restarts

@@ -399,7 +399,30 @@ export class AuthService {
    * again.
    */
   async refresh(refreshToken: string, meta: RequestMeta): Promise<AuthResult> {
-    return this.rotateRefresh(refreshToken, meta, false);
+    const result = await this.rotateRefresh(refreshToken, meta, false);
+    this.noteDeviceBuild(result, meta);
+    return result;
+  }
+
+  /**
+   * The refresh succeeded; the app is running NOW, on whatever build it says.
+   *
+   * A device's descriptor used to be refreshed only at sign-in, and a student
+   * who updates the app stays signed in - so the server kept describing the
+   * install they had months ago. Refreshing the build here keeps it current
+   * within one access-token lifetime of the app being opened.
+   *
+   * Deliberately outside the rotation, after it, and not awaited: it is not
+   * part of the refresh, cannot delay it and cannot fail it.
+   */
+  private noteDeviceBuild(result: AuthResult, meta: RequestMeta): void {
+    try {
+      const userId = (result.user as { id?: unknown } | null | undefined)?.id;
+      if (typeof userId !== 'string') return;
+      void Promise.resolve(this.devices.noteAppBuild(userId, meta.device)).catch(() => undefined);
+    } catch {
+      // Never part of the refresh outcome.
+    }
   }
 
   private async rotateRefresh(

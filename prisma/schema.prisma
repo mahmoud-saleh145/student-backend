@@ -1244,6 +1244,12 @@ model Device {
   model     String?
   osVersion String?
   appVersion String?
+  /// The native build number the app reported the last time this device signed
+  /// in (`X-App-Build`: Android versionCode, iOS build number). Every build of
+  /// the app reports the same `appVersion`, so this is the only stored signal
+  /// that tells an install that plays the mobile HLS stream from an older one.
+  /// NULL = not reported yet (the device has not signed in since this existed).
+  appBuild  String?
   status    DeviceStatus @default(ACTIVE)
 
   /// Client-reported integrity signal. A hint only — server-side attestation
@@ -1654,6 +1660,38 @@ model Video {
   mobileJobId               String?
   mobileProcessingStartedAt DateTime?
   mobileProcessedAt         DateTime?
+  /// DURABLE PROCESSING INTENT for the mobile pipeline (the outbox).
+  ///
+  /// `mobileRequestedAt` is written in the database, together with
+  /// `mobileStatus = QUEUED`, BEFORE anything is sent to Redis, so "this video
+  /// must be processed for mobile" survives a Redis outage or an API restart
+  /// between the commit and the enqueue. `mobileEnqueuedAt` is stamped only
+  /// once the BullMQ job is really in Redis; a QUEUED row without it is what
+  /// the pipeline reconciler looks for and enqueues.
+  mobileRequestedAt         DateTime?
+  mobileEnqueuedAt          DateTime?
+  /// Bumped once per processing intent. The BullMQ job id is derived from it
+  /// (`mobile-hls:<videoId>:g<n>`), which makes enqueueing idempotent: adding
+  /// the same intent twice - a retried request, two API processes, the
+  /// reconciler racing a request - is one job, never two encodes.
+  mobileGeneration          Int               @default(0)
+  /// Why the current intent exists (upload | migration | retry | recovery), so
+  /// a re-enqueue after a Redis outage keeps the job's priority.
+  mobileTrigger             String?
+
+  /// The "new video" notification owed for this lecture, as a small state
+  /// (see new-video-announcer.service.ts):
+  ///   NULL     nothing owed - not playable yet, or it predates the mechanism
+  ///   PENDING  playable, students not told yet (draft lesson, Gumlet still
+  ///            working, or an attempt that failed and will be retried)
+  ///   SENDING  one process holds the claim and is writing the notifications
+  ///   MOBILE   told only the students who can play it in the app (Gumlet
+  ///            failed); the others are told if Gumlet recovers
+  ///   DONE     told, or recorded as not needing it. Final: replacing the
+  ///            file does not reset it.
+  newVideoAnnounceState   String?
+  /// When the row entered that state; also the claim's compare-and-set value.
+  newVideoAnnounceStateAt DateTime?
 
   processingJobId String?
   processingError String?
@@ -1684,6 +1722,7 @@ model Video {
   @@index([drmProvider, drmVerifiedAt])
   /// The mobile migration sweep and the stranded-job recovery scan by state.
   @@index([mobileStatus, updatedAt])
+  @@index([newVideoAnnounceState])
   @@map("videos")
 }
 

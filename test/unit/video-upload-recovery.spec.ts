@@ -1,3 +1,4 @@
+import { uploadTranscodeJobIdFor } from 'src/modules/videos/pipeline-state';
 import { VideosService } from 'src/modules/videos/videos.service';
 
 /**
@@ -88,6 +89,10 @@ function build(options?: {
         updates.push(args.data);
         return { id: VIDEO_ID };
       }),
+      updateMany: jest.fn(async (args: { data: Record<string, unknown> }) => {
+        updates.push(args.data);
+        return { count: 1 };
+      }),
     },
   };
 
@@ -97,7 +102,8 @@ function build(options?: {
   };
 
   const storage = {
-    objectSize: jest.fn(async () => storedSize),
+    // `complete` asks the strict probe: null means "definitely not there".
+    objectSizeStrict: jest.fn(async () => storedSize),
     pruneSupersededSources: jest.fn(async () => {
       if (options?.pruneThrows) throw new Error('list failed');
       return [];
@@ -108,8 +114,10 @@ function build(options?: {
 
   const queue = {
     add: jest.fn(async () => ({ id: 'job-1' })),
-    getJob: jest.fn(async () => {
-      if (jobState === null) return null;
+    // Only the job the ROW records exists; the deterministic id of a new
+    // acceptance is not in the queue until `add` puts it there.
+    getJob: jest.fn(async (id: string) => {
+      if (jobState === null || id !== row.processingJobId) return null;
       return { getState: async () => jobState };
     }),
   };
@@ -163,7 +171,14 @@ describe('completing an upload that was interrupted', () => {
     // The job is queued, so the worker will drive the video to Gumlet.
     expect(t.queue.add).toHaveBeenCalledTimes(1);
     expect(result.status).toBe('QUEUED');
-    expect(result.jobId).toBe('job-1');
+    // The job id is derived from the video and its source, not from a clock:
+    // a retried finalisation maps to this same job.
+    expect(result.jobId).toBe(uploadTranscodeJobIdFor(VIDEO_ID, SOURCE_KEY));
+    expect(t.queue.add).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.anything(),
+      expect.objectContaining({ jobId: uploadTranscodeJobIdFor(VIDEO_ID, SOURCE_KEY) }),
+    );
   });
 
   it('records the size that is actually stored, so the row describes reality', async () => {
@@ -349,7 +364,7 @@ describe('authorisation', () => {
 
     await expect(complete(t)).rejects.toBeDefined();
 
-    expect(t.storage.objectSize).not.toHaveBeenCalled();
+    expect(t.storage.objectSizeStrict).not.toHaveBeenCalled();
     expect(t.queue.add).not.toHaveBeenCalled();
   });
 });

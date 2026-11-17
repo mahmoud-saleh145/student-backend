@@ -171,6 +171,8 @@ export class PlaybackController {
       lessonId: dto.lessonId,
       delivery: dto.delivery === 'embed' ? 'embed' : undefined,
       capabilities: dto.capabilities,
+      devicePlatform: req.deviceContext?.platform ?? null,
+      appBuild: req.deviceContext?.appBuild ?? null,
       ip: req.ip ?? null,
       userAgent: req.header('user-agent') ?? null,
       integritySuspect: req.deviceContext?.integritySuspect ?? false,

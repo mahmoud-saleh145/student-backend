@@ -214,6 +214,27 @@ export class EnvironmentVariables {
   @toBool() @IsBoolean() MOBILE_HLS_GUMLET_FALLBACK = true;
   @toBool() @IsBoolean() MOBILE_PIPELINE_ENABLED = true;
   /**
+   * The "new video" notification, sent once per student when a lecture is
+   * playable and published. OFF unless set to true, on the API and on the
+   * worker: a host that was not told sends nothing.
+   */
+  @toBool() @IsBoolean() NEW_VIDEO_NOTIFICATIONS_ENABLED = false;
+  /**
+   * First native build (Android versionCode / iOS build number) whose app
+   * plays the mobile HLS stream properly. When set, an older build of that
+   * platform (or one that does not report its build) is served Gumlet even if
+   * it declares `hls-aes128`, and is not told about a lecture that is playable
+   * in the app alone. Unset = the declaration alone decides, as before.
+   */
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(999_999_999) MOBILE_HLS_MIN_BUILD_ANDROID?: number;
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(999_999_999) MOBILE_HLS_MIN_BUILD_IOS?: number;
+  /**
+   * Background interval of the pipeline reconciler (seconds; default 600,
+   * minimum 60, 0 disables it). It also scans at boot and every 30 s while a
+   * delivery is known to have failed. See video-pipeline-reconciler.service.ts.
+   */
+  @IsOptional() @Type(() => Number) @IsInt() @Min(0) @Max(86_400) VIDEO_PIPELINE_RECONCILE_SECONDS?: number;
+  /**
    * Which queues THIS worker process consumes, comma-separated
    * (`video-processing,mobile-video-processing,push-delivery,maintenance,analytics`).
    * Empty = all of them. Lets the CPU-bound mobile transcode run on its own host

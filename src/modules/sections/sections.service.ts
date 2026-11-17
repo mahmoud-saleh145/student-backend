@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { AuditAction, ContentStatus, type UserRole, VideoStatus } from '@prisma/client';
 
 import { AppException } from '../../common/errors/app.exception';
@@ -7,6 +7,7 @@ import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { CourseAccessService } from '../courses/course-access.service';
 import { CoursesService } from '../courses/courses.service';
+import { NewVideoAnnouncer } from '../videos/new-video-announcer.service';
 
 /**
  * Dynamic course structure.
@@ -24,6 +25,8 @@ export class SectionsService {
     private readonly access: CourseAccessService,
     private readonly courses: CoursesService,
     private readonly audit: AuditService,
+    // Optional so the tests that build this service positionally keep working.
+    @Optional() private readonly announcer?: NewVideoAnnouncer,
   ) {}
 
   /**
@@ -234,6 +237,13 @@ export class SectionsService {
     });
 
     if (input.status) await this.courses.recountCourse(section.courseId);
+
+    // The section has just been PUBLISHED: lectures in it whose "new video"
+    // notification was waiting only for that are settled now (bounded, and
+    // each still checked on its own). Sends nothing unless one is owed.
+    if (section.status !== ContentStatus.PUBLISHED && updated.status === ContentStatus.PUBLISHED) {
+      await this.announcer?.settleForSection(sectionId);
+    }
 
     await this.audit.record({
       actorId: actor.id,

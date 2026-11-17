@@ -1,6 +1,7 @@
 import { Global, Module } from '@nestjs/common';
 
 import { CatalogModule } from '../catalog/catalog.module';
+import { NewVideoAnnouncerModule } from '../videos/new-video-announcer.module';
 
 import { CourseAccessService } from './course-access.service';
 import { CoursesAdminController } from './courses.admin.controller';
@@ -20,7 +21,9 @@ import { CoursesService } from './courses.service';
  */
 @Global()
 @Module({
-  imports: [CatalogModule],
+  // NewVideoAnnouncerModule: publishing a course releases the "new video"
+  // notifications its lectures were holding back.
+  imports: [CatalogModule, NewVideoAnnouncerModule],
   controllers: [CoursesController, CoursesAdminController],
   providers: [CoursesService, CoursesAdminService, CourseAccessService],
   exports: [CoursesService, CoursesAdminService, CourseAccessService],

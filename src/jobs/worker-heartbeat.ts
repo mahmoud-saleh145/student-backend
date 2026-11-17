@@ -36,6 +36,39 @@ export const WORKER_HEARTBEAT_KEY = 'worker:heartbeat';
  * that in under three minutes.
  */
 export const WORKER_HEARTBEAT_TTL_SECONDS = 180;
+
+/**
+ * Heartbeat of a worker that consumes the MOBILE queue but NOT the original
+ * one.
+ *
+ * With every queue on one host there is one worker and one key, as always.
+ * The split deployment (light queues on an always-on host so Gumlet ingests,
+ * pushes and maintenance do not stop when the encoding machine sleeps; the
+ * CPU-bound mobile encodes on their own machine) has two workers, and two
+ * processes writing one key would overwrite each other every minute: the
+ * dashboard would alternately report "no ffmpeg" and a healthy encoder.
+ *
+ * So each process writes exactly ONE key, chosen by what it consumes - no
+ * extra Redis traffic - and readers ask for the role they care about.
+ */
+export const MOBILE_WORKER_HEARTBEAT_KEY = 'worker:heartbeat:mobile';
+/** A worker that consumes neither video queue (push / maintenance only). */
+export const AUX_WORKER_HEARTBEAT_KEY = 'worker:heartbeat:aux';
+
+const ORIGINAL_QUEUE = 'video-processing';
+const MOBILE_QUEUE = 'mobile-video-processing';
+
+function consumes(queues: string[] | 'all' | undefined, name: string): boolean {
+  // A heartbeat from before the field existed came from a worker running everything.
+  return queues === undefined || queues === 'all' || queues.includes(name);
+}
+
+/** The key a worker with this queue selection reports under. */
+export function heartbeatKeyFor(queues: string[] | 'all'): string {
+  if (consumes(queues, ORIGINAL_QUEUE)) return WORKER_HEARTBEAT_KEY;
+  if (consumes(queues, MOBILE_QUEUE)) return MOBILE_WORKER_HEARTBEAT_KEY;
+  return AUX_WORKER_HEARTBEAT_KEY;
+}
 const INTERVAL_MS = 60_000;
 
 /**
@@ -97,6 +130,17 @@ export async function readWorkerHeartbeat(
   return redis.getJson<WorkerHeartbeatPayload>(WORKER_HEARTBEAT_KEY);
 }
 
+/**
+ * The worker that runs MOBILE encodes: the primary worker when it consumes the
+ * mobile queue too (the single-host deployment), otherwise the dedicated
+ * mobile worker. One GET in the usual case, two only in the split deployment.
+ */
+export async function readMobileWorkerHeartbeat(redis: RedisService): Promise<WorkerHeartbeatPayload | null> {
+  const primary = await redis.getJson<WorkerHeartbeatPayload>(WORKER_HEARTBEAT_KEY);
+  if (primary && consumes(primary.queues, MOBILE_QUEUE)) return primary;
+  return redis.getJson<WorkerHeartbeatPayload>(MOBILE_WORKER_HEARTBEAT_KEY);
+}
+
 function canRun(command: string): Promise<boolean> {
   return new Promise((resolve) => {
     try {
@@ -116,6 +160,8 @@ export class WorkerHeartbeat implements OnModuleInit, OnModuleDestroy {
   private timer: NodeJS.Timeout | null = null;
   private readonly startedAt = new Date().toISOString();
   private tools = { ffmpeg: false, ffprobe: false };
+  private readonly queues = configuredQueues();
+  private readonly key = heartbeatKeyFor(this.queues);
 
   constructor(
     private readonly redis: RedisService,
@@ -149,7 +195,7 @@ export class WorkerHeartbeat implements OnModuleInit, OnModuleDestroy {
 
   onModuleDestroy(): void {
     if (this.timer) clearInterval(this.timer);
-    void this.redis.del(WORKER_HEARTBEAT_KEY).catch(() => undefined);
+    void this.redis.del(this.key).catch(() => undefined);
   }
 
   private async beat(): Promise<void> {
@@ -165,7 +211,7 @@ export class WorkerHeartbeat implements OnModuleInit, OnModuleDestroy {
       ...this.tools,
       build: runningBuild(),
       capabilities: [...WORKER_CAPABILITIES],
-      queues: configuredQueues(),
+      queues: this.queues,
       scratch,
       load: { load1: loadavg()[0] ?? 0, cpus: cpus().length, freeMemBytes: freemem(), totalMemBytes: totalmem() },
       pause,
@@ -173,7 +219,7 @@ export class WorkerHeartbeat implements OnModuleInit, OnModuleDestroy {
       lastDeferral: this.guard.lastDeferredJob(),
     };
     await this.redis
-      .setJson(WORKER_HEARTBEAT_KEY, payload, WORKER_HEARTBEAT_TTL_SECONDS)
+      .setJson(this.key, payload, WORKER_HEARTBEAT_TTL_SECONDS)
       .catch((e: Error) => this.logger.warn(`heartbeat write failed: ${e.message}`));
   }
 }

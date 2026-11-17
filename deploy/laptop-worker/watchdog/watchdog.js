@@ -49,6 +49,7 @@ const CFG = {
   intervalSec: num(process.env.WATCHDOG_INTERVAL_SEC, 30),
   outagePollSec: num(process.env.WATCHDOG_OUTAGE_POLL_SEC, 10),
   outagePauseSec: num(process.env.WATCHDOG_OUTAGE_PAUSE_SEC, 600),
+  pauseScope: process.env.WATCHDOG_PAUSE_SCOPE === 'all' ? 'all' : 'historical',
   netfailWindowMin: num(process.env.WATCHDOG_NETFAIL_WINDOW_MIN, 120),
   netfailThreshold: num(process.env.WATCHDOG_NETFAIL_THRESHOLD, 3),
   probeTimeoutMs: num(process.env.WATCHDOG_PROBE_TIMEOUT_MS, 10000),
@@ -133,7 +134,14 @@ async function pausedNow() {
 async function writePause(reason) {
   if (CFG.dryRun) { log('pause_dry_run', { reason }); return; }
   // Same key and shape as POST /videos/mobile/pause (scratch-guard writePauseState); no TTL.
-  await redis.set(PAUSE_KEY, JSON.stringify({ reason: reason.slice(0, 200), by: 'safety-watchdog', at: new Date().toISOString() }));
+  // SCOPE: this watchdog guards the historical backlog (it only ever pauses when
+  // historical work is queued or running), so its pause holds `migration` /
+  // `recovery` jobs and lets a new upload's own encode through. A pause without
+  // a scope means "everything", which is what this used to write - and what
+  // parked every newly uploaded lecture behind a backlog safety stop until a
+  // person resumed it. Set WATCHDOG_PAUSE_SCOPE=all to get that back. A worker
+  // build from before scopes existed ignores the field and holds everything.
+  await redis.set(PAUSE_KEY, JSON.stringify({ reason: reason.slice(0, 200), by: 'safety-watchdog', at: new Date().toISOString(), scope: CFG.pauseScope }));
 }
 
 // --- state machine --------------------------------------------------------------
