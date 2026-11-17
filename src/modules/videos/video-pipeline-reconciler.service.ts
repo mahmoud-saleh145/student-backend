@@ -7,11 +7,14 @@ import { VideosService } from './videos.service';
 
 /**
  * VIDEO_PIPELINE_RECONCILE_SECONDS as applied: the interval of the BACKGROUND
- * scan. Unset means 600; 0 / negative / non-numeric disables the reconciler
+ * scan. Unset or empty means 600; 0 / negative / non-numeric disables the reconciler
  * altogether; anything else is floored to whole seconds, never below 60.
  */
 export function normalizeReconcileIntervalSeconds(raw: string | undefined): number {
-  const value = Number(raw ?? 600);
+  // A variable that is present but empty is "not set". `Number('')` is 0, which
+  // would switch the reconciler off without a word.
+  const text = (raw ?? '').trim();
+  const value = text === '' ? 600 : Number(text);
   return Number.isFinite(value) && value > 0 ? Math.max(60, Math.floor(value)) : 0;
 }
 

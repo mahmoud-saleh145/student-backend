@@ -1819,7 +1819,9 @@ export class VideosService {
   async markMobileReady(
     videoId: string,
     result: Parameters<VideosService['markReady']>[1],
-  ): Promise<void> {
+    /** The source file the encode read. Given by the worker; see below. */
+    encoded?: { sourceKey: string },
+  ): Promise<boolean> {
     // The worker's ffprobe measurement of the source it just encoded (and
     // whose segment durations the transcoder verified against it). Zero or
     // unparseable is UNKNOWN, never a duration.
@@ -1828,8 +1830,25 @@ export class VideosService {
     const before = await this.prisma.$transaction(async (tx) => {
       const current = await tx.video.findUniqueOrThrow({
         where: { id: videoId },
-        select: { durationSeconds: true, width: true, height: true, thumbnailKey: true, status: true },
+        select: {
+          durationSeconds: true,
+          width: true,
+          height: true,
+          thumbnailKey: true,
+          status: true,
+          sourceKey: true,
+        },
       });
+
+      // THE RESULT BELONGS TO THE FILE THAT WAS ENCODED.
+      //
+      // An encode takes minutes. If the lecture's file is replaced meanwhile,
+      // `initUpload` resets the mobile state - and this write, arriving
+      // afterwards, used to put it back to READY with the ladder (and the
+      // duration) of the PREVIOUS recording. Every upload has its own source
+      // key, so a result for any other key is stale and is not recorded.
+      if (encoded && current.sourceKey !== encoded.sourceKey) return null;
+
       await tx.videoRendition.deleteMany({ where: { videoId } });
       await tx.video.update({
         where: { id: videoId },
@@ -1860,6 +1879,12 @@ export class VideosService {
       });
       return current;
     });
+    if (!before) {
+      this.logger.warn(
+        `video ${videoId}: the mobile encode finished for a file that has since been replaced; its result is discarded`,
+      );
+      return false;
+    }
     this.logger.log(`video ${videoId} is mobile-READY (${result.renditions.length} renditions)`);
 
     // FROM HERE ON NOTHING MAY THROW. The ladder is recorded; an error now
@@ -1900,6 +1925,7 @@ export class VideosService {
     } else {
       await this.announcer.settle(videoId);
     }
+    return true;
   }
 
   /**
@@ -1938,11 +1964,17 @@ export class VideosService {
     this.logger.warn(`video ${videoId} mobile attempt ${attempt} of ${attempts} failed, retry pending: ${error}`);
   }
 
-  async markMobileFailed(videoId: string, error: string): Promise<void> {
-    await this.prisma.video.update({
-      where: { id: videoId },
+  async markMobileFailed(videoId: string, error: string, encoded?: { sourceKey: string }): Promise<void> {
+    // As with a finished encode: a failure of the encode of a file that has
+    // since been replaced says nothing about the file the lecture has now.
+    const { count } = await this.prisma.video.updateMany({
+      where: { id: videoId, ...(encoded ? { sourceKey: encoded.sourceKey } : {}) },
       data: { mobileStatus: MobileVideoStatus.FAILED, mobileError: error.slice(0, 1000) },
     });
+    if (count === 0) {
+      this.logger.warn(`video ${videoId}: a mobile encode failed for a file that has since been replaced; ignored`);
+      return;
+    }
     this.logger.error(`video ${videoId} mobile processing failed: ${error}`);
   }
 

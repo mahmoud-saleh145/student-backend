@@ -139,6 +139,9 @@ describe('MobileVideoProcessor', () => {
         encryptionKeyId: 'derived:v_1',
         renditions: expect.arrayContaining([expect.objectContaining({ height: 720 })]),
       }),
+      // ...together with the file the encode read, so a result for a file
+      // that was replaced meanwhile is not recorded.
+      { sourceKey: 'source/videos/v_1.mp4' },
     );
     // The primary pipeline's bookkeeping is never touched.
     expect(t.videos.markProcessing).not.toHaveBeenCalled();
@@ -165,7 +168,7 @@ describe('MobileVideoProcessor', () => {
     const t = build({ runError: new Error('ffmpeg exited with 1: Invalid data found'), attemptsMade: 1 });
 
     await expect(t.processor.process(t.job)).rejects.toThrow(/ffmpeg exited/);
-    expect(t.videos.markMobileFailed).toHaveBeenCalledWith('v_1', expect.stringContaining('ffmpeg exited'));
+    expect(t.videos.markMobileFailed).toHaveBeenCalledWith('v_1', expect.stringContaining('ffmpeg exited'), { sourceKey: 'source/videos/v_1.mp4' });
     expect(t.videos.markMobileRetrying).not.toHaveBeenCalled();
   });
 
@@ -188,6 +191,7 @@ describe('MobileVideoProcessor', () => {
     expect(t.videos.markMobileFailed).toHaveBeenCalledWith(
       'v_1',
       expect.stringMatching(/could not run the encode .*scratch.*retried/),
+      { sourceKey: 'source/videos/v_1.mp4' },
     );
   });
 
@@ -213,6 +217,7 @@ describe('MobileVideoProcessor', () => {
     expect(t.videos.markMobileFailed).toHaveBeenCalledWith(
       'v_1',
       expect.stringMatching(/failed verification and was not published/),
+      { sourceKey: 'source/videos/v_1.mp4' },
     );
   });
 
@@ -265,7 +270,7 @@ describe('MobileVideoProcessor', () => {
 
     await expect(t.processor.process(t.job, 'tok')).rejects.toThrow(/missing from storage/);
     expect(t.job.moveToDelayed).not.toHaveBeenCalled();
-    expect(t.videos.markMobileFailed).toHaveBeenCalledWith('v_1', expect.stringContaining('missing from storage'));
+    expect(t.videos.markMobileFailed).toHaveBeenCalledWith('v_1', expect.stringContaining('missing from storage'), { sourceKey: 'source/videos/v_1.mp4' });
   });
 
   it('puts the row back to QUEUED and defers when the disk watchdog killed the encode', async () => {

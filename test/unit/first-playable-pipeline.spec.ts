@@ -765,6 +765,83 @@ describe('replacing the file of a lecture', () => {
     expect(told(w)).toEqual(EVERYONE);
   });
 
+  /** What `initUpload` leaves on the row when the file is replaced (asserted above). */
+  const replacedMidEncode = (w: World) =>
+    Object.assign(w.db.get(V), {
+      sourceKey: 'source/videos/v_1/replacement.mp4',
+      sourceSizeBytes: null,
+      status: 'UPLOADING',
+      durationSeconds: 0,
+      mobileStatus: 'NONE',
+      mobileJobId: null,
+      mobileRequestedAt: null,
+      mobileEnqueuedAt: null,
+      hlsPrefix: null,
+      renditions: [],
+    });
+
+  it('a file replaced WHILE its mobile encode is running: the old file\'s finished encode is not recorded', async () => {
+    const w = lecture('failed');
+    await w.videos.enqueueMobileTranscode({ id: V, sourceKey: w.db.get(V).sourceKey as string }, 'upload' as never);
+    const worker = mobileWorker(w, { encode: () => void replacedMidEncode(w) });
+
+    const ran = await worker.runNext();
+
+    // The job ends cleanly - there is nothing to retry - and the row still
+    // describes the NEW file: no ladder, no duration, nothing announced.
+    expect(ran?.outcome).toBe('completed');
+    expect(w.db.get(V)).toMatchObject({
+      sourceKey: 'source/videos/v_1/replacement.mp4',
+      mobileStatus: 'NONE',
+      hlsPrefix: null,
+      durationSeconds: 0,
+    });
+    expect(w.db.get(V).renditions).toEqual([]);
+    expect(lessonSeconds(w)).toBe(0);
+    expect(told(w)).toEqual([]);
+    expect(state(w)).toBeNull();
+  });
+
+  it('...and a FAILED encode of the old file does not mark the new file failed', async () => {
+    const w = lecture('failed');
+    await w.videos.enqueueMobileTranscode({ id: V, sourceKey: w.db.get(V).sourceKey as string }, 'upload' as never);
+    const worker = mobileWorker(w, {
+      encode: () => {
+        replacedMidEncode(w);
+        throw new Error('ffmpeg exited with code 1');
+      },
+    });
+
+    while (await worker.runNext()) {
+      /* every attempt the queue gives it */
+    }
+
+    expect(w.db.get(V)).toMatchObject({ mobileStatus: 'NONE', mobileError: null, sourceKey: 'source/videos/v_1/replacement.mp4' });
+  });
+
+  it('the service refuses a result for any file but the lecture\'s current one, whoever calls it', async () => {
+    const w = lecture('failed');
+    const result = {
+      durationSeconds: 1800,
+      width: 1920,
+      height: 1080,
+      hlsPrefix: 'hls/v_1/',
+      masterPlaylistKey: 'hls/v_1/master.m3u8',
+      isEncrypted: true,
+      renditions: [{ height: 720, width: 1280, bitrateKbps: 2300, playlistKey: 'hls/v_1/720p/index.m3u8' }],
+    };
+
+    expect(await w.videos.markMobileReady(V, result, { sourceKey: 'source/videos/v_1/some-other-file.mp4' })).toBe(false);
+    expect(w.db.get(V)).toMatchObject({ mobileStatus: 'NONE', hlsPrefix: null });
+
+    await w.videos.markMobileFailed(V, 'ffmpeg exited', { sourceKey: 'source/videos/v_1/some-other-file.mp4' });
+    expect(w.db.get(V).mobileStatus).toBe('NONE');
+
+    // The current file's result is recorded as before.
+    expect(await w.videos.markMobileReady(V, result, { sourceKey: w.db.get(V).sourceKey as string })).toBe(true);
+    expect(w.db.get(V).mobileStatus).toBe('READY');
+  });
+
   it('replacing the file forgets the old file\'s duration, so the new recording is measured, not assumed', async () => {
     const w = lecture('ready', { newVideoAnnounceState: 'DONE', newVideoAnnounceStateAt: new Date() });
     w.db.lessons.get('lesson_1')!.durationSeconds = 1795;
@@ -1570,13 +1647,40 @@ describe('the switch', () => {
       { getOrThrow: () => ({ mobile: { delivery: 'hls', gumletFallback: true } }) } as never,
       w.redis as never,
     );
-    Object.assign(w.db.get(V), { status: 'READY', newVideoAnnounceState: 'PENDING', newVideoAnnounceStateAt: new Date() });
+    Object.assign(w.db.get(V), { status: 'READY' });
 
-    expect(await untold.settle(V)).toBe('skipped');
+    // It is the one that sees the lecture become playable.
+    expect(await untold.onFirstPlayable(V, 'gumlet')).toBe('skipped');
 
     expect(told(w)).toEqual([]);
     expect(w.pushQueue.jobs.size).toBe(0);
     expect(state(w)).toBe('DONE');
+  });
+
+  it('a host that is still OFF does not cancel an announcement a host that is ON is holding', async () => {
+    // The API and the worker are switched separately. This process is ON, and
+    // is holding a draft lecture's announcement until the lesson is published.
+    const w = lecture('processing');
+    w.db.lessons.get('lesson_1')!.status = 'DRAFT';
+    await gumletBecomes(w, 'ready');
+    expect(state(w)).toBe('PENDING');
+
+    // The other host has not been switched on yet. Every way it can come across the row:
+    const off = apiProcess({ db: w.db, redis: w.redis, pushQueue: w.pushQueue, hlsMinBuild: MIN_BUILD, newVideoNotifications: false });
+    expect(await off.announcer.settle(V)).toBe('waiting');
+    await off.announcer.settleDue();
+    await off.announcer.settleForLesson('lesson_1');
+    await off.announcer.settleForSection('section_1');
+    await off.announcer.settleForCourse('course_1');
+    expect(await off.announcer.onFirstPlayable(V, 'mobile')).toBe('waiting');
+    await new VideoPipelineReconciler(off.videos, off.announcer).tick();
+
+    expect(state(w)).toBe('PENDING');
+    expect(told(w)).toEqual([]);
+
+    // The host that is ON still sends it when the lesson is published.
+    await setLessonStatus(w, 'PUBLISHED');
+    expect(told(w)).toEqual(EVERYONE);
   });
 
   it('the shipped default is off', () => {

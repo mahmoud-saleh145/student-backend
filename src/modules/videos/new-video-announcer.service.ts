@@ -277,7 +277,7 @@ export class NewVideoAnnouncer {
         data: { newVideoAnnounceState: ANNOUNCE_STATE.PENDING, newVideoAnnounceStateAt: new Date() },
       });
       if (owed.count > 0) this.logger.log(`video ${videoId} became playable via ${pipeline}: announcement owed`);
-      return await this.settleOnce(videoId, new Pass(), true);
+      return await this.settleOnce(videoId, new Pass(), true, owed.count > 0);
     } catch (error) {
       this.attention = true;
       this.logger.warn(`new-video announcement for ${videoId} failed: ${(error as Error).message}`);
@@ -415,7 +415,13 @@ export class NewVideoAnnouncer {
     }
   }
 
-  private async settleOnce(videoId: string, pass: Pass, recheckAppOnly: boolean): Promise<AnnouncementOutcome> {
+  private async settleOnce(
+    videoId: string,
+    pass: Pass,
+    recheckAppOnly: boolean,
+    /** This very call recorded the debt (NULL -> PENDING). */
+    recordedHere = false,
+  ): Promise<AnnouncementOutcome> {
     const video = (await this.prisma.video.findFirst({
       where: { id: videoId, deletedAt: null },
       select: VIDEO_SELECT,
@@ -441,8 +447,18 @@ export class NewVideoAnnouncer {
     }
 
     if (!this.enabled) {
-      // Recorded as done, so switching the notification back on does not
-      // announce every lecture that became playable while it was off.
+      // THIS PROCESS HAS NOTIFICATIONS OFF.
+      //
+      // A debt it recorded itself a moment ago is closed at once, so that
+      // switching the notification back on does not announce every lecture
+      // that became playable while it was off.
+      //
+      // A debt it did NOT record is left exactly as it is. The two hosts (API,
+      // worker) are switched separately; while only one of them is on, the
+      // other must not cancel what that one is holding - a draft waiting to be
+      // published would be marked done by the first pass of the host that is
+      // still off, and never announced.
+      if (!recordedHere) return 'waiting';
       await this.move(video, state, ANNOUNCE_STATE.DONE);
       this.logger.log(`video ${videoId} is playable; new-video notifications are switched off`);
       return 'skipped';

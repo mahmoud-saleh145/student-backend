@@ -195,20 +195,30 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit {
         },
       });
 
-      await this.videos.markMobileReady(videoId, {
-        durationSeconds: Math.round(result.probe.durationSeconds),
-        width: result.probe.width,
-        height: result.probe.height,
-        frameRate: result.probe.frameRate,
-        videoCodec: result.probe.videoCodec,
-        audioCodec: result.probe.audioCodec,
-        hlsPrefix: result.hlsPrefix,
-        masterPlaylistKey: result.masterPlaylistKey,
-        thumbnailKey: result.thumbnailKey,
-        isEncrypted: result.isEncrypted,
-        encryptionKeyId: result.isEncrypted ? `derived:${videoId}` : undefined,
-        renditions: result.renditions,
-      });
+      const recorded = await this.videos.markMobileReady(
+        videoId,
+        {
+          durationSeconds: Math.round(result.probe.durationSeconds),
+          width: result.probe.width,
+          height: result.probe.height,
+          frameRate: result.probe.frameRate,
+          videoCodec: result.probe.videoCodec,
+          audioCodec: result.probe.audioCodec,
+          hlsPrefix: result.hlsPrefix,
+          masterPlaylistKey: result.masterPlaylistKey,
+          thumbnailKey: result.thumbnailKey,
+          isEncrypted: result.isEncrypted,
+          encryptionKeyId: result.isEncrypted ? `derived:${videoId}` : undefined,
+          renditions: result.renditions,
+        },
+        // The file this encode read: a result for a file that was replaced
+        // while it ran is not recorded.
+        { sourceKey },
+      );
+      if (recorded === false) {
+        this.logger.warn(`mobile job ${job.id} for video ${videoId} finished for a replaced file; nothing recorded`);
+        return { videoId, skipped: true };
+      }
 
       this.logger.log(`video ${videoId} mobile READY (${result.renditions.length} renditions)`);
       return { videoId, renditions: result.renditions.length };
@@ -257,7 +267,7 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit {
         if (attempt < attempts) {
           await this.videos.markMobileRetrying(videoId, String(job.id), reason, attempt, attempts);
         } else {
-          await this.videos.markMobileFailed(videoId, reason);
+          await this.videos.markMobileFailed(videoId, reason, { sourceKey });
         }
       } catch (markError) {
         this.logger.error(

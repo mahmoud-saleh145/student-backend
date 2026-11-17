@@ -1097,6 +1097,9 @@ describe('the reconciler only works when there is a reason to', () => {
       '../../src/modules/videos/video-pipeline-reconciler.service'
     );
     expect(normalizeReconcileIntervalSeconds(undefined)).toBe(600);
+    // Present but empty is "not set" - it must not switch the reconciler off.
+    expect(normalizeReconcileIntervalSeconds('')).toBe(600);
+    expect(normalizeReconcileIntervalSeconds('   ')).toBe(600);
     expect(normalizeReconcileIntervalSeconds('5')).toBe(60);
     expect(normalizeReconcileIntervalSeconds('900')).toBe(900);
     expect(normalizeReconcileIntervalSeconds('0')).toBe(0);
