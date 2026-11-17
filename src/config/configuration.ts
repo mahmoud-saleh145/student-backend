@@ -9,6 +9,12 @@ const num = (v: unknown, fallback: number) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
 };
+/** A whole number of 1 or more, or null: a native build number given as an environment variable. */
+const minBuild = (v: unknown): number | null => {
+  const n = Number(v);
+  return typeof v === 'string' && v.trim() !== '' && Number.isInteger(n) && n > 0 ? n : null;
+};
+
 const bool = (v: unknown, fallback = false) =>
   v === undefined ? fallback : v === true || v === 'true' || v === '1';
 
@@ -232,6 +238,16 @@ export const videoConfig = registerAs('video', () => ({
      * is then reported as "still being prepared".
      */
     gumletFallback: bool(process.env.MOBILE_HLS_GUMLET_FALLBACK, true),
+    /**
+     * The first native build of each platform whose app plays the mobile HLS
+     * stream. Used for ONE thing: deciding who is told when a lecture is
+     * playable only in the app (Gumlet failed). Unset = that platform's
+     * phones are not vouched for by their build.
+     */
+    hlsMinBuild: {
+      android: minBuild(process.env.MOBILE_HLS_MIN_BUILD_ANDROID),
+      ios: minBuild(process.env.MOBILE_HLS_MIN_BUILD_IOS),
+    },
     /** Queue a mobile transcode for every completed upload automatically. */
     autoProcess: bool(process.env.MOBILE_PIPELINE_ENABLED, true),
   },

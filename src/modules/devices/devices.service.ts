@@ -86,6 +86,32 @@ export class DevicesService {
   // ---------------------------------------------------------------------------
 
   /**
+   * Records the native build the app is running, when it differs from what is
+   * stored for this student's device. Called on token refresh, so the build
+   * follows an app update without a new sign-in.
+   *
+   * One conditional write, only for the caller's own device, only when the
+   * value is a well-formed build number and has changed. Never throws: a
+   * descriptor refresh must not matter to whatever called it.
+   */
+  async noteAppBuild(userId: string, device: DeviceContext): Promise<void> {
+    const build = storedBuild(device.appBuild);
+    if (!build || !device.deviceKey) return;
+    try {
+      await this.prisma.device.updateMany({
+        where: {
+          userId,
+          deviceKey: device.deviceKey,
+          OR: [{ appBuild: null }, { appBuild: { not: build } }],
+        },
+        data: { appBuild: build },
+      });
+    } catch {
+      // Nothing depends on this having been written.
+    }
+  }
+
+  /**
    * Called during login. Registers the device when the account has none, marks
    * it seen when it is the bound one, and records a mismatch otherwise.
    * Never throws — login proceeds regardless; the resolution is returned so
@@ -139,6 +165,7 @@ export class DevicesService {
         model: device.model ?? undefined,
         osVersion: device.osVersion ?? undefined,
         appVersion: device.appVersion ?? undefined,
+        appBuild: storedBuild(device.appBuild) ?? undefined,
         integritySuspect: device.integritySuspect,
       },
     });
@@ -193,6 +220,7 @@ export class DevicesService {
         model: device.model,
         osVersion: device.osVersion,
         appVersion: device.appVersion,
+        appBuild: storedBuild(device.appBuild),
         integritySuspect: device.integritySuspect,
         status: shouldAutoBind ? DeviceStatus.ACTIVE : DeviceStatus.PENDING_APPROVAL,
         approvedAt: shouldAutoBind ? new Date() : null,
@@ -433,6 +461,7 @@ export class DevicesService {
         model: params.device.model,
         osVersion: params.device.osVersion,
         appVersion: params.device.appVersion,
+        appBuild: storedBuild(params.device.appBuild),
         status: DeviceStatus.PENDING_APPROVAL,
       },
       update: { lastSeenAt: new Date() },
@@ -827,4 +856,15 @@ export class DevicesService {
     // under the ordinary limit rule.
     return { ok: true, revoked: count, cancelledRequests: cancelled };
   }
+}
+
+/**
+ * The native build number the app sent (`X-App-Build`), as it is stored: a
+ * short token of the characters a build number is made of, or null. It is a
+ * client-supplied header, so anything else is dropped rather than stored.
+ */
+export function storedBuild(raw: string | null | undefined): string | null {
+  if (typeof raw !== 'string') return null;
+  const text = raw.trim();
+  return /^[0-9][0-9.]{0,31}$/.test(text) ? text : null;
 }

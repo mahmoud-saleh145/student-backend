@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import {
   AccountStatus,
   AuditAction,
@@ -24,6 +24,7 @@ import {
 import { CatalogService } from '../catalog/catalog.service';
 import { CloudinaryService } from '../storage/cloudinary.service';
 import { assertObjectKeyInNamespace, StorageService } from '../storage/storage.service';
+import { NewVideoAnnouncer } from '../videos/new-video-announcer.service';
 
 import { CourseAccessService } from './course-access.service';
 import { CoursesService } from './courses.service';
@@ -145,6 +146,8 @@ export class CoursesAdminService {
     private readonly storage: StorageService,
     private readonly catalog: CatalogService,
     private readonly cloudinary: CloudinaryService,
+    // Optional so the tests that build this service positionally keep working.
+    @Optional() private readonly announcer?: NewVideoAnnouncer,
   ) {}
 
   /**
@@ -1019,6 +1022,8 @@ export class CoursesAdminService {
       after: { status: updated.status },
     });
 
+    await this.settleAnnouncementsIfNowServed(courseId, course.status, updated.status);
+
     return { id: updated.id, status: updated.status, publishedAt: updated.publishedAt };
   }
 
@@ -1062,7 +1067,26 @@ export class CoursesAdminService {
       note: reason,
     });
 
+    // DRAFT or SUSPENDED -> HIDDEN also starts serving enrolled students.
+    await this.settleAnnouncementsIfNowServed(courseId, before.status, updated.status);
+
     return { id: updated.id, status: updated.status };
+  }
+
+  /**
+   * A course that was not being served to its students (DRAFT, SUSPENDED) now
+   * is (PUBLISHED, or HIDDEN = unlisted): the "new video" notifications its
+   * lectures were holding back are settled now. Bounded by the announcer, so a
+   * large course cannot hold this request; the rest follows within the
+   * reconciler's next wake. Sends nothing unless one is owed; never throws.
+   */
+  private async settleAnnouncementsIfNowServed(
+    courseId: string,
+    before: CourseStatus,
+    after: CourseStatus,
+  ): Promise<void> {
+    const served = (status: CourseStatus) => status === CourseStatus.PUBLISHED || status === CourseStatus.HIDDEN;
+    if (!served(before) && served(after)) await this.announcer?.settleForCourse(courseId);
   }
 
   /**

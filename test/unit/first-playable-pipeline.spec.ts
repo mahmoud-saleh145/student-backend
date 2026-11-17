@@ -27,14 +27,21 @@
  * LessonVideoService, NotificationsService, CourseAccessService and the
  * NewVideoAnnouncer. Only Postgres, Redis, Gumlet and ffmpeg are replaced.
  */
+import { CoursesAdminService } from '../../src/modules/courses/courses.admin.service';
+import { AuthService } from '../../src/modules/auth/auth.service';
+import { DevicesService, storedBuild } from '../../src/modules/devices/devices.service';
 import { LessonsService } from '../../src/modules/lessons/lessons.service';
 import { MOBILE_DELIVERY_OVERRIDE_KEY } from '../../src/modules/playback/mobile-delivery-override';
+import { SectionsService } from '../../src/modules/sections/sections.service';
 import { GumletIngestService } from '../../src/modules/videos/gumlet-ingest.service';
 import { LessonVideoService } from '../../src/modules/videos/lesson-video.service';
 import {
+  ANNOUNCE_MOBILE_RECHECK_MS,
+  ANNOUNCE_PUBLISH_BATCH,
   ANNOUNCE_STALE_CLAIM_MS,
   ANNOUNCE_TIMEOUT_MS,
   newVideoDedupeKey,
+  parseBuild,
 } from '../../src/modules/videos/new-video-announcer.service';
 import { VideoPipelineReconciler } from '../../src/modules/videos/video-pipeline-reconciler.service';
 import {
@@ -66,16 +73,23 @@ const student = (userId: string, overrides: Partial<FakeEnrollment> = {}): FakeE
 });
 
 /** The students who may open lesson_1 (in section_1 of course_1)... */
-const EVERYONE = ['student_1', 'student_2', 'student_3', 'this_section'];
-/** ...and, of those, the ones whose phone has already played HLS. */
+const EVERYONE = ['student_1', 'student_2', 'student_3', 'student_4', 'this_section'];
+/**
+ * ...and, of those, the ones with a phone known to play the mobile stream:
+ * student_1 by the build it signed in with (it has never played anything),
+ * this_section because the app on it has declared HLS support itself.
+ */
 const APP_READY = ['student_1', 'this_section'];
+/** The first Android build that plays mobile HLS, as configured in these tests. iOS: not configured. */
+const MIN_BUILD = { android: 12, ios: null };
 
-/** Four students who must be told, and everyone who must not. */
+/** Five students who must be told, and everyone who must not. */
 function enrol(world: World): void {
   world.db.enrollments = [
     student('student_1'),
     student('student_2'),
     student('student_3'),
+    student('student_4'),
     // A section-scoped enrolment that includes this lecture's section.
     student('this_section', { coversAllSections: false, sectionGrants: [{ sectionId: 'section_1', codeId: null }] }),
     // --- not eligible -------------------------------------------------------
@@ -90,18 +104,24 @@ function enrol(world: World): void {
     student('other_course', { courseId: 'course_9' }),
   ];
   world.db.devices = [
-    { id: 'd1', userId: 'student_1', platform: 'android', status: 'ACTIVE' },
-    { id: 'd2', userId: 'student_2', platform: 'Android', status: 'ACTIVE' }, // has only ever been served Gumlet
-    { id: 'd2_old', userId: 'student_2', platform: 'android', status: 'REVOKED' }, // played HLS, no longer bound
-    { id: 'd3', userId: 'student_3', platform: 'web', status: 'ACTIVE' },
-    { id: 'd4', userId: 'this_section', platform: ' iOS ', status: 'ACTIVE' },
+    // Signed in on an HLS-capable build. Has never requested a single ticket.
+    { id: 'd1', userId: 'student_1', platform: 'android', status: 'ACTIVE', appBuild: '12' },
+    // An older build, which has only ever been served Gumlet.
+    { id: 'd2', userId: 'student_2', platform: 'Android', status: 'ACTIVE', appBuild: '10' },
+    // A newer build that played HLS - on a phone that is no longer bound.
+    { id: 'd2_old', userId: 'student_2', platform: 'android', status: 'REVOKED', appBuild: '14' },
+    // A browser. Not the app, whatever it reports.
+    { id: 'd3', userId: 'student_3', platform: 'web', status: 'ACTIVE', appBuild: '12' },
+    // A phone that has not signed in since builds were recorded: unknown.
+    { id: 'd5', userId: 'student_4', platform: 'android', status: 'ACTIVE', appBuild: null },
+    // iOS has no minimum configured here, but this app has declared HLS support itself.
+    { id: 'd4', userId: 'this_section', platform: ' iOS ', status: 'ACTIVE', appBuild: null },
   ];
   world.db.tickets = [
-    { deviceId: 'd1', delivery: 'hls' },
-    { deviceId: 'd1', delivery: 'hls' },
     { deviceId: 'd2', delivery: 'gumlet' },
     { deviceId: 'd2_old', delivery: 'hls' },
-    { deviceId: 'd3', delivery: 'hls' }, // a web "device" is not the app
+    { deviceId: 'd3', delivery: 'hls' },
+    { deviceId: 'd5', delivery: 'gumlet' },
     { deviceId: 'd4', delivery: 'hls' },
   ];
 }
@@ -130,7 +150,7 @@ function lecture(
   }[gumlet];
   const world = uploadedWorld(
     { sourceSizeBytes: BigInt(100_000_000), gumletWorkspaceId: 'ws', frameRate: null, ...byState, ...overrides },
-    parts,
+    { hlsMinBuild: MIN_BUILD, ...parts },
   );
   enrol(world);
   return world;
@@ -439,7 +459,7 @@ describe('authorised, enrolled recipients only', () => {
 
     await gumletBecomes(w, 'ready');
 
-    expect(told(w)).toEqual(['student_1', 'student_3', 'this_section']);
+    expect(told(w)).toEqual(['student_1', 'student_3', 'student_4', 'this_section']);
   });
 
   it('a lecture reused in another course notifies only its own course', async () => {
@@ -511,9 +531,10 @@ describe('playback availability: nobody is told about a lecture they cannot play
 
     expect(w.db.get(V)).toMatchObject({ status: 'FAILED', mobileStatus: 'READY' });
     expect(told(w)).toEqual(APP_READY);
-    expect(bodyFor(w, 'student_1')).toBe('Lecture 1 is ready to watch in the mobile app.');
+    expect(bodyFor(w, 'student_1')).toBe('Lecture 1 is now available to watch in the mobile app.');
     expect(w.db.notifications[0].bodyAr).toContain('تطبيق الهاتف');
-    // student_2's phone has only ever been served Gumlet; student_3 has no phone.
+    // student_2's phone is on an older build, student_3 has no phone, and
+    // student_4's phone has not said what it runs.
     expect(state(w)).toBe('MOBILE');
   });
 
@@ -542,12 +563,12 @@ describe('playback availability: nobody is told about a lecture they cannot play
     await gumletBecomes(w, 'ready');
 
     expect(told(w)).toEqual(EVERYONE);
-    expect(bodyFor(w, 'student_1')).toBe('Lecture 1 is ready to watch in the mobile app.');
+    expect(bodyFor(w, 'student_1')).toBe('Lecture 1 is now available to watch in the mobile app.');
     expect(bodyFor(w, 'student_2')).toBe('Lecture 1 is ready to watch.');
     expect(state(w)).toBe('DONE');
     // Two pushes, to two disjoint groups.
     const pushed = [...w.pushQueue.jobs.values()].map((j) => (j.data.userIds as string[]).slice().sort());
-    expect(pushed).toEqual([APP_READY, ['student_2', 'student_3']]);
+    expect(pushed).toEqual([APP_READY, ['student_2', 'student_3', 'student_4']]);
   });
 
   it('mobile HLS delivery switched to Gumlet and Gumlet FAILED: playable nowhere, so nobody is told', async () => {
@@ -622,7 +643,7 @@ describe('exactly one notification per student per lecture', () => {
 
   it('both completions land in the same instant, in two processes: the database claim lets one dispatch through', async () => {
     const w = lecture('ready', { mobileStatus: 'READY', hlsPrefix: 'hls/v_1/', renditions: [{ height: 720 }] });
-    const worker = apiProcess({ db: w.db, redis: w.redis, pushQueue: w.pushQueue });
+    const worker = apiProcess({ db: w.db, redis: w.redis, pushQueue: w.pushQueue, hlsMinBuild: MIN_BUILD });
 
     const outcomes = await Promise.all([
       w.announcer.onFirstPlayable(V, 'gumlet'),
@@ -938,7 +959,7 @@ describe('a failed dispatch is retried safely', () => {
     expect(told(w)).toEqual(EVERYONE);
     expect(state(w)).toBe('DONE');
     const pushed = [...w.pushQueue.jobs.values()].flatMap((j) => j.data.userIds as string[]).sort();
-    expect(pushed).toEqual(['student_3', 'this_section']);
+    expect(pushed).toEqual(['student_3', 'student_4', 'this_section']);
   });
 
   it('a claim that is still fresh belongs to a live process: nobody else touches it', async () => {
@@ -989,6 +1010,550 @@ describe('a failed dispatch is retried safely', () => {
     await expect(second.announcer.settle(V)).resolves.toBe('failed');
     await expect(second.announcer.settleForLesson('lesson_1')).resolves.toBeUndefined();
     expect(second.announcer.needsAttention()).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('publication is the trigger: publishing a lesson, a section or a course sends at once', () => {
+  const manage = { assertCanManageCourse: jest.fn(async () => undefined) };
+  const sections = (w: World) =>
+    new SectionsService(w.db as never, manage as never, w.courses as never, w.audit as never, w.announcer);
+  const coursesAdmin = (w: World) =>
+    new CoursesAdminService(
+      w.db as never,
+      w.courses as never,
+      manage as never,
+      w.audit as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      w.announcer,
+    );
+  const draftSection = (w: World) =>
+    w.db.sections.set('section_1', { id: 'section_1', courseId: 'course_1', status: 'DRAFT', deletedAt: null });
+  const draftCourse = (w: World, status = 'DRAFT') =>
+    w.db.courses.set('course_1', { id: 'course_1', status, deletedAt: null });
+
+  /** `count` lectures of course_1, all playable and all still waiting to be announced. */
+  function waitingLectures(count: number): World {
+    const rows = Array.from({ length: count }, (_v, i) =>
+      videoRow({
+        id: `w_${i}`,
+        lessonId: `lesson_${i}`,
+        lesson: { id: `lesson_${i}`, title: `Lecture ${i}`, courseId: 'course_1' },
+        lessonLinks: [{ lessonId: `lesson_${i}` }],
+        sourceKey: `source/videos/w_${i}/a.mp4`,
+        status: 'READY',
+        gumletAssetId: `asset_${i}`,
+        gumletStatus: 'ready',
+        newVideoAnnounceState: 'PENDING',
+        newVideoAnnounceStateAt: new Date(Date.now() - i * 1000),
+      }),
+    );
+    const w = apiProcess({ db: new FakeDb(rows), hlsMinBuild: MIN_BUILD });
+    enrol(w);
+    return w;
+  }
+  const keys = (w: World) => w.db.notifications.map((n) => n.dedupeKey as string);
+
+  it('publishing the SECTION sends inside that request - no reconciler pass involved', async () => {
+    const w = lecture('processing');
+    draftSection(w);
+    await gumletBecomes(w, 'ready');
+    expect(told(w)).toEqual([]);
+
+    await sections(w).update('section_1', { status: 'PUBLISHED' as never }, ADMIN as never);
+
+    expect(told(w)).toEqual(EVERYONE);
+    expect(state(w)).toBe('DONE');
+    expect(w.pushQueue.jobs.size).toBe(1);
+  });
+
+  it('editing a published section (a rename) sends nothing and looks nothing up', async () => {
+    const w = lecture('processing');
+    await gumletBecomes(w, 'ready');
+    const settle = jest.spyOn(w.announcer, 'settleForSection');
+
+    await sections(w).update('section_1', { title: 'Renamed' }, ADMIN as never);
+
+    expect(settle).not.toHaveBeenCalled();
+    expect(told(w)).toEqual(EVERYONE);
+  });
+
+  it('publishing the COURSE sends inside that request', async () => {
+    const w = lecture('processing');
+    draftCourse(w);
+    await gumletBecomes(w, 'ready');
+    expect(told(w)).toEqual([]);
+
+    await coursesAdmin(w).publish('course_1', ADMIN as never);
+
+    expect(w.db.courseOf('course_1').status).toBe('PUBLISHED');
+    expect(told(w)).toEqual(EVERYONE);
+    expect(state(w)).toBe('DONE');
+  });
+
+  it.each(['DRAFT', 'SUSPENDED'])('a course going from %s to HIDDEN (unlisted) starts serving its students: sent at once', async (from) => {
+    const w = lecture('processing');
+    draftCourse(w, from);
+    await gumletBecomes(w, 'ready');
+    expect(told(w)).toEqual([]);
+
+    await coursesAdmin(w).unpublish('course_1', ADMIN as never, 'HIDDEN');
+
+    expect(told(w)).toEqual(EVERYONE);
+  });
+
+  it('a course that was already being served (PUBLISHED to HIDDEN, or taken down) triggers nothing', async () => {
+    const w = lecture('processing');
+    const settle = jest.spyOn(w.announcer, 'settleForCourse');
+    await gumletBecomes(w, 'ready');
+
+    await coursesAdmin(w).unpublish('course_1', ADMIN as never, 'HIDDEN');
+    await coursesAdmin(w).unpublish('course_1', ADMIN as never, 'DRAFT');
+
+    expect(settle).not.toHaveBeenCalled();
+    expect(told(w)).toEqual(EVERYONE);
+  });
+
+  it('every lecture is still checked on its own: publishing the section does not release a DRAFT lesson', async () => {
+    const w = waitingLectures(2);
+    draftSection(w);
+    w.db.lessons.get('lesson_1')!.status = 'DRAFT';
+
+    await sections(w).update('section_1', { status: 'PUBLISHED' as never }, ADMIN as never);
+
+    expect(new Set(w.db.notifications.map((n) => n.route))).toEqual(new Set(['/lesson/lesson_0']));
+    expect(state(w, 'w_1')).toBe('PENDING');
+
+    await new LessonsService(w.db as never, manage as never, w.courses as never, w.audit as never, w.announcer).update(
+      'lesson_1',
+      { status: 'PUBLISHED' },
+      ADMIN as never,
+    );
+    expect(w.db.notifications.filter((n) => n.route === '/lesson/lesson_1').map((n) => n.userId).sort()).toEqual(EVERYONE);
+  });
+
+  it('publishing the lesson while its section is still a draft sends nothing; publishing the section then does', async () => {
+    const w = lecture('processing');
+    draftSection(w);
+    w.db.lessons.get('lesson_1')!.status = 'DRAFT';
+    await gumletBecomes(w, 'ready');
+
+    await setLessonStatus(w, 'PUBLISHED');
+    expect(told(w)).toEqual([]);
+
+    await sections(w).update('section_1', { status: 'PUBLISHED' as never }, ADMIN as never);
+    expect(told(w)).toEqual(EVERYONE);
+  });
+
+  it('a section with a release date in the future waits; the reconciler sends it once the date has passed', async () => {
+    const w = lecture('processing');
+    w.db.sections.set('section_1', {
+      id: 'section_1',
+      courseId: 'course_1',
+      status: 'PUBLISHED',
+      deletedAt: null,
+      unlocksAt: new Date(Date.now() + 3_600_000),
+    });
+
+    await gumletBecomes(w, 'ready');
+    await reconcile(w);
+    expect(told(w)).toEqual([]);
+    expect(state(w)).toBe('PENDING');
+
+    w.db.sections.get('section_1')!.unlocksAt = new Date(Date.now() - 1000);
+    await reconcile(w);
+    expect(told(w)).toEqual(EVERYONE);
+  });
+
+  it('a free preview is not held by the release date or by section-scoped enrolments, as on the lesson endpoint', async () => {
+    const w = lecture('processing');
+    w.db.lessons.get('lesson_1')!.isPreview = true;
+    w.db.sections.set('section_1', {
+      id: 'section_1',
+      courseId: 'course_1',
+      status: 'PUBLISHED',
+      deletedAt: null,
+      unlocksAt: new Date(Date.now() + 3_600_000),
+    });
+
+    await gumletBecomes(w, 'ready');
+
+    // Everyone with live access to the course, including the student whose
+    // enrolment covers a different section.
+    expect(told(w)).toEqual([...EVERYONE, 'other_section'].sort());
+  });
+
+  it('BULK: a course with 40 waiting lectures - a bounded batch in the request, the rest by the reconciler, no duplicates', async () => {
+    const w = waitingLectures(40);
+    draftCourse(w);
+    const gate = jest.spyOn(w.access, 'assertContentAccess');
+
+    await coursesAdmin(w).publish('course_1', ADMIN as never);
+
+    // In the request: the batch, and no more.
+    expect(w.db.notifications).toHaveLength(ANNOUNCE_PUBLISH_BATCH * EVERYONE.length);
+    expect([...w.db.rows.values()].filter((r) => r.newVideoAnnounceState === 'DONE')).toHaveLength(ANNOUNCE_PUBLISH_BATCH);
+    // The access gate was asked once per candidate student, not once per lecture.
+    const candidates = w.db.enrollments.filter(
+      (e) => e.courseId === 'course_1' && e.state === 'ACTIVE' && e.user.status === 'ACTIVE' && !e.user.deletedAt,
+    ).length;
+    expect(gate).toHaveBeenCalledTimes(candidates);
+    // The rest is flagged, so the reconciler wakes for it without waiting for its background interval.
+    expect(w.announcer.needsAttention()).toBe(true);
+
+    const reconciler = new VideoPipelineReconciler(w.videos, w.announcer);
+    await reconciler.tick();
+    expect(await reconciler.wake(Date.now() + 1000)).toBe(false);
+
+    expect(w.db.notifications).toHaveLength(40 * EVERYONE.length);
+    expect(new Set(keys(w)).size).toBe(40 * EVERYONE.length);
+    expect([...w.db.rows.values()].every((r) => r.newVideoAnnounceState === 'DONE')).toBe(true);
+  });
+
+  it('BULK: the request also stops when its time budget is spent', async () => {
+    const w = waitingLectures(10);
+    draftCourse(w);
+    // Every look at the clock finds 700 ms gone: the 3 s budget ends after a few lectures.
+    const realNow = Date.now.bind(Date);
+    let skew = 0;
+    const clock = jest.spyOn(Date, 'now').mockImplementation(() => realNow() + (skew += 700));
+    try {
+      await coursesAdmin(w).publish('course_1', ADMIN as never);
+    } finally {
+      clock.mockRestore();
+    }
+
+    const inRequest = w.db.notifications.length / EVERYONE.length;
+    expect(inRequest).toBeGreaterThan(0);
+    expect(inRequest).toBeLessThan(10);
+    expect(w.announcer.needsAttention()).toBe(true);
+
+    await reconcile(w);
+    expect(w.db.notifications).toHaveLength(10 * EVERYONE.length);
+    expect(new Set(keys(w)).size).toBe(10 * EVERYONE.length);
+  });
+
+  it('a publish, the reconciler and a second process all at once: one notification per student', async () => {
+    const w = lecture('processing');
+    draftSection(w);
+    await gumletBecomes(w, 'ready');
+    const other = apiProcess({ db: w.db, redis: w.redis, pushQueue: w.pushQueue, hlsMinBuild: MIN_BUILD });
+    // The section is published in the database by the time anyone looks.
+    w.db.sections.get('section_1')!.status = 'DRAFT';
+
+    await Promise.all([
+      sections(w).update('section_1', { status: 'PUBLISHED' as never }, ADMIN as never),
+      w.announcer.settleForSection('section_1'),
+      other.announcer.settleDue(),
+      reconcile(w),
+    ]);
+    await reconcile(w);
+
+    expect(told(w)).toEqual(EVERYONE);
+    expect(w.pushQueue.jobs.size).toBe(1);
+  });
+
+  it('nothing waiting in what was published: one query, and nothing else', async () => {
+    const w = lecture('ready', { newVideoAnnounceState: 'DONE', newVideoAnnounceStateAt: new Date() });
+    draftSection(w);
+    const reads = jest.spyOn(w.db.video, 'findFirst');
+
+    await sections(w).update('section_1', { status: 'PUBLISHED' as never }, ADMIN as never);
+
+    expect(reads).not.toHaveBeenCalled();
+    expect(told(w)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('app-only eligibility: what the phone reports, not what the student has played', () => {
+  const body = 'Lecture 1 is now available to watch in the mobile app.';
+
+  it('a student who has never played anything is told: their phone signed in on an HLS-capable build', async () => {
+    const w = lecture('failed');
+    w.db.tickets = []; // nobody has ever requested a ticket of any kind
+
+    await encodeForMobile(w);
+
+    expect(told(w)).toEqual(['student_1']);
+    expect(bodyFor(w, 'student_1')).toBe(body);
+  });
+
+  it('says where it can be watched, in the title and in the body, in both languages', async () => {
+    const w = lecture('failed');
+    await encodeForMobile(w);
+
+    expect(w.db.notifications[0]).toMatchObject({
+      title: 'New video available in the mobile app',
+      titleAr: 'فيديو جديد متاح في تطبيق الهاتف',
+      body,
+      bodyAr: 'Lecture 1 أصبح متاحًا للمشاهدة في تطبيق الهاتف.',
+    });
+  });
+
+  it('a phone on a build older than the first HLS build is not told; nor is one whose build is unknown', async () => {
+    const w = lecture('failed');
+    await encodeForMobile(w);
+
+    expect(told(w)).not.toContain('student_2'); // build 10 < 12
+    expect(told(w)).not.toContain('student_4'); // no build recorded, no declaration
+  });
+
+  it('a browser, a revoked phone and an account without a phone are not a compatible phone', async () => {
+    const w = lecture('failed');
+    await encodeForMobile(w);
+
+    // student_3: a web device reporting build 12. student_2: a REVOKED phone on build 14 that played HLS.
+    expect(told(w)).toEqual(APP_READY);
+  });
+
+  it('an app that has itself declared HLS support counts, even with no minimum configured for its platform', async () => {
+    const w = lecture('failed');
+    await encodeForMobile(w);
+    expect(told(w)).toContain('this_section'); // iOS: no minimum; the app was issued an HLS ticket
+  });
+
+  it('with NO minimum build configured, no phone is vouched for by its build: only declared support counts', async () => {
+    const w = lecture('failed', {}, { hlsMinBuild: { android: null, ios: null } });
+    await encodeForMobile(w);
+    expect(told(w)).toEqual(['this_section']);
+    expect(state(w)).toBe('MOBILE');
+  });
+
+  it.each(['1.2.3', 'abc', '', '0', '-5'])('a build that is not a plain positive number (%p) is unknown, not assumed', async (build) => {
+    const w = lecture('failed');
+    w.db.devices.find((d) => d.id === 'd1')!.appBuild = build;
+    await encodeForMobile(w);
+    expect(told(w)).toEqual(['this_section']);
+  });
+
+  it('nobody compatible at all: nothing is sent, nobody is dismissed - the lecture stays owed to everyone', async () => {
+    const w = lecture('failed', {}, { hlsMinBuild: { android: null, ios: null } });
+    w.db.tickets = [];
+
+    await encodeForMobile(w);
+    expect(told(w)).toEqual([]);
+    expect(state(w)).toBe('MOBILE');
+
+    await gumletBecomes(w, 'ready');
+    expect(told(w)).toEqual(EVERYONE);
+  });
+
+  it('a held-back student who signs in on a compatible build is told then - once, with the app wording', async () => {
+    const w = lecture('failed');
+    await encodeForMobile(w);
+    expect(told(w)).toEqual(APP_READY);
+    // The app-only announcement went out an hour ago.
+    const since = new Date(Date.now() - 3_600_000);
+    w.db.get(V).newVideoAnnounceStateAt = since;
+
+    // student_4 opens the updated app and signs in.
+    w.db.devices.find((d) => d.id === 'd5')!.appBuild = '12';
+    await reconcile(w);
+
+    expect(told(w)).toEqual(['student_1', 'student_4', 'this_section']);
+    expect(bodyFor(w, 'student_4')).toBe(body);
+    expect(state(w)).toBe('MOBILE');
+    // Looking again does not restart the days it is looked at.
+    expect(w.db.get(V).newVideoAnnounceStateAt).toEqual(since);
+
+    await reconcile(w);
+    await reconcile(w);
+    expect(told(w)).toEqual(['student_1', 'student_4', 'this_section']);
+  });
+
+  it('looking again with nobody new writes nothing at all', async () => {
+    const w = lecture('failed');
+    await encodeForMobile(w);
+    const writes = w.db.writes.length;
+    const pushes = w.pushQueue.jobs.size;
+
+    await reconcile(w);
+    await reconcile(w);
+
+    expect(w.db.writes.length).toBe(writes);
+    expect(w.pushQueue.jobs.size).toBe(pushes);
+    expect(told(w)).toEqual(APP_READY);
+  });
+
+  it('...and only for a few days: after that, the app-only announcement is closed', async () => {
+    const w = lecture('failed');
+    await encodeForMobile(w);
+    w.db.get(V).newVideoAnnounceStateAt = new Date(Date.now() - ANNOUNCE_MOBILE_RECHECK_MS - 60_000);
+
+    w.db.devices.find((d) => d.id === 'd5')!.appBuild = '12';
+    await reconcile(w);
+
+    expect(told(w)).toEqual(APP_READY);
+  });
+
+  it('when Gumlet recovers, everyone who was held back is told, and nobody twice', async () => {
+    const w = lecture('failed');
+    await encodeForMobile(w);
+    w.db.devices.find((d) => d.id === 'd5')!.appBuild = '12';
+    await reconcile(w);
+
+    await gumletBecomes(w, 'ready');
+
+    expect(told(w)).toEqual(EVERYONE);
+    expect(bodyFor(w, 'student_2')).toBe('Lecture 1 is ready to watch.');
+    expect(bodyFor(w, 'student_4')).toBe(body);
+    expect(state(w)).toBe('DONE');
+  });
+
+  it('the access gates still apply to a compatible phone', async () => {
+    const w = lecture('failed');
+    // A compatible phone belonging to a student whose access window has ended.
+    w.db.devices.push({ id: 'd9', userId: 'window_over', platform: 'android', status: 'ACTIVE', appBuild: '20' });
+    await encodeForMobile(w);
+    expect(told(w)).toEqual(APP_READY);
+  });
+
+  it('build numbers are read strictly, and stored only if they look like one', () => {
+    expect(parseBuild('12')).toBe(12);
+    expect(parseBuild(' 12 ')).toBe(12);
+    for (const bad of ['1.2.3', '12a', '', '0', '-1', null, undefined]) expect(parseBuild(bad)).toBeNull();
+
+    expect(storedBuild('12')).toBe('12');
+    expect(storedBuild('1.0.2.7')).toBe('1.0.2.7');
+    for (const bad of ['', 'abc', '12; DROP TABLE', 'x'.repeat(40), null, undefined]) expect(storedBuild(bad)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('the build a phone reports is recorded when it signs in and when it refreshes its tokens', () => {
+  const descriptor = (appBuild: string | null, deviceKey: string | null = 'phone-key-1') =>
+    ({
+      deviceKey,
+      platform: 'android',
+      model: 'Pixel 8',
+      name: null,
+      osVersion: '15',
+      appVersion: '1.0.0',
+      appBuild,
+      integritySuspect: false,
+    }) as never;
+
+  /** The real DevicesService over one device row. */
+  function devices(row: { id: string; userId: string; deviceKey: string; appBuild: string | null }) {
+    const writes: { where: Record<string, unknown>; data: Record<string, unknown> }[] = [];
+    const prisma = {
+      device: {
+        updateMany: jest.fn(async (args: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+          const where = args.where as { userId: string; deviceKey: string };
+          const mine = where.userId === row.userId && where.deviceKey === row.deviceKey;
+          const changed = row.appBuild === null || row.appBuild !== args.data.appBuild;
+          if (!mine || !changed) return { count: 0 };
+          writes.push(args);
+          row.appBuild = args.data.appBuild as string;
+          return { count: 1 };
+        }),
+      },
+    };
+    const service = Object.create(DevicesService.prototype) as DevicesService;
+    Object.assign(service, { prisma });
+    return { service, prisma, writes };
+  }
+
+  it('an app update is picked up on the next token refresh, without a new sign-in', async () => {
+    const row = { id: 'd1', userId: 'student_1', deviceKey: 'phone-key-1', appBuild: '10' };
+    const d = devices(row);
+
+    await d.service.noteAppBuild('student_1', descriptor('12'));
+
+    expect(row.appBuild).toBe('12');
+    // The write names the caller's own device and nothing else.
+    expect(d.writes[0].where).toMatchObject({ userId: 'student_1', deviceKey: 'phone-key-1' });
+    expect(d.writes[0].data).toEqual({ appBuild: '12' });
+  });
+
+  it('a device that had never reported a build gets one', async () => {
+    const row = { id: 'd1', userId: 'student_1', deviceKey: 'phone-key-1', appBuild: null };
+    const d = devices(row);
+    await d.service.noteAppBuild('student_1', descriptor('12'));
+    expect(row.appBuild).toBe('12');
+  });
+
+  it('an unchanged build writes nothing', async () => {
+    const row = { id: 'd1', userId: 'student_1', deviceKey: 'phone-key-1', appBuild: '12' };
+    const d = devices(row);
+    await d.service.noteAppBuild('student_1', descriptor('12'));
+    expect(d.writes).toHaveLength(0);
+  });
+
+  it.each([null, '', 'abc', '12; DROP TABLE devices', 'x'.repeat(40)])('a missing or malformed build header (%p) is not stored and not even queried', async (bad) => {
+    const row = { id: 'd1', userId: 'student_1', deviceKey: 'phone-key-1', appBuild: '10' };
+    const d = devices(row);
+    await d.service.noteAppBuild('student_1', descriptor(bad));
+    expect(d.prisma.device.updateMany).not.toHaveBeenCalled();
+    expect(row.appBuild).toBe('10');
+  });
+
+  it('a request without a device id, or for somebody else\'s device, changes nothing', async () => {
+    const row = { id: 'd1', userId: 'student_1', deviceKey: 'phone-key-1', appBuild: '10' };
+    const d = devices(row);
+    await d.service.noteAppBuild('student_1', descriptor('12', null));
+    await d.service.noteAppBuild('student_2', descriptor('12'));
+    await d.service.noteAppBuild('student_1', descriptor('12', 'another-phone'));
+    expect(row.appBuild).toBe('10');
+  });
+
+  it('never throws, whatever the database does', async () => {
+    const d = devices({ id: 'd1', userId: 'student_1', deviceKey: 'phone-key-1', appBuild: '10' });
+    d.prisma.device.updateMany.mockRejectedValueOnce(new Error('connection reset'));
+    await expect(d.service.noteAppBuild('student_1', descriptor('12'))).resolves.toBeUndefined();
+  });
+
+  /** The real AuthService.refresh, with the token rotation itself replaced by its result. */
+  function refreshWith(devicesDouble: unknown, rotation: () => Promise<unknown>) {
+    const auth = Object.create(AuthService.prototype) as AuthService;
+    Object.assign(auth, { devices: devicesDouble, rotateRefresh: jest.fn(rotation) });
+    return auth;
+  }
+  const tokens = { user: { id: 'student_1' }, accessToken: 'a', refreshToken: 'r' };
+
+  it('a successful token refresh reports the build the app is running', async () => {
+    const noteAppBuild = jest.fn(async () => undefined);
+    const auth = refreshWith({ noteAppBuild }, async () => tokens);
+
+    const result = await auth.refresh('old-refresh-token', { device: descriptor('12') } as never);
+
+    expect(result).toBe(tokens);
+    expect(noteAppBuild).toHaveBeenCalledWith('student_1', expect.objectContaining({ appBuild: '12' }));
+  });
+
+  it('a failed token refresh reports nothing and fails exactly as before', async () => {
+    const noteAppBuild = jest.fn(async () => undefined);
+    const auth = refreshWith({ noteAppBuild }, async () => {
+      throw new Error('SESSION_EXPIRED');
+    });
+
+    await expect(auth.refresh('bad', { device: descriptor('12') } as never)).rejects.toThrow('SESSION_EXPIRED');
+    expect(noteAppBuild).not.toHaveBeenCalled();
+  });
+
+  it('recording the build can neither delay nor fail the refresh', async () => {
+    const never = refreshWith({ noteAppBuild: () => new Promise(() => undefined) }, async () => tokens);
+    await expect(never.refresh('t', { device: descriptor('12') } as never)).resolves.toBe(tokens);
+
+    const rejects = refreshWith({ noteAppBuild: async () => Promise.reject(new Error('boom')) }, async () => tokens);
+    await expect(rejects.refresh('t', { device: descriptor('12') } as never)).resolves.toBe(tokens);
+
+    const throws = refreshWith(
+      {
+        noteAppBuild: () => {
+          throw new Error('boom');
+        },
+      },
+      async () => tokens,
+    );
+    await expect(throws.refresh('t', { device: descriptor('12') } as never)).resolves.toBe(tokens);
+
+    // A double that predates the method (as many existing tests use).
+    const missing = refreshWith({}, async () => tokens);
+    await expect(missing.refresh('t', { device: descriptor('12') } as never)).resolves.toBe(tokens);
   });
 });
 

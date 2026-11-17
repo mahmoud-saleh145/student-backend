@@ -219,6 +219,13 @@ export class EnvironmentVariables {
    */
   @toBool() @IsBoolean() NEW_VIDEO_NOTIFICATIONS_ENABLED = true;
   /**
+   * First native build (Android versionCode / iOS build number) whose app
+   * plays the mobile HLS stream. Only decides who is told about a lecture that
+   * is playable in the app alone. Read by the API and by the worker.
+   */
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(999_999_999) MOBILE_HLS_MIN_BUILD_ANDROID?: number;
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(999_999_999) MOBILE_HLS_MIN_BUILD_IOS?: number;
+  /**
    * Background interval of the pipeline reconciler (seconds; default 600,
    * minimum 60, 0 disables it). It also scans at boot and every 30 s while a
    * delivery is known to have failed. See video-pipeline-reconciler.service.ts.

@@ -1244,6 +1244,12 @@ model Device {
   model     String?
   osVersion String?
   appVersion String?
+  /// The native build number the app reported the last time this device signed
+  /// in (`X-App-Build`: Android versionCode, iOS build number). Every build of
+  /// the app reports the same `appVersion`, so this is the only stored signal
+  /// that tells an install that plays the mobile HLS stream from an older one.
+  /// NULL = not reported yet (the device has not signed in since this existed).
+  appBuild  String?
   status    DeviceStatus @default(ACTIVE)
 
   /// Client-reported integrity signal. A hint only — server-side attestation

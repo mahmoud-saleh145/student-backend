@@ -35,6 +35,16 @@ export interface FakeLesson {
   status: string;
   deletedAt: Date | null;
   sectionId: string;
+  isPreview?: boolean;
+}
+
+export interface FakeSection {
+  id: string;
+  courseId: string;
+  status: string;
+  deletedAt: Date | null;
+  /** Drip release: students cannot open the section's lessons before this. */
+  unlocksAt?: Date | null;
 }
 
 export interface FakeEnrollment {
@@ -140,20 +150,20 @@ export class FakeDb {
   /** Lectures, by id: what the course list shows a duration from, and whether students can see them. */
   readonly lessons = new Map<string, FakeLesson>();
   /** Sections and courses, by id. Anything not listed is PUBLISHED. */
-  readonly sections = new Map<string, { id: string; courseId: string; status: string; deletedAt: Date | null }>();
+  readonly sections = new Map<string, FakeSection>();
   readonly courses = new Map<string, { id: string; status: string; deletedAt: Date | null }>();
   /** Course enrolments, with the account each belongs to. */
   enrollments: FakeEnrollment[] = [];
   /** Bound devices, and the playback tickets issued to them. */
-  devices: { id: string; userId: string; platform: string; status: string }[] = [];
+  devices: { id: string; userId: string; platform: string; status: string; appBuild?: string | null }[] = [];
   tickets: { deviceId: string; delivery: string }[] = [];
   /** Every notification row written, in order. */
   readonly notifications: Row[] = [];
   /** Set to make the notification insert fail (and only that). */
   notificationsDown = false;
 
-  sectionOf(id: string) {
-    return this.sections.get(id) ?? { id, courseId: 'course_1', status: 'PUBLISHED', deletedAt: null };
+  sectionOf(id: string): FakeSection {
+    return this.sections.get(id) ?? { id, courseId: 'course_1', status: 'PUBLISHED', deletedAt: null, unlocksAt: null };
   }
   courseOf(id: string) {
     return this.courses.get(id) ?? { id, status: 'PUBLISHED', deletedAt: null };
@@ -240,7 +250,18 @@ export class FakeDb {
     },
     findMany: async (args: { where?: Record<string, unknown>; take?: number }) => {
       this.guard();
-      const found = [...this.rows.values()].filter((row) => matches(row, args.where)).map((row) => this.hydrate(row));
+      // `lesson: { sectionId }` is a relation filter; everything else is a field.
+      const { lesson: lessonFilter, ...fields } = (args.where ?? {}) as Record<string, unknown> & {
+        lesson?: { sectionId?: string };
+      };
+      const found = [...this.rows.values()]
+        .filter((row) => matches(row, fields))
+        .filter((row) => {
+          if (!lessonFilter?.sectionId) return true;
+          const lesson = typeof row.lessonId === 'string' ? this.lessons.get(row.lessonId) : undefined;
+          return lesson?.sectionId === lessonFilter.sectionId;
+        })
+        .map((row) => this.hydrate(row));
       return args.take ? found.slice(0, args.take) : found;
     },
     count: async (args: { where?: Record<string, unknown> }) => {
@@ -315,11 +336,23 @@ export class FakeDb {
     },
   };
   readonly course = {
-    // CourseAccessService.resolve(): the course, unless it is deleted.
+    // CourseAccessService.resolve() and the admin service: the course, unless
+    // it is deleted. Shaped so that `publish` finds nothing to object to.
     findFirst: async (args: { where: { id: string } }) => {
       this.guard();
       const course = this.courseOf(args.where.id);
-      return course.deletedAt ? null : { ...course, enrollmentMethods: [], isFree: false };
+      return course.deletedAt
+        ? null
+        : { ...course, enrollmentMethods: ['FREE'], isFree: true, prices: [], publishedAt: null, _count: { teachers: 1 } };
+    },
+    update: async (args: { where: { id: string }; data: Record<string, unknown> }) => {
+      this.guard();
+      const course = { ...this.courseOf(args.where.id) };
+      for (const [key, value] of Object.entries(args.data)) {
+        if (value !== undefined) (course as unknown as Record<string, unknown>)[key] = value;
+      }
+      this.courses.set(course.id, course);
+      return { ...course, publishedAt: (args.data.publishedAt as Date | undefined) ?? null };
     },
   };
   readonly courseSection = {
@@ -327,6 +360,20 @@ export class FakeDb {
     findMany: async () => {
       this.guard();
       return [];
+    },
+    findFirst: async (args: { where: { id: string } }) => {
+      this.guard();
+      const section = this.sectionOf(args.where.id);
+      return section.deletedAt ? null : { ...section, title: 'Section' };
+    },
+    update: async (args: { where: { id: string }; data: Record<string, unknown> }) => {
+      this.guard();
+      const section = { ...this.sectionOf(args.where.id) };
+      for (const [key, value] of Object.entries(args.data)) {
+        if (value !== undefined) (section as unknown as Record<string, unknown>)[key] = value;
+      }
+      this.sections.set(section.id, section);
+      return { ...section, title: 'Section' };
     },
   };
   readonly accessCodeRedemption = {
@@ -571,6 +618,8 @@ export function apiProcess(
     withMobileQueue?: boolean;
     /** NEW_VIDEO_NOTIFICATIONS_ENABLED for this process (default on). */
     newVideoNotifications?: boolean;
+    /** MOBILE_HLS_MIN_BUILD_ANDROID / _IOS for this process (default: not configured). */
+    hlsMinBuild?: { android: number | null; ios: number | null };
   } = {},
 ): World {
   const db = parts.db ?? new FakeDb();
@@ -597,7 +646,12 @@ export function apiProcess(
       ladder: [480, 720, 1080],
       encryptionEnabled: true,
       workDir: '/tmp/edu-transcode',
-      mobile: { delivery: 'hls', gumletFallback: true, autoProcess: parts.autoProcess ?? true },
+      mobile: {
+        delivery: 'hls',
+        gumletFallback: true,
+        autoProcess: parts.autoProcess ?? true,
+        hlsMinBuild: parts.hlsMinBuild ?? { android: null, ios: null },
+      },
       newVideoNotifications: parts.newVideoNotifications ?? true,
       drm: {
         enabled: true,
