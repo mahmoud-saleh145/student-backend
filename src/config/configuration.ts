@@ -257,7 +257,7 @@ export const videoConfig = registerAs('video', () => ({
    * recorded as announced, so switching this back on does not announce
    * everything that became playable in the meantime.
    */
-  newVideoNotifications: bool(process.env.NEW_VIDEO_NOTIFICATIONS_ENABLED, true),
+  newVideoNotifications: bool(process.env.NEW_VIDEO_NOTIFICATIONS_ENABLED, false),
   drm: {
     enabled: bool(process.env.DRM_ENABLED),
     provider: (process.env.DRM_PROVIDER ?? 'none') as 'none' | 'gumlet',

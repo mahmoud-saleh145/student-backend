@@ -38,6 +38,7 @@ import { orderSharedLectureCandidates } from '../videos/shared-lecture-order';
 import { ManifestService } from './manifest.service';
 import { GumletDrmService } from './gumlet-drm.service';
 import {
+  buildMayPlayMobileHls,
   effectiveMobileDelivery,
   MOBILE_DELIVERY_OVERRIDE_KEY,
   MOBILE_DEVICE_PLATFORMS,
@@ -244,6 +245,13 @@ export class PlaybackService {
     delivery?: 'embed';
     /** Client build capabilities; `hls-aes128` opts a mobile device into the independent pipeline. */
     capabilities?: string[];
+    /**
+     * What the device says it is (`X-Device-Platform`, `X-App-Build`). Used for
+     * one decision: whether a build that declares `hls-aes128` is new enough to
+     * be served the mobile stream (see `declaresPlayableHls`).
+     */
+    devicePlatform?: string | null;
+    appBuild?: string | null;
     ip?: string | null;
     userAgent?: string | null;
     integritySuspect: boolean;
@@ -424,11 +432,9 @@ export class PlaybackService {
     // --- 6b. the deferred pipeline decision ----------------------------------
     // Before the stream slot and the play allowance, so a request that is
     // refused here has consumed neither.
+    const declaresHls = this.declaresPlayableHls(params);
     if (mobileMayCarry) {
-      const servedFromMobile = await this.mobileHlsApplies(
-        deviceId,
-        params.capabilities?.includes('hls-aes128') === true,
-      );
+      const servedFromMobile = await this.mobileHlsApplies(deviceId, declaresHls);
       if (!servedFromMobile) await this.refuseForVideoStatus(user, video);
     }
 
@@ -451,7 +457,7 @@ export class PlaybackService {
       maxHeight: params.maxHeight ?? null,
       platform: params.platform,
       delivery: params.delivery,
-      clientSupportsHls: params.capabilities?.includes('hls-aes128') === true,
+      clientSupportsHls: declaresHls,
       ip: params.ip,
       userAgent: params.userAgent,
       rotatedFromId: null,
@@ -1023,6 +1029,33 @@ export class PlaybackService {
    * The same three conditions `planDelivery` applies, in the same order, so
    * the answer here and the plan made at mint time cannot disagree.
    */
+  /**
+   * Whether this request counts as declaring `hls-aes128`.
+   *
+   * The declaration is necessary. Where a minimum build is configured for the
+   * device's platform it is not sufficient: a build older than the first one
+   * that plays the mobile stream properly, or one that does not report its
+   * build, is treated exactly like an app from before the capability existed
+   * and keeps the Gumlet grant it has always played. Nothing else about the
+   * request changes, and with no minimum configured this is the declaration
+   * alone, as before.
+   */
+  private declaresPlayableHls(params: {
+    capabilities?: string[];
+    platform?: string;
+    devicePlatform?: string | null;
+    appBuild?: string | null;
+  }): boolean {
+    if (params.capabilities?.includes('hls-aes128') !== true) return false;
+    const platform = params.devicePlatform ?? params.platform ?? null;
+    if (buildMayPlayMobileHls(platform, params.appBuild, this.videoCfg.mobile?.hlsMinBuild)) return true;
+    this.logger.log(
+      `build ${params.appBuild ?? '(not reported)'} on ${platform ?? 'unknown'} declares hls-aes128 but is ` +
+        'older than the first build that plays the mobile stream; serving it as a Gumlet client',
+    );
+    return false;
+  }
+
   private async mobileHlsApplies(deviceId: string | null, clientSupportsHls: boolean): Promise<boolean> {
     const configured = this.videoCfg.mobile;
     if (!configured) return false;

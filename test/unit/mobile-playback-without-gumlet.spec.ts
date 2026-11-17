@@ -2,6 +2,11 @@ import { ContentStatus, UserRole, VideoStatus } from '@prisma/client';
 
 import { ErrorCode } from '../../src/common/errors/error-codes';
 import { LessonsController } from '../../src/modules/lessons/lessons.controller';
+import {
+  appBuildStanding,
+  buildMayPlayMobileHls,
+  parseAppBuild,
+} from '../../src/modules/playback/mobile-delivery-override';
 import { PlaybackService } from '../../src/modules/playback/playback.service';
 import {
   gumletStateOf,
@@ -45,7 +50,11 @@ interface Options {
   renditions?: { height: number }[];
   hlsPrefix?: string | null;
   device?: { platform: string; status: string } | null;
-  mobile?: { delivery: 'hls' | 'gumlet'; gumletFallback: boolean } | null;
+  mobile?: {
+    delivery: 'hls' | 'gumlet';
+    gumletFallback: boolean;
+    hlsMinBuild?: { android: number | null; ios: number | null };
+  } | null;
   override?: { delivery: 'hls' | 'gumlet' } | null;
   deviceRefused?: boolean;
   lessonRefused?: boolean;
@@ -196,12 +205,22 @@ function build(options: Options = {}) {
     .spyOn(service as never as { acquireStreamSlot: () => Promise<void> }, 'acquireStreamSlot')
     .mockResolvedValue(undefined);
 
-  const issue = (request: { platform?: 'android' | 'ios' | 'web'; capabilities?: string[] } = {}) =>
+  const issue = (
+    request: {
+      platform?: 'android' | 'ios' | 'web';
+      capabilities?: string[];
+      /** The `X-Device-Platform` and `X-App-Build` headers of the request. */
+      devicePlatform?: string | null;
+      appBuild?: string | null;
+    } = {},
+  ) =>
     service.issueTicket({
       user: STUDENT as never,
       videoId: 'vid_1',
       platform: request.platform ?? 'android',
       capabilities: 'capabilities' in request ? request.capabilities : ['hls-aes128'],
+      devicePlatform: request.devicePlatform,
+      appBuild: request.appBuild,
       integritySuspect: false,
     } as never);
 
@@ -356,6 +375,128 @@ describe('the status a student client is shown', () => {
       { mobileHls: false },
     ]);
     expect(lessons.byVideoId).toHaveBeenCalledWith('vid_1', 'u', 'STUDENT', 'les_1', { mobileHls: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('a build that declares HLS but cannot play it properly keeps its Gumlet grant', () => {
+  // Android versionCode 11 is live on Google Play and declares `hls-aes128`,
+  // but loses the stream at the first ticket rotation. 12 is the first that
+  // does not. No iOS minimum is configured here.
+  const MIN = { delivery: 'hls' as const, gumletFallback: true, hlsMinBuild: { android: 12, ios: null } };
+  const app = (appBuild: string | null, platform: 'android' | 'ios' = 'android') => ({
+    platform,
+    capabilities: ['hls-aes128'],
+    devicePlatform: platform,
+    appBuild,
+  });
+
+  it('versionCode 11 is served Gumlet - the path it has always played - although it asks for HLS', async () => {
+    const t = build({ videoStatus: VideoStatus.READY, mobile: MIN });
+
+    const ticket = await t.issue(app('11'));
+
+    expect(ticket.drm.scheme).toBe('widevine');
+    expect(t.ticketCreate.mock.calls[0]![0].data).toMatchObject({ delivery: 'gumlet' });
+  });
+
+  it.each(['12', '13', '240'])('versionCode %s is served the mobile ladder', async (appBuild) => {
+    const t = build({ videoStatus: VideoStatus.READY, mobile: MIN });
+
+    const ticket = await t.issue(app(appBuild));
+
+    expect(ticket.drm.scheme).toBe('none');
+    expect(t.ticketCreate.mock.calls[0]![0].data).toMatchObject({ delivery: 'hls' });
+  });
+
+  it.each([null, undefined, '', 'abc', '1.2.3', '0'])(
+    'a build that does not say what it is (%p) is treated like an old one, never guessed',
+    async (appBuild) => {
+      const t = build({ videoStatus: VideoStatus.READY, mobile: MIN });
+      const ticket = await t.issue(app(appBuild as string | null));
+      expect(t.ticketCreate.mock.calls[0]![0].data).toMatchObject({ delivery: 'gumlet' });
+      expect(ticket.drm.scheme).toBe('widevine');
+    },
+  );
+
+  it('when Gumlet has FAILED, the old build is refused exactly like an app that never declared HLS', async () => {
+    const old = build({ videoStatus: VideoStatus.FAILED, mobile: MIN });
+    await expect(old.issue(app('11'))).rejects.toMatchObject({ code: ErrorCode.VIDEO_PROCESSING_FAILED });
+    // Refused before anything is consumed.
+    expect(old.slot).not.toHaveBeenCalled();
+    expect(old.playCreate).not.toHaveBeenCalled();
+    expect(old.ticketCreate).not.toHaveBeenCalled();
+
+    const current = build({ videoStatus: VideoStatus.FAILED, mobile: MIN });
+    const ticket = await current.issue(app('12'));
+    expect(ticket.drm.scheme).toBe('none');
+  });
+
+  it('a platform with NO minimum configured is decided by the declaration alone, as before', async () => {
+    const ios = build({ videoStatus: VideoStatus.READY, mobile: MIN, device: { platform: 'ios', status: 'ACTIVE' } });
+    await ios.issue(app(null, 'ios'));
+    expect(ios.ticketCreate.mock.calls[0]![0].data).toMatchObject({ delivery: 'hls' });
+
+    // No minimum anywhere: today's production behaviour, whatever the build says.
+    const unconfigured = build({ videoStatus: VideoStatus.READY });
+    await unconfigured.issue(app('3'));
+    expect(unconfigured.ticketCreate.mock.calls[0]![0].data).toMatchObject({ delivery: 'hls' });
+  });
+
+  it('a new enough build still has to declare the capability and be a bound phone', async () => {
+    const silent = build({ videoStatus: VideoStatus.READY, mobile: MIN });
+    await silent.issue({ platform: 'android', capabilities: undefined, devicePlatform: 'android', appBuild: '12' });
+    expect(silent.ticketCreate.mock.calls[0]![0].data).toMatchObject({ delivery: 'gumlet' });
+
+    const browser = build({ videoStatus: VideoStatus.READY, mobile: MIN, device: { platform: 'web', status: 'ACTIVE' } });
+    await browser.issue({ platform: 'web', capabilities: ['hls-aes128'], devicePlatform: 'web', appBuild: '12' });
+    expect(browser.ticketCreate.mock.calls[0]![0].data).toMatchObject({ delivery: 'gumlet' });
+  });
+
+  it('the operator override back to Gumlet still wins over any build', async () => {
+    const t = build({ videoStatus: VideoStatus.READY, mobile: MIN, override: { delivery: 'gumlet' } });
+    await t.issue(app('12'));
+    expect(t.ticketCreate.mock.calls[0]![0].data).toMatchObject({ delivery: 'gumlet' });
+  });
+
+  it('the lesson endpoints show an old build the Gumlet status, and a current one its own', async () => {
+    const lessons = { detail: jest.fn(async () => ({})), byVideoId: jest.fn(async () => ({})) };
+    const controller = new LessonsController(lessons as never, { get: () => ({ mobile: MIN }) } as never);
+    const user = { id: 'u', role: 'STUDENT' } as never;
+    const device = (platform: string, appBuild: string | null) => ({ platform, appBuild }) as never;
+
+    await controller.detail('les_1', user, device('android', '11'));
+    await controller.detail('les_1', user, device('android', '12'));
+    await controller.detail('les_1', user, device('android', null));
+    await controller.detail('les_1', user, device('ios', null)); // no iOS minimum configured
+    await controller.detail('les_1', user, device('web', '12'));
+
+    expect(lessons.detail.mock.calls.map((call) => (call as unknown[])[3])).toEqual([
+      { mobileHls: false },
+      { mobileHls: true },
+      { mobileHls: false },
+      { mobileHls: true },
+      { mobileHls: false },
+    ]);
+  });
+
+  it('reads a build number strictly', () => {
+    expect(parseAppBuild('12')).toBe(12);
+    expect(parseAppBuild(' 12 ')).toBe(12);
+    for (const bad of ['1.2.3', '12a', '', '0', '-1', null, undefined]) expect(parseAppBuild(bad)).toBeNull();
+
+    const min = { android: 12, ios: null };
+    expect(appBuildStanding('android', '11', min)).toBe('below');
+    expect(appBuildStanding('Android ', '12', min)).toBe('at-or-above');
+    expect(appBuildStanding('android', null, min)).toBe('unknown-build');
+    expect(appBuildStanding('ios', '1', min)).toBe('no-minimum');
+    expect(appBuildStanding('web', '99', min)).toBe('no-minimum');
+    expect(appBuildStanding('android', '11', null)).toBe('no-minimum');
+
+    expect(buildMayPlayMobileHls('android', '11', min)).toBe(false);
+    expect(buildMayPlayMobileHls('android', '12', min)).toBe(true);
+    expect(buildMayPlayMobileHls('android', 'x', min)).toBe(false);
+    expect(buildMayPlayMobileHls('ios', null, min)).toBe(true);
   });
 });
 

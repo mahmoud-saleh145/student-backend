@@ -28,6 +28,7 @@ import {
 import { CurrentUser, DeviceInfo } from '../../common/decorators/current-user.decorator';
 import { StaffOnly } from '../../common/decorators/roles.decorator';
 import type { VideoConfig } from '../../config/configuration';
+import { buildMayPlayMobileHls } from '../playback/mobile-delivery-override';
 import type { AuthenticatedUser, DeviceContext } from '../../common/types/request-context';
 
 import { LessonsService } from './lessons.service';
@@ -83,8 +84,16 @@ export class LessonsController {
   private clientOf(device: DeviceContext | null): { mobileHls: boolean } {
     const platform = device?.platform?.trim().toLowerCase();
     const native = platform === 'android' || platform === 'ios';
-    const delivery = this.config?.get<VideoConfig>('video')?.mobile?.delivery;
-    return { mobileHls: native && delivery === 'hls' };
+    const mobile = this.config?.get<VideoConfig>('video')?.mobile;
+    // A build older than the first one that plays the mobile stream is served
+    // Gumlet (see PlaybackService.declaresPlayableHls), so it is shown the
+    // status of the Gumlet side, like the web.
+    return {
+      mobileHls:
+        native &&
+        mobile?.delivery === 'hls' &&
+        buildMayPlayMobileHls(platform, device?.appBuild, mobile?.hlsMinBuild),
+    };
   }
 
   // --- student ---------------------------------------------------------------

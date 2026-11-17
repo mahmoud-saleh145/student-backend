@@ -108,8 +108,8 @@ A 44-minute lecture is therefore about 1.5–2 core-hours; see the hosting note.
 | `MOBILE_VIDEO_DELIVERY` | `hls` | `gumlet` keeps every platform on Gumlet (pre-migration behaviour) |
 | `MOBILE_HLS_GUMLET_FALLBACK` | `true` | Serve Gumlet to mobile while a video's ladder is not ready |
 | `MOBILE_PIPELINE_ENABLED` | `true` | Queue a mobile transcode for every completed upload |
-| `NEW_VIDEO_NOTIFICATIONS_ENABLED` | `true` | Tell the students who can open a lecture, once, when it is playable and its lesson is published. Read by the API and the worker. `false` sends nothing and does not announce later what became playable meanwhile |
-| `MOBILE_HLS_MIN_BUILD_ANDROID`, `MOBILE_HLS_MIN_BUILD_IOS` | unset | First native build (versionCode / iOS build number) whose app plays the mobile HLS stream. Only decides who is told when a lecture is playable in the app alone (Gumlet failed). Unset = phones of that platform are not vouched for by their build; those students are held back and told when Gumlet recovers. Read by the API and the worker |
+| `NEW_VIDEO_NOTIFICATIONS_ENABLED` | `false` | Tell the students who can open a lecture, once, when it is playable and its lesson is published. Off unless `true` on the API **and** the worker. While off, lectures that become playable are recorded as dealt with and are not announced later |
+| `MOBILE_HLS_MIN_BUILD_ANDROID`, `MOBILE_HLS_MIN_BUILD_IOS` | unset | First native build (versionCode / iOS build number) whose app plays the mobile HLS stream properly. When set: an older build, or one that does not report its build, is served Gumlet even if it declares `hls-aes128`, and is not told about a lecture playable in the app alone. Unset = the declaration alone decides. Same values on the API and the worker. Android: 12 (11 declares the capability but loses the stream at ticket rotation) |
 | `TRANSCODE_THREADS` | `0` | ffmpeg thread cap; `0` = every core but one |
 | `TRANSCODE_WORK_DIR` | `/tmp/edu-transcode` | Scratch; bind-mount it to a host folder in Docker (see below) |
 | `WORKER_QUEUES` | all | Which queues this worker consumes, e.g. `mobile-video-processing` alone |

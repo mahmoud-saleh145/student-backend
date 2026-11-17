@@ -40,6 +40,7 @@ import {
   ANNOUNCE_PUBLISH_BATCH,
   ANNOUNCE_STALE_CLAIM_MS,
   ANNOUNCE_TIMEOUT_MS,
+  NewVideoAnnouncer,
   newVideoDedupeKey,
   parseBuild,
 } from '../../src/modules/videos/new-video-announcer.service';
@@ -1559,6 +1560,46 @@ describe('the build a phone reports is recorded when it signs in and when it ref
 
 // ---------------------------------------------------------------------------
 describe('the switch', () => {
+  it('is OFF unless it is switched on: a process with no setting sends nothing, and records the lecture as dealt with', async () => {
+    const w = lecture('processing');
+    // A process whose configuration does not mention the notification at all.
+    const untold = new NewVideoAnnouncer(
+      w.db as never,
+      w.notifications,
+      w.access,
+      { getOrThrow: () => ({ mobile: { delivery: 'hls', gumletFallback: true } }) } as never,
+      w.redis as never,
+    );
+    Object.assign(w.db.get(V), { status: 'READY', newVideoAnnounceState: 'PENDING', newVideoAnnounceStateAt: new Date() });
+
+    expect(await untold.settle(V)).toBe('skipped');
+
+    expect(told(w)).toEqual([]);
+    expect(w.pushQueue.jobs.size).toBe(0);
+    expect(state(w)).toBe('DONE');
+  });
+
+  it('the shipped default is off', () => {
+    const before = process.env.NEW_VIDEO_NOTIFICATIONS_ENABLED;
+    delete process.env.NEW_VIDEO_NOTIFICATIONS_ENABLED;
+    try {
+      jest.isolateModules(() => {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { videoConfig } = require('../../src/config/configuration');
+        expect(videoConfig().newVideoNotifications).toBe(false);
+      });
+      process.env.NEW_VIDEO_NOTIFICATIONS_ENABLED = 'true';
+      jest.isolateModules(() => {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { videoConfig } = require('../../src/config/configuration');
+        expect(videoConfig().newVideoNotifications).toBe(true);
+      });
+    } finally {
+      if (before === undefined) delete process.env.NEW_VIDEO_NOTIFICATIONS_ENABLED;
+      else process.env.NEW_VIDEO_NOTIFICATIONS_ENABLED = before;
+    }
+  });
+
   it('off: nothing is sent, and switching it back on does not announce what became playable meanwhile', async () => {
     const w = lecture('processing', {}, { newVideoNotifications: false });
 

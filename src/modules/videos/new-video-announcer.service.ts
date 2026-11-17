@@ -11,7 +11,9 @@ import { NotificationsService } from '../notifications/notifications.service';
 import {
   MOBILE_DELIVERY_OVERRIDE_KEY,
   MOBILE_DEVICE_PLATFORMS,
+  appBuildStanding,
   effectiveMobileDelivery,
+  parseAppBuild,
   type MobileDeliveryOverride,
 } from '../playback/mobile-delivery-override';
 
@@ -246,7 +248,9 @@ export class NewVideoAnnouncer {
     } catch {
       // No video configuration (a unit test's bare double): the defaults apply.
     }
-    this.enabled = video?.newVideoNotifications !== false;
+    // OFF unless it is switched on. A process that was not told (a missing
+    // variable on one of the two hosts) sends nothing.
+    this.enabled = video?.newVideoNotifications === true;
     this.mobileCfg = {
       delivery: video?.mobile?.delivery === 'gumlet' ? 'gumlet' : 'hls',
       gumletFallback: video?.mobile?.gumletFallback !== false,
@@ -739,10 +743,11 @@ export class NewVideoAnnouncer {
 
   /** What a phone's recorded build says on its own. */
   private buildVerdict(platform: string, appBuild: string | null): Exclude<PhoneVerdict, 'declared'> {
-    const minimum = platform === 'android' ? this.hlsMinBuild.android : platform === 'ios' ? this.hlsMinBuild.ios : null;
-    const build = parseBuild(appBuild);
-    if (minimum === null || build === null) return 'unknown';
-    return build >= minimum ? 'build' : 'below-minimum';
+    // The same reading of a build number the ticket endpoint uses, so "told it
+    // is in the app" and "served the app's stream" cannot disagree.
+    const standing = appBuildStanding(platform, appBuild, this.hlsMinBuild);
+    if (standing === 'at-or-above') return 'build';
+    return standing === 'below' ? 'below-minimum' : 'unknown';
   }
 
   /**
@@ -808,18 +813,8 @@ export function newVideoDedupeKey(videoId: string, userId: string): string {
   return `new-video:${videoId}:${userId}`;
 }
 
-/**
- * A native build number as a whole number, or null when it is not one. Android
- * reports its versionCode ("12"); an iOS build may be dotted ("1.2.3"), which
- * cannot be compared to a single minimum and is treated as unknown.
- */
-export function parseBuild(raw: string | null | undefined): number | null {
-  if (typeof raw !== 'string') return null;
-  const text = raw.trim();
-  if (!/^\d{1,9}$/.test(text)) return null;
-  const value = Number(text);
-  return value > 0 ? value : null;
-}
+/** A native build number as a whole number, or null (see `parseAppBuild`). */
+export const parseBuild = parseAppBuild;
 
 function positiveInt(raw: unknown): number | null {
   return typeof raw === 'number' && Number.isInteger(raw) && raw > 0 ? raw : null;
