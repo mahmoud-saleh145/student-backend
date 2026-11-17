@@ -30,10 +30,10 @@ Conditions, all of them steps in section 7:
    also the default now, so a missing variable sends nothing.
 3. The mobile pause is re-issued with `scope=historical` and the watchdog
    script replaced **before** `MOBILE_PIPELINE_ENABLED=true`. The replacement
-   is the **failure-ledger watchdog** from branch
-   `fix/hls-watchdog-failure-ledger` (section 4a), not the copy in the merge
-   commit: that copy still counts yesterday's Batch 5 failures as recent and
-   would re-pause the backlog the moment it is resumed.
+   is the **failure-ledger watchdog** (section 4a): from `main` once branch
+   `fix/hls-watchdog-ledger-stage2` is merged, otherwise from that branch. Not
+   the copy in `3cf1bd9`: that copy still counts the 16 Nov Batch 5 failures
+   as recent and would re-pause the backlog the moment it is resumed.
 4. `.env.worker` gets the new `WORKER_IMAGE` and `BUILD_COMMIT`.
 5. Both smoke tests run in the hidden course that nobody is enrolled in.
 
@@ -209,11 +209,13 @@ Noted, not changed:
 - `scope: historical` is not understood by the old worker, which treats any
   pause as "hold everything". It is used only after the worker swap (step 6).
 
-The watchdog changes that were briefly uncommitted in `edu-backend-dual-pipeline`
-now live on their own local branch `fix/hls-watchdog-failure-ledger` (worktree
-`edu-backend-watchdog-ledger`), and that folder is back as it was. They are not
-in commit 1aecb4a and do not change the worker image (section 4a). Release
-builds are made from the clean checkout `edu-backend-dual-pipeline-release`.
+The watchdog fix is integrated on its own local branch
+`fix/hls-watchdog-ledger-stage2`, based on `main` = `3cf1bd9` (the merge of
+PR #21; its tree is identical to `4520bc5`). It is in worktree
+`edu-backend-watchdog-ledger`, not pushed, not merged. It changes only the
+watchdog script, its two test files and this document, so the worker image
+built from `3cf1bd9` is unaffected (section 4a). Release builds are made from
+the clean checkout `edu-backend-dual-pipeline-release`.
 
 ### 4a. Watchdog failure-ledger fix (required before Batch 5 resumes)
 
@@ -376,11 +378,37 @@ on.
 
 ### Step 4 - smoke test #1 (section 8)
 
+### Stage 2 = steps 5 - 9 (each needs the owner's explicit go)
+
+Stage 2 swaps three things on the laptop and Redis, in this order, with
+historical processing paused the whole time:
+
+1. the **worker**, to the image built from the merge commit. It brings the
+   resumable source download (HTTP `Range` resume with per-chunk retry); the
+   current worker `30a21fa-priority-vfr` restarts a dropped download from zero;
+2. the **watchdog script**, to the failure-ledger version (section 4a);
+3. the **pause**, to `scope: historical` (backlog held, new uploads through).
+
+Before step 5, read-only:
+
+- The 8 Batch 5 jobs are intact: each video has exactly one job, `delayed`,
+  trigger `migration`, owned by its row (`mobileJobId`), with a `sourceKey`
+  equal to the row's. Verified 2026-11-17: 8 of 8.
+- `GET /videos/mobile/overview` → nothing active, `pause.paused = true`.
+- Nothing else is needed for them: the new worker claims a job by
+  `videoId` + `sourceKey` and its own id, so these old ids are accepted. The
+  stranded sweep skips them (their jobs are live), and the outbox drain skips
+  them (`mobileRequestedAt` is NULL on rows from before the migration). They
+  are neither duplicated nor lost.
+
 ### Step 5 - worker and watchdog (laptop)
 
 - [ ] Build the image from a clean checkout of the merge commit, tag it
       `edu-worker:dual-pipeline-<short sha>`, and repeat the image checks of
-      section 4.
+      section 4. Also check the resumable download is inside:
+      `grep -c "resuming in" /app/dist/src/modules/storage/storage.service.js`
+      in the image is ≥ 1. (`3cf1bd9` contains it in source, from
+      `40cd792`. The running `30a21fa-priority-vfr` has 0.)
 - [ ] `deploy/laptop-worker/.env.worker`: back it up, then set
       `WORKER_IMAGE` to that tag, `BUILD_COMMIT` to the full merge commit,
       `NEW_VIDEO_NOTIFICATIONS_ENABLED=false`,
@@ -392,11 +420,14 @@ on.
 - [ ] Verify: `docker inspect edu-worker --format "{{.Image}}"` → the image id;
       healthy; heartbeat build = the first 12 characters of the merge commit;
       the 8 backlog jobs still delayed.
-- [ ] Watchdog: back up `C:\edu-watchdog\watchdog.js`, copy
-      `deploy/laptop-worker/watchdog/watchdog.js` **from branch
-      `fix/hls-watchdog-failure-ledger`** (section 4a) over it, and
-      `docker restart edu-hls-watchdog`. **Not** the copy in the merge commit.
-      Do this while processing is still paused.
+- [ ] Watchdog: back up `C:\edu-watchdog\watchdog.js`, copy the
+      **failure-ledger** `deploy/laptop-worker/watchdog/watchdog.js` over it
+      (from `main` once `fix/hls-watchdog-ledger-stage2` is merged, otherwise
+      from that branch; check it contains `SNAPSHOT_LUA` and
+      `netfail-events`), then `docker restart edu-hls-watchdog`. **Not** the
+      copy in `3cf1bd9`. Do this while processing is still paused. The
+      watchdog container keeps its image (`30a21fa-priority-r2`, only Node and
+      the client libraries); no rebuild.
 - [ ] Verify the watchdog:
       - its start log shows `pauseScope: historical` and `ledgerKey`;
       - its first tick logs `netfail_baseline` with exactly the four Batch 5
@@ -412,6 +443,12 @@ on.
       `{ "reason": "backlog paused between batches", "scope": "historical" }`.
 - [ ] `GET /videos/mobile/overview` → `pause.scope = historical`; queue counts
       unchanged (8 delayed). Do not go on until this reads `historical`.
+- [ ] From here on, both writers of the pause flag hold the backlog only: the
+      operator (this pause) and the watchdog (it writes `scope: historical`).
+      A new upload's mobile job goes through them. The worker's disk guard
+      writes no flag; it defers jobs one by one while space is short. A pause
+      without a scope still means "hold everything", and is the emergency stop
+      (section 9).
 
 ### Step 7 - turn automatic mobile processing on
 
@@ -556,8 +593,8 @@ No rollback step deletes a video, a Gumlet asset, an R2 object or a queue.
    announced later.
 5. **Carried over, unchanged:** the 211 historical lectures are a separate,
    manual backfill; the laptop is still the worker.
-6. **Watchdog failure counting (fixed, not yet deployed).** Branch
-   `fix/hls-watchdog-failure-ledger` (section 4a). It must replace
+6. **Watchdog failure counting (fixed, not yet merged or deployed).** Branch
+   `fix/hls-watchdog-ledger-stage2` on `main` `3cf1bd9` (section 4a). It must replace
    `C:\edu-watchdog\watchdog.js` in step 5, **before** Batch 5 is resumed.
    Until then the production watchdog re-pauses on the 16 Nov failures. It
    does not block steps 1–4.
