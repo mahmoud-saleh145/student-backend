@@ -214,8 +214,8 @@ export class EnvironmentVariables {
   @toBool() @IsBoolean() MOBILE_HLS_GUMLET_FALLBACK = true;
   @toBool() @IsBoolean() MOBILE_PIPELINE_ENABLED = true;
   /**
-   * The "new video" notification, sent once when a lecture first becomes
-   * playable through either pipeline. Read by the API and by the worker.
+   * The "new video" notification, sent once per student when a lecture is
+   * playable and published. Read by the API and by the worker.
    */
   @toBool() @IsBoolean() NEW_VIDEO_NOTIFICATIONS_ENABLED = true;
   /**

@@ -37,7 +37,12 @@ import { orderSharedLectureCandidates } from '../videos/shared-lecture-order';
 
 import { ManifestService } from './manifest.service';
 import { GumletDrmService } from './gumlet-drm.service';
-import { effectiveMobileDelivery, MOBILE_DELIVERY_OVERRIDE_KEY, type MobileDeliveryOverride } from './mobile-delivery-override';
+import {
+  effectiveMobileDelivery,
+  MOBILE_DELIVERY_OVERRIDE_KEY,
+  MOBILE_DEVICE_PLATFORMS,
+  type MobileDeliveryOverride,
+} from './mobile-delivery-override';
 import { mobileLadderCanCarry } from '../videos/pipeline-state';
 import { DrmVerificationService } from './drm-verification.service';
 
@@ -106,9 +111,6 @@ class DrmGatePass {
  *           device binding, and only when the ladder exists.
  */
 type DeliveryPlan = { delivery: 'gumlet'; drmGate: DrmGatePass } | { delivery: 'hls' };
-
-/** Device platforms the independent mobile pipeline serves. */
-const MOBILE_DEVICE_PLATFORMS = new Set(['android', 'ios']);
 
 /** An attached, non-deleted lecture as loaded for ticket authorisation. */
 type PlayableLesson = {

@@ -108,7 +108,7 @@ A 44-minute lecture is therefore about 1.5–2 core-hours; see the hosting note.
 | `MOBILE_VIDEO_DELIVERY` | `hls` | `gumlet` keeps every platform on Gumlet (pre-migration behaviour) |
 | `MOBILE_HLS_GUMLET_FALLBACK` | `true` | Serve Gumlet to mobile while a video's ladder is not ready |
 | `MOBILE_PIPELINE_ENABLED` | `true` | Queue a mobile transcode for every completed upload |
-| `NEW_VIDEO_NOTIFICATIONS_ENABLED` | `true` | Tell enrolled students once when a lecture first becomes playable (either pipeline). Read by the API and the worker. `false` sends nothing and does not announce later what became playable meanwhile |
+| `NEW_VIDEO_NOTIFICATIONS_ENABLED` | `true` | Tell the students who can open a lecture, once, when it is playable and its lesson is published. Read by the API and the worker. `false` sends nothing and does not announce later what became playable meanwhile |
 | `TRANSCODE_THREADS` | `0` | ffmpeg thread cap; `0` = every core but one |
 | `TRANSCODE_WORK_DIR` | `/tmp/edu-transcode` | Scratch; bind-mount it to a host folder in Docker (see below) |
 | `WORKER_QUEUES` | all | Which queues this worker consumes, e.g. `mobile-video-processing` alone |

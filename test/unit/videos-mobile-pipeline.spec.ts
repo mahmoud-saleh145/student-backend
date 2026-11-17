@@ -259,7 +259,9 @@ describe('markMobileReady', () => {
     await t.svc.markMobileReady('v_1', result);
 
     expect(t.prisma.videoRendition.deleteMany).toHaveBeenCalledWith({ where: { videoId: 'v_1' } });
-    const data = t.writes.at(-1)?.data as Record<string, unknown>;
+    // The write that records the ladder (the "new video" bookkeeping that
+    // follows it writes to its own two columns and is not what this is about).
+    const data = t.writes.find((w) => (w.data as Record<string, unknown>).mobileStatus === 'READY')?.data as Record<string, unknown>;
     expect(data).toMatchObject({ mobileStatus: 'READY', mobileError: null, hlsPrefix: 'hls/v_1/', isEncrypted: true });
     expect(data).not.toHaveProperty('status');
     expect(data).not.toHaveProperty('gumletStatus');
@@ -275,7 +277,8 @@ describe('markMobileReady', () => {
 
     await t.svc.markMobileReady('v_1', result);
 
-    expect(t.writes.at(-1)?.data).toMatchObject({ durationSeconds: 100, width: 1280, height: 720, thumbnailKey: 'thumbnails/videos/v_1.jpg' });
+    const ladderWrite = t.writes.find((w) => (w.data as Record<string, unknown>).mobileStatus === 'READY');
+    expect(ladderWrite?.data).toMatchObject({ durationSeconds: 100, width: 1280, height: 720, thumbnailKey: 'thumbnails/videos/v_1.jpg' });
   });
 });
 

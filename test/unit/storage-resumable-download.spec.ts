@@ -1,3 +1,4 @@
+import { statSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -33,6 +34,24 @@ interface Plan {
   status?: (attempt: number) => number | undefined;
 }
 
+/** Where the test in progress downloads to (every test uses the same file name). */
+let downloadTarget = '';
+
+/**
+ * Breaks `stream` once the bytes it delivered are ON DISK. A fixed delay is not
+ * the same thing: on a busy machine the write had not been flushed when the
+ * stream broke, the download (correctly) resumed from the smaller size the file
+ * really had, and a test that expected exact resume offsets failed at random.
+ */
+function breakOnceOnDisk(stream: Readable, bytesOnDisk: number, waitedMs = 0): void {
+  const size = statSync(downloadTarget, { throwIfNoEntry: false })?.size ?? 0;
+  if (size >= bytesOnDisk || waitedMs >= 5_000) {
+    setTimeout(() => stream.destroy(new Error('aborted')), 2);
+    return;
+  }
+  setTimeout(() => breakOnceOnDisk(stream, bytesOnDisk, waitedMs + 3), 3);
+}
+
 function storageWith(plan: Plan, object = OBJECT) {
   const requests: { Range?: string; IfMatch?: string }[] = [];
   const client = {
@@ -56,7 +75,7 @@ function storageWith(plan: Plan, object = OBJECT) {
           sent = true;
           if (slice.length > 0) this.push(slice);
           if (!breaks) this.push(null);
-          else setTimeout(() => this.destroy(new Error('aborted')), 15);
+          else breakOnceOnDisk(this, start + slice.length);
         },
       });
       return {
@@ -81,6 +100,7 @@ describe('StorageService.downloadToFile', () => {
   let dir: string;
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'edu-download-'));
+    downloadTarget = join(dir, 'source.bin');
   });
   afterEach(async () => {
     await rm(dir, { recursive: true, force: true });
@@ -153,7 +173,7 @@ describe('StorageService.downloadToFile', () => {
   it('refuses to stitch two different uploads together when the object changes mid-download', async () => {
     const t = storageWith({ deliver: [3000], status: (attempt) => (attempt === 1 ? 412 : undefined) });
 
-    await expect(t.service.downloadToFile('uploads', 'source/a.mp4', join(dir, 'x'), fast)).rejects.toMatchObject({
+    await expect(t.service.downloadToFile('uploads', 'source/a.mp4', join(dir, 'source.bin'), fast)).rejects.toMatchObject({
       code: 'STORAGE_UNAVAILABLE',
     });
   });

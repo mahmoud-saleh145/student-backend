@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import {
   AuditAction,
   ContentStatus,
@@ -13,6 +13,7 @@ import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { CourseAccessService } from '../courses/course-access.service';
 import { CoursesService } from '../courses/courses.service';
+import { NewVideoAnnouncer } from '../videos/new-video-announcer.service';
 import { studentFacingVideoStatus } from '../videos/pipeline-state';
 import { orderSharedLectureCandidates } from '../videos/shared-lecture-order';
 import {
@@ -38,6 +39,8 @@ export class LessonsService {
     private readonly access: CourseAccessService,
     private readonly courses: CoursesService,
     private readonly audit: AuditService,
+    // Optional so the tests that build this service positionally keep working.
+    @Optional() private readonly announcer?: NewVideoAnnouncer,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -603,6 +606,16 @@ export class LessonsService {
     }
 
     await this.courses.recountCourse(lesson.courseId);
+
+    // The lesson has just been PUBLISHED. If its lecture finished processing
+    // while it was a draft, the "new video" notification was held back for
+    // exactly this moment. Sends nothing unless one is owed; never throws.
+    if (
+      lesson.status !== ContentStatus.PUBLISHED &&
+      updated.status === ContentStatus.PUBLISHED
+    ) {
+      await this.announcer?.settleForLesson(lessonId);
+    }
 
     await this.audit.record({
       actorId: actor.id,

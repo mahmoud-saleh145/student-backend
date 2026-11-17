@@ -236,9 +236,10 @@ export const videoConfig = registerAs('video', () => ({
     autoProcess: bool(process.env.MOBILE_PIPELINE_ENABLED, true),
   },
   /**
-   * Tell enrolled students when a lecture first becomes playable. Off = the
-   * lecture is still recorded as announced, so switching this back on does not
-   * announce everything that became playable in the meantime.
+   * Tell the students who can open a lecture, once, when it is playable and
+   * published (see new-video-announcer.service.ts). Off = the lecture is still
+   * recorded as announced, so switching this back on does not announce
+   * everything that became playable in the meantime.
    */
   newVideoNotifications: bool(process.env.NEW_VIDEO_NOTIFICATIONS_ENABLED, true),
   drm: {

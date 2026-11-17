@@ -1,7 +1,8 @@
-import { Injectable, Logger, type OnApplicationBootstrap, type OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, Optional, type OnApplicationBootstrap, type OnModuleDestroy } from '@nestjs/common';
 
 import { describeDatabaseError, isTransientDatabaseError } from '../../database/transient-db-error';
 
+import { NewVideoAnnouncer } from './new-video-announcer.service';
 import { VideosService } from './videos.service';
 
 /**
@@ -73,7 +74,11 @@ export class VideoPipelineReconciler implements OnApplicationBootstrap, OnModule
   private running = false;
   private lastScanAt = 0;
 
-  constructor(private readonly videos: VideosService) {}
+  constructor(
+    private readonly videos: VideosService,
+    // The same pass also retries owed "new video" announcements.
+    @Optional() private readonly announcer?: NewVideoAnnouncer,
+  ) {}
 
   onApplicationBootstrap(): void {
     if (this.intervalSeconds === 0 || process.env.NODE_ENV === 'test') return;
@@ -97,7 +102,8 @@ export class VideoPipelineReconciler implements OnApplicationBootstrap, OnModule
    * whether a scan ran (for tests).
    */
   async wake(now = Date.now()): Promise<boolean> {
-    const knownPending = this.videos.hasUndeliveredIntents();
+    // ... or an announcement attempt that failed in this process.
+    const knownPending = this.videos.hasUndeliveredIntents() || this.announcer?.needsAttention() === true;
     const backgroundDue = now - this.lastScanAt >= this.intervalSeconds * 1000;
     if (!knownPending && !backgroundDue) return false;
     await this.tick();
@@ -121,7 +127,26 @@ export class VideoPipelineReconciler implements OnApplicationBootstrap, OnModule
       }
       return null;
     } finally {
+      // OWED "NEW VIDEO" ANNOUNCEMENTS, in the same pass and independent of
+      // the outcome above. One indexed query when nothing is owed. This is
+      // what retries an attempt that failed, takes over the claim of a process
+      // that died, and notices a section or course being published (a lesson
+      // being published has its own hook and does not wait for this).
+      await this.settleAnnouncements();
       this.running = false;
+    }
+  }
+
+  private async settleAnnouncements(): Promise<void> {
+    if (!this.announcer) return;
+    try {
+      await this.announcer.settleDue();
+    } catch (error) {
+      if (isTransientDatabaseError(error)) {
+        this.logger.warn(`announcements not settled: database unreachable (${describeDatabaseError(error)})`);
+      } else {
+        this.logger.error(`announcements not settled: ${(error as Error)?.message ?? error}`);
+      }
     }
   }
 }

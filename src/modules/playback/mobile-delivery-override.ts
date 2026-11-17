@@ -17,6 +17,9 @@
  */
 export const MOBILE_DELIVERY_OVERRIDE_KEY = 'mobile:delivery:override';
 
+/** `devices.platform` values (trimmed, lower-cased) that are a native mobile OS. */
+export const MOBILE_DEVICE_PLATFORMS: ReadonlySet<string> = new Set(['android', 'ios']);
+
 export interface MobileDeliveryOverride {
   delivery: 'gumlet' | 'hls';
   /** Only meaningful with delivery 'hls'; undefined keeps the configured value. */

@@ -224,7 +224,8 @@ export class VideosService {
     @Optional() announcer?: NewVideoAnnouncer,
   ) {
     this.cfg = config.getOrThrow<VideoConfig>('video');
-    this.announcer = announcer ?? new NewVideoAnnouncer(this.prisma, this.notifications, config);
+    this.announcer =
+      announcer ?? new NewVideoAnnouncer(this.prisma, this.notifications, this.access, config, this.redis);
   }
 
   private readonly announcer: NewVideoAnnouncer;
@@ -428,9 +429,9 @@ export class VideosService {
               // lecture keeps its old figure until a pipeline measures the new
               // file, so nothing reads 0 in the meantime.
               durationSeconds: 0,
-              // A replacement is new content: it is announced when it becomes
-              // playable, as a re-transcode always was.
-              newVideoAnnouncedAt: null,
+              // `newVideoAnnounceState` is deliberately NOT reset: a lecture
+              // that was announced is not announced again because its file was
+              // replaced, and one still waiting to be announced keeps waiting.
               mobileStatus: MobileVideoStatus.NONE,
               mobileError: null,
               mobileJobId: null,
@@ -1887,12 +1888,17 @@ export class VideosService {
       }
     }
 
-    // "NEW VIDEO", when this pipeline is the FIRST to make the lecture
-    // playable. If the Gumlet side is already READY it was first: it announced
-    // the lecture, or the lecture predates the announcement - which is what
-    // keeps a backfill of old lectures from notifying anyone.
+    // "NEW VIDEO". An announcement becomes OWED only when this pipeline is the
+    // first to make the lecture playable. If the Gumlet side is already READY
+    // it was first: it created the debt itself, or the lecture predates the
+    // mechanism - which is what keeps a backfill of old lectures from
+    // notifying anyone. Either way, whatever is already owed is settled: the
+    // announcer decides whether it may go out yet (it waits for a draft to be
+    // published, and for Gumlet to finish one way or the other).
     if (before.status !== VideoStatus.READY) {
-      await this.announcer.announce(videoId, 'mobile');
+      await this.announcer.onFirstPlayable(videoId, 'mobile');
+    } else {
+      await this.announcer.settle(videoId);
     }
   }
 
@@ -2685,7 +2691,7 @@ export class VideosService {
     // Every course whose lecture just received this duration; recounted below.
     const touchedCourseIds = new Set<string>();
 
-    const video = await this.prisma.$transaction(async (tx) => {
+    await this.prisma.$transaction(async (tx) => {
       await tx.videoRendition.deleteMany({ where: { videoId } });
 
       const updated = await tx.video.update({
@@ -2745,7 +2751,6 @@ export class VideosService {
         });
       }
 
-      return updated;
     });
 
     // Course totals are SUM(lesson durations): every course that just received
@@ -2756,15 +2761,13 @@ export class VideosService {
 
     // Tell enrolled students. This is the "new video" notification from §63.
     //
-    // Skipped when the asset has no origin lecture (a reused asset whose author
-    // lesson was removed). There is no lesson to link to, and a notification
-    // pointing at the wrong lecture would be worse than none.
-    //
-    // Sent through the announcer both pipelines share, so it goes out once per
-    // uploaded file however many times this runs (a re-transcode, a retry).
-    if (video.lesson && video.lessonId) {
-      await this.announcer.announce(videoId, 'local');
-    }
+    // Owed through the announcer both pipelines share, so it goes out once per
+    // lecture however many times this runs (a re-transcode, a retry), and only
+    // once the lesson is published. The announcer drops it when the asset has
+    // no origin lecture (a reused asset whose author lesson was removed): there
+    // is no lesson to link to, and a notification pointing at the wrong lecture
+    // would be worse than none.
+    await this.announcer.onFirstPlayable(videoId, 'local');
 
     this.logger.log(`video ${videoId} is READY (${result.renditions.length} renditions)`);
   }
@@ -2787,6 +2790,10 @@ export class VideosService {
       return false;
     }
     this.logger.error(`video ${videoId} processing failed: ${error}`);
+    // Gumlet has now ended, in failure. A lecture whose mobile ladder is ready
+    // was waiting for exactly that before telling the students who can play it
+    // in the app. Sends nothing unless an announcement is owed; never throws.
+    await this.announcer.settle(videoId);
     return true;
   }
 

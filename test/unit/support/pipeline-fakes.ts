@@ -1,6 +1,8 @@
 import { MobileVideoProcessor } from '../../../src/jobs/processors/mobile-video.processor';
 import { VideoProcessor } from '../../../src/jobs/processors/video.processor';
+import { CourseAccessService } from '../../../src/modules/courses/course-access.service';
 import { NotificationsService } from '../../../src/modules/notifications/notifications.service';
+import { NewVideoAnnouncer } from '../../../src/modules/videos/new-video-announcer.service';
 import { LessonVideoService } from '../../../src/modules/videos/lesson-video.service';
 import { VideosService } from '../../../src/modules/videos/videos.service';
 
@@ -24,6 +26,29 @@ import { VideosService } from '../../../src/modules/videos/videos.service';
 // ---------------------------------------------------------------------------
 
 export type Row = Record<string, unknown> & { id: string };
+
+export interface FakeLesson {
+  id: string;
+  courseId: string;
+  title: string;
+  durationSeconds: number;
+  status: string;
+  deletedAt: Date | null;
+  sectionId: string;
+}
+
+export interface FakeEnrollment {
+  userId: string;
+  courseId: string;
+  state: string;
+  /** The access window `CourseAccessService.decide()` evaluates live. */
+  accessStartsAt: Date;
+  accessEndsAt: Date | null;
+  /** false = a section- or part-scoped enrolment, limited to `sectionGrants`. */
+  coversAllSections: boolean;
+  sectionGrants: { sectionId: string; codeId: string | null }[];
+  user: { status: string; deletedAt: Date | null };
+}
 
 function matchesField(actual: unknown, expected: unknown): boolean {
   if (expected === null || typeof expected !== 'object' || expected instanceof Date) {
@@ -91,7 +116,8 @@ export function videoRow(overrides: Partial<Row> = {}): Row {
     mobileEnqueuedAt: null,
     mobileGeneration: 0,
     mobileTrigger: null,
-    newVideoAnnouncedAt: null,
+    newVideoAnnounceState: null,
+    newVideoAnnounceStateAt: null,
     deletedAt: null,
     createdAt: new Date('2026-11-16T10:00:00Z'),
     updatedAt: new Date('2026-11-16T10:00:00Z'),
@@ -111,14 +137,38 @@ export class FakeDb {
   down = false;
   now = () => new Date();
 
-  /** Lectures, by id: what the course list actually shows a duration from. */
-  readonly lessons = new Map<string, { id: string; courseId: string; title: string; durationSeconds: number }>();
+  /** Lectures, by id: what the course list shows a duration from, and whether students can see them. */
+  readonly lessons = new Map<string, FakeLesson>();
+  /** Sections and courses, by id. Anything not listed is PUBLISHED. */
+  readonly sections = new Map<string, { id: string; courseId: string; status: string; deletedAt: Date | null }>();
+  readonly courses = new Map<string, { id: string; status: string; deletedAt: Date | null }>();
   /** Course enrolments, with the account each belongs to. */
-  enrollments: { userId: string; courseId: string; state: string; user: { status: string; deletedAt: Date | null } }[] = [];
+  enrollments: FakeEnrollment[] = [];
+  /** Bound devices, and the playback tickets issued to them. */
+  devices: { id: string; userId: string; platform: string; status: string }[] = [];
+  tickets: { deviceId: string; delivery: string }[] = [];
   /** Every notification row written, in order. */
   readonly notifications: Row[] = [];
   /** Set to make the notification insert fail (and only that). */
   notificationsDown = false;
+
+  sectionOf(id: string) {
+    return this.sections.get(id) ?? { id, courseId: 'course_1', status: 'PUBLISHED', deletedAt: null };
+  }
+  courseOf(id: string) {
+    return this.courses.get(id) ?? { id, status: 'PUBLISHED', deletedAt: null };
+  }
+
+  /** A video row as a query with relations returns it: lesson (+section), course, counts. */
+  private hydrate(row: Row): Row {
+    const lesson = typeof row.lessonId === 'string' ? this.lessons.get(row.lessonId) : undefined;
+    return {
+      ...row,
+      lesson: lesson ? { ...lesson, section: this.sectionOf(lesson.sectionId) } : row.lesson,
+      course: this.courseOf(String(row.courseId)),
+      _count: { renditions: ((row.renditions as unknown[]) ?? []).length },
+    };
+  }
 
   constructor(rows: Row[] = []) {
     for (const row of rows) {
@@ -130,6 +180,9 @@ export class FakeDb {
             courseId: String(row.courseId),
             title: (row.lesson as { title?: string } | null)?.title ?? link.lessonId,
             durationSeconds: 0,
+            status: 'PUBLISHED',
+            deletedAt: null,
+            sectionId: 'section_1',
           });
         }
       }
@@ -173,21 +226,21 @@ export class FakeDb {
     // and then writes to it must not see its own write in the copy it holds.
     findFirst: async (args: { where?: Record<string, unknown> }) => {
       this.guard();
-      for (const row of this.rows.values()) if (matches(row, args.where)) return { ...row };
+      for (const row of this.rows.values()) if (matches(row, args.where)) return this.hydrate(row);
       return null;
     },
     findUniqueOrThrow: async (args: { where: { id: string } }) => {
       this.guard();
-      return { ...this.get(args.where.id) };
+      return this.hydrate(this.get(args.where.id));
     },
     findUnique: async (args: { where: { id: string } }) => {
       this.guard();
       const row = this.rows.get(args.where.id);
-      return row ? { ...row } : null;
+      return row ? this.hydrate(row) : null;
     },
     findMany: async (args: { where?: Record<string, unknown>; take?: number }) => {
       this.guard();
-      const found = [...this.rows.values()].filter((row) => matches(row, args.where)).map((row) => ({ ...row }));
+      const found = [...this.rows.values()].filter((row) => matches(row, args.where)).map((row) => this.hydrate(row));
       return args.take ? found.slice(0, args.take) : found;
     },
     count: async (args: { where?: Record<string, unknown> }) => {
@@ -245,6 +298,61 @@ export class FakeDb {
       }
       return { count };
     },
+    findFirst: async (args: { where: { id: string } }) => {
+      this.guard();
+      const lesson = this.lessons.get(args.where.id);
+      return lesson && !lesson.deletedAt ? { ...lesson } : null;
+    },
+    update: async (args: { where: { id: string }; data: Record<string, unknown> }) => {
+      this.guard();
+      const lesson = this.lessons.get(args.where.id);
+      if (!lesson) throw new Error(`no lesson ${args.where.id}`);
+      // Prisma ignores `undefined`: only the fields that were given change.
+      for (const [key, value] of Object.entries(args.data)) {
+        if (value !== undefined) (lesson as unknown as Record<string, unknown>)[key] = value;
+      }
+      return { ...lesson };
+    },
+  };
+  readonly course = {
+    // CourseAccessService.resolve(): the course, unless it is deleted.
+    findFirst: async (args: { where: { id: string } }) => {
+      this.guard();
+      const course = this.courseOf(args.where.id);
+      return course.deletedAt ? null : { ...course, enrollmentMethods: [], isFree: false };
+    },
+  };
+  readonly courseSection = {
+    // Sections unlocked by a part the student holds: none in these tests.
+    findMany: async () => {
+      this.guard();
+      return [];
+    },
+  };
+  readonly accessCodeRedemption = {
+    count: async () => {
+      this.guard();
+      return 0;
+    },
+  };
+  readonly device = {
+    findMany: async (args: { where: { userId: { in: string[] }; status: string } }) => {
+      this.guard();
+      return this.devices
+        .filter((d) => args.where.userId.in.includes(d.userId) && d.status === args.where.status)
+        .map((d) => ({ ...d }));
+    },
+  };
+  readonly playbackTicket = {
+    findMany: async (args: { where: { deviceId: { in: string[] }; delivery: string } }) => {
+      this.guard();
+      const seen = new Set<string>();
+      return this.tickets
+        .filter((t) => args.where.deviceId.in.includes(t.deviceId) && t.delivery === args.where.delivery)
+        .filter((t) => (seen.has(t.deviceId) ? false : (seen.add(t.deviceId), true)))
+        .map((t) => ({ deviceId: t.deviceId }));
+    },
+    updateMany: async () => ({ count: 0 }),
   };
   readonly enrollment = {
     // The one query `notifyCourseStudents` makes, evaluated for real: an
@@ -263,13 +371,37 @@ export class FakeDb {
         )
         .map((e) => ({ userId: e.userId }));
     },
+    // CourseAccessService: one student's enrolment on one course, whole.
+    findUnique: async (args: { where: { userId_courseId: { userId: string; courseId: string } } }) => {
+      this.guard();
+      const key = args.where.userId_courseId;
+      const found = this.enrollments.find((e) => e.userId === key.userId && e.courseId === key.courseId);
+      return found ? { id: `enr_${found.userId}`, ...found } : null;
+    },
   };
   readonly notification = {
-    createMany: async (args: { data: Row[] }) => {
+    findMany: async (args: { where: { dedupeKey: { in: string[] } } }) => {
+      this.guard();
+      return this.notifications
+        .filter((n) => args.where.dedupeKey.in.includes(n.dedupeKey as string))
+        .map((n) => ({ dedupeKey: n.dedupeKey }));
+    },
+    // `dedupeKey` is UNIQUE in the database; `skipDuplicates` is what the
+    // service relies on, so the fake enforces the same thing.
+    createMany: async (args: { data: Row[]; skipDuplicates?: boolean }) => {
       this.guard();
       if (this.notificationsDown) throw new Error('notifications insert failed');
-      this.notifications.push(...args.data.map((row) => ({ ...row })));
-      return { count: args.data.length };
+      let count = 0;
+      for (const row of args.data) {
+        const taken = row.dedupeKey && this.notifications.some((n) => n.dedupeKey === row.dedupeKey);
+        if (taken) {
+          if (!args.skipDuplicates) throw Object.assign(new Error('Unique constraint failed'), { code: 'P2002' });
+          continue;
+        }
+        this.notifications.push({ ...row });
+        count += 1;
+      }
+      return { count };
     },
   };
 
@@ -422,6 +554,10 @@ export interface World {
   /** The push-delivery queue the real NotificationsService adds to. */
   pushQueue: FakeQueue;
   courses: { recountCourse: jest.Mock };
+  /** The real access gate and the real announcer this process uses. */
+  access: CourseAccessService;
+  announcer: NewVideoAnnouncer;
+  notifications: NotificationsService;
 }
 
 /**
@@ -477,6 +613,12 @@ export function apiProcess(
   const courses = { recountCourse: jest.fn(async (_courseId: string) => undefined) };
   const notifications = new NotificationsService(db as never, pushQueue as never, { get: () => undefined } as never);
   const lessonVideos = new LessonVideoService(db as never, courses as never);
+  // The REAL access gate (course state, access window, section-scoped
+  // enrolments). Academic targeting needs the whole profile schema; a test
+  // that is about it switches it on and answers `isTargetedToStudent` itself.
+  const access = new CourseAccessService(db as never, {} as never, {} as never);
+  access.targetingEnforced = false;
+  const announcer = new NewVideoAnnouncer(db as never, notifications, access, config as never, redis as never);
   const videos = new VideosService(
     db as never,
     storage as never,
@@ -490,8 +632,9 @@ export function apiProcess(
     lessonVideos as never,
     gumlet as never,
     parts.withMobileQueue === false ? undefined : (mobileQueue as never),
+    announcer,
   );
-  return { db, storage, redis, webQueue, mobileQueue, videos, gumlet, audit, pushQueue, courses };
+  return { db, storage, redis, webQueue, mobileQueue, videos, gumlet, audit, pushQueue, courses, access, announcer, notifications };
 }
 
 /** A confirmed upload sitting in the bucket, ready for `completeUpload`. */
