@@ -29,7 +29,11 @@ Conditions, all of them steps in section 7:
 2. `NEW_VIDEO_NOTIFICATIONS_ENABLED=false` on the API and on the worker. It is
    also the default now, so a missing variable sends nothing.
 3. The mobile pause is re-issued with `scope=historical` and the watchdog
-   script replaced **before** `MOBILE_PIPELINE_ENABLED=true`.
+   script replaced **before** `MOBILE_PIPELINE_ENABLED=true`. The replacement
+   is the **failure-ledger watchdog** from branch
+   `fix/hls-watchdog-failure-ledger` (section 4a), not the copy in the merge
+   commit: that copy still counts yesterday's Batch 5 failures as recent and
+   would re-pause the backlog the moment it is resumed.
 4. `.env.worker` gets the new `WORKER_IMAGE` and `BUILD_COMMIT`.
 5. Both smoke tests run in the hidden course that nobody is enrolled in.
 
@@ -205,11 +209,78 @@ Noted, not changed:
 - `scope: historical` is not understood by the old worker, which treats any
   pause as "hold everything". It is used only after the worker swap (step 6).
 
-The worktree `edu-backend-dual-pipeline` is also being edited by another
-session (uncommitted changes to `deploy/laptop-worker/watchdog/watchdog.js`
-and two new watchdog test files). They are not part of this release and are
-not in commit 1aecb4a. Release builds are made from the clean checkout
-`edu-backend-dual-pipeline-release`, never from that folder.
+The watchdog changes that were briefly uncommitted in `edu-backend-dual-pipeline`
+now live on their own local branch `fix/hls-watchdog-failure-ledger` (worktree
+`edu-backend-watchdog-ledger`), and that folder is back as it was. They are not
+in commit 1aecb4a and do not change the worker image (section 4a). Release
+builds are made from the clean checkout `edu-backend-dual-pipeline-release`.
+
+### 4a. Watchdog failure-ledger fix (required before Batch 5 resumes)
+
+**The defect (production, 2026-11-17, read-only evidence).** The watchdog's
+threshold B ("3 network failures in 120 min") dated each failure by the job's
+`processedOn`. BullMQ stores no time for a failure that will be retried, and a
+paused worker moves every job back with the same `moveToDelayed` script once a
+minute, which refreshes `processedOn` and keeps the old `failedReason`. The
+four Batch 5 failures of 16 Nov therefore looked "recent" forever: the
+production watchdog logged `threshold_network_failures` again at 14:57 and
+15:24 UTC on 17 Nov for failures from the day before, after 6,000+ deferrals.
+Any resume would have been paused again within one tick.
+
+**The fix** (`deploy/laptop-worker/watchdog/watchdog.js` only; no worker code):
+
+- A failure is an **event** `(job id, atm)`. BullMQ increments `atm` once per
+  failed attempt and never on a deferral (verified in BullMQ 5.81.3 and on the
+  production job hashes: `atm` stayed 1 through 870+ deferrals).
+- Its time is `finishedOn` for a final failure (genuine), otherwise the moment
+  the watchdog first saw the event (at most one 30 s poll late).
+- Events are kept in `<prefix>:watchdog:netfail-events` (a hash, 14-day TTL
+  refreshed every tick), so a watchdog restart neither forgets nor re-dates
+  them. When the ledger is first created, failures already present are
+  `baseline`: time unknown, never recent. On the first production tick that
+  is exactly the four Batch 5 failures.
+- An event can trip the threshold once (`tripped`), so after an operator
+  resume only failures that happen afterwards count.
+- The queue snapshot is one atomic Lua read (`SNAPSHOT_LUA`): separate reads
+  missed a job moving between `delayed` and `active` (caught by the real-queue
+  test), which would have re-dated an old failure as new.
+- Unchanged: the probes, threshold A (outage ≥ 10 min, pause on reconnect),
+  `scope: historical` pauses, never resuming, never pausing without queued
+  historical work, never overwriting an existing pause. Disk exhaustion stays
+  the worker's own scratch guard.
+- The heartbeat now carries `netfail: { newFailures, recentFailures,
+  historicalFailures, awaitingRetry }`.
+
+**Tests** (in the branch):
+
+- `test/unit/watchdog-failure-ledger.spec.ts`, 9 tests, always run. It
+  reproduces the incident: the old rule counts 4 "recent" failures a day
+  later. Then: 4 historical failures, 8 delayed jobs, 3,000+ deferrals and
+  0 new failures give no trip, and no pause after resume. A retry that fails
+  again is a new event, and 3 new ones trip and pause with scope `historical`.
+  A watchdog running at the time trips once and never again. A restart
+  neither re-dates nor re-trips. Also covered: the outage threshold, failures
+  during a Redis outage counted on reconnect, non-network failures and the
+  window, and the no-work and no-overwrite rules. Mutation-checked: dating
+  the baseline "now" fails 3 tests, and dropping the trip marker fails 2.
+- `test/unit/watchdog-failure-ledger-real-queue.spec.ts`, opt-in
+  (`WATCHDOG_TEST_REDIS_URL` = a local Redis). It runs real BullMQ with the
+  real `MobileVideoProcessor`: 4 real failed attempts, a pause, 3,000+ real
+  deferrals (the old rule would trip), resume with all 8 completing and no
+  re-pause, then 3 genuinely new terminal failures that trip and pause.
+  Passed 4 of 4 runs.
+- The real script in the production watchdog image (`30a21fa-priority-r2`,
+  node 20, ioredis 5.11.1) against a local Redis 7 seeded with the Batch 5
+  state gave `netfail_baseline` (4 events), then nothing after a deferral
+  pass and resume, then `netfail_seen` → `threshold_network_failures` →
+  `PAUSED` (scope `historical`) for 3 new failures.
+- Full unit suite on this branch's tree: 3,689 passed, 0 failed.
+
+**Image impact: none.** The watchdog runs from
+`C:\edu-watchdog\watchdog.js`, bind-mounted into its own container (image
+`30a21fa-priority-r2`, used only for Node and the client libraries). No
+`src/`, `prisma/` or package file changed, so the worker image from the merge
+commit needs no rebuild for this. Only the external script is replaced (step 5).
 
 ---
 
@@ -322,9 +393,18 @@ on.
       healthy; heartbeat build = the first 12 characters of the merge commit;
       the 8 backlog jobs still delayed.
 - [ ] Watchdog: back up `C:\edu-watchdog\watchdog.js`, copy
-      `deploy/laptop-worker/watchdog/watchdog.js` over it,
-      `docker restart edu-hls-watchdog`; its start log shows
-      `pauseScope: historical`.
+      `deploy/laptop-worker/watchdog/watchdog.js` **from branch
+      `fix/hls-watchdog-failure-ledger`** (section 4a) over it, and
+      `docker restart edu-hls-watchdog`. **Not** the copy in the merge commit.
+      Do this while processing is still paused.
+- [ ] Verify the watchdog:
+      - its start log shows `pauseScope: historical` and `ledgerKey`;
+      - its first tick logs `netfail_baseline` with exactly the four Batch 5
+        failures (`cmva5bgod…#1`, `cmva607km…#1`, `cmvbbzo2k…#1`,
+        `cmvbc937d…#1`);
+      - the heartbeat shows `netfail.newFailures: 0`, `historicalFailures: 4`;
+      - no `threshold_network_failures` line over the next few minutes, even
+        though the 8 jobs keep being deferred.
 
 ### Step 6 - pause scope
 
@@ -342,7 +422,28 @@ on.
 
 ### Step 8 - smoke test #2 (section 8)
 
-### Step 9 - backfill (separate approval)
+### Step 9 - finish Batch 5 (separate approval)
+
+The 8 jobs already queued from Batch 5 (`cmva5bgod`, `cmva607km`,
+`cmvbbzo2k`, `cmvbc937d` with one attempt left; `cmva6lw6a`, `cmvb9e833`,
+`cmvbcjqll`, `cmvcrhg5y` with two) run on the new worker as they are. Nothing
+is re-queued. The new worker's resumable source download addresses the
+aborted downloads that stopped the batch.
+
+- [ ] Gates:
+      - laptop on home Wi-Fi, on AC, lid open (lid-close on AC is still
+        Sleep), at least 30 GB free;
+      - three stable network probes;
+      - watchdog heartbeat `netfail.newFailures: 0`;
+      - one live job per video, 0 locks.
+- [ ] `POST /videos/mobile/resume`, with the batch watcher running detached.
+- [ ] Expected: the 8 jobs encode one at a time, and the watchdog does **not**
+      pause on the 16 Nov failures. It pauses only on 3 failures that happen
+      after the resume, or on a 10-minute outage.
+- [ ] Validate every READY video (validator, every segment, records), then
+      pause with `scope: historical`.
+
+### Step 10 - backfill (separate approval)
 
 - [ ] List A (32 ids, `backfill-A.txt`) in batches of about 8 with the usual
       watcher; `POST /videos/mobile/resume` only when a batch should run.
@@ -427,7 +528,7 @@ account's grant.
 | Put every phone back on Gumlet | `POST /videos/mobile/delivery` `mode=gumlet` | the emergency switch, unchanged |
 | A build is wrongly kept on Gumlet, or wrongly given HLS | change `MOBILE_HLS_MIN_BUILD_ANDROID` / `_IOS` on Render and redeploy | unset = the app's declaration decides, as before this release |
 | Worker | restore the `.env.worker` backup (image `30a21fa-priority-vfr`), `docker compose --env-file .env.worker up -d` | jobs keep their ids; the old image runs them |
-| Watchdog | restore the `watchdog.js` backup, `docker restart edu-hls-watchdog` | its pauses hold new uploads again |
+| Watchdog | restore the `watchdog.js` backup, `docker restart edu-hls-watchdog` | its pauses hold new uploads again, and it again counts old failures of paused jobs as recent (re-pauses on resume). The ledger key `<prefix>:watchdog:netfail-events` is left behind, unused, and expires after 14 days |
 | API | Render → roll back to the noted deploy | new columns ignored; build 11 is served HLS again for lectures that have a mobile version |
 | Dashboard | Vercel → promote the previous deployment | - |
 | Migrations | not needed for any rollback; if wanted, drop the index and the seven columns after the API and worker rollback | - |
@@ -455,3 +556,8 @@ No rollback step deletes a video, a Gumlet asset, an R2 object or a queue.
    announced later.
 5. **Carried over, unchanged:** the 211 historical lectures are a separate,
    manual backfill; the laptop is still the worker.
+6. **Watchdog failure counting (fixed, not yet deployed).** Branch
+   `fix/hls-watchdog-failure-ledger` (section 4a). It must replace
+   `C:\edu-watchdog\watchdog.js` in step 5, **before** Batch 5 is resumed.
+   Until then the production watchdog re-pauses on the 16 Nov failures. It
+   does not block steps 1–4.
