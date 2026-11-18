@@ -90,6 +90,7 @@ const YEAR = 365 * 24 * 3600_000;
 const DEFER_MS = 200;
 const ADMIN = { id: 'admin_1', role: 'ADMIN' as never };
 const STAFF = { id: 'staff_1', role: 'TEACHER' as never };
+const MASTER = { id: 'master_1', role: 'MASTER' as never };
 
 /** ioredis/BullMQ options for a URL (redis:// or rediss://, user and password), optionally via a local proxy port. */
 function connectionFor(url: string, viaPort?: number) {
@@ -923,7 +924,7 @@ interface Server {
     },
   );
 
-  it('S10 batch-5 recovery on real row states under a FULL pause: nothing taken until resume, then each video encoded exactly once, nobody notified', async () => {
+  it('S10 batch-5 recovery on real row states: a FULL pause refuses every retry (MASTER included) and changes nothing; under a historical hold only MASTER recovers, the rest stay parked; resume encodes the rest; each video encoded exactly once, nobody notified', async () => {
     const base = (id: string, i: number, over: Record<string, unknown>) => ({
       id,
       lessonId: `lesson_${id}`,
@@ -979,30 +980,84 @@ interface Server {
     const seeded = await snapAll(oldIds);
     const failedBefore = await Promise.all(['fail_1', 'fail_2'].map((id) => srv.raw.hgetall(jobKey(old(id)))));
 
-    // FULL pause, worker running.
+    const recovered = ['fail_1', 'fail_2', 'half_1', 'half_2', 'stalled_1'];
+    const parkedOld = ['half_1', 'half_2', 'stalled_1', 'ok_1', 'ok_2', 'ok_3'].map(old);
+    const newIds = recovered.map((id) => mobileJobIdFor(id, 1));
+    const audit = jest.spyOn((w.videos as unknown as { audit: { record: () => Promise<void> } }).audit, 'record');
+    /** Every mobile field of every row: a refused request must not move any of them. */
+    const mobileRows = () =>
+      JSON.stringify(
+        rows.map((r) => {
+          const x = w.db.get(r.id);
+          return [x.mobileStatus, x.mobileJobId, x.mobileGeneration, x.mobileTrigger, x.mobileRequestedAt, x.mobileEnqueuedAt, x.mobileError];
+        }),
+      );
+    /** Refused, and nothing anywhere changed: no job, no intent, no audit row, no notification. */
+    // `reason` null: refused by the older "only an administrator can supersede" rule, which runs first.
+    const expectRefused = async (call: () => Promise<unknown>, reason: string | null) => {
+      const before = { rows: mobileRows(), counts: await srv.mobileQueue.getJobCounts(), audits: audit.mock.calls.length };
+      await expect(call()).rejects.toMatchObject(reason ? { code: 'FORBIDDEN', details: { reason } } : { code: 'FORBIDDEN' });
+      expect(mobileRows()).toBe(before.rows);
+      expect(await srv.mobileQueue.getJobCounts()).toEqual(before.counts);
+      expect(audit.mock.calls.length).toBe(before.audits);
+      for (const id of newIds) expect(await srv.mobileQueue.getJob(id)).toBeUndefined();
+      expect(createOnce).not.toHaveBeenCalled();
+    };
+
+    // 1. FULL pause, worker running: every retry is refused, for every role, MASTER included.
     await w.videos.setMobileProcessingPaused(true, ADMIN, 'batch 5 recovery', 'all');
     await startWorker(w, { startReconciler: true, reconcileMs: 250 });
-
-    // Staff retry of the four FAILED rows; supersede of the stalled one.
-    for (const id of ['fail_1', 'fail_2', 'half_1', 'half_2']) {
-      await expect(w.videos.retryMobileProcessing(id, STAFF)).resolves.toMatchObject({ jobId: mobileJobIdFor(id, 1), alreadyQueued: false });
+    for (const actor of [STAFF, ADMIN, MASTER]) {
+      for (const id of ['fail_1', 'fail_2', 'half_1', 'half_2']) {
+        await expectRefused(() => w.videos.retryMobileProcessing(id, actor), 'full-pause');
+        await expectRefused(() => w.videos.retryMobileProcessing(id, actor, { force: true }), 'full-pause');
+      }
+      await expectRefused(() => w.videos.retryMobileProcessing('stalled_1', actor, { supersede: true }), actor === STAFF ? null : 'full-pause');
     }
-    await expect(w.videos.retryMobileProcessing('stalled_1', ADMIN, { supersede: true })).resolves.toMatchObject({
+    await sleep(4_000); // the half_* retry backoffs come due behind the paused queue
+    expect(encodes).toEqual([]);
+    const held = await snapAll(oldIds);
+    for (const id of oldIds) expect(held[id]).toEqual(seeded[id]);
+    expect(await srv.mobileQueue.isPaused()).toBe(true);
+
+    // 2. Historical hold: the queue runs and every live historical job parks after one take, unencoded.
+    await expect(w.videos.setMobileProcessingPaused(true, ADMIN, 'batch 5 recovery', 'historical')).resolves.toMatchObject({
+      scope: 'historical',
+      queuePaused: false,
+    });
+    await until(async () => {
+      const parked = await parkedIds();
+      return parkedOld.every((id) => parked.has(id));
+    }, 'the six live historical jobs to park', 30_000);
+    expect(encodes).toEqual([]);
+    const parkedSnap = await snapAll(parkedOld);
+    for (const id of parkedOld) expect({ ...parkedSnap[id], ats: 0 }).toEqual({ ...seeded[id], ats: 0 }); // no attempt or stall used
+
+    // 3. Under the hold, a teacher and an administrator are still refused...
+    for (const actor of [STAFF, ADMIN]) {
+      for (const id of ['fail_1', 'fail_2', 'half_1', 'half_2']) {
+        await expectRefused(() => w.videos.retryMobileProcessing(id, actor), 'historical-hold');
+      }
+      await expectRefused(() => w.videos.retryMobileProcessing('stalled_1', actor, { supersede: true }), actor === STAFF ? null : 'historical-hold');
+    }
+    // ...and MASTER recovers the four FAILED rows and supersedes the stalled one.
+    for (const id of ['fail_1', 'fail_2', 'half_1', 'half_2']) {
+      await expect(w.videos.retryMobileProcessing(id, MASTER)).resolves.toMatchObject({ jobId: mobileJobIdFor(id, 1), alreadyQueued: false });
+    }
+    await expect(w.videos.retryMobileProcessing('stalled_1', MASTER, { supersede: true })).resolves.toMatchObject({
       jobId: mobileJobIdFor('stalled_1', 1),
       alreadyQueued: false,
     });
-    const newIds = ['fail_1', 'fail_2', 'half_1', 'half_2', 'stalled_1'].map((id) => mobileJobIdFor(id, 1));
-    for (const id of newIds) expect(await srv.mobileQueue.getJob(id)).toBeTruthy();
+    // Those five (trigger `retry`) encode now; the held ones stay parked and unencoded.
+    await until(() => recovered.every((id) => w.db.get(id).mobileStatus === 'READY'), 'the five recovered videos READY', 40_000);
+    await until(async () => (await Promise.all(newIds.map(stateOf))).every((st) => st === 'completed'), 'the five retry jobs to finish', 20_000);
+    expect(encodes.map((e) => e.videoId).sort()).toEqual([...recovered].sort());
+    const stillParked = await parkedIds();
+    for (const id of parkedOld) expect(stillParked.has(id)).toBe(true);
+    for (const id of ['ok_1', 'ok_2', 'ok_3']) expect(w.db.get(id).mobileStatus).toBe('QUEUED');
 
-    await sleep(4_000); // the half_* retries come due behind the paused queue
-    expect(encodes).toEqual([]);
-    const held = await snapAll([...oldIds, ...newIds]);
-    for (const id of oldIds) expect(held[id]).toEqual(seeded[id]);
-    for (const id of newIds) expect(held[id].ats).toBe(0);
-    expect(await srv.mobileQueue.isPaused()).toBe(true);
-
-    // Resume: every video is encoded exactly once.
-    await expect(w.videos.setMobileProcessingPaused(false, ADMIN)).resolves.toMatchObject({ queuePaused: false, parkedPromoted: 0 });
+    // 4. Resume: the parked jobs are released once; the ok_* encode, the overtaken ones step aside.
+    await expect(w.videos.setMobileProcessingPaused(false, ADMIN)).resolves.toMatchObject({ queuePaused: false, parkedPromoted: 6 });
     await until(() => rows.every((r) => w.db.get(r.id).mobileStatus === 'READY'), 'all eight videos READY', 40_000);
     const settled = async () =>
       (await Promise.all([...newIds, ...['half_1', 'half_2', 'stalled_1', 'ok_1', 'ok_2', 'ok_3'].map(old)].map(stateOf))).every(

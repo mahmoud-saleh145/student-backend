@@ -269,7 +269,14 @@ Use `deploy/laptop-worker/` (compose file, `.env.worker.example`,
   migration; neither is needed once the mount is in place.
 
 Endpoints (staff): `GET /videos/:id/status` carries `mobile`;
-`POST /videos/:id/mobile/retry`. Admin: `GET /videos/mobile/overview`
+`POST /videos/:id/mobile/retry`. A retry creates a job with trigger `retry`,
+which a historical hold does not hold. So while an operator pause is in place
+the retry itself is restricted (`src/modules/videos/mobile-retry-policy.ts`):
+- a full pause refuses every retry, including the master's;
+- a historical hold allows only the `MASTER` account;
+- an unreadable flag refuses (503).
+
+See `docs/API_CONTRACT.md`. Admin: `GET /videos/mobile/overview`
 (counts, remaining, progress %, throughput-based ETA, output bytes, queue
 counts, pause, delivery override, the worker's host view, recent failures),
 `POST /videos/mobile/migrate?dryRun=true|false&limit=N`,
