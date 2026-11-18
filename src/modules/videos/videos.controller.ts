@@ -80,6 +80,16 @@ class MobileRetryDto {
   @IsOptional()
   @IsBoolean()
   force?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'Administrators only: replace a queued job that is still live with a new one (fresh attempts and ' +
+      'stall budget). The old job stays in the queue and steps aside when it runs. Refused while the ' +
+      'video is being encoded.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  supersede?: boolean;
 }
 
 class MobileDeliveryDto {
@@ -227,6 +237,10 @@ export class VideosController {
   @AdminOnly()
   @ApiOperation({
     summary: 'Pause mobile encodes (the running one finishes; queued ones wait until resumed)',
+    description:
+      'scope=all (default) also pauses the mobile queue itself, so no job is taken at all. ' +
+      'scope=historical keeps the queue running for new uploads and staff retries; each held ' +
+      'back-catalogue job is parked on its single take. The result includes queuePaused.',
   })
   mobilePause(@Body() body: MobilePauseDto, @CurrentUser() actor: AuthenticatedUser) {
     return this.videos.setMobileProcessingPaused(true, actor, body.reason, body.scope);
@@ -234,7 +248,12 @@ export class VideosController {
 
   @Post('mobile/resume')
   @AdminOnly()
-  @ApiOperation({ summary: 'Resume mobile encodes' })
+  @ApiOperation({
+    summary: 'Resume mobile encodes',
+    description:
+      'Clears the pause flag, releases every parked job (parkedPromoted) and resumes the mobile queue. ' +
+      'This is the only way the queue is resumed: deleting the flag directly does not resume it.',
+  })
   mobileResume(@CurrentUser() actor: AuthenticatedUser) {
     return this.videos.setMobileProcessingPaused(false, actor);
   }
@@ -262,14 +281,18 @@ export class VideosController {
     description:
       'Touches the mobile pipeline only; the Gumlet side is not reset or restarted. A video that is ' +
       'already queued or encoding keeps its existing job (no duplicate), and a READY ladder is ' +
-      'refused unless an administrator sends force=true.',
+      'refused unless an administrator sends force=true. An administrator may send supersede=true to ' +
+      'replace a live queued job with a fresh one (the old job steps aside when it runs).',
   })
   mobileRetry(
     @Param('videoId') videoId: string,
     @CurrentUser() actor: AuthenticatedUser,
     @Body() body?: MobileRetryDto,
   ) {
-    return this.videos.retryMobileProcessing(videoId, actor, { force: body?.force === true });
+    return this.videos.retryMobileProcessing(videoId, actor, {
+      force: body?.force === true,
+      supersede: body?.supersede === true,
+    });
   }
 
   @Post(':videoId/captions')

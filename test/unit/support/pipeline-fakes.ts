@@ -1,4 +1,5 @@
 import { MobileVideoProcessor } from '../../../src/jobs/processors/mobile-video.processor';
+import { readPauseState } from '../../../src/jobs/processors/scratch-guard';
 import { VideoProcessor } from '../../../src/jobs/processors/video.processor';
 import { CourseAccessService } from '../../../src/modules/courses/course-access.service';
 import { NotificationsService } from '../../../src/modules/notifications/notifications.service';
@@ -468,6 +469,8 @@ export interface FakeJob {
   attemptsMade: number;
   progress: number;
   timestamp: number;
+  /** While delayed: when it is due (epoch ms), as `moveToDelayed` set it. */
+  dueAt?: number;
 }
 
 /**
@@ -521,8 +524,28 @@ export class FakeQueue {
       return counts;
     });
 
-  isPaused = async () => false;
+  /** BullMQ's queue-level pause: no worker takes a job while it is set. */
+  paused = false;
+  isPaused = () => this.gate(() => this.paused);
+  pause = () => this.gate(() => void (this.paused = true));
+  resume = () => this.gate(() => void (this.paused = false));
   getJobs = async (states: string[]) => this.inState(...(states as FakeJob['state'][])).map((j) => this.handle(j));
+
+  /**
+   * The delayed set as BullMQ 5 stores it (score = due * 0x1000), through the
+   * two client calls the park bookkeeping uses.
+   */
+  readonly keys = { delayed: 'fake:mobile:delayed' };
+  get client() {
+    const score = (job: FakeJob) => String((job.dueAt ?? 0) * 0x1000);
+    return this.gate(() => ({
+      zrange: async () => this.inState('delayed').flatMap((job) => [job.id, score(job)]),
+      zscore: async (_key: string, id: string) => {
+        const job = this.jobs.get(id);
+        return job?.state === 'delayed' ? score(job) : null;
+      },
+    }));
+  }
 
   private handle(job: FakeJob) {
     return {
@@ -533,6 +556,13 @@ export class FakeQueue {
       timestamp: job.timestamp,
       getState: () => this.gate(() => (this.jobs.has(job.id) ? job.state : 'unknown')),
       remove: () => this.gate(() => void this.jobs.delete(job.id)),
+      /** Back from the delayed set into the queue, counters unchanged (BullMQ `Job#promote`). */
+      promote: () =>
+        this.gate(() => {
+          if (job.state !== 'delayed') throw new Error(`Job ${job.id} is not in the delayed state. promote`);
+          job.state = job.opts.priority ? 'prioritized' : 'waiting';
+          job.dueAt = undefined;
+        }),
     };
   }
 
@@ -547,8 +577,9 @@ export class FakeQueue {
     return this.inState('waiting', 'prioritized', 'delayed', 'active');
   }
 
-  /** What a worker would take next: the plain wait list before the prioritized set. */
+  /** What a worker would take next: the plain wait list before the prioritized set; nothing while paused. */
   next(): FakeJob | null {
+    if (this.paused) return null;
     return this.inState('waiting')[0] ?? this.inState('prioritized')[0] ?? null;
   }
 
@@ -580,9 +611,12 @@ export class FakeStorage {
 export class FakeRedis {
   readonly store = new Map<string, unknown>();
   getJson = async <T>(key: string): Promise<T | null> => (this.store.get(key) as T | undefined) ?? null;
+  getJsonOrThrow = this.getJson;
   setJson = async (key: string, value: unknown) => void this.store.set(key, value);
   setJsonPersistent = async (key: string, value: unknown) => void this.store.set(key, value);
+  setJsonPersistentOrThrow = this.setJsonPersistent;
   del = async (key: string) => void this.store.delete(key);
+  delOrThrow = this.del;
 }
 
 export const STAFF = { id: 'staff_1', role: 'TEACHER' } as never;
@@ -726,7 +760,10 @@ function jobFor(queue: FakeQueue, job: FakeJob) {
       return job.attemptsMade;
     },
     updateProgress: async (pct: number) => void (job.progress = pct),
-    moveToDelayed: async () => void (job.state = 'delayed'),
+    moveToDelayed: async (timestamp: number) => {
+      job.state = 'delayed';
+      job.dueAt = timestamp;
+    },
   } as never;
 }
 
@@ -739,6 +776,8 @@ export function mobileWorker(
   options: {
     encode?: (videoId: string) => Promise<void> | void;
     pause?: { paused: boolean; scope?: 'all' | 'historical'; reason?: string | null };
+    /** Read the pause flag from the world's Redis (what the operator API writes) instead of `pause`. */
+    pauseFromRedis?: boolean;
   } = {},
 ) {
   const transcoder = {
@@ -755,13 +794,16 @@ export function mobileWorker(
     }),
   };
   const guard = {
-    pauseState: async () => ({
-      paused: options.pause?.paused ?? false,
-      reason: options.pause?.reason ?? null,
-      by: null,
-      at: null,
-      scope: options.pause?.scope ?? 'all',
-    }),
+    pauseState: async () =>
+      options.pauseFromRedis
+        ? readPauseState(world.redis as never, { strict: true })
+        : {
+            paused: options.pause?.paused ?? false,
+            reason: options.pause?.reason ?? null,
+            by: null,
+            at: null,
+            scope: options.pause?.scope ?? 'all',
+          },
     noteActive: jest.fn(),
     noteProgress: jest.fn(),
     noteFinished: jest.fn(),
@@ -777,6 +819,7 @@ export function mobileWorker(
     { getOrThrow: () => ({ workDir: '/tmp/edu-transcode' }) } as never,
     guard as never,
     scheduler as never,
+    world.mobileQueue as never,
   );
 
   /**

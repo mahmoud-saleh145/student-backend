@@ -79,6 +79,27 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * Like `getJson`, but a Redis error (or an unparseable value) THROWS instead
+   * of reading as "absent". For flags where absent means "go ahead" - the
+   * mobile pause - so an unreadable flag is never taken for a cleared one.
+   */
+  async getJsonOrThrow<T>(key: string): Promise<T | null> {
+    const raw = await this.client.get(this.key(key));
+    return raw ? (JSON.parse(raw) as T) : null;
+  }
+
+  /** `setJsonPersistent` that reports failure, for operator flags whose write must be known. */
+  async setJsonPersistentOrThrow(key: string, value: unknown): Promise<void> {
+    await this.client.set(this.key(key), JSON.stringify(value));
+  }
+
+  /** `del` that reports failure. */
+  async delOrThrow(...keys: string[]): Promise<void> {
+    if (keys.length === 0) return;
+    await this.client.del(...keys.map((k) => this.key(k)));
+  }
+
   async setJson(key: string, value: unknown, ttlSeconds: number): Promise<void> {
     try {
       await this.client.set(this.key(key), JSON.stringify(value), 'EX', ttlSeconds);

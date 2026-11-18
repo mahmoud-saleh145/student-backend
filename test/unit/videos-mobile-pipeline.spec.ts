@@ -51,6 +51,7 @@ function harness(opts: {
     $transaction: jest.fn(async (fn: (client: unknown) => unknown) => fn(tx)),
   };
   tx = prisma;
+  const queueState = { paused: false };
   const mobileQueue = {
     add: jest.fn(async () => {
       if (opts.queueAddFails) throw new Error('redis unavailable');
@@ -62,6 +63,12 @@ function harness(opts: {
         : { getState: jest.fn(async () => opts.jobState) },
     ),
     getJobCounts: jest.fn(async () => ({ waiting: 2, active: 1, delayed: 0, failed: 0, completed: 9 })),
+    // Queue-level pause and the (empty) delayed set the park bookkeeping reads.
+    isPaused: jest.fn(async () => queueState.paused),
+    pause: jest.fn(async () => void (queueState.paused = true)),
+    resume: jest.fn(async () => void (queueState.paused = false)),
+    keys: { delayed: 'bull:mobile-video-processing:delayed' },
+    client: Promise.resolve({ zrange: jest.fn(async () => []), zscore: jest.fn(async () => null) }),
   };
   const storage = { exists: jest.fn(async (_b: string, key: string) => (opts.exists ? opts.exists(key) : true)) };
   const access = { assertCanManageCourse: jest.fn() };
@@ -338,7 +345,10 @@ describe('markMobileProcessing', () => {
     await expect(t.svc.markMobileProcessing('v_1', 'source/v_1.mp4', 'job_B')).resolves.toBe(false);
     expect(t.prisma.video.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: expect.objectContaining({ OR: [{ mobileJobId: 'job_old' }, { mobileJobId: 'job_B' }] }),
+        where: expect.objectContaining({
+          // A non-owner may take the row only while it is not READY (atomic with the claim).
+          OR: [{ mobileJobId: 'job_old', mobileStatus: { not: 'READY' } }, { mobileJobId: 'job_B' }],
+        }),
       }),
     );
   });
@@ -432,17 +442,17 @@ describe('mobilePipelineOverview', () => {
     const t = harness();
     const store: Record<string, unknown> = {};
     t.redis.getJson.mockImplementation(async (key: string) => store[key] ?? null);
-    (t.redis as unknown as { setJsonPersistent: jest.Mock }).setJsonPersistent = jest.fn(async (k: string, v: unknown) => {
-      store[k] = v;
-    });
-    (t.redis as unknown as { del: jest.Mock }).del = jest.fn(async (k: string) => {
-      delete store[k];
+    // The operator transitions read and write the flag strictly (a failed write is reported).
+    Object.assign(t.redis, {
+      getJsonOrThrow: jest.fn(async (key: string) => store[key] ?? null),
+      setJsonPersistentOrThrow: jest.fn(async (k: string, v: unknown) => void (store[k] = v)),
+      delOrThrow: jest.fn(async (k: string) => void delete store[k]),
     });
 
     const paused = await t.svc.setMobileProcessingPaused(true, { id: 'admin_1', role: 'ADMIN' as never }, 'laptop in use');
-    expect(paused).toMatchObject({ paused: true, reason: 'laptop in use', by: 'admin_1' });
+    expect(paused).toMatchObject({ paused: true, reason: 'laptop in use', by: 'admin_1', queuePaused: true });
     const resumed = await t.svc.setMobileProcessingPaused(false, { id: 'admin_1', role: 'ADMIN' as never });
-    expect(resumed.paused).toBe(false);
+    expect(resumed).toMatchObject({ paused: false, queuePaused: false, parkedPromoted: 0 });
     expect(t.audit.record).toHaveBeenCalledTimes(2);
   });
 
