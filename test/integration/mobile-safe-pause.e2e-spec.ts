@@ -73,8 +73,11 @@ describe('mobile safe pause (real Postgres + real BullMQ queue)', () => {
   let queue: Queue<MobileTranscodeJobData>;
   let redis: RedisService;
   let admin: { id: string; role: UserRole };
+  let master: { id: string; role: UserRole };
   let teacher: { id: string; role: UserRole };
   let teacherPhone: string;
+  let adminPhone: string;
+  let masterPhone: string;
   let courseId: string;
   let videoIds: string[];
 
@@ -101,10 +104,14 @@ describe('mobile safe pause (real Postgres + real BullMQ queue)', () => {
 
     const t = await createUser(prisma, { role: UserRole.TEACHER });
     const a = await createUser(prisma, { role: UserRole.ADMIN });
+    const m = await createUser(prisma, { role: UserRole.MASTER });
     const student = await createUser(prisma, { role: UserRole.STUDENT });
     teacher = { id: t.id, role: t.role };
     teacherPhone = t.phone;
     admin = { id: a.id, role: a.role };
+    adminPhone = a.phone;
+    master = { id: m.id, role: m.role };
+    masterPhone = m.phone;
     const course = await createCourse(prisma, { teacherId: t.id });
     await enroll(prisma, student.id, course.id);
     courseId = course.id;
@@ -274,6 +281,84 @@ describe('mobile safe pause (real Postgres + real BullMQ queue)', () => {
     expect(await row(id)).toMatchObject({ mobileJobId: oldJobId(id), mobileGeneration: 0 });
   });
 
+  // --- S2-P1: who may retry while an operator pause is in place ----------------
+
+  describe('retry guard during an operator pause (service and HTTP)', () => {
+    const failed = async (id: string) =>
+      setMobile(id, { mobileStatus: MobileVideoStatus.FAILED, mobileJobId: oldJobId(id), mobileGeneration: 0 });
+    const retryHttp = async (phone: string, device: string, id: string, body: Record<string, unknown> = {}) => {
+      const { headers } = await login(app, phone, device);
+      return http(app).post(`${API}/videos/${id}/mobile/retry`).set(headers).send(body);
+    };
+
+    it('historical hold: teacher and admin get 403 over HTTP, the master gets the new job', async () => {
+      const id = videoIds[0];
+      await failed(id);
+      await videos.setMobileProcessingPaused(true, admin, 'between batches', 'historical');
+      const before = await studentFacing();
+
+      for (const [phone, device] of [[teacherPhone, 'teacher-device'], [adminPhone, 'admin-device']] as const) {
+        const res = await retryHttp(phone, device, id);
+        expect(res.status).toBe(403);
+        expect(errorCode(res.body)).toBe('FORBIDDEN');
+      }
+      expect(await row(id)).toMatchObject({ mobileJobId: oldJobId(id), mobileGeneration: 0 });
+      expect(await queue.getJob(mobileJobIdFor(id, 1))).toBeUndefined();
+
+      const ok = await retryHttp(masterPhone, 'master-device', id);
+      expect([200, 201]).toContain(ok.status);
+      expect(await row(id)).toMatchObject({ mobileStatus: MobileVideoStatus.QUEUED, mobileJobId: mobileJobIdFor(id, 1), mobileTrigger: 'retry' });
+      expect((await queue.getJob(mobileJobIdFor(id, 1)))?.data.trigger).toBe('retry');
+      expect(await studentFacing()).toBe(before);
+    });
+
+    it('full pause: even the master gets 403 over HTTP; nothing is queued', async () => {
+      const id = videoIds[0];
+      await failed(id);
+      await videos.setMobileProcessingPaused(true, admin, 'metered', 'all');
+      const res = await retryHttp(masterPhone, 'master-device', id);
+      expect(res.status).toBe(403);
+      expect(await row(id)).toMatchObject({ mobileJobId: oldJobId(id), mobileGeneration: 0 });
+      expect(await queue.getJobCounts('waiting', 'prioritized', 'delayed', 'paused')).toEqual({ waiting: 0, prioritized: 0, delayed: 0, paused: 0 });
+    });
+
+    it('the status endpoint offers "Retry mobile" exactly when the endpoint would accept it', async () => {
+      const id = videoIds[0];
+      await failed(id);
+      const canRetry = async (phone: string, device: string) => {
+        const { headers } = await login(app, phone, device);
+        const res = await http(app).get(`${API}/videos/${id}/status`).set(headers);
+        expect(res.status).toBe(200);
+        return (res.body.data ?? res.body).mobile.canRetry;
+      };
+      expect(await canRetry(teacherPhone, 'teacher-device')).toBe(true);
+      await videos.setMobileProcessingPaused(true, admin, 'between batches', 'historical');
+      expect(await canRetry(teacherPhone, 'teacher-device')).toBe(false);
+      expect(await canRetry(masterPhone, 'master-device')).toBe(true);
+      await videos.setMobileProcessingPaused(true, admin, 'metered', 'all');
+      expect(await canRetry(masterPhone, 'master-device')).toBe(false);
+    });
+
+    it('concurrent master retries on real rows during a hold: one new generation, one job', async () => {
+      const id = videoIds[0];
+      await failed(id);
+      await videos.setMobileProcessingPaused(true, admin, 'between batches', 'historical');
+      const results = await Promise.allSettled(Array.from({ length: 5 }, () => videos.retryMobileProcessing(id, master)));
+      expect(results.every((r) => r.status === 'fulfilled')).toBe(true);
+      expect(await row(id)).toMatchObject({ mobileGeneration: 1, mobileJobId: mobileJobIdFor(id, 1) });
+      expect(await queue.getJobCounts('waiting', 'prioritized', 'delayed')).toMatchObject({ waiting: 1, prioritized: 0, delayed: 0 });
+    });
+
+    it('lifting the pause restores the teacher retry', async () => {
+      const id = videoIds[0];
+      await failed(id);
+      await videos.setMobileProcessingPaused(true, admin, 'between batches', 'historical');
+      await expect(videos.retryMobileProcessing(id, teacher)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+      await videos.setMobileProcessingPaused(false, admin);
+      await expect(videos.retryMobileProcessing(id, teacher)).resolves.toMatchObject({ jobId: mobileJobIdFor(id, 1) });
+    });
+  });
+
   // --- the claim ---------------------------------------------------------------
 
   describe('markMobileProcessing compare-and-set on real rows', () => {
@@ -372,12 +457,18 @@ describe('mobile safe pause (real Postgres + real BullMQ queue)', () => {
     await addHistorical(b, oldJobId(b), { delay: 60_000 });
     await setMobile(c, { mobileStatus: MobileVideoStatus.READY, mobileJobId: mobileJobIdFor(c, 1), mobileGeneration: 1 });
 
+    // A full pause refuses every retry (S2-P1), the master's included...
     await videos.setMobileProcessingPaused(true, admin, 'x', 'all');
-    await videos.retryMobileProcessing(a, teacher);
-    await videos.retryMobileProcessing(b, admin, { supersede: true });
-    await videos.retryMobileProcessing(c, admin, { force: true });
-    await videos.markMobileProcessing(c, await sourceOf(c), mobileJobIdFor(c, 2));
+    await expect(videos.retryMobileProcessing(a, teacher)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(videos.retryMobileProcessing(b, master, { supersede: true })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(videos.retryMobileProcessing(c, master, { force: true })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    // ...and a historical hold lets only the master queue one.
     await videos.setMobileProcessingPaused(true, admin, 'y', 'historical');
+    await expect(videos.retryMobileProcessing(a, teacher)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await videos.retryMobileProcessing(a, master);
+    await videos.retryMobileProcessing(b, master, { supersede: true });
+    await videos.retryMobileProcessing(c, master, { force: true });
+    await videos.markMobileProcessing(c, await sourceOf(c), mobileJobIdFor(c, 2));
     await videos.setMobileProcessingPaused(false, admin);
 
     expect(await studentFacing()).toBe(before);

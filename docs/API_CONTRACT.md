@@ -817,6 +817,23 @@ queue untouched and steps aside when it runs. Refused with `409 INVALID_STATE`
 while the old job is being encoded, `503 QUEUE_UNAVAILABLE` when the queue does
 not answer. Audited with `supersede: true` and `supersededJobId`.
 
+**While an operator pause is in place** (`POST /videos/mobile/pause`), the
+pause decides who may queue a mobile retry. This applies to every variant
+(plain, `force`, `supersede`) and is checked on the server, so a direct API call
+is held to the same rule as the dashboard:
+
+| Pause flag | Who may retry |
+|---|---|
+| none | unchanged: anyone who can manage the course (`force`/`supersede` as above) |
+| `scope: "all"` (or a flag with no scope) | **nobody**, `MASTER` included: `403 FORBIDDEN`, `details.reason = "full-pause"` |
+| `scope: "historical"` | **`MASTER` only**: others get `403 FORBIDDEN`, `details.reason = "historical-hold"` |
+| unreadable (Redis error) | nobody: `503 QUEUE_UNAVAILABLE`, `details.reason = "pause-unreadable"` |
+
+A refused retry writes nothing (no row change, no job, no audit entry). The
+existing checks come first: 404 for an unknown video, and the course-permission
+403. `GET /videos/:id/status` reports `mobile.canRetry: true` only when this
+actor's retry would be accepted now.
+
 ### `POST /videos/mobile/pause`
 
 Body: `{ "reason"?: string, "scope"?: "all" | "historical" }`. `all` (default,

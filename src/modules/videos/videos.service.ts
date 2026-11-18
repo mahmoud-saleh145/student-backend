@@ -51,6 +51,7 @@ import { assertObjectKeyInNamespace, StorageService } from '../storage/storage.s
 import { isTerminalGumletFailure, sanitizeProviderText } from './gumlet-failure';
 import { GumletIngestService } from './gumlet-ingest.service';
 import { LessonVideoService } from './lesson-video.service';
+import { MOBILE_RETRY_REFUSAL_MESSAGE, mobileRetryVerdict, type MobileRetryVerdict } from './mobile-retry-policy';
 import { NewVideoAnnouncer } from './new-video-announcer.service';
 import { normalizeProviderDurationSeconds } from './provider-duration.util';
 import {
@@ -1493,6 +1494,16 @@ export class VideosService {
     });
     if (!video) throw AppException.notFound('Video', videoId);
     await this.access.assertCanManageCourse(actor.id, actor.role, video.courseId, 'content');
+    // An operator pause decides whether a retry may be queued at all (and by
+    // whom). Checked on the server, so the dashboard and a direct API call are
+    // held to the same rule; every variant (plain, force, supersede) passes here.
+    const verdict = await this.mobileRetryVerdictFor(actor);
+    if (!verdict.allowed) {
+      throw new AppException(
+        verdict.reason === 'pause-unreadable' ? ErrorCode.QUEUE_UNAVAILABLE : ErrorCode.FORBIDDEN,
+        { message: MOBILE_RETRY_REFUSAL_MESSAGE[verdict.reason], details: { reason: verdict.reason } },
+      );
+    }
     if (!video.sourceKey) {
       throw new AppException(ErrorCode.INVALID_STATE, {
         message: 'No source file to process for mobile — re-upload the video',
@@ -1538,6 +1549,22 @@ export class VideosService {
       },
     });
     return { videoId, ...result, ...(await this.mobileWorkerStatus()) };
+  }
+
+  /**
+   * Whether `actor` may queue a mobile retry right now, from the operator pause
+   * flag (see `mobile-retry-policy.ts`). Read strictly: if Redis cannot answer,
+   * the verdict is a refusal, never "not paused".
+   */
+  async mobileRetryVerdictFor(actor: { role: UserRole }): Promise<MobileRetryVerdict> {
+    let pause: PauseState;
+    try {
+      pause = await readPauseState(this.redis, { strict: true });
+    } catch (error) {
+      this.logger.warn(`mobile retry: pause state unreadable (${(error as Error)?.message ?? error}); refusing`);
+      return { allowed: false, reason: 'pause-unreadable' };
+    }
+    return mobileRetryVerdict(pause, actor.role);
   }
 
   /**
@@ -2448,6 +2475,13 @@ export class VideosService {
     const isAdmin = actor.role === 'ADMIN' || actor.role === 'MASTER';
     const sourceState = sourceStateOf(video);
     const gumletState = gumletStateOf(video);
+    // "Retry mobile" is offered only when the endpoint would accept it from
+    // this actor now. The pause flag is read only for a video the button could
+    // apply to (FAILED / never processed), which the panel does not poll.
+    const mobileRetryable =
+      sourceState === 'VERIFIED' &&
+      (video.mobileStatus === MobileVideoStatus.FAILED || video.mobileStatus === MobileVideoStatus.NONE);
+    const mobileRetryAllowed = mobileRetryable && (await this.mobileRetryVerdictFor(actor)).allowed;
     const mobileAutomatic = Boolean(this.mobileQueue) && this.cfg.mobile?.autoProcess !== false;
 
     return {
@@ -2543,12 +2577,12 @@ export class VideosService {
             }
           : {}),
         /**
-         * Whether "Retry mobile" would do something: a failed ladder, or a
-         * verified source that was never processed. Never while a job exists.
+         * Whether "Retry mobile" would do something AND this actor may ask for
+         * it now: a failed ladder, or a verified source that was never
+         * processed; never while a job exists; and not while an operator pause
+         * refuses this actor (or the pause state cannot be read).
          */
-        canRetry:
-          sourceState === 'VERIFIED' &&
-          (video.mobileStatus === MobileVideoStatus.FAILED || video.mobileStatus === MobileVideoStatus.NONE),
+        canRetry: mobileRetryAllowed,
       },
       captions: video.captions.map((c) => ({
         language: c.language,
