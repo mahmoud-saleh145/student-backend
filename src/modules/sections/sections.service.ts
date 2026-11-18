@@ -1,5 +1,11 @@
 import { Injectable, Optional } from '@nestjs/common';
-import { AuditAction, ContentStatus, type UserRole, VideoStatus } from '@prisma/client';
+import {
+  AuditAction,
+  ContentStatus,
+  type Prisma,
+  type UserRole,
+  VideoStatus,
+} from '@prisma/client';
 
 import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
@@ -17,6 +23,10 @@ import { NewVideoAnnouncer } from '../videos/new-video-announcer.service';
  * time — "Before Midterm", "Unit 3", "Part 4" are all just strings. The only
  * structural rule is that `sortOrder` is unique and contiguous within a
  * course, which `reorder()` maintains.
+ *
+ * "Contiguous" is a statement about LIVE sections. A soft-deleted section keeps
+ * its row, and `@@unique([courseId, sortOrder])` covers that row too, so it is
+ * moved off the positive number line instead - see `vacateDeletedPositions()`.
  */
 @Injectable()
 export class SectionsService {
@@ -162,7 +172,16 @@ export class SectionsService {
         select: { sortOrder: true },
       });
 
-      const target = input.sortOrder ?? (last?.sortOrder ?? 0) + 1;
+      const lastLive = last?.sortOrder ?? 0;
+      const target = input.sortOrder ?? lastLive + 1;
+
+      // `last` is read from live rows only, so `target` can be a position a
+      // soft-deleted section still holds - which is what answered 409 on a
+      // course whose sections had all been deleted. The positions this request
+      // is about to give to a live section are `target` for the new one and,
+      // on an explicit insert, everything up to `lastLive + 1` for the block
+      // shifted below.
+      await this.vacateDeletedPositions(tx, courseId, target, Math.max(target, lastLive + 1));
 
       if (input.sortOrder !== undefined) {
         // Two-phase shift: move the block out to negative space first, because
@@ -172,10 +191,12 @@ export class SectionsService {
           SET "sortOrder" = -("sortOrder" + 1)
           WHERE "courseId" = ${courseId} AND "sortOrder" >= ${target} AND "deletedAt" IS NULL
         `;
+        // Live rows only - exactly the set the statement above made negative.
+        // Parked soft-deleted sections are negative too and must stay there.
         await tx.$executeRaw`
           UPDATE course_sections
           SET "sortOrder" = -"sortOrder"
-          WHERE "courseId" = ${courseId} AND "sortOrder" < 0
+          WHERE "courseId" = ${courseId} AND "sortOrder" < 0 AND "deletedAt" IS NULL
         `;
       }
 
@@ -293,6 +314,12 @@ export class SectionsService {
         WHERE "courseId" = ${courseId} AND "deletedAt" IS NULL
       `;
 
+      // The final positions are 1..N. A soft-deleted section holding one of
+      // them would collide with the live section written there. Done after the
+      // park, not before it, so nothing is added between reading the list of
+      // sections above and the statement that takes hold of them.
+      await this.vacateDeletedPositions(tx, courseId, 1, sectionIds.length);
+
       for (const [index, id] of sectionIds.entries()) {
         await tx.courseSection.update({
           where: { id },
@@ -388,12 +415,38 @@ export class SectionsService {
         data: { status: 'REVOKED', revokedAt: now, revokedReason: 'Section deleted' },
       });
 
-      // Close the gap so ordering stays contiguous.
+      // The row soft-deleted above still holds `section.sortOrder`, and the
+      // statement below moves the next live section onto exactly that
+      // position - so removing any section that had a live one after it
+      // violated the unique index and rolled the whole delete back. Give the
+      // position up first (and any other deleted row sitting between here and
+      // the last live section, which the same shift would run into).
+      const lastLive = await tx.courseSection.findFirst({
+        where: { courseId: section.courseId, ...notDeleted },
+        orderBy: { sortOrder: 'desc' },
+        select: { sortOrder: true },
+      });
+      await this.vacateDeletedPositions(
+        tx,
+        section.courseId,
+        section.sortOrder,
+        Math.max(section.sortOrder, lastLive?.sortOrder ?? 0),
+      );
+
+      // Close the gap so ordering stays contiguous. In two statements, like the
+      // shift in `create()`: Postgres checks the unique index row by row, so a
+      // single `"sortOrder" - 1` over several rows succeeds or fails with the
+      // order the rows happen to be visited in (3 -> 2 while 2 is still there).
       await tx.$executeRaw`
-        UPDATE course_sections SET "sortOrder" = "sortOrder" - 1
+        UPDATE course_sections SET "sortOrder" = -("sortOrder" - 1)
         WHERE "courseId" = ${section.courseId}
           AND "sortOrder" > ${section.sortOrder}
           AND "deletedAt" IS NULL
+      `;
+      // Live rows only - exactly the set the statement above made negative.
+      await tx.$executeRaw`
+        UPDATE course_sections SET "sortOrder" = -"sortOrder"
+        WHERE "courseId" = ${section.courseId} AND "sortOrder" < 0 AND "deletedAt" IS NULL
       `;
     });
 
@@ -409,6 +462,50 @@ export class SectionsService {
     });
 
     return { ok: true, preservedWatchRecords: watched };
+  }
+
+  /**
+   * Moves the soft-deleted sections of ONE course off the positions
+   * `from..to`, which the caller is about to give to live sections.
+   *
+   * `@@unique([courseId, sortOrder])` is not partial: the index
+   * (`course_sections_courseId_sortOrder_key`) covers every row, soft-deleted
+   * ones included, and a deleted section keeps its row. Left where it was, it
+   * holds a position that every reader and every live-only query here believes
+   * is free.
+   *
+   * A row is parked below every position any row of the course holds:
+   * `LEAST(lowest position in the course, -1000000000) - 1 - own position`.
+   * That is strictly below every existing row, and distinct for each row moved
+   * by the same statement, so it cannot collide - including when the same
+   * position is deleted, reused and deleted again, which a spot derived from
+   * the position alone (`-"sortOrder" - 1000`) cannot survive. It is also far
+   * below the temporary negatives `create()` and `reorder()` write
+   * (`-(n + 1)`, `-n - 1000`).
+   *
+   * Only rows with `deletedAt` set are touched, only in this course, only in
+   * the range given, and each at most once: a parked row is negative and no
+   * range starts below 1. No reader sees a deleted section, and nothing
+   * restores one, so its position carries no meaning once it is deleted.
+   */
+  private async vacateDeletedPositions(
+    tx: Prisma.TransactionClient,
+    courseId: string,
+    from: number,
+    to: number,
+  ): Promise<void> {
+    await tx.$executeRaw`
+      UPDATE course_sections
+      SET "sortOrder" = (
+            SELECT LEAST(MIN("sortOrder"), -1000000000)
+            FROM course_sections
+            WHERE "courseId" = ${courseId}
+          ) - 1 - "sortOrder"
+      WHERE "courseId" = ${courseId}
+        AND "deletedAt" IS NOT NULL
+        AND "sortOrder" >= ${from}
+        AND "sortOrder" <= ${to}
+    `;
   }
 
   private async requireSection(sectionId: string) {

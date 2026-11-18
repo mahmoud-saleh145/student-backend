@@ -42,7 +42,9 @@ function build(options: { teacherMayDeleteLectures: boolean; liveLessons: number
   const ticketUpdateMany = jest.fn(async () => ({ count: 0 }));
 
   const tx = {
-    courseSection: { update: sectionUpdate },
+    // `findFirst`: the highest remaining live section, read before the gap is
+    // closed. None here - the deleted section was the only one.
+    courseSection: { update: sectionUpdate, findFirst: jest.fn(async () => null) },
     lesson: { updateMany: lessonUpdateMany, findMany: jest.fn(async () => [{ id: 'l_1' }]) },
     // A video may be attached to lectures in OTHER sections. Only one whose
     // every attachment is inside the deleted section may be archived.
