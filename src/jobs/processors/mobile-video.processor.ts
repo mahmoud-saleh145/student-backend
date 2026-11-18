@@ -1,13 +1,14 @@
-import { Processor, WorkerHost } from '@nestjs/bullmq';
-import { Logger, type OnModuleInit } from '@nestjs/common';
+import { InjectQueue, Processor, WorkerHost } from '@nestjs/bullmq';
+import { Logger, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { DelayedError, type Job } from 'bullmq';
+import { DelayedError, Queue, type Job } from 'bullmq';
 import { readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { VideoConfig } from '../../config/configuration';
 import { describeDatabaseError, isTransientDatabaseError } from '../../database/transient-db-error';
-import { VideosService } from '../../modules/videos/videos.service';
+import { VideosService, withinQueueTimeout } from '../../modules/videos/videos.service';
+import { MOBILE_PARK_MS } from '../mobile-park';
 import { MOBILE_VIDEO_JOBS, QUEUE_NAMES, type MobileTranscodeJobData } from '../queue.constants';
 import { RESPONSIVE_WORKER } from '../queue.tuning';
 import {
@@ -23,13 +24,15 @@ import {
   MobileEncodeScheduler,
   type EncodeSlot,
 } from './mobile-encode-scheduler';
-import { formatBytes, pauseHolds, ScratchGuard } from './scratch-guard';
+import { formatBytes, pauseHolds, ScratchGuard, type PauseState } from './scratch-guard';
 
 /** How long a deferred job waits before the worker looks at it again. */
 export const DEFER_WHEN_PAUSED_MS = 60_000;
 export const DEFER_WHEN_DISK_LOW_MS = 5 * 60_000;
 /** See the processor options: interruptions of the host are routine here. */
 export const MOBILE_MAX_STALLED_COUNT = 5;
+/** How often the worker makes sure a full pause has also paused the queue. */
+export const PAUSE_RECONCILE_MS = 30_000;
 
 /**
  * The independent mobile pipeline.
@@ -42,9 +45,21 @@ export const MOBILE_MAX_STALLED_COUNT = 5;
  * Runs on its own queue at concurrency 1: an encode holds a core for most of
  * an hour on a small host and must not sit in front of a Gumlet ingest.
  *
- * Before a job is CLAIMED it can be DEFERRED (moved back to the delayed set
- * without using an attempt and without touching the row's state):
- *  - the operator paused mobile processing (ScratchGuard pause flag);
+ * OPERATOR HOLDS ("park and release", see jobs/mobile-park.ts). A held job
+ * is taken at most ONCE per hold, because every take risks a stall or an
+ * attempt when the connection drops at that moment:
+ *  - a FULL pause (flag without the `historical` scope) pauses the BullMQ
+ *    queue itself; the job that noticed it is deferred once, and nothing is
+ *    taken until the operator resumes. A flag written by something that does
+ *    not pause the queue (the safety watchdog) is turned into a queue pause
+ *    here and by a background check every PAUSE_RECONCILE_MS;
+ *  - a HISTORICAL hold PARKS each `migration`/`recovery` job on its single
+ *    take (delayed MOBILE_PARK_MS); resuming promotes exactly those jobs;
+ *  - a pause flag that cannot be read defers the job (no attempt used), so
+ *    an unreadable flag is never mistaken for a cleared one.
+ *
+ * Before a job is CLAIMED it can also be DEFERRED (moved back to the delayed
+ * set without using an attempt and without touching the row's state):
  *  - it is HISTORICAL work (`migration`/`recovery`) and a new upload is waiting
  *    in the original queue (MobileEncodeScheduler: new uploads always first);
  *  - the scratch volume cannot hold this job's budget while keeping the
@@ -82,7 +97,7 @@ export const MOBILE_MAX_STALLED_COUNT = 5;
   maxStalledCount: MOBILE_MAX_STALLED_COUNT,
   ...RESPONSIVE_WORKER,
 })
-export class MobileVideoProcessor extends WorkerHost implements OnModuleInit {
+export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(MobileVideoProcessor.name);
   private readonly cfg: VideoConfig;
   /** Deferral intervals; a field only so a real-queue test can shorten them. */
@@ -92,6 +107,11 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit {
     disk: DEFER_WHEN_DISK_LOW_MS,
     slot: DEFER_FOR_ENCODE_SLOT_MS,
   };
+  /** Interval of the pause reconciler; a field only so a real-queue test can shorten it. */
+  protected pauseReconcileMs = PAUSE_RECONCILE_MS;
+  private reconcileTimer: NodeJS.Timeout | null = null;
+  /** One reconcile at a time: a hung Redis must not pile them up. */
+  private reconciling = false;
 
   constructor(
     private readonly transcoder: HlsTranscoder,
@@ -99,6 +119,12 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit {
     config: ConfigService,
     private readonly guard: ScratchGuard,
     private readonly scheduler: MobileEncodeScheduler,
+    /**
+     * This processor's own queue, to pause it when a full pause is in force.
+     * Typed optional only so a test may leave it out; without it a full pause
+     * falls back to deferring each job (the previous behaviour).
+     */
+    @InjectQueue(QUEUE_NAMES.mobileVideo) private readonly mobileQueue?: Queue<MobileTranscodeJobData>,
   ) {
     super();
     this.cfg = config.getOrThrow<VideoConfig>('video');
@@ -110,6 +136,7 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit {
    * remains of an interrupted job.
    */
   async onModuleInit(): Promise<void> {
+    this.startPauseReconciler();
     const root = join(this.cfg.workDir, 'mobile');
     const stale = await readdir(root).catch(() => [] as string[]);
     if (stale.length === 0) return;
@@ -119,20 +146,101 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit {
     this.logger.warn(`removed ${stale.length} stale scratch director${stale.length === 1 ? 'y' : 'ies'} under ${root}`);
   }
 
+  onModuleDestroy(): void {
+    if (this.reconcileTimer) clearInterval(this.reconcileTimer);
+    this.reconcileTimer = null;
+  }
+
+  /**
+   * Starts the background check that turns a full-pause FLAG into a paused
+   * QUEUE (once now, then every `pauseReconcileMs`). Public for tests.
+   */
+  startPauseReconciler(): void {
+    if (this.reconcileTimer || !this.mobileQueue) return;
+    void this.reconcileQueuePause();
+    this.reconcileTimer = setInterval(() => void this.reconcileQueuePause(), this.pauseReconcileMs);
+    this.reconcileTimer.unref();
+  }
+
+  /**
+   * A full pause in the flag and a queue that is still running: pause the
+   * queue. This is how a pause written by something that only knows the flag
+   * (the safety watchdog, an operator with redis-cli) stops the worker from
+   * taking jobs at all. It NEVER resumes the queue - only the operator's
+   * resume does that, after releasing parked jobs - so a flag that is cleared
+   * or unreadable leaves the queue as it is. Errors are logged and ignored.
+   * Returns whether it paused the queue (for tests).
+   */
+  async reconcileQueuePause(): Promise<boolean> {
+    if (!this.mobileQueue || this.reconciling) return false;
+    this.reconciling = true;
+    try {
+      const pause = await this.guard.pauseState();
+      if (!pause.paused || pause.scope === 'historical') return false;
+      return await this.ensureQueuePaused(pause, 'pause reconciler');
+    } catch (error) {
+      this.logger.warn(`pause reconciler: ${(error as Error)?.message ?? error}; will look again`);
+      return false;
+    } finally {
+      this.reconciling = false;
+    }
+  }
+
+  /**
+   * Pauses the mobile queue at BullMQ level unless it already is. Never
+   * throws: failing to pause leaves the previous behaviour (each job is
+   * deferred), never a job that runs. Returns whether it paused the queue.
+   */
+  private async ensureQueuePaused(pause: PauseState, who: string): Promise<boolean> {
+    if (!this.mobileQueue) return false;
+    try {
+      if (await withinQueueTimeout(this.mobileQueue.isPaused(), 'mobile queue read')) return false;
+      await withinQueueTimeout(this.mobileQueue.pause(), 'mobile queue pause');
+      this.logger.warn(
+        `${who}: mobile processing is paused (${pause.reason ?? 'no reason given'}; by ${pause.by ?? 'unknown'}); ` +
+          `paused the mobile queue so no job is taken until an operator resumes`,
+      );
+      return true;
+    } catch (error) {
+      this.logger.error(`${who}: could not pause the mobile queue (${(error as Error)?.message ?? error})`);
+      return false;
+    }
+  }
+
   async process(job: Job<MobileTranscodeJobData>, token?: string): Promise<unknown> {
     if (job.name !== MOBILE_VIDEO_JOBS.transcode) return null;
 
     const { videoId, sourceKey, ladder, encrypt, trigger, durationSeconds } = job.data;
     const workDir = join(this.cfg.workDir, 'mobile', videoId);
 
-    // --- gates that defer rather than fail ----------------------------------
+    // --- operator holds (see the class comment) -----------------------------
+    // A flag that cannot be read is not "not paused": the job is deferred,
+    // which uses no attempt.
+    let pause: PauseState;
+    try {
+      pause = await this.guard.pauseState();
+    } catch (error) {
+      this.logger.warn(`could not read the mobile pause flag (${(error as Error)?.message ?? error}); deferring ${videoId}`);
+      this.guard.noteDeferred(videoId, 'pause state unreadable');
+      return this.defer(job, token, this.deferMs.paused, 'pause state unreadable');
+    }
     // A `historical` pause holds only the back catalogue; a new upload or a
     // staff retry goes through it. A pause without a scope holds everything.
-    const pause = await this.guard.pauseState();
     if (pauseHolds(pause, trigger)) {
+      if (pause.scope === 'historical') {
+        // Taken once, parked until the operator releases the hold.
+        this.logger.log(
+          `historical mobile work is held (${pause.reason ?? 'no reason given'}); ${videoId} parked until released`,
+        );
+        this.guard.noteDeferred(videoId, 'parked (historical hold)');
+        return this.defer(job, token, MOBILE_PARK_MS, 'parked until released');
+      }
+      // Everything is held: stop the queue itself, so this is the last take.
+      await this.ensureQueuePaused(pause, `job ${job.id}`);
       this.logger.log(
         `mobile processing is paused (${pause.scope}; ${pause.reason ?? 'no reason given'}); deferring ${videoId}`,
       );
+      this.guard.noteDeferred(videoId, 'paused');
       return this.defer(job, token, this.deferMs.paused, 'paused');
     }
 

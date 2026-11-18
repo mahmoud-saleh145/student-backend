@@ -24,6 +24,10 @@ function build(opts: { freeGB?: number | null; reserved?: Record<string, number>
       const raw = store.get(`edu:${key}`);
       return raw ? JSON.parse(raw) : null;
     }),
+    getJsonOrThrow: jest.fn(async (key: string) => {
+      const raw = store.get(`edu:${key}`);
+      return raw ? JSON.parse(raw) : null;
+    }),
     setJson: jest.fn(async (key: string, value: unknown) => void store.set(`edu:${key}`, JSON.stringify(value))),
     setJsonPersistent: jest.fn(async (key: string, value: unknown) => void store.set(`edu:${key}`, JSON.stringify(value))),
     del: jest.fn(async (...keys: string[]) => keys.forEach((k) => store.delete(`edu:${k}`))),
@@ -159,6 +163,16 @@ describe('pause flag', () => {
     expect(await readPauseState(redis as never)).toMatchObject({ paused: true });
     const resumed = await writePauseState(redis as never, false, 'admin_1');
     expect(resumed.paused).toBe(false);
+  });
+
+  it('the guard reads strictly: a Redis error throws instead of reading as "not paused"', async () => {
+    // The lenient read answered "not paused" on any Redis error, so a held job
+    // could start encoding during a connection drop.
+    const { guard, redis } = build();
+    redis.getJsonOrThrow.mockRejectedValueOnce(new Error('Connection is closed.'));
+    await expect(guard.pauseState()).rejects.toThrow('Connection is closed.');
+    // Dashboards keep the lenient read (getJson swallows the error itself).
+    expect(redis.getJson).not.toHaveBeenCalled();
   });
 });
 

@@ -88,12 +88,20 @@ function build(
     }),
     acquireEncodeSlot: jest.fn(async () => (opts.slotBusy ? null : slot)),
   };
+  // The processor's own queue (BullMQ-level pause on a full operator pause).
+  const queueState = { paused: false };
+  const queue = {
+    isPaused: jest.fn(async () => queueState.paused),
+    pause: jest.fn(async () => void (queueState.paused = true)),
+    resume: jest.fn(async () => void (queueState.paused = false)),
+  };
   const processor = new MobileVideoProcessor(
     transcoder as never,
     videos as never,
     config as never,
     guard as never,
     scheduler as never,
+    queue as never,
   );
   const job = {
     id: 'mobile-hls:v_1:1',
@@ -111,7 +119,7 @@ function build(
     updateProgress: jest.fn(async () => undefined),
     moveToDelayed: jest.fn(async () => undefined),
   } as unknown as Job<MobileTranscodeJobData>;
-  return { processor, videos, transcoder, job, guard, scheduler, slot };
+  return { processor, videos, transcoder, job, guard, scheduler, slot, queue, queueState };
 }
 
 describe('MobileVideoProcessor', () => {
@@ -226,6 +234,7 @@ describe('MobileVideoProcessor', () => {
     (readdir as jest.Mock).mockResolvedValueOnce(['v_old', 'v_older']);
 
     await t.processor.onModuleInit();
+    t.processor.onModuleDestroy(); // stops the pause reconciler started at init
 
     expect(rm).toHaveBeenCalledWith(expect.stringMatching(/mobile[\\/]v_old$/), { recursive: true, force: true });
     expect(rm).toHaveBeenCalledWith(expect.stringMatching(/mobile[\\/]v_older$/), { recursive: true, force: true });
@@ -237,6 +246,7 @@ describe('MobileVideoProcessor', () => {
     (rm as jest.Mock).mockClear();
 
     await expect(t.processor.onModuleInit()).resolves.toBeUndefined();
+    t.processor.onModuleDestroy();
     expect(rm).not.toHaveBeenCalled();
   });
 
@@ -248,6 +258,8 @@ describe('MobileVideoProcessor', () => {
     expect(t.transcoder.run).not.toHaveBeenCalled();
     expect(t.videos.markMobileProcessing).not.toHaveBeenCalled();
     expect(t.videos.markMobileFailed).not.toHaveBeenCalled();
+    // ...and the queue itself is paused, so this is the last time a job is taken.
+    expect(t.queue.pause).toHaveBeenCalledTimes(1);
   });
 
   it('defers before downloading anything when the scratch volume cannot hold the job and the reserve', async () => {

@@ -41,6 +41,7 @@ import {
   type MobileDeliveryOverride,
 } from '../playback/mobile-delivery-override';
 import { TRANSCODE_BACKOFF_BASE_MS, TRANSCODE_BACKOFF_JITTER } from '../../jobs/queue.tuning';
+import { countParkedJobs, promoteParkedJobs, type PromoteParkedResult } from '../../jobs/mobile-park';
 import { RedisService } from '../../redis/redis.service';
 import { AuditService } from '../audit/audit.service';
 import { CourseAccessService } from '../courses/course-access.service';
@@ -117,6 +118,20 @@ export const WAITING_FOR_QUEUE_NOTE =
   'Waiting for the processing queue. It will be queued automatically - no action is needed.';
 
 export type QueueJobPresence = 'live' | 'finished' | 'missing' | 'unknown';
+
+/** Upper bound of a whole "release parked jobs" pass (one promote per parked job). */
+export const RELEASE_PARKED_TIMEOUT_MS = 60_000;
+
+/** What a mobile pause/resume did: the flag, plus the queue-level control. */
+export type MobilePauseTransition = PauseState & {
+  /** The BullMQ queue's paused state after the transition; null when this process has no mobile queue. */
+  queuePaused: boolean | null;
+  /** Parked (held) jobs released by a resume. */
+  parkedPromoted: number;
+  /** `flag-only`: no mobile queue on this process, only the flag was written (the old behaviour). */
+  queueControl: 'queue' | 'flag-only';
+  note?: string;
+};
 
 export interface MobileEnqueueResult {
   jobId: string | null;
@@ -1214,6 +1229,15 @@ export class VideosService {
     video: { id: string; sourceKey: string },
     trigger: MobileTranscodeJobData['trigger'],
     requestedById?: string,
+    /**
+     * `supersede`: an administrator's recovery of a job that is live but
+     * worn (attempts or stalls used up by interruptions). The live job is NOT
+     * returned: a NEW generation is recorded and queued with fresh counters.
+     * The old job stays in Redis untouched and steps aside when it is next
+     * taken, because the row no longer names it. Refused while the old job is
+     * being encoded, so the two can never both write a ladder.
+     */
+    options: { supersede?: boolean } = {},
   ): Promise<MobileEnqueueResult> {
     if (!this.mobileQueue) {
       throw new AppException(ErrorCode.QUEUE_UNAVAILABLE, {
@@ -1235,13 +1259,19 @@ export class VideosService {
     if (!current) throw AppException.notFound('Video', video.id);
     const generation = current.mobileGeneration ?? 0;
     const durationSeconds = current.durationSeconds > 0 ? current.durationSeconds : undefined;
+    /** The live job a supersede replaces; the intent below is conditional on the row still naming it. */
+    let superseding: string | null = null;
 
     if (
       current.mobileStatus === MobileVideoStatus.QUEUED ||
       current.mobileStatus === MobileVideoStatus.PROCESSING
     ) {
       const presence = await this.jobPresence(this.mobileQueue, current.mobileJobId);
-      if (presence === 'live') {
+      if (presence === 'live' && options.supersede) {
+        await this.assertMobileJobNotRunning(video.id, current.mobileJobId!, current.mobileStatus);
+        superseding = current.mobileJobId;
+        // ...and on to a new intent, below.
+      } else if (presence === 'live') {
         if (!current.mobileEnqueuedAt) await this.stampMobileEnqueued(video.id, current.mobileJobId!);
         return { jobId: current.mobileJobId, alreadyQueued: true, enqueued: true };
       }
@@ -1274,7 +1304,14 @@ export class VideosService {
     const nextGeneration = generation + 1;
     const jobId = mobileJobIdFor(video.id, nextGeneration);
     const claimed = await this.prisma.video.updateMany({
-      where: { id: video.id, deletedAt: null, mobileGeneration: generation },
+      where: {
+        id: video.id,
+        deletedAt: null,
+        mobileGeneration: generation,
+        // A supersede only replaces a job that has not been claimed meanwhile:
+        // a claim turns the row PROCESSING, and this write then does nothing.
+        ...(superseding ? { mobileJobId: superseding, mobileStatus: MobileVideoStatus.QUEUED } : {}),
+      },
       data: {
         mobileStatus: MobileVideoStatus.QUEUED,
         mobileJobId: jobId,
@@ -1308,6 +1345,36 @@ export class VideosService {
       durationSeconds,
     });
     return { jobId, alreadyQueued: false, enqueued: added };
+  }
+
+  /**
+   * A supersede is refused while the job it replaces is ACTIVE: that job is
+   * encoding now and records READY when it ends without asking whether it
+   * still owns the row, so the new generation would encode the video a
+   * second time. Also refused when Redis cannot say.
+   */
+  private async assertMobileJobNotRunning(videoId: string, jobId: string, rowStatus: MobileVideoStatus): Promise<void> {
+    if (rowStatus !== MobileVideoStatus.QUEUED) {
+      // PROCESSING with a live job: it is encoding, or its worker died and the
+      // stalled check is about to hand it back. Either way it may still write.
+      throw new AppException(ErrorCode.INVALID_STATE, {
+        message: `Video ${videoId} is being processed for mobile (job ${jobId}); it cannot be superseded until that ends.`,
+      });
+    }
+    let state: string | null;
+    try {
+      const job = await withinQueueTimeout(this.mobileQueue!.getJob(jobId), 'queue read');
+      state = job ? await withinQueueTimeout(job.getState(), 'queue read') : null;
+    } catch {
+      throw new AppException(ErrorCode.QUEUE_UNAVAILABLE, {
+        message: 'The processing queue did not answer, so the live job cannot be superseded safely. Try again.',
+      });
+    }
+    if (state === 'active') {
+      throw new AppException(ErrorCode.INVALID_STATE, {
+        message: `Video ${videoId} is being encoded for mobile right now (job ${jobId}); it cannot be superseded until that ends.`,
+      });
+    }
   }
 
   /**
@@ -1404,15 +1471,25 @@ export class VideosService {
    * Refused when it would duplicate work: a video that is already queued or
    * being encoded keeps the job it has, and a READY ladder is not thrown away
    * and re-encoded unless an administrator explicitly forces it.
+   *
+   * `supersede` (administrators only) replaces a queued job that is still
+   * live with a NEW generation - fresh attempts and stall budget - for a job
+   * worn down by interruptions. The old job is left in Redis and steps aside
+   * when it next runs. Refused while the old job is encoding.
    */
   async retryMobileProcessing(
     videoId: string,
     actor: { id: string; role: UserRole },
-    options: { force?: boolean } = {},
+    options: { force?: boolean; supersede?: boolean } = {},
   ) {
+    if (options.supersede && actor.role !== 'ADMIN' && actor.role !== 'MASTER') {
+      throw new AppException(ErrorCode.FORBIDDEN, {
+        message: 'Only an administrator can supersede a queued mobile job',
+      });
+    }
     const video = await this.prisma.video.findFirst({
       where: { id: videoId, ...notDeleted },
-      select: { id: true, courseId: true, sourceKey: true, mobileStatus: true },
+      select: { id: true, courseId: true, sourceKey: true, mobileStatus: true, mobileJobId: true },
     });
     if (!video) throw AppException.notFound('Video', videoId);
     await this.access.assertCanManageCourse(actor.id, actor.role, video.courseId, 'content');
@@ -1444,6 +1521,7 @@ export class VideosService {
       { id: video.id, sourceKey: video.sourceKey },
       'retry',
       actor.id,
+      { supersede: options.supersede === true },
     );
     await this.audit.record({
       action: AuditAction.UPDATE,
@@ -1451,7 +1529,13 @@ export class VideosService {
       actorRole: actor.role,
       entity: 'video',
       entityId: videoId,
-      after: { mobileRetry: true, ...result },
+      after: {
+        mobileRetry: true,
+        ...result,
+        ...(options.supersede
+          ? { supersede: true, supersededJobId: result.jobId !== video.mobileJobId ? video.mobileJobId : null }
+          : {}),
+      },
     });
     return { videoId, ...result, ...(await this.mobileWorkerStatus()) };
   }
@@ -1571,6 +1655,10 @@ export class VideosService {
     };
     output: { readyVideos: number; totalBytes: number; averageBytesPerContentHour: number | null };
     queue: Record<string, number> | null;
+    /** Whether the mobile queue is paused at BullMQ level (null: unknown / no queue here). */
+    queuePaused: boolean | null;
+    /** Historical jobs parked behind a backlog hold (null: unknown / no queue here). */
+    parked: number | null;
     pause: PauseState;
     deliveryOverride: MobileDeliveryOverride | null;
     worker: Awaited<ReturnType<VideosService['workerStatus']>> & {
@@ -1586,7 +1674,8 @@ export class VideosService {
       ...migratableWhere,
       mobileStatus: { in: [MobileVideoStatus.NONE, MobileVideoStatus.FAILED, MobileVideoStatus.QUEUED, MobileVideoStatus.PROCESSING] },
     };
-    const [rows, migratable, pendingAgg, recent, output, failures, beat, pause, deliveryOverride, queue] =
+    const mobileQueue = this.mobileQueue;
+    const [rows, migratable, pendingAgg, recent, output, failures, beat, pause, deliveryOverride, queue, queuePaused, parked] =
       await Promise.all([
         this.prisma.video.groupBy({ by: ['mobileStatus'], where: notDeleted, _count: { _all: true } }),
         this.prisma.video.count({ where: migratableWhere }),
@@ -1611,6 +1700,12 @@ export class VideosService {
         readPauseState(this.redis),
         this.redis.getJson<MobileDeliveryOverride>(MOBILE_DELIVERY_OVERRIDE_KEY),
         this.mobileQueue ? this.mobileQueue.getJobCounts().catch(() => null) : Promise.resolve(null),
+        mobileQueue
+          ? withinQueueTimeout(Promise.resolve().then(() => mobileQueue.isPaused()), 'queue read').catch(() => null)
+          : Promise.resolve(null),
+        mobileQueue
+          ? withinQueueTimeout(Promise.resolve().then(() => countParkedJobs(mobileQueue)), 'queue read').catch(() => null)
+          : Promise.resolve(null),
       ]);
 
     const byStatus = Object.fromEntries(
@@ -1666,6 +1761,8 @@ export class VideosService {
         averageBytesPerContentHour: readyContentHours > 0 ? Math.round(totalBytes / (readyContentHours / 3600)) : null,
       },
       queue,
+      queuePaused,
+      parked,
       pause,
       deliveryOverride,
       worker: {
@@ -1687,25 +1784,106 @@ export class VideosService {
   }
 
   /**
-   * Operator pause of mobile encodes. Takes effect before the next job is
-   * claimed; the encode already running completes. Recorded in the audit log.
+   * Operator pause / resume of mobile encodes ("park and release", see
+   * jobs/mobile-park.ts). Two controls, applied in an order that is safe at
+   * every intermediate step; each step is idempotent, so re-running a
+   * transition that failed half-way converges:
+   *
+   *   pause, all         1. pause the BullMQ queue   2. write the flag
+   *   pause, historical  1. write the flag (historical)
+   *                      2. resume the queue if paused (uploads run again;
+   *                         each held historical job is parked on its one take)
+   *   resume             1. delete the flag   2. promote every PARKED job
+   *                      3. resume the queue
+   *
+   * The encode already running completes. A failure throws with the queue
+   * still paused (the safe side). Without the mobile queue on this process
+   * only the flag is written, as before, and the result says so.
    */
   async setMobileProcessingPaused(
     paused: boolean,
     actor: { id: string; role: UserRole },
     reason?: string,
     scope?: PauseScope,
-  ): Promise<PauseState> {
-    const state = await writePauseState(this.redis, paused, actor.id, reason, scope);
+  ): Promise<MobilePauseTransition> {
+    const queue = this.mobileQueue;
+    const strict = { strict: true } as const;
+    let state: PauseState;
+    let queuePaused: boolean | null = null;
+    let parkedPromoted = 0;
+
+    if (!queue) {
+      state = await writePauseState(this.redis, paused, actor.id, reason, scope, strict);
+    } else {
+      const step = async <T>(work: () => Promise<T>, what: string): Promise<T> => {
+        try {
+          return await withinQueueTimeout(work(), what);
+        } catch (error) {
+          this.logger.error(`mobile ${paused ? 'pause' : 'resume'}: ${what} failed (${(error as Error)?.message ?? error})`);
+          throw new AppException(ErrorCode.QUEUE_UNAVAILABLE, {
+            message: `The mobile queue did not complete "${what}". Nothing unsafe was left behind; send the same request again.`,
+          });
+        }
+      };
+      if (paused && scope !== 'historical') {
+        if (!(await step(() => queue.isPaused(), 'read the queue state'))) {
+          await step(() => queue.pause(), 'pause the queue');
+        }
+        queuePaused = true;
+        state = await writePauseState(this.redis, true, actor.id, reason, 'all', strict);
+      } else if (paused) {
+        state = await writePauseState(this.redis, true, actor.id, reason, 'historical', strict);
+        if (await step(() => queue.isPaused(), 'read the queue state')) {
+          await step(() => queue.resume(), 'resume the queue');
+        }
+        queuePaused = false;
+      } else {
+        state = await writePauseState(this.redis, false, actor.id, undefined, undefined, strict);
+        // Only PARKED jobs (due years from now); deferrals and retry backoffs
+        // in the delayed set are left to come due on their own.
+        let released: PromoteParkedResult;
+        try {
+          released = await withinQueueTimeout(promoteParkedJobs(queue), 'release parked jobs', RELEASE_PARKED_TIMEOUT_MS);
+        } catch (error) {
+          this.logger.error(`mobile resume: releasing parked jobs failed (${(error as Error)?.message ?? error})`);
+          throw new AppException(ErrorCode.QUEUE_UNAVAILABLE, {
+            message:
+              'Releasing the held jobs did not complete. Jobs not yet released stay held and the queue was not ' +
+              'resumed; send the same request again.',
+          });
+        }
+        parkedPromoted = released.promoted.length;
+        if (await step(() => queue.isPaused(), 'read the queue state')) {
+          await step(() => queue.resume(), 'resume the queue');
+        }
+        queuePaused = false;
+      }
+    }
+
     await this.audit.record({
       action: AuditAction.UPDATE,
       actorId: actor.id,
       actorRole: actor.role,
       entity: 'video',
       entityId: 'mobile-pipeline',
-      after: { paused: state.paused, reason: state.reason, scope: state.scope },
+      after: {
+        paused: state.paused,
+        reason: state.reason,
+        scope: state.scope,
+        queuePaused,
+        parkedPromoted,
+        queueControl: queue ? 'queue' : 'flag-only',
+      },
     });
-    return state;
+    return {
+      ...state,
+      queuePaused,
+      parkedPromoted,
+      queueControl: queue ? 'queue' : 'flag-only',
+      ...(queue
+        ? {}
+        : { note: 'The mobile queue is not configured on this process: only the pause flag was written.' }),
+    };
   }
 
   /**
@@ -1791,14 +1969,19 @@ export class VideosService {
 
     // Compare-and-set, so two DIFFERENT jobs racing past the check above
     // cannot both win the claim. The row may hold the id just read, or THIS
-    // job's id: `enqueueMobileTranscode` records the id right after adding
-    // the job, and that write can land between the read above and this one.
+    // job's id (an older API recorded the id right after adding the job, so
+    // that write could land between the read above and this one). A job that
+    // does not own the row also cannot claim it if it BECAME READY in between
+    // (the owner finished meanwhile): the READY rule above, made atomic.
     const claimed = await this.prisma.video.updateMany({
       where: {
         id: videoId,
         deletedAt: null,
         sourceKey,
-        OR: [{ mobileJobId: current.mobileJobId }, { mobileJobId: jobId }],
+        OR: [
+          { mobileJobId: current.mobileJobId, mobileStatus: { not: MobileVideoStatus.READY } },
+          { mobileJobId: jobId },
+        ],
       },
       data: {
         mobileStatus: MobileVideoStatus.PROCESSING,

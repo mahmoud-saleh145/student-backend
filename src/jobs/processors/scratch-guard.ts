@@ -94,9 +94,21 @@ export interface ActiveJobNote {
   progress: number;
 }
 
+/**
+ * `strict`: a Redis error throws instead of reading as "not paused". The
+ * worker's gate and the operator transitions read strictly; dashboards, which
+ * only display the flag, keep the lenient read.
+ */
+export interface PauseIo {
+  strict?: boolean;
+}
+
 /** Pause flag readers/writers for processes that do not host the guard (the API). */
-export async function readPauseState(redis: RedisService): Promise<PauseState> {
-  const stored = await redis.getJson<Partial<Omit<PauseState, 'paused'>>>(SCRATCH_PAUSE_KEY);
+export async function readPauseState(redis: RedisService, io: PauseIo = {}): Promise<PauseState> {
+  type Stored = Partial<Omit<PauseState, 'paused'>>;
+  const stored = io.strict
+    ? await redis.getJsonOrThrow<Stored>(SCRATCH_PAUSE_KEY)
+    : await redis.getJson<Stored>(SCRATCH_PAUSE_KEY);
   return stored
     ? {
         paused: true,
@@ -114,18 +126,23 @@ export async function writePauseState(
   by: string,
   reason?: string,
   scope: PauseScope = 'all',
+  io: PauseIo = {},
 ): Promise<PauseState> {
   if (paused) {
-    await redis.setJsonPersistent(SCRATCH_PAUSE_KEY, {
+    const value = {
       reason: reason?.slice(0, 200) ?? null,
       by,
       at: new Date().toISOString(),
       scope,
-    });
+    };
+    if (io.strict) await redis.setJsonPersistentOrThrow(SCRATCH_PAUSE_KEY, value);
+    else await redis.setJsonPersistent(SCRATCH_PAUSE_KEY, value);
+  } else if (io.strict) {
+    await redis.delOrThrow(SCRATCH_PAUSE_KEY);
   } else {
     await redis.del(SCRATCH_PAUSE_KEY);
   }
-  return readPauseState(redis);
+  return readPauseState(redis, io);
 }
 
 @Injectable()
@@ -268,8 +285,12 @@ export class ScratchGuard {
 
   // --- operator pause -------------------------------------------------------
 
+  /**
+   * Strict: THROWS when Redis cannot be read. The lenient read answered "not
+   * paused" during a Redis hiccup, which let a held job start encoding.
+   */
   async pauseState(): Promise<PauseState> {
-    return readPauseState(this.redis);
+    return readPauseState(this.redis, { strict: true });
   }
 
   /**

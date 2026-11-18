@@ -100,7 +100,7 @@ type Encode = { videoId: string; trigger: string; start: number; end?: number };
       markMobileFailed: async () => undefined,
       markMobileDeferred: async () => undefined,
     };
-    const processor = new MobileVideoProcessor(transcoder as never, videos as never, config as never, guard, scheduler);
+    const processor = new MobileVideoProcessor(transcoder as never, videos as never, config as never, guard, scheduler, mobile);
     (processor as unknown as { deferMs: Record<string, number> }).deferMs = { paused: 200, uploads: 200, disk: 200, slot: 200 };
     const w = new Worker(
       QUEUE_NAMES.mobileVideo,
@@ -262,8 +262,13 @@ type Encode = { videoId: string; trigger: string; start: number; end?: number };
     await until(() => originalDone.length === 1, 10_000, 'original upload to process while mobile is paused');
     await sleep(800);
     expect(encodes).toHaveLength(0);
+    // A full pause also pauses the mobile queue itself (the original one is untouched).
+    expect(await mobile.isPaused()).toBe(true);
+    expect(await original.isPaused()).toBe(false);
 
+    // Resuming is the flag AND the queue (what POST /videos/mobile/resume does).
     await redis.del('mobile:transcode:paused');
+    await mobile.resume();
     await until(() => !!encodeOf('new_upload_C')?.end, 10_000, 'mobile encode after resume');
   }, 60_000);
 });

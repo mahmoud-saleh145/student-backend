@@ -810,12 +810,41 @@ ladder that is already READY. Without it a READY video answers
 where `enqueued: false` means the request is recorded and the job reaches the
 queue on its own. Never reads or writes a Gumlet field.
 
+`{ "supersede": true }` - administrators only (`403 FORBIDDEN` otherwise):
+replaces a queued job that is still live with a NEW job (new generation id,
+fresh attempts and stall budget, trigger `retry`). The old job is left in the
+queue untouched and steps aside when it runs. Refused with `409 INVALID_STATE`
+while the old job is being encoded, `503 QUEUE_UNAVAILABLE` when the queue does
+not answer. Audited with `supersede: true` and `supersededJobId`.
+
 ### `POST /videos/mobile/pause`
 
 Body: `{ "reason"?: string, "scope"?: "all" | "historical" }`. `all` (default,
-and what a pause without a scope has always meant) holds every mobile encode.
-`historical` holds only `migration` / `recovery` jobs; new uploads and staff
-retries keep running.
+and what a pause without a scope has always meant) holds every mobile encode
+and also pauses the mobile BullMQ queue (queue first, then the flag), so no job
+is taken at all. `historical` holds only `migration` / `recovery` jobs (flag
+first, then the queue is resumed if it was paused); new uploads and staff
+retries keep running, and each held historical job is parked (delayed for
+years) the one time it is taken.
+
+Response: the pause state (`paused`, `reason`, `by`, `at`, `scope`) plus
+`queuePaused` (boolean; `null` when the process has no mobile queue),
+`parkedPromoted` (0) and `queueControl` (`queue` | `flag-only`, with a `note`
+for `flag-only`). `503 QUEUE_UNAVAILABLE` when a queue step did not complete;
+every step is idempotent, so the same request again finishes the transition.
+
+### `POST /videos/mobile/resume`
+
+Deletes the flag, then promotes every parked job (and only those: deferrals
+and retry backoffs are left alone), then resumes the mobile queue. Same
+response shape; `parkedPromoted` is the number of jobs released. This is the
+only thing that resumes the queue: deleting the flag directly in Redis does
+not, and the worker never resumes it on its own.
+
+### `GET /videos/mobile/overview`
+
+Adds `queuePaused` (BullMQ-level pause) and `parked` (historical jobs parked
+behind a backlog hold); either is `null` when unknown.
 
 ### `GET /lessons/:id`, `GET /lessons/by-video/:videoId`
 

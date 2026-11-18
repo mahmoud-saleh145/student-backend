@@ -2,7 +2,7 @@ import { Queue, UnrecoverableError, Worker, type Job } from 'bullmq';
 import IORedis from 'ioredis';
 
 import { MobileVideoProcessor } from '../../src/jobs/processors/mobile-video.processor';
-import { ScratchGuard, writePauseState } from '../../src/jobs/processors/scratch-guard';
+import { ScratchGuard } from '../../src/jobs/processors/scratch-guard';
 import { QUEUE_NAMES, type MobileTranscodeJobData, type TranscodeJobData } from '../../src/jobs/queue.constants';
 import { mobileJobIdFor, uploadTranscodeJobIdFor } from '../../src/modules/videos/pipeline-state';
 import { QUEUE_OPERATION_TIMEOUT_MS, VideosService } from '../../src/modules/videos/videos.service';
@@ -61,7 +61,12 @@ async function until(check: () => boolean | Promise<boolean>, what: string, time
   let mobileQueue: Queue<MobileTranscodeJobData>;
   const workers: Worker[] = [];
 
-  function world(rows: Parameters<typeof videoRow>[0][], queues?: { web?: Queue; mobile?: Queue }, sharedDb?: FakeDb) {
+  function world(
+    rows: Parameters<typeof videoRow>[0][],
+    queues?: { web?: Queue; mobile?: Queue },
+    sharedDb?: FakeDb,
+    redis: RedisService | FakeRedis = new FakeRedis(),
+  ) {
     const db = sharedDb ?? new FakeDb(rows.map((r) => videoRow(r)));
     const storage = new FakeStorage();
     for (const row of db.rows.values()) if (row.sourceKey) storage.objects.set(row.sourceKey as string, 1_000_000);
@@ -72,7 +77,7 @@ async function until(check: () => boolean | Promise<boolean>, what: string, time
       { recountCourse: async () => undefined } as never,
       { notifyCourseStudents: async () => undefined } as never,
       { record: async () => undefined } as never,
-      new FakeRedis() as never,
+      redis as never,
       (queues?.web ?? webQueue) as never,
       {
         getOrThrow: () => ({
@@ -133,6 +138,7 @@ async function until(check: () => boolean | Promise<boolean>, what: string, time
       { getOrThrow: () => ({ workDir: `/tmp/${prefix}` }) } as never,
       (realGuard ?? guard) as never,
       scheduler as never,
+      mobileQueue as never,
     );
     // A deferred job comes back quickly, so the tests do not wait a minute per deferral.
     (processor as unknown as { deferMs: Record<string, number> }).deferMs = { paused: 250, uploads: 250, disk: 250, slot: 250 };
@@ -409,14 +415,20 @@ async function until(check: () => boolean | Promise<boolean>, what: string, time
     await redis.onModuleInit();
     try {
       const guard = new ScratchGuard(redis, { getOrThrow: () => ({ workDir: `/tmp/${prefix}`, minFreeBytes: 0, diskCheckSeconds: 15 }) } as never);
-      const w = world([
-        { id: 'old_lecture', sourceKey: 'source/videos/old_lecture/a.mp4', status: 'READY', sourceSizeBytes: BigInt(1_000_000) },
-        { id: 'new_lecture', sourceKey: 'source/videos/new_lecture/a.mp4' },
-        { id: 'next_lecture', sourceKey: 'source/videos/next_lecture/a.mp4' },
-      ]);
+      const w = world(
+        [
+          { id: 'old_lecture', sourceKey: 'source/videos/old_lecture/a.mp4', status: 'READY', sourceSizeBytes: BigInt(1_000_000) },
+          { id: 'new_lecture', sourceKey: 'source/videos/new_lecture/a.mp4' },
+          { id: 'next_lecture', sourceKey: 'source/videos/next_lecture/a.mp4' },
+        ],
+        undefined,
+        undefined,
+        redis,
+      );
+      const admin = { id: 'admin_1', role: 'ADMIN' as never };
 
-      // The operator pauses the BACKLOG, as between batches.
-      await writePauseState(redis, true, 'admin_1', 'between backlog batches', 'historical');
+      // The operator pauses the BACKLOG, as between batches (through the API's transition).
+      await w.videos.setMobileProcessingPaused(true, admin, 'between backlog batches', 'historical');
       await w.videos.enqueueMobileTranscode({ id: 'old_lecture', sourceKey: 'source/videos/old_lecture/a.mp4' }, 'migration');
       await w.videos.completeUpload('new_lecture', STAFF);
       const encoded: string[] = [];
@@ -424,23 +436,28 @@ async function until(check: () => boolean | Promise<boolean>, what: string, time
 
       await until(() => w.db.get('new_lecture').mobileStatus === 'READY', 'the new upload to be encoded during a backlog pause');
       await sleep(1200);
-      // The backlog job is still in the queue (it is looked at and deferred
-      // again every few hundred milliseconds here) and was never encoded.
+      // The backlog job is still in the queue - PARKED in the delayed set after
+      // its single take, not looked at again - and was never encoded.
       expect(w.db.get('old_lecture')).toMatchObject({ mobileStatus: 'QUEUED' });
       expect(encoded).toEqual(['new_lecture']);
-      expect(['delayed', 'active', 'prioritized', 'waiting']).toContain(
-        await (await mobileQueue.getJob(w.db.get('old_lecture').mobileJobId as string))!.getState(),
-      );
+      const oldJob = (await mobileQueue.getJob(w.db.get('old_lecture').mobileJobId as string))!;
+      expect(await oldJob.getState()).toBe('delayed');
+      expect(oldJob.attemptsStarted).toBe(1);
 
       // A full pause (the metered-connection case) holds a new upload too - and says so truthfully.
-      await writePauseState(redis, true, 'admin_1', 'laptop on a metered connection', 'all');
+      await w.videos.setMobileProcessingPaused(true, admin, 'laptop on a metered connection', 'all');
+      expect(await mobileQueue.isPaused()).toBe(true);
       await w.videos.completeUpload('next_lecture', STAFF);
       await sleep(1500);
       expect(w.db.get('next_lecture')).toMatchObject({ mobileStatus: 'QUEUED', mobileError: null });
       expect(encoded).toEqual(['new_lecture']);
 
-      // Resume: both waiting jobs run, the upload first.
-      await writePauseState(redis, false, 'admin_1');
+      // Resume: the parked job is released, the queue resumed; both run, the upload first.
+      await expect(w.videos.setMobileProcessingPaused(false, admin)).resolves.toMatchObject({
+        paused: false,
+        queuePaused: false,
+        parkedPromoted: 1,
+      });
       await until(
         () => w.db.get('next_lecture').mobileStatus === 'READY' && w.db.get('old_lecture').mobileStatus === 'READY',
         'both jobs to run after resume',

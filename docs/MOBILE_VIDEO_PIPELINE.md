@@ -185,11 +185,19 @@ and `lastDeferral`; `GET /videos/mobile/overview` shows them.
 
 ### Pause, resume and the emergency switch
 
-- `POST /videos/mobile/pause` (admin, body `{ reason? }`) sets a persistent
-  Redis flag. The encode already running finishes; every job picked up after
-  that is deferred a minute at a time until `POST /videos/mobile/resume`.
-  The flag survives worker and API restarts. To interrupt the running encode
-  as well, stop the container (SIGTERM → "interrupted" → retried later).
+- `POST /videos/mobile/pause` (admin, body `{ reason?, scope? }`) sets a
+  persistent Redis flag and ("park and release", `src/jobs/mobile-park.ts`)
+  makes sure a held job is not taken by the worker over and over: a full
+  pause also pauses the BullMQ queue, so nothing is taken; a `historical`
+  hold parks each back-catalogue job (delayed ten years) on its single take
+  while uploads keep running. `POST /videos/mobile/resume` deletes the flag,
+  promotes exactly the parked jobs and resumes the queue. A flag written by
+  something else (the safety watchdog) is turned into a queue pause by the
+  worker within 30 s; the worker never resumes the queue by itself, so a flag
+  deleted by hand leaves the queue paused until the resume endpoint is used.
+  The encode already running finishes. The flag survives worker and API
+  restarts. To interrupt the running encode as well, stop the container
+  (SIGTERM → "interrupted" → retried later).
 - `POST /videos/mobile/delivery` (admin, body `{ mode: 'gumlet' | 'hls' |
   'configured', gumletFallback? }`) is the **emergency routing switch**: a
   persistent override of `MOBILE_VIDEO_DELIVERY` / `MOBILE_HLS_GUMLET_FALLBACK`

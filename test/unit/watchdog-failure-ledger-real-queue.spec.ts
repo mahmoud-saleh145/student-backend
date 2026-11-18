@@ -1,9 +1,10 @@
 import { Logger } from '@nestjs/common';
-import { DelayedError, Queue, Worker, type Job } from 'bullmq';
+import { DelayedError, Queue, Worker, type Job, type WorkerOptions } from 'bullmq';
 import IORedis from 'ioredis';
 
-import { MobileEncodeScheduler } from '../../src/jobs/processors/mobile-encode-scheduler';
+import { ENCODE_SLOT_KEY, MobileEncodeScheduler } from '../../src/jobs/processors/mobile-encode-scheduler';
 import { MobileVideoProcessor } from '../../src/jobs/processors/mobile-video.processor';
+import { countParkedJobs, promoteParkedJobs } from '../../src/jobs/mobile-park';
 import { ScratchGuard, writePauseState } from '../../src/jobs/processors/scratch-guard';
 import {
   MOBILE_JOB_PRIORITY,
@@ -78,12 +79,20 @@ const FRESH = ['cmva6lw6a', 'cmvb9e833', 'cmvbcjqll', 'cmvcrhg5y'];
     let original: Queue;
     let mobile: Queue<MobileTranscodeJobData>;
     const workers: Worker[] = [];
+    /** Queues a test opens besides the two above; closed in afterAll even when a test fails. */
+    const extraQueues: Queue[] = [];
     const failWith = new Map<string, string>();
     const encodeMs = new Map<string, number>();
+    /** Videos whose encode never returns (the host died mid-encode). */
+    const hangs = new Set<string>();
+    /** Successful mobile-READY writes per video: a duplicate successful encode would show here. */
+    const ready = new Map<string, number>();
     let deferrals = 0;
     let encodes = 0;
+    /** Every time a mobile worker TOOK a job (lock, attemptsStarted + 1), whatever it then did. */
+    let takes = 0;
 
-    function startMobileWorker(): Worker {
+    function startMobileWorker(workerOpts: Partial<WorkerOptions> = {}): Worker {
       const config = {
         getOrThrow: () => ({
           workDir: `/tmp/${prefix}`,
@@ -108,6 +117,7 @@ const FRESH = ['cmva6lw6a', 'cmvb9e833', 'cmvbcjqll', 'cmvcrhg5y'];
         }),
         run: async ({ videoId }: { videoId: string }) => {
           encodes += 1;
+          if (hangs.has(videoId)) await new Promise(() => undefined); // never returns
           await sleep(encodeMs.get(videoId) ?? 20);
           const reason = failWith.get(videoId);
           if (reason) throw new Error(reason); // what a dropped R2 download looks like
@@ -130,7 +140,9 @@ const FRESH = ['cmva6lw6a', 'cmvb9e833', 'cmvbcjqll', 'cmvcrhg5y'];
       };
       const videos = {
         markMobileProcessing: async () => true,
-        markMobileReady: async () => undefined,
+        markMobileReady: async (videoId: string) => {
+          ready.set(videoId, (ready.get(videoId) ?? 0) + 1);
+        },
         markMobileFailed: async () => undefined,
         markMobileRetrying: async () => undefined,
         markMobileDeferred: async () => undefined,
@@ -141,6 +153,8 @@ const FRESH = ['cmva6lw6a', 'cmvb9e833', 'cmvbcjqll', 'cmvcrhg5y'];
         config as never,
         guard,
         scheduler,
+        // As in production (@InjectQueue): the safe-pause gate pauses this queue on a full pause.
+        mobile,
       );
       // Production defers a paused job for 60 s; 1 ms produces the same Redis writes thousands of times faster.
       (processor as unknown as { deferMs: Record<string, number> }).deferMs = {
@@ -152,6 +166,7 @@ const FRESH = ['cmva6lw6a', 'cmvb9e833', 'cmvbcjqll', 'cmvcrhg5y'];
       const w = new Worker(
         QUEUE_NAMES.mobileVideo,
         async (job: Job<MobileTranscodeJobData>, token?: string) => {
+          takes += 1;
           try {
             return await processor.process(job, token);
           } catch (e) {
@@ -159,7 +174,9 @@ const FRESH = ['cmva6lw6a', 'cmvb9e833', 'cmvbcjqll', 'cmvcrhg5y'];
             throw e;
           }
         },
-        { ...bull, concurrency: 1 },
+        // BullMQ rate-limits the stalled check with ONE shared key per queue (its TTL is the checking
+        // worker's stalledInterval), so every mobile worker here uses the same short interval.
+        { ...bull, concurrency: 1, lockDuration: 1_500, stalledInterval: 1_000, ...workerOpts },
       );
       workers.push(w);
       return w;
@@ -184,9 +201,33 @@ const FRESH = ['cmva6lw6a', 'cmvb9e833', 'cmvbcjqll', 'cmvcrhg5y'];
           removeOnFail: false,
         },
       );
-    const pause = () =>
-      writePauseState(redis, true, 'operator', 'batch 5 paused', 'historical');
-    const resume = () => writePauseState(redis, false, 'operator');
+    // The operator transitions, in exactly the order VideosService.setMobileProcessingPaused applies them
+    // (that service is exercised end to end in mobile-safe-pause-real-queue / mobile-safe-pause.e2e).
+    /** Full pause: the BullMQ queue first, then the flag. */
+    const pauseAll = async () => {
+      if (!(await mobile.isPaused())) await mobile.pause();
+      await writePauseState(redis, true, 'operator', 'batch 5 paused', 'all', { strict: true });
+    };
+    /** Historical hold (Stage 2 partial processing): the flag first, then the queue resumed. */
+    const holdHistorical = async () => {
+      await writePauseState(redis, true, 'operator', 'backlog held', 'historical', { strict: true });
+      if (await mobile.isPaused()) await mobile.resume();
+    };
+    /** Resume: delete the flag, release exactly the parked jobs, then resume the queue. */
+    const resumeAll = async () => {
+      await writePauseState(redis, false, 'operator', undefined, undefined, { strict: true });
+      await promoteParkedJobs(mobile);
+      if (await mobile.isPaused()) await mobile.resume();
+    };
+    /** attempts made, stall counter, attempts started (takes) and last take, per job. */
+    const counters = async (ids: string[]) => {
+      const out: Record<string, { atm: string | null; stc: string | null; ats: string | null; processedOn: string | null }> = {};
+      for (const id of ids) {
+        const [atm, stc, ats, processedOn] = await raw.hmget(MQ() + id, 'atm', 'stc', 'ats', 'processedOn');
+        out[id] = { atm, stc, ats, processedOn };
+      }
+      return out;
+    };
 
     function watchdog() {
       const events: Array<{ event: string; data: Record<string, unknown> }> = [];
@@ -245,6 +286,7 @@ const FRESH = ['cmva6lw6a', 'cmvb9e833', 'cmvbcjqll', 'cmvcrhg5y'];
       await Promise.all(workers.splice(0).map((w) => w.close(true)));
       await original.obliterate({ force: true }).catch(() => undefined);
       await mobile.obliterate({ force: true }).catch(() => undefined);
+      await Promise.all(extraQueues.splice(0).map((q) => q.close().catch(() => undefined)));
       await original.close();
       await mobile.close();
       await redis.delByPattern('*');
@@ -255,11 +297,11 @@ const FRESH = ['cmva6lw6a', 'cmvb9e833', 'cmvbcjqll', 'cmvcrhg5y'];
       jest.restoreAllMocks();
     });
 
-    it('4 real failures, 8 paused jobs, thousands of real deferrals: no trip; resume runs all 8 with no re-pause; 3 new failures trip it', async () => {
+    it('4 real failures, 8 held jobs: a full pause takes nothing (no deferral, no counter used) across worker and watchdog restarts and never trips the watchdog; a historical hold parks each job once; other queues keep running; resume runs all 8 with no re-pause; a real stall is still detected; 3 new failures trip it', async () => {
       // 1. Four jobs fail their first attempt with network errors (as on 16 Nov).
       FAILED.forEach(([v, reason]) => failWith.set(v, reason));
       const failedJobs = await Promise.all(FAILED.map(([v]) => add(v)));
-      startMobileWorker();
+      let mobileWorker = startMobileWorker();
       await until(
         async () =>
           (await Promise.all(failedJobs.map((j) => mobile.getJob(j.id!)))).every(
@@ -269,53 +311,141 @@ const FRESH = ['cmva6lw6a', 'cmvb9e833', 'cmvbcjqll', 'cmvcrhg5y'];
         'four first-attempt failures',
       );
 
-      // 2. Processing is paused; the four fresh jobs are added; the retries come back early.
-      await pause();
+      // 2. FULL pause (the API's order: queue, then flag). The four fresh jobs are added; the
+      //    retries come back early - into the PAUSED queue, where no worker takes them.
+      await pauseAll();
       const freshJobs = await Promise.all(FRESH.map((v) => add(v)));
       await mobile.promoteJobs();
       failWith.clear(); // nothing would fail now - nothing runs while paused anyway
+      const held = [...failedJobs, ...freshJobs].map((j) => j.id!);
+      const takesBefore = takes;
+      const deferralsBefore = deferrals;
       const encodesBefore = encodes;
+      const pausedSnapshot = await counters(held);
 
-      // 3. Thousands of real pause deferrals. The fixed watchdog starts part-way, like a
-      //    deployment the day after; it ticks alongside the churn.
-      await until(() => deferrals >= 500, 120_000, '500 deferrals');
-      const { w, events, count } = watchdog();
-      await w.tick();
-      expect(count('netfail_baseline')).toBe(1);
-      expect((events[0].data.events as string[]).length).toBe(4);
+      // The fixed watchdog starts part-way, like a deployment the day after.
+      const instances = [watchdog()];
+      let wdog = instances[0];
+      const total = (e: string) => instances.reduce((n, i) => n + i.count(e), 0);
+      await wdog.w.tick();
+      expect(wdog.count('netfail_baseline')).toBe(1);
+      expect((wdog.events[0].data.events as string[]).length).toBe(4);
+
+      // Gumlet ingest, push and maintenance queues keep working while the mobile queue is paused.
+      const others = [QUEUE_NAMES.video, QUEUE_NAMES.push, QUEUE_NAMES.maintenance].map((name) => {
+        const q = new Queue(name, bull);
+        extraQueues.push(q);
+        const done: string[] = [];
+        workers.push(new Worker(name, async (job) => { done.push(String(job.id)); return 'ok'; }, { ...bull, concurrency: 1 }));
+        return { name, q, done };
+      });
+      for (const o of others) await o.q.add('probe', { during: 'mobile full pause' }, { jobId: `probe-${o.name}` });
+
+      // Many watchdog ticks across a WORKER restart and a WATCHDOG restart, with time passing
+      // (the 1 ms deferral that used to churn would have fired thousands of times).
+      for (let i = 0; i < 40; i++) {
+        if (i === 12) {
+          await mobileWorker.close();
+          mobileWorker = startMobileWorker(); // worker restart
+        }
+        if (i === 24) {
+          wdog = watchdog(); // watchdog restart: a fresh process, same Redis ledger
+          instances.push(wdog);
+        }
+        await wdog.w.tick();
+        await sleep(100);
+      }
+      await until(async () => others.every((o) => o.done.length === 1), 20_000, 'the other queues to process their job');
+      // Under a BullMQ pause the held jobs wait in the queue itself (BullMQ 5.81.3: the `paused` list for
+      // promoted jobs, `prioritized` for jobs promoted by a worker) - state "waiting"/"prioritized", never
+      // taken. (The old watchdog rule does not scan the `paused` list, so it is asserted in step 3 instead.)
+      for (const id of held) {
+        expect(['waiting', 'prioritized']).toContain(await (await mobile.getJob(id))!.getState());
+      }
+      expect(takes).toBe(takesBefore); // paused jobs are never taken...
+      expect(deferrals).toBe(deferralsBefore); // ...so never deferred
+      expect(encodes).toBe(encodesBefore); // nothing ran while paused
+      expect(await counters(held)).toEqual(pausedSnapshot); // atm, stc, ats, processedOn unchanged
+      expect(await mobile.isPaused()).toBe(true); // the pause survived both restarts
+      expect(JSON.parse((await raw.get(`${prefix}:mobile:transcode:paused`))!)).toMatchObject({ scope: 'all' });
+      expect(total('threshold_network_failures')).toBe(0);
+      expect(total('netfail_seen')).toBe(0);
+      expect(total('PAUSED')).toBe(0);
+      for (const j of failedJobs) {
+        const job = await mobile.getJob(j.id!);
+        expect(job?.attemptsMade).toBe(1); // no retry used...
+        expect(job?.failedReason).toMatch(/socket hang up|aborted/); // ...and the original reason kept
+      }
+
+      // 3. HISTORICAL hold (Stage 2 partial processing): each held job is taken ONCE and parked;
+      //    then none is taken again however long the hold lasts.
+      await holdHistorical();
+      await until(async () => (await countParkedJobs(mobile)) === 8, 20_000, 'all 8 parked');
+      expect(takes - takesBefore).toBe(8);
+      expect(deferrals - deferralsBefore).toBe(8);
+      const takesParked = takes;
+      const parkedSnapshot = await counters(held);
+      for (const id of held) {
+        expect(parkedSnapshot[id].atm).toBe(pausedSnapshot[id].atm); // parking uses no attempt
+        expect(parkedSnapshot[id].stc).toBe(pausedSnapshot[id].stc); // nor a stall
+      }
+      // Parking took each job once and so refreshed its processedOn - the very thing that made the four
+      // OLD failures look recent in production. The old processedOn rule now sees them (parked jobs are in
+      // `delayed`, which it scans) and would trip; the ledger must not.
       let maxLegacy = 0;
-      while (deferrals < 3_000) {
-        await w.tick();
+      for (let i = 0; i < 20; i++) {
+        await wdog.w.tick();
         maxLegacy = Math.max(maxLegacy, await legacyRecent());
         await sleep(100);
       }
-      expect(encodes).toBe(encodesBefore); // nothing ran while paused
-      expect(maxLegacy).toBeGreaterThanOrEqual(3); // the old rule would have tripped
-      expect(count('threshold_network_failures')).toBe(0);
-      expect(count('netfail_seen')).toBe(0);
-      for (const j of failedJobs) {
-        const job = await mobile.getJob(j.id!);
-        expect(job?.attemptsMade).toBe(1); // deferrals never touched atm...
-        expect(job?.failedReason).toMatch(/socket hang up|aborted/); // ...nor the old reason
-      }
+      expect(maxLegacy).toBeGreaterThanOrEqual(3); // the old rule would have tripped on these 4
+      expect(takes).toBe(takesParked);
+      expect(encodes).toBe(encodesBefore);
+      expect(await counters(held)).toEqual(parkedSnapshot);
+      expect(total('threshold_network_failures')).toBe(0); // the ledger does not
+      expect(total('netfail_seen')).toBe(0);
+      expect(total('PAUSED')).toBe(0);
 
-      // 4. RESUME: all eight run (the four retries succeed), no new failure, no re-pause.
-      await resume();
+      // 4. RESUME (the API's order): all eight run once, no new failure, no re-pause.
+      await resumeAll();
       await until(
         async () => (await mobile.getJobCounts('completed')).completed === 8,
         60_000,
         'all 8 completed',
       );
       for (let i = 0; i < 5; i++) {
-        await w.tick();
+        await wdog.w.tick();
         await sleep(50);
       }
-      expect(count('threshold_network_failures')).toBe(0);
-      expect(count('PAUSED')).toBe(0);
+      expect(total('threshold_network_failures')).toBe(0);
+      expect(total('PAUSED')).toBe(0);
       expect(await raw.get(`${prefix}:mobile:transcode:paused`)).toBeNull();
       expect(freshJobs).toHaveLength(4);
 
-      // 5. Genuinely NEW network failures after the resume still trip the threshold.
+      // 5. A REAL stall is still detected and recovered: the worker holding an encode dies mid-encode
+      //    (its encode never returns, its lock lapses); BullMQ's stall check on the next worker hands the
+      //    job back (stalled counter + 1, no attempt used) and it completes exactly once.
+      await mobileWorker.close();
+      hangs.add('stall_me');
+      const dying = startMobileWorker();
+      const stallJob = await add('stall_me');
+      await until(async () => (await mobile.getActiveCount()) === 1, 10_000, 'stall_me running');
+      await dying.close(true); // the host is gone: no lock renewal, the encode never finishes
+      // A dead host also stops renewing the cross-process encode slot, which then expires on its own
+      // (120 s TTL). Its holder here lives on inside this test process, so the expiry is applied now -
+      // the same time compression as the short lock duration above.
+      await raw.del(redis.key(ENCODE_SLOT_KEY));
+      hangs.delete('stall_me'); // the next worker's encode of it succeeds
+      mobileWorker = startMobileWorker();
+      await until(async () => (await raw.hget(MQ() + stallJob.id!, 'stc')) === '1', 30_000, 'the stall to be detected');
+      await until(async () => (await mobile.getJob(stallJob.id!))?.finishedOn !== undefined, 30_000, 'stall_me completed after the stall');
+      const recovered = await mobile.getJob(stallJob.id!);
+      expect(await recovered!.getState()).toBe('completed');
+      expect(recovered!.attemptsMade).toBe(1); // the completed attempt; the stall itself used none
+      expect(ready.get('stall_me')).toBe(1); // exactly one successful encode - the dead attempt never wrote READY
+      expect(total('PAUSED')).toBe(0); // a stall is not a network failure for the watchdog
+
+      // 6. Genuinely NEW network failures after the resume still trip the threshold.
       ['new_a', 'new_b', 'new_c'].forEach((v) => failWith.set(v, 'aborted'));
       const fresh3 = await Promise.all(['new_a', 'new_b', 'new_c'].map((v) => add(v, 1))); // last attempt: terminal
       await until(
@@ -332,24 +462,24 @@ const FRESH = ['cmva6lw6a', 'cmvb9e833', 'cmvbcjqll', 'cmvcrhg5y'];
         10_000,
         'the next historical job running',
       );
-      await w.tick();
-      expect(count('netfail_seen')).toBe(1);
-      expect(count('threshold_network_failures')).toBe(1);
+      await wdog.w.tick();
+      expect(wdog.count('netfail_seen')).toBe(1);
+      expect(wdog.count('threshold_network_failures')).toBe(1);
       expect(
         (
-          events.find((e) => e.event === 'threshold_network_failures')!.data
+          wdog.events.find((e) => e.event === 'threshold_network_failures')!.data
             .jobs as Array<{ src: string }>
         ).every((j) => j.src === 'finishedOn'),
       ).toBe(true);
-      expect(count('PAUSED')).toBe(1);
+      expect(wdog.count('PAUSED')).toBe(1);
       expect(
         JSON.parse((await raw.get(`${prefix}:mobile:transcode:paused`))!),
       ).toMatchObject({ by: 'safety-watchdog', scope: 'historical' });
       expect(fresh3).toHaveLength(3);
       // Further ticks on the same evidence never pause again.
-      await resume();
-      for (let i = 0; i < 3; i++) await w.tick();
-      expect(count('threshold_network_failures')).toBe(1);
+      await resumeAll();
+      for (let i = 0; i < 3; i++) await wdog.w.tick();
+      expect(wdog.count('threshold_network_failures')).toBe(1);
       expect(await raw.get(`${prefix}:mobile:transcode:paused`)).toBeNull();
     });
   },
