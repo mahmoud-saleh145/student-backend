@@ -241,6 +241,17 @@ Progress percent is **monotonic** — re-watching a finished lesson never lowers
 it — and `watchedSeconds` is clamped server-side to 900 per report, so a client
 cannot mint watch time.
 
+**Free previews** (`isPreview` lessons and documents) open without an
+enrolment only while their course is `PUBLISHED`. A `HIDDEN`, `DRAFT`,
+`SUSPENDED`, archived or deleted course previews nothing to a student who is not
+already entitled. The same rule applies to `GET /lessons/:id`,
+`GET /lessons/by-video/:videoId`, the playback ticket and each heartbeat, and the
+attachment ticket.
+That refusal carries no `courseId` in `details` when the student holds no
+enrolment in the course, so a lesson id never confirms that an unlisted course
+exists. Enrolled students of a `HIDDEN` course keep full access through these
+routes.
+
 ### Playback
 
 ```

@@ -23,12 +23,16 @@ type Decision = {
   state: string;
   canAccessContent: boolean;
   denialCode?: ErrorCode;
+  courseStatus?: string;
 };
 
+// The free-preview lesson belongs to a course that is on offer: previews are
+// only honoured for a PUBLISHED course (course-access-preview.spec.ts).
 const NOT_ENROLLED: Decision = {
   state: 'NOT_ENROLLED',
   canAccessContent: false,
   denialCode: ErrorCode.NOT_ENROLLED,
+  courseStatus: 'PUBLISHED',
 };
 const ACTIVE: Decision = { state: 'ACTIVE', canAccessContent: true };
 
@@ -143,6 +147,19 @@ describe('heartbeat on a free preview lesson', () => {
     });
     expect(t.revokeTicket).toHaveBeenCalledWith('t_1', 'Access lost mid-playback: ARCHIVED');
   });
+
+  it.each(['HIDDEN', 'DRAFT', 'SUSPENDED'])(
+    'ends at the next beat once the course is %s and the student was never enrolled',
+    async (courseStatus) => {
+      const t = harness({ decision: { ...NOT_ENROLLED, courseStatus }, isPreview: true });
+
+      await expect(t.beat()).resolves.toEqual({
+        ok: false,
+        terminate: { reason: ErrorCode.NOT_ENROLLED },
+      });
+      expect(t.revokeTicket).toHaveBeenCalledWith('t_1', 'Access lost mid-playback: NOT_ENROLLED');
+    },
+  );
 });
 
 describe('heartbeat on a protected lesson', () => {

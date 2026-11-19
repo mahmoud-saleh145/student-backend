@@ -15,6 +15,8 @@
  * LessonsService.byVideoId + detail(), and assert that both pick the same
  * lecture. Preview access itself is expected behaviour and is preserved.
  */
+import { CourseStatus } from '@prisma/client';
+
 import { ErrorCode } from '../../src/common/errors/error-codes';
 import { CourseAccessService } from '../../src/modules/courses/course-access.service';
 import { LessonsService } from '../../src/modules/lessons/lessons.service';
@@ -55,12 +57,20 @@ function world(opts: {
   const role = opts.role ?? 'STUDENT';
   const origin = opts.lectures[0];
 
-  // The real access engine; only enrolment state is modelled.
+  // The real access engine; only enrolment state is modelled. Every course is
+  // on offer (PUBLISHED), which is what makes its free previews open.
   const access = new CourseAccessService({} as never, {} as never, {} as never);
   jest.spyOn(access, 'resolve').mockImplementation(async ({ courseId, role: r }) =>
     r === 'ADMIN' || enrolled.has(courseId)
-      ? { state: 'ACTIVE', canAccessContent: true, enrollment: null, expiresAt: null }
-      : { state: 'NOT_ENROLLED', canAccessContent: false, enrollment: null, expiresAt: null, denialCode: ErrorCode.NOT_ENROLLED },
+      ? { state: 'ACTIVE', canAccessContent: true, enrollment: null, expiresAt: null, courseStatus: CourseStatus.PUBLISHED }
+      : {
+          state: 'NOT_ENROLLED',
+          canAccessContent: false,
+          enrollment: null,
+          expiresAt: null,
+          denialCode: ErrorCode.NOT_ENROLLED,
+          courseStatus: CourseStatus.PUBLISHED,
+        },
   );
   // Enrolments here are whole-course.
   jest.spyOn(access, 'assertSectionAccessible').mockImplementation(async () => undefined as never);
