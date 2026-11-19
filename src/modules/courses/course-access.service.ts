@@ -46,6 +46,13 @@ export interface AccessDecision {
   expiresAt: Date | null;
   /** The error to raise if the caller demanded access. */
   denialCode?: ErrorCode;
+  /**
+   * Status of the course the decision is about. Set by `resolve()` whenever
+   * the course exists; absent when it does not (or is deleted), and when
+   * `decide()` is called on its own. Read by the preview exception of
+   * `assertContentAccess`, which only applies to a PUBLISHED course.
+   */
+  courseStatus?: CourseStatus;
 }
 
 /**
@@ -153,6 +160,7 @@ export class CourseAccessService {
             course.status === CourseStatus.ARCHIVED
               ? ErrorCode.COURSE_ARCHIVED
               : undefined,
+          courseStatus: course.status,
         };
       }
     }
@@ -164,6 +172,7 @@ export class CourseAccessService {
         enrollment: null,
         expiresAt: null,
         denialCode: ErrorCode.UNAUTHORIZED,
+        courseStatus: course.status,
       };
     }
 
@@ -177,7 +186,7 @@ export class CourseAccessService {
       where: { userId_courseId: { userId: params.userId, courseId: params.courseId } },
     });
 
-    return this.decide(course.status, enrollment);
+    return { ...this.decide(course.status, enrollment), courseStatus: course.status };
   }
 
   /** Pure decision function — unit-testable without a database. */
@@ -339,19 +348,36 @@ export class CourseAccessService {
 
     if (decision.canAccessContent) return decision;
 
-    // Preview content is the one documented exception, and only when the
-    // course itself is still available.
+    // Preview content is the one documented exception, and only for a course
+    // that is on offer: PUBLISHED. `decide()` does not look at the course
+    // status for a student without an active enrolment, so without this check
+    // an unlisted (HIDDEN), withdrawn (DRAFT), paused (SUSPENDED) or deleted
+    // course handed its preview lessons and documents to anyone holding their
+    // id. Enrolled students of a HIDDEN course never reach this branch: their
+    // decision already grants access.
     if (
       params.allowPreview &&
       params.isPreviewContent &&
+      decision.courseStatus === CourseStatus.PUBLISHED &&
       decision.state !== 'ARCHIVED' &&
       decision.denialCode !== ErrorCode.COURSE_NOT_AVAILABLE
     ) {
       return { ...decision, canAccessContent: true };
     }
 
+    // A caller with no enrolment in a course that is not on offer learns
+    // nothing about it: the same code as any locked lesson, without the course
+    // id. (A PUBLISHED course keeps it - the app offers enrolment from it - and
+    // so does anyone who holds an enrolment row, since they know the course.)
+    const outsiderOfUnlistedCourse =
+      decision.enrollment === null &&
+      decision.courseStatus !== CourseStatus.PUBLISHED &&
+      decision.courseStatus !== CourseStatus.ARCHIVED;
+
     throw new AppException(decision.denialCode ?? ErrorCode.NOT_ENROLLED, {
-      details: { accessState: decision.state, courseId: params.courseId },
+      details: outsiderOfUnlistedCourse
+        ? { accessState: decision.state }
+        : { accessState: decision.state, courseId: params.courseId },
     });
   }
 
