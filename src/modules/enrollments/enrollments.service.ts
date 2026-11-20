@@ -1,6 +1,7 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import {
   AuditAction,
+  CodeTargetType,
   EnrollmentMethod,
   EnrollmentState,
   NotificationKind,
@@ -21,7 +22,7 @@ import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { withSerializableRetry } from '../../database/serializable-retry';
 import { AuditService } from '../audit/audit.service';
 import { CatalogService } from '../catalog/catalog.service';
-import { CodesService } from '../codes/codes.service';
+import { type CodeValidation, CodesService } from '../codes/codes.service';
 import { grantPartFromCode } from '../course-parts/grant-part-from-code';
 import { CourseAccessService } from '../courses/course-access.service';
 import { CoursesService } from '../courses/courses.service';
@@ -29,6 +30,10 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { REFUND_TX_INCLUDE, refundStateOf } from '../payments/refund-state';
 import { PaymentsService } from '../payments/payments.service';
 
+import {
+  type RedemptionCoverageFacts,
+  redemptionGrantsNothing,
+} from './redemption-coverage';
 import { revokeEnrollmentInTx } from './revoke-enrollment';
 
 /**
@@ -349,6 +354,14 @@ export class EnrollmentsService {
         courseId: params.courseId,
         ipAddress: params.ip,
         deviceKey: params.deviceKey,
+        // Refuses a part or section card that would unlock nothing new, while
+        // the card is still unspent. See `assertRedemptionGrantsSomething`.
+        beforeConsume: (pending) =>
+          this.assertRedemptionGrantsSomething(tx, {
+            userId: params.userId,
+            course,
+            pending,
+          }),
       });
 
       const durationOverride = {
@@ -474,6 +487,113 @@ export class EnrollmentsService {
       payment: null,
       message: null,
     };
+  }
+
+  /**
+   * Refuses a PART or SECTION card the student would gain nothing from.
+   *
+   * Called from inside `CodesService.redeemInTransaction`, after the card has
+   * been validated and before it is consumed, with the redemption's own
+   * transaction client. Every fact is read through `tx`, at Serializable
+   * isolation, so the decision and the consumption cannot be separated: a
+   * second card for the same part racing this one either sees the entitlement
+   * the first wrote, or is aborted by the database and retried
+   * (`withSerializableRetry`) — and then sees it.
+   *
+   * The rule itself is `redemptionGrantsNothing`; what a student "already
+   * holds" is `CourseAccessService.sectionCoverage`, the same rule the lesson
+   * gate uses. Nothing about what a card grants changes here: a redemption
+   * that is allowed through writes exactly what it wrote before.
+   *
+   * `ALREADY_ENROLLED` is reused deliberately. It is what a whole-course
+   * holder has always been answered with, and every shipped client already
+   * reads it as "you already have access to this" — a new code would reach
+   * the released mobile app as an unknown error.
+   */
+  private async assertRedemptionGrantsSomething(
+    tx: Prisma.TransactionClient,
+    params: {
+      userId: string;
+      course: {
+        id: string;
+        accessDurationType: string;
+        accessDurationDays: number | null;
+        accessEndsAt: Date | null;
+      };
+      pending: CodeValidation;
+    },
+  ): Promise<void> {
+    const { scope, code } = params.pending;
+
+    if (
+      scope.targetType !== CodeTargetType.SECTION &&
+      scope.targetType !== CodeTargetType.PART
+    ) {
+      return;
+    }
+
+    const enrollment = await tx.enrollment.findUnique({
+      where: { userId_courseId: { userId: params.userId, courseId: params.course.id } },
+      select: { state: true, accessEndsAt: true },
+    });
+    // Nothing held at all: the common case, decided without further reads.
+    if (!enrollment) return;
+
+    const now = new Date();
+
+    let part: RedemptionCoverageFacts['part'] = null;
+    if (scope.targetType === CodeTargetType.PART && code.coursePartId) {
+      const existingPart = await tx.coursePart.findFirst({
+        where: { id: code.coursePartId, deletedAt: null },
+        select: { id: true },
+      });
+      if (!existingPart) {
+        part = 'GONE';
+      } else {
+        const entitlement = await tx.coursePartEntitlement.findUnique({
+          where: {
+            userId_coursePartId: { userId: params.userId, coursePartId: code.coursePartId },
+          },
+          select: { revokedAt: true },
+        });
+        part = entitlement && entitlement.revokedAt === null ? 'HELD' : 'NOT_HELD';
+      }
+    }
+
+    const nothingNew = redemptionGrantsNothing({
+      targetType: scope.targetType,
+      cardSectionIds: scope.sectionIds,
+      enrollment,
+      coveredSectionIds: await this.access.sectionCoverage(
+        tx,
+        params.userId,
+        params.course.id,
+      ),
+      part,
+      nextAccessEndsAt: this.computeAccessEnd(
+        params.course,
+        {
+          type: code.accessDurationType,
+          days: code.accessDurationDays,
+          endsAt: code.accessEndsAt,
+        },
+        now,
+      ),
+      now,
+    });
+
+    if (nothingNew) {
+      throw new AppException(ErrorCode.ALREADY_ENROLLED, {
+        message:
+          'You already have access to everything this code unlocks. The code was not used.',
+        details: {
+          reason: 'CODE_SCOPE_ALREADY_HELD',
+          targetType: scope.targetType,
+          coursePartId: code.coursePartId,
+          sectionIds: scope.sectionIds,
+        },
+      });
+    }
   }
 
   // ---------------------------------------------------------------------------

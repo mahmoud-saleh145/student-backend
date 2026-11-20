@@ -205,6 +205,19 @@ POST /courses/:id/enroll         { method: FREE | PAYMENT | CODE | ADMIN_APPROVA
 POST /courses/:id/redeem         { code }
 ```
 
+`POST /courses/:id/redeem` never spends a card on nothing. `409 ALREADY_ENROLLED`
+means the card was **not** used, in two cases:
+
+- the student holds the whole course, live (any card for it); or
+- a PART or SECTION card would unlock nothing new — the student already holds
+  the part, or can already open every section the card carries.
+
+The second check runs inside the redemption transaction, before the card is
+consumed. A card still redeems when it gives the student anything at all: no
+enrollment yet, an enrollment that is not live (pending, revoked, expired), an
+access end date the card would move later, a section not yet open, or a part
+not yet held. Whole-course and teacher cards are unchanged.
+
 `GET /courses/:id` includes an `access` object the app renders directly:
 
 ```json

@@ -925,8 +925,27 @@ export class CourseAccessService {
    */
   async allowedSectionIds(userId: string, courseId: string): Promise<string[] | null> {
     await this.assertCourseTargeting(userId, UserRole.STUDENT, courseId);
+    return this.sectionCoverage(this.prisma, userId, courseId);
+  }
 
-    const enrollment = await this.prisma.enrollment.findUnique({
+  /**
+   * The coverage rule behind `allowedSectionIds`, readable through any client.
+   *
+   * Split out so the code-redemption transaction can ask the same question
+   * with its own transaction client: "does this student already hold what this
+   * card unlocks?" has to be answered from the snapshot the card is consumed
+   * in, by the one rule that decides what a student may open — not by a second
+   * copy of that rule that could drift from it.
+   *
+   * No targeting check here: that is a property of the request, decided by the
+   * callers before they get this far.
+   */
+  async sectionCoverage(
+    db: Prisma.TransactionClient,
+    userId: string,
+    courseId: string,
+  ): Promise<string[] | null> {
+    const enrollment = await db.enrollment.findUnique({
       where: { userId_courseId: { userId, courseId } },
       select: {
         id: true,
@@ -944,11 +963,11 @@ export class CourseAccessService {
     // history, not a limit: an enrollment that holds any grant written by a
     // COURSE card is whole-course access, live, like every other whole-course
     // enrollment. No data is rewritten; the rule is applied on every read.
-    if (await this.grantedByWholeCourseCard(userId, courseId, enrollment.sectionGrants)) {
+    if (await this.grantedByWholeCourseCard(userId, courseId, enrollment.sectionGrants, db)) {
       return null;
     }
 
-    const partSections = await this.prisma.courseSection.findMany({
+    const partSections = await db.courseSection.findMany({
       where: {
         courseId,
         deletedAt: null,
@@ -1009,13 +1028,14 @@ export class CourseAccessService {
     userId: string,
     courseId: string,
     grants: { codeId: string | null }[],
+    db: Prisma.TransactionClient = this.prisma,
   ): Promise<boolean> {
     const codeIds = Array.from(
       new Set(grants.map((g) => g.codeId).filter((id): id is string => typeof id === 'string')),
     );
     if (codeIds.length === 0) return false;
 
-    const wholeCourseRedemptions = await this.prisma.accessCodeRedemption.count({
+    const wholeCourseRedemptions = await db.accessCodeRedemption.count({
       where: {
         userId,
         codeId: { in: codeIds },

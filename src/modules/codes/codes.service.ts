@@ -519,6 +519,18 @@ export class CodesService {
       enrollmentId?: string;
       ipAddress?: string | null;
       deviceKey?: string | null;
+      /**
+       * Runs after the card has passed every check and its scope is resolved,
+       * and BEFORE anything is written. Throwing here leaves the card exactly
+       * as it was — no redemption row, no counter increment.
+       *
+       * This is where the caller refuses a card that would grant the student
+       * nothing they do not already hold. It lives here, between the checks
+       * and the writes, rather than in the caller before the transaction,
+       * because only this point knows what the card unlocks AND is inside the
+       * Serializable snapshot the card is consumed in.
+       */
+      beforeConsume?: (pending: CodeValidation) => Promise<void>;
     },
   ): Promise<CodeValidation> {
     const normalized = this.normalize(params.rawCode);
@@ -553,6 +565,20 @@ export class CodesService {
     });
     if (previous) throw new AppException(ErrorCode.CODE_ALREADY_USED);
 
+    const validation: CodeValidation = {
+      code: {
+        id: code.id,
+        courseId: code.courseId,
+        coursePartId: code.coursePartId,
+        accessDurationType: code.accessDurationType,
+        accessDurationDays: code.accessDurationDays,
+        accessEndsAt: code.accessEndsAt,
+      },
+      scope,
+    };
+
+    if (params.beforeConsume) await params.beforeConsume(validation);
+
     await tx.accessCodeRedemption.create({
       data: {
         codeId: code.id,
@@ -574,17 +600,7 @@ export class CodesService {
       },
     });
 
-    return {
-      code: {
-        id: code.id,
-        courseId: code.courseId,
-        coursePartId: code.coursePartId,
-        accessDurationType: code.accessDurationType,
-        accessDurationDays: code.accessDurationDays,
-        accessEndsAt: code.accessEndsAt,
-      },
-      scope,
-    };
+    return validation;
   }
 
   /**
