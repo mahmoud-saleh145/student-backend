@@ -15,9 +15,11 @@ import { paginated, type Paginated } from '../../common/types/api-response';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { StorageService } from '../storage/storage.service';
 
-import { CourseAccessService } from './course-access.service';
+import { CourseAccessService, LISTED_ENROLMENT_STATES } from './course-access.service';
 import {
+  attachmentSectionId,
   computeCourseProgress,
+  hasDocumentAccess,
   toAttachment,
   toCourseSummary,
   toSection,
@@ -54,17 +56,6 @@ const COURSE_INCLUDE = {
   academicYear: { select: { id: true, name: true, nameAr: true } },
 } satisfies Prisma.CourseInclude;
 
-/**
- * A course a student (or an anonymous visitor) may read: published, or
- * archived for those who already hold it. Shared by `detail`, `sections` and
- * `attachments`; the last two used to have no status check at all, so a guessed
- * id listed the outline and documents of a DRAFT or HIDDEN course (audit F-14).
- */
-function assertReadableByStudents(status: CourseStatus, isStaff: boolean): void {
-  if (!isStaff && status !== CourseStatus.PUBLISHED && status !== CourseStatus.ARCHIVED) {
-    throw new AppException(ErrorCode.COURSE_NOT_AVAILABLE);
-  }
-}
 
 /**
  * Documents a student may see listed: none that belongs to an unpublished
@@ -215,15 +206,12 @@ export class CoursesService {
           userId: params.userId,
           // PENDING_PAYMENT is deliberately included: the student started a
           // purchase and needs to find it again to finish.
-          state: {
-            in: [
-              EnrollmentState.ACTIVE,
-              EnrollmentState.EXPIRED,
-              EnrollmentState.ARCHIVED,
-              EnrollmentState.PENDING_APPROVAL,
-              EnrollmentState.PENDING_PAYMENT,
-            ],
-          },
+          //
+          // The same list decides who may still open a HIDDEN course's page
+          // (CourseAccessService.mayViewCoursePage), so nothing listed here
+          // answers "not available" when tapped - unless the course itself is
+          // withdrawn (DRAFT) or paused (SUSPENDED), which is the true state.
+          state: { in: [...LISTED_ENROLMENT_STATES] },
         },
       },
     };
@@ -319,9 +307,10 @@ export class CoursesService {
 
     const isStaff = params.role && params.role !== UserRole.STUDENT;
 
-    // A draft or hidden course is invisible to students even by direct id —
-    // otherwise a guessed id leaks unpublished content.
-    assertReadableByStudents(course.status, Boolean(isStaff));
+    // A draft course, or a hidden one the caller is not in, is invisible to
+    // students even by direct id - otherwise a guessed id leaks unpublished
+    // content.
+    await this.assertPageVisible(course, params.userId, Boolean(isStaff));
 
     const decision = await this.access.resolve({
       userId: params.userId,
@@ -330,6 +319,7 @@ export class CoursesService {
     });
 
     const hasAccess = decision.canAccessContent;
+    const previewUnlocks = this.access.previewUnlocks(decision);
 
     const sections = await this.loadSections(course.id, {
       includeUnpublished: Boolean(isStaff),
@@ -384,6 +374,7 @@ export class CoursesService {
         ...(isStaff ? {} : STUDENT_VISIBLE_ATTACHMENTS),
       },
       orderBy: [{ lessonId: 'asc' }, { sortOrder: 'asc' }],
+      include: { lesson: { select: { sectionId: true } } },
     });
 
     const summary = toCourseSummary({
@@ -410,9 +401,19 @@ export class CoursesService {
           hasCourseAccess:
             hasAccess && (allowedSections === null || allowedSections.includes(section.id)),
           progressByLesson,
+          previewUnlocks,
         }),
       ),
-      attachments: attachments.map((a) => toAttachment(a, hasAccess)),
+      // Each document locked exactly as the download gate decides it: section
+      // scope included, so a part-limited student is not shown another part's
+      // handout as open.
+      attachments: attachments.map((a) =>
+        toAttachment(
+          a,
+          hasDocumentAccess(hasAccess, allowedSections, attachmentSectionId(a)),
+          previewUnlocks,
+        ),
+      ),
       completionRule: {
         type: course.completionRuleType,
         threshold: course.completionThreshold,
@@ -430,7 +431,7 @@ export class CoursesService {
     if (!course) throw AppException.notFound('Course', params.courseId);
 
     const isStaff = Boolean(params.role && params.role !== UserRole.STUDENT);
-    assertReadableByStudents(course.status, isStaff);
+    await this.assertPageVisible(course, params.userId, isStaff);
 
     const decision = await this.access.resolve({
       userId: params.userId,
@@ -463,8 +464,24 @@ export class CoursesService {
           decision.canAccessContent &&
           (allowedSections === null || allowedSections.includes(section.id)),
         progressByLesson,
+        previewUnlocks: this.access.previewUnlocks(decision),
       }),
     );
+  }
+
+  /**
+   * Refuses a course page the caller may not see
+   * (`CourseAccessService.mayViewCoursePage`). One answer for HIDDEN, DRAFT and
+   * SUSPENDED, so a refusal never confirms which of them a guessed id is.
+   */
+  private async assertPageVisible(
+    course: { id: string; status: CourseStatus },
+    userId: string | null,
+    isStaff: boolean,
+  ): Promise<void> {
+    if (!(await this.access.mayViewCoursePage({ userId, isStaff, course }))) {
+      throw new AppException(ErrorCode.COURSE_NOT_AVAILABLE);
+    }
   }
 
   /**
@@ -531,8 +548,9 @@ export class CoursesService {
 
   async attachments(courseId: string, userId: string | null, role?: UserRole) {
     // Same visibility rules as `detail()`, which is what student-web renders
-    // from: no DRAFT/HIDDEN/SUSPENDED course, and no document of an
-    // unpublished lecture or section, for students and anonymous callers.
+    // from: no DRAFT/SUSPENDED course, no HIDDEN course the caller is not in,
+    // and no document of an unpublished lecture or section, for students and
+    // anonymous callers. Locked flags as in `detail()`.
     const course = await this.prisma.course.findFirst({
       where: { id: courseId, ...notDeleted },
       select: { id: true, status: true },
@@ -540,16 +558,25 @@ export class CoursesService {
     if (!course) throw AppException.notFound('Course', courseId);
 
     const isStaff = Boolean(role && role !== UserRole.STUDENT);
-    assertReadableByStudents(course.status, isStaff);
+    await this.assertPageVisible(course, userId, isStaff);
 
     const decision = await this.access.resolve({ userId, role, courseId });
+    const allowedSections = userId ? await this.access.allowedSectionIds(userId, courseId) : null;
+    const previewUnlocks = this.access.previewUnlocks(decision);
 
     const rows = await this.prisma.attachment.findMany({
       where: { courseId, ...notDeleted, ...(isStaff ? {} : STUDENT_VISIBLE_ATTACHMENTS) },
       orderBy: [{ lessonId: 'asc' }, { sortOrder: 'asc' }],
+      include: { lesson: { select: { sectionId: true } } },
     });
 
-    return rows.map((a) => toAttachment(a, decision.canAccessContent));
+    return rows.map((a) =>
+      toAttachment(
+        a,
+        hasDocumentAccess(decision.canAccessContent, allowedSections, attachmentSectionId(a)),
+        previewUnlocks,
+      ),
+    );
   }
 
   // ---------------------------------------------------------------------------

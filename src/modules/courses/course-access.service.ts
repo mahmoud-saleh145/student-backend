@@ -56,6 +56,27 @@ export interface AccessDecision {
 }
 
 /**
+ * The enrolment states for which "My courses" (`CoursesService.listMine`) lists
+ * a course - and therefore the states that keep an unlisted (HIDDEN) course's
+ * page open to its student (`mayViewCoursePage`).
+ *
+ * One list for both, so a course a student is shown in "My courses" can never
+ * answer "this course is not available" when tapped. REVOKED is the one state
+ * left out: an explicit administrative removal.
+ *
+ * Note that being able to SEE a page is not the same as being able to OPEN its
+ * content - that remains `decide()` per state (EXPIRED, ARCHIVED and both
+ * PENDING states unlock nothing) plus the section scope of the enrolment.
+ */
+export const LISTED_ENROLMENT_STATES: readonly EnrollmentState[] = [
+  EnrollmentState.ACTIVE,
+  EnrollmentState.EXPIRED,
+  EnrollmentState.ARCHIVED,
+  EnrollmentState.PENDING_APPROVAL,
+  EnrollmentState.PENDING_PAYMENT,
+];
+
+/**
  * The access engine.
  *
  * Every gate in the system — course detail, lesson detail, playback ticket,
@@ -116,6 +137,63 @@ export class CourseAccessService {
    */
   private get onlinePaymentEnabled(): boolean {
     return false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Course page visibility
+  // ---------------------------------------------------------------------------
+
+  /**
+   * May this caller see a course's page - its metadata, outline, document list
+   * and parts - at all? Visibility only: what the page UNLOCKS is still
+   * `resolve()` and `allowedSectionIds()`, exactly as before.
+   *
+   *   staff                 → yes (their own scoping happens in `resolve()`)
+   *   PUBLISHED, ARCHIVED   → yes
+   *   HIDDEN                → only a signed-in student holding an enrolment in
+   *                           one of LISTED_ENROLMENT_STATES. HIDDEN means
+   *                           "unlisted": off the catalogue for new students,
+   *                           unchanged for those already in (see `decide()`).
+   *                           Every such row was created while the course was
+   *                           on offer, or by an administrator - joining and
+   *                           buying require PUBLISHED - so the page shows such
+   *                           a student nothing they were not already shown.
+   *   DRAFT, SUSPENDED      → no (withdrawn / paused for everyone)
+   *
+   * Anyone else learns nothing: callers refuse with the same code whether the
+   * course is HIDDEN, DRAFT or SUSPENDED (audit F-14).
+   */
+  async mayViewCoursePage(params: {
+    userId: string | null;
+    isStaff: boolean;
+    course: { id: string; status: CourseStatus };
+  }): Promise<boolean> {
+    if (params.isStaff) return true;
+    const { status } = params.course;
+    if (status === CourseStatus.PUBLISHED || status === CourseStatus.ARCHIVED) return true;
+    if (status !== CourseStatus.HIDDEN || !params.userId) return false;
+
+    // Only HIDDEN pays for this lookup; a PUBLISHED page costs nothing extra.
+    const row = await this.prisma.enrollment.findUnique({
+      where: { userId_courseId: { userId: params.userId, courseId: params.course.id } },
+      select: { state: true },
+    });
+    return row !== null && LISTED_ENROLMENT_STATES.includes(row.state);
+  }
+
+  /**
+   * Whether a free-preview lecture or document is open under `decision` - the
+   * one exception `assertContentAccess` makes for a caller without access, and
+   * only for a course that is on offer (PUBLISHED). Exposed so the course page
+   * marks a preview as open exactly when the gate will serve it, and never
+   * shows as open what the gate then refuses.
+   */
+  previewUnlocks(decision: AccessDecision): boolean {
+    return (
+      decision.courseStatus === CourseStatus.PUBLISHED &&
+      decision.state !== 'ARCHIVED' &&
+      decision.denialCode !== ErrorCode.COURSE_NOT_AVAILABLE
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -355,13 +433,7 @@ export class CourseAccessService {
     // course handed its preview lessons and documents to anyone holding their
     // id. Enrolled students of a HIDDEN course never reach this branch: their
     // decision already grants access.
-    if (
-      params.allowPreview &&
-      params.isPreviewContent &&
-      decision.courseStatus === CourseStatus.PUBLISHED &&
-      decision.state !== 'ARCHIVED' &&
-      decision.denialCode !== ErrorCode.COURSE_NOT_AVAILABLE
-    ) {
+    if (params.allowPreview && params.isPreviewContent && this.previewUnlocks(decision)) {
       return { ...decision, canAccessContent: true };
     }
 

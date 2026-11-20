@@ -4,17 +4,19 @@ import {
   type AttachmentKind,
   AuditAction,
   ContentStatus,
+  type CourseStatus,
   UserRole,
 } from '@prisma/client';
 import { createHash, randomBytes } from 'node:crypto';
 
 import { AppException } from '../../common/errors/app.exception';
+import { ErrorCode } from '../../common/errors/error-codes';
 import type { AuthenticatedUser } from '../../common/types/request-context';
 import type { PlaybackConfig } from '../../config/configuration';
 import { PrismaService, notDeleted } from '../../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { CourseAccessService } from '../courses/course-access.service';
-import { toAttachment } from '../courses/course.serializer';
+import { hasDocumentAccess, toAttachment } from '../courses/course.serializer';
 import { DevicesService } from '../devices/devices.service';
 import { SecurityEventService } from '../security/security-event.service';
 import {
@@ -470,9 +472,22 @@ export class AttachmentsService {
   async listForSection(sectionId: string, userId: string, role: UserRole) {
     const section = await this.prisma.courseSection.findFirst({
       where: { id: sectionId, ...notDeleted },
-      select: { id: true, courseId: true },
+      select: {
+        id: true,
+        courseId: true,
+        status: true,
+        course: { select: { id: true, status: true } },
+      },
     });
     if (!section) throw AppException.notFound('Section', sectionId);
+    await this.assertCoursePageVisible(section.course, userId, role);
+    // An unpublished section is not in the student's outline, and its
+    // documents are refused by `issueTicket`; its handout titles are not listed
+    // either (the course-level lists apply the same rule through
+    // STUDENT_VISIBLE_ATTACHMENTS). Answered as if it did not exist.
+    if (role === UserRole.STUDENT && section.status !== ContentStatus.PUBLISHED) {
+      throw AppException.notFound('Section', sectionId);
+    }
 
     const decision = await this.access.resolve({
       userId,
@@ -487,16 +502,41 @@ export class AttachmentsService {
 
     // `canAccessContent` decides whether the row carries anything actionable;
     // the list itself is visible either way, so a student can see that buying
-    // the section would give them three handouts.
-    return rows.map((a) => toAttachment(a, decision.canAccessContent));
+    // the section would give them three handouts. Narrowed to this section for
+    // a section-scoped enrolment, exactly as `issueTicket` narrows it.
+    const open = hasDocumentAccess(
+      decision.canAccessContent,
+      await this.studentSectionScope(userId, role, section.courseId),
+      section.id,
+    );
+    const previewUnlocks = this.access.previewUnlocks(decision);
+    return rows.map((a) => toAttachment(a, open, previewUnlocks));
   }
 
   async listForLesson(lessonId: string, userId: string, role: UserRole) {
     const lesson = await this.prisma.lesson.findFirst({
       where: { id: lessonId, ...notDeleted },
-      select: { id: true, courseId: true, isPreview: true },
+      select: {
+        id: true,
+        courseId: true,
+        sectionId: true,
+        isPreview: true,
+        status: true,
+        section: { select: { status: true } },
+        course: { select: { id: true, status: true } },
+      },
     });
     if (!lesson) throw AppException.notFound('Lesson', lessonId);
+    await this.assertCoursePageVisible(lesson.course, userId, role);
+    // As for a section: an unpublished lecture, or one inside an unpublished
+    // section, lists nothing to a student.
+    if (
+      role === UserRole.STUDENT &&
+      (lesson.status !== ContentStatus.PUBLISHED ||
+        lesson.section.status !== ContentStatus.PUBLISHED)
+    ) {
+      throw AppException.notFound('Lesson', lessonId);
+    }
 
     const decision = await this.access.resolve({ userId, role, courseId: lesson.courseId });
 
@@ -505,6 +545,38 @@ export class AttachmentsService {
       orderBy: { sortOrder: 'asc' },
     });
 
-    return rows.map((a) => toAttachment(a, decision.canAccessContent));
+    const open = hasDocumentAccess(
+      decision.canAccessContent,
+      await this.studentSectionScope(userId, role, lesson.courseId),
+      lesson.sectionId,
+    );
+    const previewUnlocks = this.access.previewUnlocks(decision);
+    return rows.map((a) => toAttachment(a, open, previewUnlocks));
+  }
+
+  /** A student's section scope (null = whole course); staff are never scoped. */
+  private async studentSectionScope(
+    userId: string,
+    role: UserRole,
+    courseId: string,
+  ): Promise<string[] | null> {
+    return role === UserRole.STUDENT ? this.access.allowedSectionIds(userId, courseId) : null;
+  }
+
+  /**
+   * The document lists of a section or a lecture are part of the course page,
+   * so they follow its visibility rule (`CourseAccessService.mayViewCoursePage`)
+   * - they used to answer for any course status, listing the document titles
+   * of a DRAFT or HIDDEN course to anyone holding a section or lecture id.
+   */
+  private async assertCoursePageVisible(
+    course: { id: string; status: CourseStatus },
+    userId: string,
+    role: UserRole,
+  ): Promise<void> {
+    const isStaff = role !== UserRole.STUDENT;
+    if (!(await this.access.mayViewCoursePage({ userId, isStaff, course }))) {
+      throw new AppException(ErrorCode.COURSE_NOT_AVAILABLE);
+    }
   }
 }
