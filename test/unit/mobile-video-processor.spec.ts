@@ -388,3 +388,86 @@ describe('MobileVideoProcessor', () => {
     await expect(t.processor.process(t.job)).rejects.toThrow('ffmpeg exited with 1');
   });
 });
+
+describe('MobileVideoProcessor: transient database errors and Redis hiccups (no wasted encodes)', () => {
+  const outage = () =>
+    new Prisma.PrismaClientKnownRequestError("Can't reach database server", { code: 'P1001', clientVersion: 'test' });
+  const fast = (t: ReturnType<typeof build>, waits: number[]) => {
+    (t.processor as unknown as { dbRetryDelaysMs: number[] }).dbRetryDelaysMs = waits;
+  };
+
+  it('re-tries the FINISH write in place: one encode, no attempt used, READY recorded', async () => {
+    const t = build();
+    fast(t, [1, 1, 1]);
+    t.videos.markMobileReady
+      .mockRejectedValueOnce(outage())
+      .mockRejectedValueOnce(outage())
+      .mockResolvedValueOnce(undefined);
+
+    await expect(t.processor.process(t.job)).resolves.toEqual({ videoId: 'v_1', renditions: 2 });
+    expect(t.transcoder.run).toHaveBeenCalledTimes(1);
+    expect(t.videos.markMobileReady).toHaveBeenCalledTimes(3);
+    expect(t.videos.markMobileFailed).not.toHaveBeenCalled();
+  });
+
+  it('re-tries the CLAIM write in place before encoding', async () => {
+    const t = build();
+    fast(t, [1]);
+    t.videos.markMobileProcessing.mockRejectedValueOnce(outage()).mockResolvedValueOnce(true);
+
+    await expect(t.processor.process(t.job)).resolves.toEqual({ videoId: 'v_1', renditions: 2 });
+    expect(t.videos.markMobileProcessing).toHaveBeenCalledTimes(2);
+    expect(t.transcoder.run).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives up after the last wait and leaves the row for the queue retry (as before)', async () => {
+    const t = build();
+    fast(t, [1, 1]);
+    const err = outage();
+    t.videos.markMobileReady.mockRejectedValue(err);
+
+    await expect(t.processor.process(t.job)).rejects.toBe(err);
+    expect(t.videos.markMobileReady).toHaveBeenCalledTimes(3);
+    expect(t.videos.markMobileFailed).not.toHaveBeenCalled();
+  });
+
+  it('never re-tries a non-transient error', async () => {
+    const t = build();
+    fast(t, [1, 1, 1]);
+    t.videos.markMobileReady.mockRejectedValue(new Error('constraint violated'));
+
+    await expect(t.processor.process(t.job)).rejects.toThrow(/constraint/);
+    expect(t.videos.markMobileReady).toHaveBeenCalledTimes(1);
+  });
+
+  it('an unreachable Redis on a progress update does not fail (or stall) the encode', async () => {
+    const t = build();
+    (t.job.updateProgress as jest.Mock).mockRejectedValue(new Error('Stream isn\'t writeable'));
+    (t.transcoder.run as jest.Mock).mockImplementationOnce(async (params: { onProgress?: (p: number) => unknown }) => {
+      params.onProgress?.(40);
+      params.onProgress?.(80);
+      return {
+        probe: { durationSeconds: 10, width: 1280, height: 720, frameRate: 30, videoCodec: 'h264', audioCodec: 'aac' },
+        renditions: [{ height: 720, width: 1280, bitrateKbps: 2328, playlistKey: 'hls/v_1/720p/index.m3u8', sizeBytes: 2 }],
+        hlsPrefix: 'hls/v_1/',
+        masterPlaylistKey: 'hls/v_1/master.m3u8',
+        isEncrypted: true,
+      };
+    });
+
+    await expect(t.processor.process(t.job)).resolves.toEqual({ videoId: 'v_1', renditions: 1 });
+    expect(t.videos.markMobileReady).toHaveBeenCalledTimes(1);
+  });
+
+  it('records the key id the transcoder actually used (v2), or v1 when it reports none', async () => {
+    const t = build();
+    const base = await (t.transcoder.run as jest.Mock).getMockImplementation()!();
+    (t.transcoder.run as jest.Mock).mockResolvedValueOnce({ ...base, encryptionKeyId: 'derived:v2:r1:v_1' });
+    await t.processor.process(t.job);
+    expect((t.videos.markMobileReady as jest.Mock).mock.calls[0]![1]).toMatchObject({ encryptionKeyId: 'derived:v2:r1:v_1' });
+
+    const t2 = build();
+    await t2.processor.process(t2.job);
+    expect((t2.videos.markMobileReady as jest.Mock).mock.calls[0]![1]).toMatchObject({ encryptionKeyId: 'derived:v_1' });
+  });
+});

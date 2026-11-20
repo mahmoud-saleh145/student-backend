@@ -1,7 +1,7 @@
 import { Controller, Get, Header, Param, Query, Res } from '@nestjs/common';
 import { ApiExcludeEndpoint, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsInt, IsOptional, IsString, MaxLength, Min } from 'class-validator';
+import { IsInt, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
 import type { Response } from 'express';
 
 import { Public } from '../../common/decorators/public.decorator';
@@ -24,6 +24,12 @@ export class SignedQueryDto {
    * playlist and failed immediately.
    */
   @IsOptional() @Type(() => Number) @IsInt() @Min(0) maxHeight?: number;
+
+  /**
+   * Key URLs of v2 (per-rendition key) videos only: the rendition height the
+   * key belongs to. Covered by the signature; v1 key URLs never carry it.
+   */
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(4320) r?: number;
 }
 
 /**
@@ -105,6 +111,7 @@ export class ManifestController {
       ticketId,
       exp: query.exp,
       signature: query.sig,
+      rendition: query.r,
     });
 
     res.setHeader('Content-Type', 'application/octet-stream');

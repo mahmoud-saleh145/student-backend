@@ -2,6 +2,7 @@ import { registerAs } from '@nestjs/config';
 
 import { type EnvironmentVariables, NodeEnv, resolvePublicApiUrl } from './env.validation';
 import { resolveGumletIngestUrlTtlSeconds } from '../modules/videos/gumlet-ingest-url-ttl';
+import { DEFAULT_KEY_ROOT_ID, type HlsKeyVersion, keyRootsFromEnv } from '../modules/playback/hls-keys';
 
 const env = () => process.env as unknown as EnvironmentVariables;
 
@@ -209,6 +210,17 @@ export const videoConfig = registerAs('video', () => ({
   segmentSeconds: num(process.env.HLS_SEGMENT_SECONDS, 6),
   encryptionEnabled: bool(process.env.HLS_ENCRYPTION_ENABLED, true),
   keyRoot: process.env.HLS_KEY_ROOT!,
+  /**
+   * Key scheme for NEW mobile encodes (see src/modules/playback/hls-keys.ts).
+   * `v1` (default) is the original one-key-per-video scheme; `v2` is a key per
+   * rendition with sequence-number IVs. Read by the worker only; the API reads
+   * both schemes regardless, from each row's `encryptionKeyId`.
+   */
+  keyVersion: (process.env.HLS_KEY_VERSION === 'v2' ? 'v2' : 'v1') as HlsKeyVersion,
+  /** Root id new v2 encodes record (`r1` = HLS_KEY_ROOT). */
+  keyRootId: (process.env.HLS_KEY_ROOT_ID ?? DEFAULT_KEY_ROOT_ID).toLowerCase(),
+  /** Every configured root by id; the API must hold each root a READY row names. */
+  keyRoots: keyRootsFromEnv(process.env),
   /** ffmpeg `-threads`; 0 lets ffmpeg decide (every core). */
   transcodeThreads: num(process.env.TRANSCODE_THREADS, 0),
   /**
