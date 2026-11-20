@@ -84,6 +84,8 @@ function harness(opts: { drmProvider?: string | null; status?: string; gumletSta
     isAssetApiConfigured: () => true,
     isSigningConfigured: () => true,
     isAssetPlayable: (s: string) => s === 'ready',
+    // Lookup by tag before any create (no existing asset by default).
+    findAssetsByTag: jest.fn(async (_tag?: string) => [] as unknown[]),
     createAsset: jest.fn(async () => ({ assetId: 'new_asset', status: 'pre-queued', playbackUrl: null })),
     getAsset: jest.fn(async (id: string) => ({
       assetId: id,

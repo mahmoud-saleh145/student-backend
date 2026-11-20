@@ -1,3 +1,4 @@
+import { creationClaimTracker } from './helpers/creation-claim-tracker';
 import { Logger } from '@nestjs/common';
 
 import { GumletIngestService } from '../../src/modules/videos/gumlet-ingest.service';
@@ -61,15 +62,17 @@ function build(opts: {
   const updates: Array<Record<string, unknown>> = [];
   const updateManyCalls: Array<{ where: Record<string, unknown>; data: Record<string, unknown> }> = [];
 
+  const claims = creationClaimTracker();
   const prisma = {
     video: {
-      findFirst: jest.fn(async () => row),
+      findFirst: jest.fn(async () => claims.view(row)),
       // `replaceFailedAsset`'s new tail guards the claim and the commit on the
       // dead asset id. NOTE: unlike `update`, a real Prisma `updateMany` does NOT
       // change the object `findFirst` already handed back - the service keeps
       // using its own in-memory copy of `video.gumletStatus`. The mock must not
       // mutate either, or it silently changes what the code under test sees.
       updateMany: jest.fn(async (args: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+        claims.observe(args);
         updateManyCalls.push(args);
         // Only succeeds while the row still points at the dead asset.
         return { count: row.gumletAssetId === args.where.gumletAssetId ? 1 : 0 };
@@ -101,6 +104,8 @@ function build(opts: {
     isAssetApiConfigured: () => true,
     isSigningConfigured: () => true,
     isAssetPlayable: (s: string) => s === 'ready',
+    // Lookup by tag before any create (no existing asset by default).
+    findAssetsByTag: jest.fn(async (_tag?: string) => [] as unknown[]),
     createAsset: jest.fn(async (params: { sourceUrl: string; enableDrm?: boolean; tag?: string[] }) => {
       if (opts.createAssetFails) {
         throw Object.assign(new Error('provider rejected the input'), {

@@ -11,6 +11,7 @@ import { VideosService, withinQueueTimeout } from '../../modules/videos/videos.s
 import { MOBILE_PARK_MS } from '../mobile-park';
 import { MOBILE_VIDEO_JOBS, QUEUE_NAMES, type MobileTranscodeJobData } from '../queue.constants';
 import { RESPONSIVE_WORKER } from '../queue.tuning';
+import { deferForTransientFailure, type WithTransientDeferral } from '../transient-deferral';
 import {
   HlsTranscoder,
   TranscodeDiskPressureError,
@@ -42,6 +43,22 @@ export const PAUSE_RECONCILE_MS = 30_000;
  * to cost an attempt, and a full re-encode, for a brief Neon/network blip.
  */
 export const DB_WRITE_RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000, 120_000];
+
+/**
+ * The CLAIM is retried in place only briefly (~50 s). Nothing has been done yet,
+ * so a longer outage costs nothing to wait out in the delayed set instead,
+ * where it holds no encode slot and uses no attempt (transient-deferral.ts).
+ */
+export const DB_CLAIM_RETRY_DELAYS_MS = [5_000, 15_000, 30_000];
+
+/**
+ * The FINISH write is retried in place for much longer (~28 min): the ladder
+ * is already encoded and on R2, and giving up means encoding it all again. On
+ * 2026-11-20 one 17-minute lecture was fully encoded three times because this
+ * window was 3.8 min and the outage was 5.5 h. Past this window the job is
+ * deferred (no attempt used); the re-run overwrites the same R2 keys.
+ */
+export const DB_FINISH_RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000, 120_000, 240_000, 300_000, 300_000, 300_000, 300_000];
 
 /**
  * The independent mobile pipeline.
@@ -118,8 +135,12 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
   };
   /** Interval of the pause reconciler; a field only so a real-queue test can shorten it. */
   protected pauseReconcileMs = PAUSE_RECONCILE_MS;
-  /** In-place DB retry waits; a field only so a test can shorten them. */
-  protected dbRetryDelaysMs: number[] = DB_WRITE_RETRY_DELAYS_MS;
+  /**
+   * In-place DB retry waits for BOTH writes; a field only so a test can shorten
+   * them. When unset, the claim uses DB_CLAIM_RETRY_DELAYS_MS and the finish
+   * DB_FINISH_RETRY_DELAYS_MS.
+   */
+  protected dbRetryDelaysMs: number[] | null = null;
   private reconcileTimer: NodeJS.Timeout | null = null;
   /** One reconcile at a time: a hung Redis must not pile them up. */
   private reconciling = false;
@@ -218,7 +239,7 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
     }
   }
 
-  async process(job: Job<MobileTranscodeJobData>, token?: string): Promise<unknown> {
+  async process(job: Job<MobileTranscodeJobData & WithTransientDeferral>, token?: string): Promise<unknown> {
     if (job.name !== MOBILE_VIDEO_JOBS.transcode) return null;
 
     const { videoId, sourceKey, ladder, encrypt, trigger, durationSeconds } = job.data;
@@ -349,9 +370,21 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
 
-      // A database outage is not a verdict on the video: leave the row as it
-      // is and let the queue's bounded, jittered retry come back to it.
+      // A database outage is not a verdict on the video, and it is not an
+      // attempt either: the row is left as it is and the job is deferred with
+      // a growing, jittered delay for a bounded window (transient-deferral.ts).
+      // Only once that window is used up does it fall back to the queue's
+      // attempts, as before. Safe to run again: the claim is a compare-and-set
+      // on (sourceKey, job id) and the ladder overwrites the same R2 keys.
       if (isTransientDatabaseError(error)) {
+        await deferForTransientFailure({
+          job,
+          token,
+          kind: 'database',
+          logger: this.logger,
+          videoId,
+          detail: describeDatabaseError(error),
+        });
         this.logger.warn(
           `video ${videoId}: database unreachable during mobile processing (${describeDatabaseError(error)}; ` +
             `job ${job.id}, attempt ${job.attemptsMade + 1} of ${job.opts?.attempts ?? 1})`,
@@ -429,7 +462,7 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
    * as before (attempt + backoff).
    */
   private async withDbRetry<T>(what: 'claim' | 'finish', videoId: string, op: () => Promise<T>): Promise<T> {
-    const waits = this.dbRetryDelaysMs;
+    const waits = this.dbRetryDelaysMs ?? (what === 'claim' ? DB_CLAIM_RETRY_DELAYS_MS : DB_FINISH_RETRY_DELAYS_MS);
     for (let i = 0; ; i += 1) {
       try {
         return await op();

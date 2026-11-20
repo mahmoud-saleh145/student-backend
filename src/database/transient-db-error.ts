@@ -32,8 +32,19 @@ const TRANSIENT_CONNECTIVITY_CODES: ReadonlySet<string> = new Set([
   'P2024', // Timed out fetching a new connection from the connection pool
 ]);
 
+/**
+ * P2028 ("Transaction API error") is transient ONLY when the transaction could
+ * not START: the pool had no connection to give, because the database was
+ * unreachable. On 2026-11-20 finished mobile ladders failed this way during a
+ * DNS outage and were counted as real failures, so a complete encode was
+ * thrown away three times. A transaction that started and then timed out or
+ * was closed is a different fact and stays definitive.
+ */
+const TRANSACTION_START_FAILURE = /Unable to start a transaction in the given time/i;
+
 export function isTransientDatabaseError(error: unknown): boolean {
   if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    if (error.code === 'P2028') return TRANSACTION_START_FAILURE.test(error.message);
     return TRANSIENT_CONNECTIVITY_CODES.has(error.code);
   }
   if (error instanceof Prisma.PrismaClientInitializationError) {

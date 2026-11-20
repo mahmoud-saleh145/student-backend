@@ -12,7 +12,13 @@ import {
   withDatabaseRetry,
 } from '../../database/transient-db-error';
 import { StorageService } from '../storage/storage.service';
-import { GumletCreationOutcomeUnknownError, GumletDrmService } from '../playback/gumlet-drm.service';
+import {
+  GumletCreationOutcomeUnknownError,
+  GumletDrmService,
+  type GumletAssetCandidate,
+  gumletVideoTag,
+  normalizeGumletTag,
+} from '../playback/gumlet-drm.service';
 import {
   DrmVerificationService,
   isTransientProviderError,
@@ -124,18 +130,136 @@ export class GumletIngestAbandonedError extends Error {
 }
 
 export class GumletAdoptionNotRecordedError extends Error {
+  /**
+   * True when the only problem was the database (unreachable). A retry is then
+   * SAFE: `adopt()` looks the asset up by its tag before it would ever create
+   * one, finds this asset, and records it. False when the row already records a
+   * DIFFERENT asset - that asset is the duplicate and a human decides.
+   */
+  readonly retryable: boolean;
   constructor(
     readonly videoId: string,
     readonly assetId: string,
     readonly dbError: unknown,
+    options: { retryable?: boolean } = {},
   ) {
     super(
-      `Gumlet created asset ${assetId} for video ${videoId}, but the database could not record it ` +
-        `(${describeDatabaseError(dbError)}). Not retried automatically, because a retry would create a ` +
-        `second asset. Record asset ${assetId} on this video, or delete it at Gumlet, before reprocessing.`,
+      options.retryable
+        ? `Gumlet created asset ${assetId} for video ${videoId}, but the database could not record it ` +
+            `(${describeDatabaseError(dbError)}). The retry finds it by its tag and records it; no second asset is created.`
+        : `Gumlet created asset ${assetId} for video ${videoId}, but the row already records another asset. ` +
+            `Asset ${assetId} is unused; delete it at Gumlet once the recorded one is confirmed.`,
     );
     this.name = 'GumletAdoptionNotRecordedError';
+    this.retryable = options.retryable === true;
   }
+}
+
+/**
+ * Claim marker written to `gumletStatus` while ONE attempt creates the asset.
+ *
+ * Same pattern as `replacing` below (a plain string column, no migration).
+ * It does two jobs:
+ *   1. Concurrency: a second worker, a staff retry and the sweep cannot all
+ *      create an asset for the same video at once; the loser of the guarded
+ *      write defers (GumletCreationPendingError).
+ *   2. Memory of an ambiguous create: if the create's answer is lost, the
+ *      marker STAYS. The next attempt looks the asset up by tag; until the
+ *      marker is older than GUMLET_CREATE_CLAIM_STALE_MS it will not create a
+ *      new one even if the lookup is empty, which gives Gumlet time to list it.
+ * Every reader treats an unknown `gumletStatus` as neither playable nor a
+ * terminal failure, which is the honest reading of "being created".
+ */
+export const GUMLET_ASSET_CREATING = 'creating';
+
+/**
+ * After this long a `creating` claim with no asset found by tag is taken to
+ * mean Gumlet never received the request, and a new create is allowed.
+ * Gumlet listed new assets within seconds in production; ten minutes is a
+ * wide margin and also bounds how long a crashed attempt can block a video.
+ */
+export const GUMLET_CREATE_CLAIM_STALE_MS = 10 * 60_000;
+
+/** Another attempt holds a fresh creation claim. Retry later; never create now. */
+export class GumletCreationPendingError extends Error {
+  override readonly name = 'GumletCreationPendingError';
+  constructor(readonly videoId: string) {
+    super(
+      `Another attempt is creating the Gumlet asset for video ${videoId} (or its last create got no answer ` +
+        'and is being reconciled); not creating a second one',
+    );
+  }
+}
+
+/** Why a listed asset was not adopted (for logs and tests). */
+export type CandidateRejection =
+  | 'tag-mismatch'
+  | 'excluded'
+  | 'other-workspace'
+  | 'terminal-status'
+  | 'source-unknown'
+  | 'source-mismatch'
+  | 'size-mismatch'
+  | 'drm-missing';
+
+/**
+ * Pure decision: which (if any) listed asset may be recorded on this video.
+ *
+ * An asset is adoptable only if EVERY check passes:
+ *   - it carries exactly this video's tag (normalised);
+ *   - it lives in the configured workspace (ownership);
+ *   - it is not a terminal failure, and not explicitly excluded (the dead
+ *     asset a replacement is replacing);
+ *   - it was made from THIS video's stored file: the object path of the URL
+ *     Gumlet fetched is the row's `sourceKey` (a re-uploaded file has a new
+ *     key, so an asset of the previous file is never picked);
+ *   - its size matches the stored size when both are known;
+ *   - it was created with Widevine DRM.
+ * Several adoptable assets (duplicates from before this fix) resolve
+ * deterministically: a `ready` one first, then the oldest. The others are
+ * reported, never deleted.
+ */
+export function selectAdoptableAsset(
+  video: { id: string; sourceKey: string | null; sourceSizeBytes?: bigint | number | null },
+  candidates: GumletAssetCandidate[],
+  options: { workspaceId: string | null | undefined; excludeAssetIds?: string[] },
+): {
+  chosen: GumletAssetCandidate | null;
+  duplicates: GumletAssetCandidate[];
+  rejected: Array<{ assetId: string; reason: CandidateRejection }>;
+} {
+  const tag = normalizeGumletTag(gumletVideoTag(video.id));
+  const exclude = new Set(options.excludeAssetIds ?? []);
+  const size = video.sourceSizeBytes === null || video.sourceSizeBytes === undefined ? null : Number(video.sourceSizeBytes);
+  const rejected: Array<{ assetId: string; reason: CandidateRejection }> = [];
+  const valid: GumletAssetCandidate[] = [];
+
+  for (const c of candidates) {
+    const reason = ((): CandidateRejection | null => {
+      if (!c.assetId || !c.tags.some((t) => normalizeGumletTag(t) === tag)) return 'tag-mismatch';
+      if (exclude.has(c.assetId)) return 'excluded';
+      if (!options.workspaceId || c.workspaceId !== options.workspaceId) return 'other-workspace';
+      if (isTerminalGumletFailure(c.status)) return 'terminal-status';
+      if (!video.sourceKey || !c.sourceObjectPath) return 'source-unknown';
+      const key = video.sourceKey.replace(/^\/+/, '');
+      // Virtual-hosted URLs put the key at the root of the path; path-style
+      // URLs put the bucket first. Either way the key is the whole tail.
+      if (c.sourceObjectPath !== key && !c.sourceObjectPath.endsWith(`/${key}`)) return 'source-mismatch';
+      if (size !== null && c.sizeBytes !== null && c.sizeBytes !== size) return 'size-mismatch';
+      if (!c.drmSystems || !c.drmSystems.includes('widevine')) return 'drm-missing';
+      return null;
+    })();
+    if (reason) rejected.push({ assetId: c.assetId, reason });
+    else valid.push(c);
+  }
+
+  valid.sort((a, b) => {
+    const ra = a.status === 'ready' ? 0 : 1;
+    const rb = b.status === 'ready' ? 0 : 1;
+    if (ra !== rb) return ra - rb;
+    return (a.createdAtMs ?? Number.MAX_SAFE_INTEGER) - (b.createdAtMs ?? Number.MAX_SAFE_INTEGER);
+  });
+  return { chosen: valid[0] ?? null, duplicates: valid.slice(1), rejected };
 }
 
 /**
@@ -256,13 +380,236 @@ export class GumletIngestService {
       });
     }
 
-    // The last moment before a billable asset is created.
+    // 1. RECONCILE BEFORE CREATING.
+    //
+    // The row records no asset, but that is not proof Gumlet has none: a create
+    // whose answer was lost, or whose id could not be written because the
+    // database was down, leaves an asset at Gumlet that only its tag points to
+    // (2026-11-20, cmwp0i2sx001rho01ap2is9gu). So Gumlet is ASKED first, and a
+    // verified asset of this very file is recorded instead of creating another.
+    // A lookup that cannot complete throws: "could not look" is never read as
+    // "nothing there".
     stopIfAbandoned();
-    const created = await this.createGumletAsset(video);
+    const reconciled = await this.reconcileByTag(video, 'before creating an asset');
+    if (reconciled) return reconciled;
+
+    // 2. SIGN the source first: an R2 signing failure must still write nothing.
+    const sourceUrl = await this.presignSource(video);
+
+    // 3. CLAIM the creation (see GUMLET_ASSET_CREATING). The loser of a race,
+    //    and any attempt while an ambiguous create is still being reconciled,
+    //    stops here without creating anything.
+    stopIfAbandoned();
+    const claimedAt = await this.claimCreation(videoId);
+
+    // 4. CREATE. The last moment before a billable asset exists.
+    let created: { assetId: string; status: string; playbackUrl: string | null };
+    try {
+      stopIfAbandoned();
+      // OWNERSHIP, re-checked at the last moment. This worker may have been
+      // frozen between the claim and here (laptop standby) for longer than the
+      // claim lives; another attempt may then have taken the stale claim over,
+      // or recorded an asset. Creating anyway would be the duplicate.
+      await this.assertClaimStillHeld(videoId, claimedAt);
+      created = await this.createFromSignedUrl(video, sourceUrl);
+    } catch (error) {
+      if (error instanceof GumletCreationOutcomeUnknownError) {
+        // The claim STAYS: it is the record that an asset may exist. The next
+        // attempt reconciles by tag and will not create until it is stale.
+        this.logger.warn(
+          `GUMLET_CREATE_OUTCOME_UNKNOWN video=${videoId} reason="${error.reason}"; ` +
+            'the creation claim is kept so the next attempt looks the asset up before creating',
+        );
+      } else if (!(error instanceof GumletCreationPendingError)) {
+        // Nothing was created (refused, never sent, or abandoned before the
+        // call): release OUR claim so a later attempt is not held up. Scoped to
+        // this claim, so an abandoned attempt can never clear a newer one.
+        await this.releaseCreationClaim(videoId, claimedAt);
+      }
+      throw error;
+    }
 
     await this.markAdopted(videoId, created);
 
     return { assetId: created.assetId, status: created.status };
+  }
+
+  /**
+   * Looks for an asset Gumlet already holds for this video and, if one passes
+   * every check in `selectAdoptableAsset`, records it on the row (guarded on
+   * "no asset recorded yet"). Returns it, or null when none is adoptable.
+   *
+   * Never creates or deletes anything at Gumlet. Throws when the lookup itself
+   * cannot complete.
+   */
+  private async reconcileByTag(
+    video: { id: string; sourceKey: string | null; sourceSizeBytes?: bigint | number | null },
+    why: string,
+    options: { excludeAssetIds?: string[]; record?: boolean } = {},
+  ): Promise<{ assetId: string; status: string } | null> {
+    const candidates = await this.gumlet.findAssetsByTag(gumletVideoTag(video.id));
+    if (candidates.length === 0) return null;
+
+    const { chosen, duplicates, rejected } = selectAdoptableAsset(video, candidates, {
+      workspaceId: this.cfg.workspaceId,
+      excludeAssetIds: options.excludeAssetIds,
+    });
+    for (const r of rejected) {
+      if (r.reason === 'terminal-status' || r.reason === 'excluded') continue;
+      this.logger.warn(
+        `GUMLET_ASSET_NOT_ADOPTED video=${video.id} asset=${r.assetId} reason=${r.reason} (${why})`,
+      );
+    }
+    if (!chosen) return null;
+    for (const d of duplicates) {
+      this.logger.error(
+        `GUMLET_DUPLICATE_ASSET video=${video.id} asset=${d.assetId} status=${d.status} kept=${chosen.assetId}; ` +
+          'left untouched at Gumlet for an operator to delete',
+      );
+    }
+    if (options.record === false) return { assetId: chosen.assetId, status: chosen.status };
+
+    await this.markAdopted(video.id, { assetId: chosen.assetId, status: chosen.status });
+    this.logger.warn(
+      `GUMLET_ASSET_RECONCILED video=${video.id} asset=${chosen.assetId} status=${chosen.status} (${why}); ` +
+        'an existing asset was recorded instead of creating a new one',
+    );
+    await this.audit
+      ?.record({
+        actorId: null,
+        actorRole: null,
+        action: 'UPDATE',
+        entity: 'video',
+        entityId: video.id,
+        after: { gumletAssetId: chosen.assetId, gumletStatus: chosen.status },
+        note: `Recorded an existing Gumlet asset found by its tag (${why}); no new asset was created`,
+      })
+      .catch(() => undefined);
+    return { assetId: chosen.assetId, status: chosen.status };
+  }
+
+  /**
+   * Takes the creation claim, or throws GumletCreationPendingError when a
+   * fresh claim is held. A claim older than GUMLET_CREATE_CLAIM_STALE_MS is
+   * taken over: the attempt that wrote it crashed, or its ambiguous create has
+   * been reconciled without finding an asset for that long.
+   */
+  private async claimCreation(videoId: string): Promise<Date> {
+    const now = new Date();
+    const staleBefore = new Date(now.getTime() - GUMLET_CREATE_CLAIM_STALE_MS);
+    // Retried in place on a blip like the other ingest writes. If a retry
+    // follows a write that committed but lost its acknowledgement, it matches
+    // zero rows (the claim is now fresh) and this attempt defers instead of
+    // creating: safe in the direction that matters.
+    const { count } = await withDatabaseRetry(() =>
+      this.prisma.video.updateMany({
+        where: {
+          id: videoId,
+          deletedAt: null,
+          gumletAssetId: null,
+          OR: [
+            { gumletStatus: null },
+            { gumletStatus: { not: GUMLET_ASSET_CREATING } },
+            { gumletStatus: GUMLET_ASSET_CREATING, gumletUpdatedAt: null },
+            { gumletStatus: GUMLET_ASSET_CREATING, gumletUpdatedAt: { lt: staleBefore } },
+          ],
+        },
+        data: { gumletStatus: GUMLET_ASSET_CREATING, gumletUpdatedAt: now },
+      }),
+    );
+    if (count === 0) {
+      this.logger.warn(`GUMLET_CREATE_PENDING video=${videoId}; another attempt holds a fresh creation claim`);
+      throw new GumletCreationPendingError(videoId);
+    }
+    // The claim's own timestamp is its owner token (millisecond precision is
+    // stored exactly): see assertClaimStillHeld and releaseCreationClaim.
+    return now;
+  }
+
+  /**
+   * Throws GumletCreationPendingError unless the row still carries THIS claim
+   * and still records no asset. Read immediately before the create call.
+   */
+  private async assertClaimStillHeld(videoId: string, claimedAt: Date): Promise<void> {
+    const row = await withDatabaseRetry(() =>
+      this.prisma.video.findFirst({
+        where: { id: videoId, ...notDeleted },
+        select: { gumletAssetId: true, gumletStatus: true, gumletUpdatedAt: true },
+      }),
+    );
+    const held =
+      !!row &&
+      row.gumletAssetId === null &&
+      row.gumletStatus === GUMLET_ASSET_CREATING &&
+      row.gumletUpdatedAt?.getTime() === claimedAt.getTime();
+    if (!held) {
+      this.logger.warn(
+        `GUMLET_CLAIM_LOST video=${videoId}; the creation claim was taken over or an asset was recorded ` +
+          'while this attempt waited - not creating',
+      );
+      throw new GumletCreationPendingError(videoId);
+    }
+  }
+
+  /** Best effort: drops THIS creation claim when no asset was made. */
+  private async releaseCreationClaim(videoId: string, claimedAt: Date): Promise<void> {
+    await this.prisma.video
+      .updateMany({
+        where: { id: videoId, gumletAssetId: null, gumletStatus: GUMLET_ASSET_CREATING, gumletUpdatedAt: claimedAt },
+        data: { gumletStatus: null, gumletUpdatedAt: new Date() },
+      })
+      .catch((error: unknown) =>
+        this.logger.warn(
+          `video ${videoId}: could not release the creation claim (${describeDatabaseError(error)}); ` +
+            'it expires on its own',
+        ),
+      );
+  }
+
+  /**
+   * Recovery-sweep entry point: records an asset Gumlet holds for a Gumlet
+   * video whose row records none. Lookup only - never creates. Returns the
+   * adopted asset id, or null. Safe to race an in-flight ingest: both sides
+   * record with the same guarded write, and recording the same asset twice is
+   * not an error (see markAdopted).
+   */
+  async reconcileUnrecordedAsset(videoId: string): Promise<{ assetId: string } | null> {
+    const video = await this.prisma.video.findFirst({
+      where: { id: videoId, ...notDeleted },
+      select: { id: true, sourceKey: true, sourceSizeBytes: true, gumletAssetId: true, drmProvider: true },
+    });
+    if (!video || video.drmProvider !== 'gumlet' || video.gumletAssetId || !video.sourceKey) return null;
+    if (!this.gumlet.isAssetApiConfigured()) return null;
+    const adopted = await this.reconcileByTag(video, 'recovery sweep');
+    return adopted ? { assetId: adopted.assetId } : null;
+  }
+
+  /**
+   * READ-ONLY report: Gumlet videos whose row records no asset, and whether
+   * Gumlet holds an adoptable asset for them. Nothing is written. Used by the
+   * operator script `scripts/find-unrecorded-gumlet-assets.js`.
+   */
+  async findUnrecordedAssets(options: { sinceDays?: number; limit?: number } = {}): Promise<
+    Array<{ videoId: string; status: VideoStatus; listed: number; adoptable: string | null; error?: string }>
+  > {
+    const since = new Date(Date.now() - (options.sinceDays ?? 30) * 24 * 3600_000);
+    const rows = await this.prisma.video.findMany({
+      where: { ...notDeleted, drmProvider: 'gumlet', gumletAssetId: null, updatedAt: { gt: since } },
+      select: { id: true, status: true, sourceKey: true, sourceSizeBytes: true },
+      orderBy: { updatedAt: 'desc' },
+      take: options.limit ?? 50,
+    });
+    const report: Array<{ videoId: string; status: VideoStatus; listed: number; adoptable: string | null; error?: string }> = [];
+    for (const row of rows) {
+      try {
+        const candidates = await this.gumlet.findAssetsByTag(gumletVideoTag(row.id));
+        const { chosen } = selectAdoptableAsset(row, candidates, { workspaceId: this.cfg.workspaceId });
+        report.push({ videoId: row.id, status: row.status, listed: candidates.length, adoptable: chosen?.assetId ?? null });
+      } catch (error) {
+        report.push({ videoId: row.id, status: row.status, listed: -1, adoptable: null, error: (error as Error).message });
+      }
+    }
+    return report;
   }
 
   /**
@@ -281,6 +628,24 @@ export class GumletIngestService {
     sourceKey: string | null;
     lesson?: { title: string } | null;
   }): Promise<{ assetId: string; status: string; playbackUrl: string | null }> {
+    return this.createFromSignedUrl(video, await this.presignSource(video));
+  }
+
+  /** The create half of `createGumletAsset`, for a URL already signed. */
+  private createFromSignedUrl(
+    video: { id: string; lesson?: { title: string } | null },
+    sourceUrl: string,
+  ): Promise<{ assetId: string; status: string; playbackUrl: string | null }> {
+    return this.gumlet.createAsset({
+      sourceUrl,
+      title: video.lesson?.title ?? undefined,
+      enableDrm: true,
+      tag: [gumletVideoTag(video.id)],
+    });
+  }
+
+  /** The signing half of `createGumletAsset` (see the comment inside). */
+  private async presignSource(video: { id: string; sourceKey: string | null }): Promise<string> {
     if (!video.sourceKey) {
       // Both callers assert this first, but the selected row is re-read data -
       // a null here would otherwise become a presign for the key "null".
@@ -311,17 +676,10 @@ export class GumletIngestService {
     // resolving an already-resolved value changes nothing.
     //
     // The URL itself is never logged, never returned to a client, never stored.
-    const sourceUrl = await this.storage.presignIngestionUrl({
+    return this.storage.presignIngestionUrl({
       bucket: 'uploads',
       objectKey: video.sourceKey,
       expiresIn: resolveGumletIngestUrlTtlSeconds(this.cfg.ingestUrlTtlSeconds),
-    });
-
-    return this.gumlet.createAsset({
-      sourceUrl,
-      title: video.lesson?.title ?? undefined,
-      enableDrm: true,
-      tag: [`edu-video:${video.id}`],
     });
   }
 
@@ -370,14 +728,22 @@ export class GumletIngestService {
     } catch (error) {
       if (!isTransientDatabaseError(error)) throw error;
       this.logger.error(
-        `ORPHANED_GUMLET_ASSET video ${videoId}: Gumlet created asset ${created.assetId} ` +
-          `(tag edu-video:${videoId}) but the database stayed unreachable, so it was not recorded. ` +
-          'The job will not be retried automatically, because a retry would create a second asset.',
+        `GUMLET_ASSET_UNRECORDED video=${videoId} asset=${created.assetId}: the database stayed unreachable ` +
+          `(${describeDatabaseError(error)}). The retry looks it up by its tag and records it; no second asset is created.`,
       );
-      throw new GumletAdoptionNotRecordedError(videoId, created.assetId, error);
+      throw new GumletAdoptionNotRecordedError(videoId, created.assetId, error, { retryable: true });
     }
 
     if (written === 0) {
+      // Recorded already, by a concurrent reconcile (the sweep, or another
+      // attempt that found it by tag)? Then this is the same asset, not an orphan.
+      const current = await this.prisma.video
+        .findFirst({ where: { id: videoId }, select: { gumletAssetId: true } })
+        .catch(() => null);
+      if (current?.gumletAssetId === created.assetId) {
+        this.logger.log(`video ${videoId}: asset ${created.assetId} was already recorded by a concurrent reconcile`);
+        return;
+      }
       this.logger.error(
         `ORPHANED_GUMLET_ASSET video ${videoId}: Gumlet created asset ${created.assetId} ` +
           `(tag edu-video:${videoId}) but the row already records another asset (or no longer exists); ` +
@@ -504,6 +870,7 @@ export class GumletIngestService {
         gumletStatus: true,
         gumletError: true,
         sourceKey: true,
+        sourceSizeBytes: true,
         durationSeconds: true,
       },
     });
@@ -655,7 +1022,17 @@ export class GumletIngestService {
       // can fail (config, signing, source existence, Gumlet rejection) now
       // happens while the dead asset id is STILL on the row. A failure here
       // leaves the video exactly as diagnosable as it was before.
-      created = await this.createGumletAsset(video);
+      //
+      // And look before creating: an earlier replacement whose create answer
+      // was lost may already have produced a live asset for this file. The dead
+      // asset being replaced is excluded explicitly (terminal assets always are).
+      const existing = await this.reconcileByTag(video, 'replacing a failed asset', {
+        excludeAssetIds: [failedAssetId],
+        record: false,
+      });
+      created = existing
+        ? { assetId: existing.assetId, status: existing.status, playbackUrl: null }
+        : await this.createGumletAsset(video);
     } catch (error) {
       // Restore the terminal marker so the row stays diagnosable AND still
       // replaceable. Without this, a failed attempt would leave `gumletStatus`
@@ -1183,7 +1560,8 @@ export class GumletIngestService {
       if (
         isTransientDatabaseError(error) ||
         error instanceof GumletAdoptionNotRecordedError ||
-        error instanceof GumletCreationOutcomeUnknownError
+        error instanceof GumletCreationOutcomeUnknownError ||
+        error instanceof GumletCreationPendingError
       ) {
         throw error;
       }

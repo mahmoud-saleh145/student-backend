@@ -1,3 +1,4 @@
+import { creationClaimTracker } from './helpers/creation-claim-tracker';
 import { GumletIngestService } from '../../src/modules/videos/gumlet-ingest.service';
 
 /**
@@ -61,10 +62,12 @@ function build(opts: {
 
   let guardedWriteWins = !opts.loseCommit;
 
+  const claims = creationClaimTracker();
   const prisma = {
     video: {
-      findFirst: jest.fn(async () => row),
+      findFirst: jest.fn(async () => claims.view(row)),
       updateMany: jest.fn(async (args: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+        claims.observe(args);
         writes.push(args.data);
         // Both the claim and the commit are guarded on the dead asset id.
         const owner = row.gumletAssetId === args.where.gumletAssetId && guardedWriteWins;
@@ -100,6 +103,8 @@ function build(opts: {
     isAssetApiConfigured: () => true,
     isSigningConfigured: () => true,
     isAssetPlayable: (s: string) => s === 'ready',
+    // Lookup by tag before any create (no existing asset by default).
+    findAssetsByTag: jest.fn(async (_tag?: string) => [] as unknown[]),
     createAsset: jest.fn(async () => {
       created += 1;
       return { assetId: `asset_new_${created}`, status: 'pre-queued', playbackUrl: null };

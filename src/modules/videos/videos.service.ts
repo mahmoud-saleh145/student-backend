@@ -1104,6 +1104,15 @@ export class VideosService {
             gumletAssetId: { not: null },
             updatedAt: { lt: gumletCutoff },
           },
+          // A Gumlet row in PROCESSING with NO asset: an ingest that stopped
+          // between "Gumlet created it" and "the row recorded it" (2026-11-20,
+          // cmwp0i2sx001rho01ap2is9gu). Looked up by tag below, never re-created.
+          {
+            status: VideoStatus.PROCESSING,
+            drmProvider: 'gumlet',
+            gumletAssetId: null,
+            updatedAt: { lt: queuedCutoff },
+          },
         ],
       },
       select: {
@@ -1113,6 +1122,7 @@ export class VideosService {
         lessonId: true,
         courseId: true,
         processingJobId: true,
+        processingStartedAt: true,
         drmProvider: true,
         gumletAssetId: true,
       },
@@ -1157,6 +1167,35 @@ export class VideosService {
       }
 
       if (!video.sourceKey) continue;
+
+      // ---- Gumlet row with no recorded asset: ask Gumlet, by tag -------------
+      // The job is gone, but Gumlet may hold an asset made from this file. If it
+      // does (and it passes every ownership/source/DRM check), it is recorded
+      // and synced: the normal DRM verification then decides READY. If the
+      // lookup cannot complete, nothing is decided on an outage. If Gumlet has
+      // nothing, the row falls through to the legacy rule below, but only once
+      // the 3-hour cutoff has passed, as before.
+      if (video.drmProvider === 'gumlet' && !video.gumletAssetId && video.status === VideoStatus.PROCESSING) {
+        try {
+          const adopted = await this.gumletIngest.reconcileUnrecordedAsset(video.id);
+          if (adopted) {
+            this.logger.warn(
+              `GUMLET_UNRECORDED_ASSET_RECOVERED video=${video.id} asset=${adopted.assetId}; syncing it now`,
+            );
+            await this.gumletIngest
+              .sync(video.id)
+              .catch((e: Error) => this.logger.warn(`video ${video.id}: sync after recovery failed (${e.message}); the next sweep retries`));
+            synced += 1;
+            continue;
+          }
+        } catch (error) {
+          this.logger.warn(
+            `video ${video.id}: could not look its Gumlet asset up (${(error as Error).message}); leaving it for the next sweep`,
+          );
+          continue;
+        }
+        if (!(video.processingStartedAt && video.processingStartedAt < processingCutoff)) continue;
+      }
 
       if (video.status === VideoStatus.PROCESSING) {
         // Conditional: a sync may have finished the video since it was read.

@@ -73,6 +73,32 @@ export interface WorkerBeat {
   at?: string;
   ffmpeg?: boolean;
   ffprobe?: boolean;
+  db?: {
+    ok: boolean | null;
+    lastOkAt: string | null;
+    lastError: string | null;
+    consecutiveFailures: number;
+    outageSince: string | null;
+  };
+}
+
+/**
+ * One diagnostic line about DATABASE reachability, or null when the beat does
+ * not carry it.
+ *
+ * Printed, never part of the verdict: the container stays healthy while the
+ * process is alive, because restarting it does not repair a network that cannot
+ * reach the database (2026-11-20). The line makes the difference between
+ * "alive" and "able to work" visible in the container's health log.
+ */
+export function describeDbHealth(beat: WorkerBeat): string | null {
+  const db = beat.db;
+  if (!db || db.ok === null) return null;
+  if (db.ok) return `[healthcheck] database reachable (last ok ${db.lastOkAt ?? '?'})`;
+  return (
+    `[healthcheck] DATABASE UNREACHABLE since ${db.outageSince ?? '?'} (${db.lastError ?? 'unknown error'}, ` +
+    `${db.consecutiveFailures} failed probes, last ok ${db.lastOkAt ?? 'never'}); jobs are deferred, not failed`
+  );
 }
 
 /**
@@ -135,6 +161,8 @@ async function checkWorker(redisUrl: string, prefix: string): Promise<boolean> {
           `[healthcheck] worker pid ${beat.pid ?? '?'} on ${beat.host ?? '?'}, ` +
             `up since ${beat.startedAt ?? '?'}, ffmpeg=${beat.ffmpeg} ffprobe=${beat.ffprobe}`,
         );
+        const dbLine = describeDbHealth(beat);
+        if (dbLine) console.error(dbLine);
         if (beat.ffmpeg === false || beat.ffprobe === false) {
           console.error(
             '[healthcheck] the worker cannot transcode: ffmpeg/ffprobe are not runnable in this image',

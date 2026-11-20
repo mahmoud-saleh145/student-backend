@@ -1,3 +1,4 @@
+import { creationClaimTracker } from './helpers/creation-claim-tracker';
 import { GumletIngestService } from 'src/modules/videos/gumlet-ingest.service';
 import { buildDrmVerification } from './helpers/drm-doubles';
 import { fetchManifestViaGlobalFetch } from './helpers/drm-doubles';
@@ -56,9 +57,10 @@ function build(opts: {
     lesson: { title: 'Lesson' },
   };
 
+  const claims = creationClaimTracker();
   const prisma = {
     video: {
-      findFirst: jest.fn(async () => row),
+      findFirst: jest.fn(async () => claims.view(row)),
       findUniqueOrThrow: jest.fn(async () => ({ status: updates.at(-1)?.status ?? row.status })),
       update: jest.fn(async (args: { data: Record<string, unknown> }) => {
         updates.push(args.data);
@@ -75,6 +77,7 @@ function build(opts: {
       // NOT happening. So: record only, and honour the `where` guard.
       updateMany: jest.fn(
         async (args: { where?: Record<string, unknown>; data: Record<string, unknown> }) => {
+        claims.observe(args);
           updateManyCalls.push(args);
           updates.push(args.data);
           const assetMismatch =
@@ -107,6 +110,8 @@ function build(opts: {
     fetchManifest: fetchManifestViaGlobalFetch,
     assetHasDrm: (text: string) =>
       /urn:mpeg:dash:mp4protection:2011/.test(text) && /cenc:default_KID=/.test(text),
+    // Lookup by tag before any create (no existing asset by default).
+    findAssetsByTag: jest.fn(async (_tag?: string) => [] as unknown[]),
     createAsset: jest.fn(async () => ({ assetId: 'asset_1', status: 'pre-queued', playbackUrl: null })),
     getAsset: jest.fn(async () => ({
       assetId: 'asset_1',
@@ -203,7 +208,7 @@ describe('GumletIngestService.adopt', () => {
     // would therefore stop the new asset from ever being verified on demand.
     const t = build({ row: { ...baseRow(), drmBlockedReason: 'old asset: manifest not CENC' } as Row });
     await t.service.adopt('v1');
-    expect(t.updates[0]).toMatchObject({ drmVerifiedAt: null, drmBlockedReason: null, drmRequested: true });
+    expect(t.updates.find((u) => u.gumletAssetId)).toMatchObject({ drmVerifiedAt: null, drmBlockedReason: null, drmRequested: true });
   });
 });
 

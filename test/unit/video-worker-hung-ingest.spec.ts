@@ -262,7 +262,7 @@ describe('a Gumlet create request whose answer never arrived', () => {
 
     expect(error).toBeInstanceOf(UnrecoverableError);
     expect(t.videos.markFailed).toHaveBeenCalledWith('v1', expect.stringContaining('edu-video:v1'));
-    expect(t.videos.markFailed).toHaveBeenCalledWith('v1', expect.stringContaining('check Gumlet before retrying'));
+    expect(t.videos.markFailed).toHaveBeenCalledWith('v1', expect.stringContaining('looks it up by tag before creating anything'));
   });
 });
 
