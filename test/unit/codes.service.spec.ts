@@ -385,3 +385,65 @@ describe('role assumptions', () => {
     expect(UserRole.STUDENT).toBe('STUDENT');
   });
 });
+
+/**
+ * The pre-consume hook.
+ *
+ * `beforeConsume` is how the redemption path refuses a part or section card
+ * that would unlock nothing the student does not already hold. Its whole value
+ * is its position: after every check, before every write. A refusal there has
+ * to leave the card exactly as it was.
+ */
+describe('CodesService.redeemInTransaction: beforeConsume', () => {
+  it('runs with the resolved scope, before anything is written', async () => {
+    const { service, tx, codeUpdate, redemptionCreate } = buildService(code());
+    const seen: unknown[] = [];
+
+    await service.redeemInTransaction(tx as never, {
+      ...REDEEM,
+      rawCode: 'DEVCIRCUIT01',
+      beforeConsume: async (pending) => {
+        seen.push(pending.code.id, pending.scope.courseIds);
+        expect(redemptionCreate).not.toHaveBeenCalled();
+        expect(codeUpdate).not.toHaveBeenCalled();
+      },
+    });
+
+    expect(seen).toEqual(['cod_1', ['crs_1']]);
+    expect(redemptionCreate).toHaveBeenCalledTimes(1);
+    expect(codeUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves the card unspent when the hook refuses', async () => {
+    const { service, tx, codeUpdate, redemptionCreate } = buildService(code());
+    const refusal = new Error('already held');
+
+    await expect(
+      service.redeemInTransaction(tx as never, {
+        ...REDEEM,
+        rawCode: 'DEVCIRCUIT01',
+        beforeConsume: async () => {
+          throw refusal;
+        },
+      }),
+    ).rejects.toBe(refusal);
+
+    expect(redemptionCreate).not.toHaveBeenCalled();
+    expect(codeUpdate).not.toHaveBeenCalled();
+  });
+
+  it('is not reached by a card that is refused on its own', async () => {
+    const { service, tx } = buildService(code({ status: CodeStatus.REVOKED }));
+    const hook = jest.fn(async () => undefined);
+
+    await expect(
+      service.redeemInTransaction(tx as never, {
+        ...REDEEM,
+        rawCode: 'DEVCIRCUIT01',
+        beforeConsume: hook,
+      }),
+    ).rejects.toMatchObject({ code: ErrorCode.INVALID_CODE });
+
+    expect(hook).not.toHaveBeenCalled();
+  });
+});
