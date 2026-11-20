@@ -255,6 +255,12 @@ export class EnvironmentVariables {
   @MinLength(32, { message: 'HLS_KEY_ROOT must be at least 32 characters' })
   HLS_KEY_ROOT!: string;
 
+  /** Key scheme for new mobile encodes: `v1` (default) or `v2`. See hls-keys.ts. */
+  @IsOptional() @IsIn(['v1', 'v2']) HLS_KEY_VERSION?: 'v1' | 'v2';
+
+  /** Root id new v2 encodes use; `r1` (default) is HLS_KEY_ROOT, others need HLS_KEY_ROOT_<ID>. */
+  @IsOptional() @Matches(/^[a-z0-9]{1,16}$/i) HLS_KEY_ROOT_ID?: string;
+
   // --- Library ----------------------------------------------------------------
   /**
    * The Library storefront switch. Optional string, NOT `@IsBoolean`: an
@@ -507,6 +513,17 @@ export function validateEnv(raw: Record<string, unknown>): EnvironmentVariables 
       .map((e) => `  • ${e.property}: ${Object.values(e.constraints ?? {}).join(', ')}`)
       .join('\n');
     throw new Error(`Invalid environment configuration:\n${detail}`);
+  }
+
+  // A v2 encode records the root it used; a root id that is not configured
+  // would write keys no API instance can serve, so it must refuse to boot.
+  // Extra roots are HLS_KEY_ROOT_<ID> (raw env: not declared fields).
+  {
+    const rootId = (config.HLS_KEY_ROOT_ID ?? 'r1').toLowerCase();
+    const extra = raw[`HLS_KEY_ROOT_${rootId.toUpperCase()}`];
+    if (rootId !== 'r1' && (typeof extra !== 'string' || extra.length < 32)) {
+      throw new Error(`HLS_KEY_ROOT_ID=${rootId} requires HLS_KEY_ROOT_${rootId.toUpperCase()} (at least 32 characters).`);
+    }
   }
 
   // Enforcing with nothing to compare against would refuse every Worker probe.

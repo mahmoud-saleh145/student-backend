@@ -2029,8 +2029,11 @@ export class VideosService {
   async markMobileReady(
     videoId: string,
     result: Parameters<VideosService['markReady']>[1],
-    /** The source file the encode read. Given by the worker; see below. */
-    encoded?: { sourceKey: string },
+    /**
+     * The source file the encode read and, from the mobile worker, the job
+     * that encoded it. Given by the worker; see below.
+     */
+    encoded?: { sourceKey: string; jobId?: string },
   ): Promise<boolean> {
     // The worker's ffprobe measurement of the source it just encoded (and
     // whose segment durations the transcoder verified against it). Zero or
@@ -2047,8 +2050,17 @@ export class VideosService {
           thumbnailKey: true,
           status: true,
           sourceKey: true,
+          mobileJobId: true,
         },
       });
+
+      // THE RESULT BELONGS TO THE JOB THAT STILL OWNS THE ROW. A job whose row
+      // was claimed by another job meanwhile (a staff re-process, a supersede)
+      // is stale: recording it would mark READY with this job's key id while
+      // the newer job is rewriting the same `hls/<id>/` objects. This matters
+      // more now that a transient-database finish is retried in place for
+      // minutes (MobileVideoProcessor.withDbRetry).
+      if (encoded?.jobId && current.mobileJobId !== encoded.jobId) return null;
 
       // THE RESULT BELONGS TO THE FILE THAT WAS ENCODED.
       //
@@ -2091,7 +2103,8 @@ export class VideosService {
     });
     if (!before) {
       this.logger.warn(
-        `video ${videoId}: the mobile encode finished for a file that has since been replaced; its result is discarded`,
+        `video ${videoId}: the mobile encode finished for a file that has since been replaced, or by a job that no ` +
+          'longer owns the row; its result is discarded',
       );
       return false;
     }
@@ -2113,7 +2126,11 @@ export class VideosService {
     // already measured is left exactly as it is, lectures included, and a
     // Gumlet sync that finishes later still writes the provider's figure over
     // this one, as it always has.
-    if (before.durationSeconds <= 0 && measuredSeconds !== null) {
+    // Also when the stored duration IS this measurement: that is this same
+    // write re-applied after its first commit lost its acknowledgement
+    // (MobileVideoProcessor.withDbRetry), whose propagation never ran.
+    // Propagating an equal value is harmless in every other case.
+    if (measuredSeconds !== null && (before.durationSeconds <= 0 || before.durationSeconds === measuredSeconds)) {
       try {
         await this.lessonVideos.propagateDurationToAttachedLessons(videoId, measuredSeconds);
       } catch (e) {

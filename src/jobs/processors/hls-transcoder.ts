@@ -6,6 +6,7 @@ import { availableParallelism } from 'node:os';
 import { join } from 'node:path';
 
 import type { VideoConfig } from '../../config/configuration';
+import { deriveContentKeyV2, formatV2KeyId } from '../../modules/playback/hls-keys';
 import { HLS_CODECS, ManifestService } from '../../modules/playback/manifest.service';
 import { StorageService } from '../../modules/storage/storage.service';
 import { formatBytes, ScratchGuard, type ScratchAssessment } from './scratch-guard';
@@ -63,6 +64,8 @@ export interface HlsLadderResult {
   masterPlaylistKey: string;
   thumbnailKey?: string;
   isEncrypted: boolean;
+  /** What the row must record: `derived:<id>` (v1) or `derived:v2:<root>:<id>`; unset when unencrypted. */
+  encryptionKeyId?: string;
 }
 
 /**
@@ -378,8 +381,23 @@ export class HlsTranscoder implements OnModuleDestroy {
     );
 
     // 3. encryption key ------------------------------------------------------
-    let keyInfoPath: string | undefined;
-    if (params.encrypt) keyInfoPath = await this.writeKeyInfo(workDir, videoId);
+    // v1: one key and one IV for the whole video, written once. v2: a key per
+    // rung, written in the loop below (see hls-keys.ts).
+    const keyVersion = params.encrypt ? this.cfg.keyVersion : null;
+    let v2Root: string | undefined;
+    if (keyVersion === 'v2') {
+      v2Root = this.cfg.keyRoots[this.cfg.keyRootId];
+      if (!v2Root) {
+        throw new TranscodeEnvironmentError(
+          `HLS_KEY_VERSION=v2 but key root "${this.cfg.keyRootId}" is not configured on this worker`,
+        );
+      }
+    }
+    const v1KeyInfoPath = keyVersion === 'v1' ? await this.writeKeyInfo(workDir, videoId) : undefined;
+    const encryptionKeyId =
+      keyVersion === 'v2' ? formatV2KeyId(this.cfg.keyRootId, videoId)
+      : keyVersion === 'v1' ? `derived:${videoId}`
+      : undefined;
 
     // 4. encode + upload, one rendition at a time ------------------------------
     const renditions: HlsRendition[] = [];
@@ -389,6 +407,12 @@ export class HlsTranscoder implements OnModuleDestroy {
       const rate = HlsTranscoder.rateForTier(tier);
       const outDir = join(workDir, `${tier}p`);
       await mkdir(outDir, { recursive: true });
+
+      let keyInfoPath = v1KeyInfoPath;
+      let keyPath = v1KeyInfoPath ? join(workDir, 'enc.key') : undefined;
+      if (keyVersion === 'v2') {
+        ({ keyInfoPath, keyPath } = await this.writeKeyInfoV2(workDir, videoId, tier, v2Root!));
+      }
 
       // Encoding is ~70% of a rung's time, uploading the rest; ffmpeg's own
       // progress stream drives the first part so a 2-hour encode is not one
@@ -407,6 +431,7 @@ export class HlsTranscoder implements OnModuleDestroy {
           maxrateKbps: rate.maxrate,
           audioKbps: rate.audio,
           keyInfoPath,
+          perSegmentIv: keyVersion === 'v2',
           segmentSeconds: this.cfg.segmentSeconds,
           frameRate: probe.frameRate,
           constantFrameRate: probe.outputFrameRate,
@@ -429,7 +454,7 @@ export class HlsTranscoder implements OnModuleDestroy {
       // Nothing leaves the host unverified: the playlist must be complete,
       // every segment must demux (and decrypt), and the rung must be as long
       // as the source.
-      await this.verifyRendition(outDir, probe, keyInfoPath ? join(workDir, 'enc.key') : undefined);
+      await this.verifyRendition(outDir, probe, keyPath);
 
       const uploaded = await this.uploadRendition(outDir, hlsPrefix, tier);
       renditions.push({
@@ -470,6 +495,7 @@ export class HlsTranscoder implements OnModuleDestroy {
       masterPlaylistKey,
       thumbnailKey,
       isEncrypted: params.encrypt,
+      encryptionKeyId,
     };
   }
 
@@ -588,6 +614,8 @@ export class HlsTranscoder implements OnModuleDestroy {
     maxrateKbps: number;
     audioKbps: number;
     keyInfoPath?: string;
+    /** v2: encrypt each segment with its own IV (its sequence number). See `-hls_flags` below. */
+    perSegmentIv?: boolean;
     segmentSeconds: number;
     frameRate: number;
     /** Only for a variable-frame-rate source (`ProbeResult.outputFrameRate`). */
@@ -656,7 +684,13 @@ export class HlsTranscoder implements OnModuleDestroy {
       '-hls_time', String(seg),
       '-hls_playlist_type', 'vod',
       '-hls_segment_filename', join(params.outDir, 'seg_%05d.ts'),
-      '-hls_flags', 'independent_segments',
+      // `periodic_rekey` (v2 only): ffmpeg re-reads the keyinfo for EVERY
+      // segment and, with no IV in it, encrypts segment n with IV = n and
+      // writes that IV explicitly on a key line before the segment. Without the
+      // flag ffmpeg derives the sequence IV ONCE (n = 0) and encrypts the whole
+      // rung with it - measured on ffmpeg 9.0.2 by decrypting each segment's
+      // first block - so the flag is what makes the IV per segment.
+      '-hls_flags', params.perSegmentIv ? 'independent_segments+periodic_rekey' : 'independent_segments',
     ];
     if (params.threads > 0) args.push('-threads', String(params.threads));
     if (params.keyInfoPath) args.push('-hls_key_info_file', params.keyInfoPath);
@@ -867,8 +901,42 @@ export class HlsTranscoder implements OnModuleDestroy {
     const keyPath = join(workDir, 'enc.key');
     const keyInfoPath = join(workDir, 'enc.keyinfo');
     await writeFile(keyPath, key);
-    await writeFile(keyInfoPath, `key-placeholder\n${keyPath}\n${iv}\n`);
+    await writeFile(keyInfoPath, HlsTranscoder.keyInfoText(keyPath, iv));
     return keyInfoPath;
+  }
+
+  /**
+   * v2: this rung's own key, and a keyinfo with NO IV line. Together with
+   * `periodic_rekey` (ffmpegArgs `perSegmentIv`) ffmpeg encrypts segment n with
+   * IV = n and writes that IV on a key line before it. Both files live in the
+   * job's work dir, never in the rung's upload dir.
+   */
+  private async writeKeyInfoV2(
+    workDir: string,
+    videoId: string,
+    tier: number,
+    root: string,
+  ): Promise<{ keyInfoPath: string; keyPath: string }> {
+    const keyPath = join(workDir, `enc-${tier}.key`);
+    const keyInfoPath = join(workDir, `enc-${tier}.keyinfo`);
+    await writeFile(keyPath, deriveContentKeyV2(root, videoId, tier));
+    await writeFile(keyInfoPath, HlsTranscoder.keyInfoText(keyPath));
+    return { keyInfoPath, keyPath };
+  }
+
+  /** ffmpeg keyinfo: placeholder URI, key file path, optional IV (pure; unit-tested). */
+  static keyInfoText(keyPath: string, iv?: string): string {
+    return iv ? `key-placeholder\n${keyPath}\n${iv}\n` : `key-placeholder\n${keyPath}\n`;
+  }
+
+  /**
+   * The playlist with EVERY key URI pointed at `keyName` (pure; unit-tested).
+   * Replacing only the first would leave later key lines (one per segment, as
+   * some encoders write) pointing at the placeholder, and verification would
+   * fail on a perfectly good rung.
+   */
+  static pointKeysAt(playlist: string, keyName: string): string {
+    return playlist.replace(/URI="[^"]*"/g, `URI="${keyName}"`);
   }
 
   /**
@@ -911,7 +979,7 @@ export class HlsTranscoder implements OnModuleDestroy {
     let input = text;
     if (keyPath) {
       await copyFile(keyPath, verifyKey);
-      input = text.replace(/URI="[^"]*"/, 'URI="verify.key"');
+      input = HlsTranscoder.pointKeysAt(text, 'verify.key');
     }
     await writeFile(verifyPlaylist, input);
     try {

@@ -176,7 +176,7 @@ export class VideoProcessor extends WorkerHost {
         masterPlaylistKey: result.masterPlaylistKey,
         thumbnailKey: result.thumbnailKey,
         isEncrypted: result.isEncrypted,
-        encryptionKeyId: result.isEncrypted ? `derived:${videoId}` : undefined,
+        encryptionKeyId: result.isEncrypted ? (result.encryptionKeyId ?? `derived:${videoId}`) : undefined,
         renditions: result.renditions,
       });
 

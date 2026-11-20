@@ -9,6 +9,14 @@ import type { AppConfig, PlaybackConfig, VideoConfig } from '../../config/config
 import { PrismaService } from '../../database/prisma.service';
 import { StorageService } from '../storage/storage.service';
 
+import {
+  deriveContentKeyV1,
+  deriveContentKeyV2,
+  deriveIvV1,
+  parseEncryptionKeyId,
+  type ParsedKeyId,
+} from './hls-keys';
+
 /**
  * Dynamic HLS manifest generation.
  *
@@ -75,10 +83,41 @@ export class ManifestService {
     return `${base}/${this.app.apiPrefix}/v${this.app.apiVersion}/playback/manifest/${ticketId}/${height}.m3u8?exp=${exp}&sig=${sig}`;
   }
 
-  private buildKeyUrl(ticketId: string, exp: number): string {
-    const sig = this.sign(`key:${ticketId}:${exp}`);
+  /**
+   * The key URL for one media playlist. A v1 video has one key for every
+   * rendition, so its URL names only the ticket (unchanged since v1: same
+   * canonical, same query). A v2 video has a key per rendition: its URL also
+   * names the rendition (`r=<height>`) and the signature covers it under its
+   * own `key2:` label, so a client cannot re-point a signed URL at another
+   * rendition's key.
+   */
+  private buildKeyUrl(ticketId: string, exp: number, renditionHeight?: number): string {
     const base = this.app.publicUrl.replace(/\/$/, '');
-    return `${base}/${this.app.apiPrefix}/v${this.app.apiVersion}/playback/keys/${ticketId}?exp=${exp}&sig=${sig}`;
+    const path = `${base}/${this.app.apiPrefix}/v${this.app.apiVersion}/playback/keys/${ticketId}`;
+    if (renditionHeight === undefined) {
+      return `${path}?exp=${exp}&sig=${this.sign(`key:${ticketId}:${exp}`)}`;
+    }
+    const sig = this.sign(`key2:${ticketId}:${renditionHeight}:${exp}`);
+    return `${path}?exp=${exp}&r=${renditionHeight}&sig=${sig}`;
+  }
+
+  /**
+   * The key scheme of an encrypted video, from its `encryptionKeyId`. A row
+   * with no id is v1, exactly as every encrypted row was read before v2
+   * existed. A row whose id is present but malformed (or names another video)
+   * is refused: serving a key derived by guesswork would hand out the wrong
+   * bytes at best.
+   */
+  private keySchemeOf(video: { id: string; isEncrypted: boolean; encryptionKeyId?: string | null }): ParsedKeyId {
+    if (!video.encryptionKeyId) return { version: 1 };
+    const parsed = parseEncryptionKeyId(video.encryptionKeyId, video.id);
+    if (!parsed) {
+      this.logger.error(`video ${video.id}: unrecognised encryptionKeyId; refusing to serve its key`);
+      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
+        message: 'This video cannot be decrypted for playback',
+      });
+    }
+    return parsed;
   }
 
   private sign(canonical: string): string {
@@ -277,6 +316,14 @@ export class ManifestService {
       });
     }
 
+    // v1: one ticket-scoped key URL for every rendition (as always).
+    // v2: a key per rendition, so the URL is scoped to THIS rendition.
+    const keyUrl = ticket.video.isEncrypted
+      ? this.keySchemeOf(ticket.video).version === 2
+        ? this.buildKeyUrl(params.ticketId, params.exp, rendition.height)
+        : this.buildKeyUrl(params.ticketId, params.exp)
+      : null;
+
     const stored = await this.storage.getObjectBuffer('media', rendition.playlistKey);
     const source = stored.toString('utf8');
 
@@ -293,12 +340,13 @@ export class ManifestService {
     for (const raw of source.split('\n')) {
       const line = raw.trimEnd();
 
+      // Every key line is repointed, whichever form the encoder wrote (one line
+      // at the top, or one per segment).
       if (line.startsWith('#EXT-X-KEY')) {
         out.push(
-          line.replace(
-            /URI="[^"]*"/,
-            `URI="${this.buildKeyUrl(params.ticketId, params.exp)}"`,
-          ),
+          keyUrl === null
+            ? line
+            : line.replace(/URI="[^"]*"/g, `URI="${keyUrl}"`),
         );
         continue;
       }
@@ -351,8 +399,20 @@ export class ManifestService {
     ticketId: string;
     exp: number;
     signature: string;
+    /** `r` of a v2 key URL: the rendition height the key belongs to. */
+    rendition?: number;
   }): Promise<Buffer> {
-    this.verify(`key:${params.ticketId}:${params.exp}`, params.signature, params.exp);
+    // The signature is checked first, against the canonical the URL claims
+    // (v1 `key:` or v2 `key2:`); the video's own scheme must then agree, so a
+    // v1-style URL never yields a v2 key and vice versa.
+    const v2Url = params.rendition !== undefined;
+    this.verify(
+      v2Url
+        ? `key2:${params.ticketId}:${params.rendition}:${params.exp}`
+        : `key:${params.ticketId}:${params.exp}`,
+      params.signature,
+      params.exp,
+    );
 
     const ticket = await this.requireLiveTicket(params.ticketId);
 
@@ -362,24 +422,55 @@ export class ManifestService {
       });
     }
 
-    return ManifestService.deriveContentKey(this.videoCfg.keyRoot, ticket.videoId);
+    const scheme = this.keySchemeOf(ticket.video);
+    if (scheme.version === 1) {
+      if (v2Url) {
+        throw new AppException(ErrorCode.PLAYBACK_DENIED, { message: 'Key link does not match this asset' });
+      }
+      return deriveContentKeyV1(this.videoCfg.keyRoot, ticket.videoId);
+    }
+
+    if (!v2Url) {
+      throw new AppException(ErrorCode.PLAYBACK_DENIED, { message: 'Key link does not match this asset' });
+    }
+    // The rendition must exist and be inside the ticket's quality ceiling: a
+    // grant capped at 480p does not receive the 720p key.
+    const rendition = ticket.video.renditions.find((r) => r.height === params.rendition);
+    if (!rendition) {
+      throw new AppException(ErrorCode.PLAYBACK_DENIED, { message: 'Unknown rendition for this asset' });
+    }
+    const tier = ManifestService.tierOf(rendition);
+    if (ticket.maxHeight && tier > ticket.maxHeight) {
+      throw new AppException(ErrorCode.PLAYBACK_DENIED, {
+        message: 'Requested rendition exceeds the granted ceiling',
+      });
+    }
+    const root = this.videoCfg.keyRoots[scheme.rootId];
+    if (!root) {
+      this.logger.error(`video ${ticket.videoId}: key root "${scheme.rootId}" is not configured on this API`);
+      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
+        message: 'This video cannot be decrypted for playback',
+      });
+    }
+    return deriveContentKeyV2(root, ticket.videoId, tier);
   }
 
-  /** Shared with the transcoding worker so both sides derive the same key. */
   /** The quality a rendition represents: its short side (portrait rungs are taller than wide). */
   static tierOf(rendition: { width?: number | null; height: number }): number {
     return rendition.width ? Math.min(rendition.width, rendition.height) : rendition.height;
   }
 
+  /** The v1 key, shared with the worker so both sides derive the same bytes. Unchanged since v1. */
   static deriveContentKey(keyRoot: string, videoId: string): Buffer {
-    return createHmac('sha256', keyRoot).update(`hls-key:${videoId}`).digest().subarray(0, 16);
+    return deriveContentKeyV1(keyRoot, videoId);
   }
 
-  /** Deterministic per-segment IV base, also shared with the worker. */
+  /**
+   * The v1 IV: ONE fixed IV per video, written into ffmpeg's keyinfo (not a
+   * per-segment IV, despite the old comment). Unchanged since v1. v2 encodes
+   * write no IV, so every segment is encrypted with its sequence number.
+   */
   static deriveIv(videoId: string): string {
-    return createHmac('sha256', `iv:${videoId}`)
-      .update(videoId)
-      .digest('hex')
-      .slice(0, 32);
+    return deriveIvV1(videoId);
   }
 }

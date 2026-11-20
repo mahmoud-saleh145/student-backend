@@ -842,6 +842,42 @@ describe('replacing the file of a lecture', () => {
     expect(w.db.get(V).mobileStatus).toBe('READY');
   });
 
+  const finishedLadder = {
+    durationSeconds: 1800,
+    width: 1920,
+    height: 1080,
+    hlsPrefix: 'hls/v_1/',
+    masterPlaylistKey: 'hls/v_1/master.m3u8',
+    isEncrypted: true,
+    encryptionKeyId: 'derived:v2:r1:v_1',
+    renditions: [{ height: 720, width: 1280, bitrateKbps: 2300, playlistKey: 'hls/v_1/720p/index.m3u8' }],
+  };
+
+  it('the service refuses a result from a job that no longer owns the row (re-claimed while it retried its finish)', async () => {
+    const w = lecture('failed');
+    const sourceKey = w.db.get(V).sourceKey as string;
+    w.db.get(V).mobileJobId = 'mobile-hls:v_1:p1g2'; // a staff re-process claimed the row meanwhile
+
+    expect(await w.videos.markMobileReady(V, finishedLadder, { sourceKey, jobId: 'mobile-hls:v_1:p1g1' })).toBe(false);
+    expect(w.db.get(V).mobileStatus).not.toBe('READY');
+    expect(w.db.get(V).hlsPrefix ?? null).toBeNull();
+
+    // The job that owns the row records its result.
+    expect(await w.videos.markMobileReady(V, finishedLadder, { sourceKey, jobId: 'mobile-hls:v_1:p1g2' })).toBe(true);
+    expect(w.db.get(V)).toMatchObject({ mobileStatus: 'READY', encryptionKeyId: 'derived:v2:r1:v_1' });
+  });
+
+  it('a finish re-applied after its first commit lost its acknowledgement still gives the lecture its duration', async () => {
+    const w = lecture('failed');
+    expect(lessonSeconds(w)).toBe(0);
+    // The first attempt committed (it wrote the measured duration on the video)
+    // but the worker never heard back, so the write is applied again.
+    w.db.get(V).durationSeconds = 1800;
+
+    expect(await w.videos.markMobileReady(V, finishedLadder, { sourceKey: w.db.get(V).sourceKey as string })).toBe(true);
+    expect(lessonSeconds(w)).toBe(1800);
+  });
+
   it('replacing the file forgets the old file\'s duration, so the new recording is measured, not assumed', async () => {
     const w = lecture('ready', { newVideoAnnounceState: 'DONE', newVideoAnnounceStateAt: new Date() });
     w.db.lessons.get('lesson_1')!.durationSeconds = 1795;

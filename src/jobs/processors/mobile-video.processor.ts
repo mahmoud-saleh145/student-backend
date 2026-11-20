@@ -33,6 +33,15 @@ export const DEFER_WHEN_DISK_LOW_MS = 5 * 60_000;
 export const MOBILE_MAX_STALLED_COUNT = 5;
 /** How often the worker makes sure a full pause has also paused the queue. */
 export const PAUSE_RECONCILE_MS = 30_000;
+/**
+ * In-place waits before re-trying a CLAIM or FINISH write that hit a transient
+ * database error (≈ 3.8 min in total). Both writes are idempotent for the job
+ * that owns the row (a compare-and-set claim; a transactional replace of the
+ * ladder), so repeating one after a dropped connection is safe, and it saves
+ * the whole encode that throwing would re-run: a finished 2-hour ladder used
+ * to cost an attempt, and a full re-encode, for a brief Neon/network blip.
+ */
+export const DB_WRITE_RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000, 120_000];
 
 /**
  * The independent mobile pipeline.
@@ -109,6 +118,8 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
   };
   /** Interval of the pause reconciler; a field only so a real-queue test can shorten it. */
   protected pauseReconcileMs = PAUSE_RECONCILE_MS;
+  /** In-place DB retry waits; a field only so a test can shorten them. */
+  protected dbRetryDelaysMs: number[] = DB_WRITE_RETRY_DELAYS_MS;
   private reconcileTimer: NodeJS.Timeout | null = null;
   /** One reconcile at a time: a hung Redis must not pile them up. */
   private reconciling = false;
@@ -284,7 +295,9 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
     this.guard.noteActive({ videoId, jobId: String(job.id), startedAt: new Date().toISOString(), progress: 0 });
 
     try {
-      const claimed = await this.videos.markMobileProcessing(videoId, sourceKey, String(job.id));
+      const claimed = await this.withDbRetry('claim', videoId, () =>
+        this.videos.markMobileProcessing(videoId, sourceKey, String(job.id)),
+      );
       if (!claimed) {
         this.logger.warn(`skipping stale mobile job ${job.id} for video ${videoId}`);
         return { videoId, skipped: true };
@@ -297,13 +310,16 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
         ladder,
         encrypt,
         durationSeconds,
-        onProgress: async (pct) => {
+        // Progress is informational. It is not awaited: with Redis briefly
+        // unreachable, awaiting it would stall (offline queue) or fail (error)
+        // an encode that does not need Redis at all.
+        onProgress: (pct) => {
           this.guard.noteProgress(videoId, pct);
-          await job.updateProgress(pct);
+          job.updateProgress(pct).catch(() => undefined);
         },
       });
 
-      const recorded = await this.videos.markMobileReady(
+      const recorded = await this.withDbRetry('finish', videoId, () => this.videos.markMobileReady(
         videoId,
         {
           durationSeconds: Math.round(result.probe.durationSeconds),
@@ -316,13 +332,13 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
           masterPlaylistKey: result.masterPlaylistKey,
           thumbnailKey: result.thumbnailKey,
           isEncrypted: result.isEncrypted,
-          encryptionKeyId: result.isEncrypted ? `derived:${videoId}` : undefined,
+          encryptionKeyId: result.isEncrypted ? (result.encryptionKeyId ?? `derived:${videoId}`) : undefined,
           renditions: result.renditions,
         },
         // The file this encode read: a result for a file that was replaced
         // while it ran is not recorded.
-        { sourceKey },
-      );
+        { sourceKey, jobId: String(job.id) },
+      ));
       if (recorded === false) {
         this.logger.warn(`mobile job ${job.id} for video ${videoId} finished for a replaced file; nothing recorded`);
         return { videoId, skipped: true };
@@ -404,5 +420,27 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
     await job.moveToDelayed(Date.now() + ms, token);
     this.logger.log(`job ${job.id} deferred ${Math.round(ms / 1000)} s (${why})`);
     throw new DelayedError();
+  }
+
+  /**
+   * Runs an idempotent row write, re-trying it in place on a TRANSIENT
+   * database error (see DB_WRITE_RETRY_DELAYS_MS). Any other error, or a
+   * transient one that outlasts every wait, is thrown unchanged and handled
+   * as before (attempt + backoff).
+   */
+  private async withDbRetry<T>(what: 'claim' | 'finish', videoId: string, op: () => Promise<T>): Promise<T> {
+    const waits = this.dbRetryDelaysMs;
+    for (let i = 0; ; i += 1) {
+      try {
+        return await op();
+      } catch (error) {
+        if (!isTransientDatabaseError(error) || i >= waits.length) throw error;
+        this.logger.warn(
+          `video ${videoId}: ${what} hit a transient database error (${describeDatabaseError(error)}); ` +
+            `retrying in place in ${Math.round(waits[i]! / 1000)} s (${i + 1}/${waits.length})`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, waits[i]));
+      }
+    }
   }
 }
