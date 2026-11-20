@@ -149,7 +149,7 @@ describe('MobileVideoProcessor', () => {
       }),
       // ...together with the file the encode read, so a result for a file
       // that was replaced meanwhile is not recorded.
-      { sourceKey: 'source/videos/v_1.mp4' },
+      { sourceKey: 'source/videos/v_1.mp4', jobId: 'mobile-hls:v_1:1' },
     );
     // The primary pipeline's bookkeeping is never touched.
     expect(t.videos.markProcessing).not.toHaveBeenCalled();

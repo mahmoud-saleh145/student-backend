@@ -29,7 +29,7 @@ export class SignedQueryDto {
    * Key URLs of v2 (per-rendition key) videos only: the rendition height the
    * key belongs to. Covered by the signature; v1 key URLs never carry it.
    */
-  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(4320) r?: number;
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(16384) r?: number;
 }
 
 /**

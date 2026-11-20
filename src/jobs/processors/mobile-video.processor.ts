@@ -337,7 +337,7 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
         },
         // The file this encode read: a result for a file that was replaced
         // while it ran is not recorded.
-        { sourceKey },
+        { sourceKey, jobId: String(job.id) },
       ));
       if (recorded === false) {
         this.logger.warn(`mobile job ${job.id} for video ${videoId} finished for a replaced file; nothing recorded`);
