@@ -161,14 +161,22 @@ export function toLessonSummary(params: {
   hasCourseAccess: boolean;
   sectionLocked: boolean;
   progress: WatchProgress | undefined;
+  /**
+   * Whether free previews are open to this caller
+   * (`CourseAccessService.previewUnlocks`). Defaults to true, the historical
+   * behaviour; the course page passes the real answer so a preview of a course
+   * that is not on offer is not shown as open when the gate refuses it.
+   */
+  previewUnlocks?: boolean;
 }) {
   const { lesson, hasCourseAccess, sectionLocked, progress } = params;
+  const previewOpen = lesson.isPreview && (params.previewUnlocks ?? true);
 
   // A lesson is locked unless the student has course access, or it is an
   // explicit free preview. Locked lessons are still RETURNED, with their
   // titles — the app shows them greyed out so the student can evaluate the
   // course before joining.
-  const locked = (!hasCourseAccess || sectionLocked) && !lesson.isPreview;
+  const locked = (!hasCourseAccess || sectionLocked) && !previewOpen;
 
   return {
     id: lesson.id,
@@ -190,8 +198,10 @@ export function toSection(params: {
   section: SectionWithLessons;
   hasCourseAccess: boolean;
   progressByLesson: Map<string, WatchProgress>;
+  /** See `toLessonSummary`. */
+  previewUnlocks?: boolean;
 }) {
-  const { section, hasCourseAccess, progressByLesson } = params;
+  const { section, hasCourseAccess, progressByLesson, previewUnlocks } = params;
 
   const dripLocked =
     section.unlocksAt !== null && section.unlocksAt.getTime() > Date.now();
@@ -203,6 +213,7 @@ export function toSection(params: {
       hasCourseAccess,
       sectionLocked: dripLocked,
       progress: progressByLesson.get(lesson.id),
+      previewUnlocks,
     }),
   );
 
@@ -224,8 +235,45 @@ export function toSection(params: {
   };
 }
 
-/** Matches the app's `Attachment`. */
-export function toAttachment(attachment: Attachment, hasCourseAccess: boolean) {
+/**
+ * The section a document belongs to, the way the download gate reads it
+ * (`AttachmentsService.issueTicket`): its own `sectionId`, or its lecture's.
+ * Null for course-wide material, which is part of no section.
+ */
+export function attachmentSectionId(
+  attachment: Pick<Attachment, 'sectionId'> & { lesson?: { sectionId: string } | null },
+): string | null {
+  return attachment.sectionId ?? attachment.lesson?.sectionId ?? null;
+}
+
+/**
+ * Course access narrowed to one document, matching the download gate:
+ * `allowedSections` null is whole-course access; course-wide material (no
+ * section) follows course access alone.
+ */
+export function hasDocumentAccess(
+  hasCourseAccess: boolean,
+  allowedSections: string[] | null,
+  sectionId: string | null,
+): boolean {
+  return (
+    hasCourseAccess &&
+    (allowedSections === null || sectionId === null || allowedSections.includes(sectionId))
+  );
+}
+
+/**
+ * Matches the app's `Attachment`.
+ *
+ * `hasCourseAccess` is the caller's answer for THIS document: course access,
+ * narrowed to the document's section for a section-scoped enrolment (see
+ * `attachmentSectionId`). `previewUnlocks` as in `toLessonSummary`.
+ */
+export function toAttachment(
+  attachment: Attachment,
+  hasCourseAccess: boolean,
+  previewUnlocks = true,
+) {
   return {
     id: attachment.id,
     lessonId: attachment.lessonId,
@@ -240,7 +288,7 @@ export function toAttachment(attachment: Attachment, hasCourseAccess: boolean) {
     pageCount: attachment.pageCount,
     protected: attachment.isProtected,
     downloadable: attachment.isDownloadable && !attachment.isProtected,
-    locked: !hasCourseAccess && !attachment.isPreview,
+    locked: !hasCourseAccess && !(attachment.isPreview && previewUnlocks),
     // The stored flags under their own names. The dashboard edits these
     // (create/PATCH take `isPreview`/`isProtected`/`isDownloadable`) and has
     // always read them back by the same names; without them every row read as

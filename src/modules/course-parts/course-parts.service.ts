@@ -196,7 +196,17 @@ export class CoursePartsService {
     // *asking* for a draft course id — that is what `requirePublishedCourse` is
     // for at the acquisition boundary — but there is no reason for the read path
     // to volunteer the details as well.
-    if (course.status !== CourseStatus.PUBLISHED) {
+    //
+    // The one exception is a HIDDEN (unlisted) course for the students who are
+    // already in it - the same students its course page opens for
+    // (CourseAccessService.mayViewCoursePage). Their course screen renders this
+    // panel; refusing it left an error in the middle of a page they may see.
+    // Nothing is for sale there (`onOffer` below).
+    const onOffer = course.status === CourseStatus.PUBLISHED;
+    const listedForThisStudent =
+      course.status === CourseStatus.HIDDEN &&
+      (await this.access.mayViewCoursePage({ userId, isStaff: false, course }));
+    if (!onOffer && !listedForThisStudent) {
       throw AppException.notFound('Course', courseId);
     }
 
@@ -333,7 +343,10 @@ export class CoursePartsService {
             : coversEverything
               ? 'FULL_COURSE'
               : null,
-          purchasable: !isOwned && allocation?.get(part.id) !== undefined,
+          // Never for a course that is not on offer: acquiring a part of a
+          // HIDDEN course is refused (assertCourseAcquirable), so offering it
+          // would be a button leading nowhere.
+          purchasable: onOffer && !isOwned && allocation?.get(part.id) !== undefined,
           sectionCount: part.sections.length,
           // Titles only. A locked part shows what it contains — that is what
           // makes it worth buying — but never anything playable.
@@ -397,6 +410,12 @@ export class CoursePartsService {
     ]);
 
     if (!course) throw AppException.notFound('Course', courseId);
+    // Joining is for a course that is on offer. `listForStudent` now answers
+    // for a HIDDEN course's own students (their course page needs it), so the
+    // join sheet keeps its own PUBLISHED rule - the same answer as before.
+    if (course.status !== CourseStatus.PUBLISHED) {
+      throw AppException.notFound('Course', courseId);
+    }
 
     const courseEnrollmentMethods = course.enrollmentMethods;
 

@@ -15,6 +15,7 @@ import {
 import { ErrorCode } from '../../src/common/errors/error-codes';
 import { AuthService } from '../../src/modules/auth/auth.service';
 import { TokenService } from '../../src/modules/auth/token.service';
+import { CourseAccessService } from '../../src/modules/courses/course-access.service';
 import { CoursesAdminService, changesCommercialTerms } from '../../src/modules/courses/courses.admin.service';
 import { CoursesService } from '../../src/modules/courses/courses.service';
 import { DevicesService } from '../../src/modules/devices/devices.service';
@@ -202,10 +203,16 @@ describe('F-14 public course outline and documents', () => {
       courseSection: { findMany: jest.fn(async () => []) },
       watchProgress: { findMany: jest.fn(async () => []) },
       attachment: { findMany: attachmentFindMany },
+      // No enrolment rows: every caller here is an outsider or staff.
+      enrollment: { findUnique: jest.fn(async () => null) },
     };
+    // The real page-visibility and preview rules, over the same stand-in data.
+    const rules = new CourseAccessService(prisma as never, null as never, null as never);
     const access = {
       resolve: jest.fn(async () => ({ canAccessContent: false })),
       allowedSectionIds: jest.fn(async () => null),
+      mayViewCoursePage: rules.mayViewCoursePage.bind(rules),
+      previewUnlocks: rules.previewUnlocks.bind(rules),
     };
     const service = new CoursesService(prisma as never, access as never, {} as never);
     return { service, attachmentFindMany };

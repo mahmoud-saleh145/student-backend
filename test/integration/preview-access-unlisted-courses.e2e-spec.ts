@@ -226,11 +226,17 @@ describe('preview content of courses that are not on offer', () => {
       expect(await ticketsFor(s.student.id)).toBe(2);
     });
 
-    it('the HIDDEN course page stays closed even to its enrolled student (unchanged)', async () => {
+    // Changed by the hidden-course page fix: the course page of a HIDDEN course
+    // now opens for the students "My courses" lists it for, and stays closed to
+    // everyone else. Full coverage in hidden-course-page.e2e-spec.ts.
+    it('the HIDDEN course page opens for its enrolled student, and stays closed to an outsider', async () => {
       const s = await scenario(CourseStatus.HIDDEN);
+      const outsider = await http(app).get(`${API}/courses/${s.course.id}`).set(s.session.headers);
+      expect(errorCode(outsider.body)).toBe('COURSE_NOT_AVAILABLE');
+
       await enroll(prisma, s.student.id, s.course.id);
-      const res = await http(app).get(`${API}/courses/${s.course.id}`).set(s.session.headers);
-      expect(errorCode(res.body)).toBe('COURSE_NOT_AVAILABLE');
+      const res = await http(app).get(`${API}/courses/${s.course.id}`).set(s.session.headers).expect(200);
+      expect(res.body.data.id).toBe(s.course.id);
     });
   });
 });

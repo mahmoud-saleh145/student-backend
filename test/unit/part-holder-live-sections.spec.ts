@@ -181,10 +181,14 @@ describe('CoursesService.detail applies the section scope to locked flags', () =
       watchProgress: { findMany: jest.fn(async () => []) },
       attachment: { findMany: jest.fn(async () => []) },
     };
+    // The real page-visibility and preview rules (a PUBLISHED course needs no lookup).
+    const rules = new CourseAccessService(prisma as never, null as never, null as never);
     const access = {
-      resolve: jest.fn(async () => ({ canAccessContent, state: 'ACTIVE' })),
+      resolve: jest.fn(async () => ({ canAccessContent, state: 'ACTIVE', courseStatus: 'PUBLISHED' })),
       toCourseAccess: jest.fn(() => ({ state: 'ACTIVE', availableMethods: [] })),
       allowedSectionIds: jest.fn(async () => allowed),
+      mayViewCoursePage: rules.mayViewCoursePage.bind(rules),
+      previewUnlocks: rules.previewUnlocks.bind(rules),
     };
     const storage = { publicAssetUrl: jest.fn(async () => null) };
     const service = new CoursesService(prisma as never, access as never, storage as never);

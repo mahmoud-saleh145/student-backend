@@ -1,4 +1,5 @@
 import { CoursesService } from 'src/modules/courses/courses.service';
+import { CourseAccessService } from 'src/modules/courses/course-access.service';
 
 /**
  * What a student sees under "Materials" on a course.
@@ -201,11 +202,15 @@ function build(rows: Record<string, unknown>[] = ROWS) {
     },
   });
 
+  // The real page-visibility and preview rules (a PUBLISHED course needs no lookup).
+  const rules = new CourseAccessService(prisma as never, null as never, null as never);
   const access = {
-    resolve: jest.fn(async () => ({ canAccessContent: true, hasAccess: true })),
+    resolve: jest.fn(async () => ({ canAccessContent: true, hasAccess: true, courseStatus: 'PUBLISHED' })),
     toCourseAccess: jest.fn(() => ({ hasAccess: true })),
     // Whole-course access: the section scope is not what this file tests.
     allowedSectionIds: jest.fn(async () => null),
+    mayViewCoursePage: rules.mayViewCoursePage.bind(rules),
+    previewUnlocks: rules.previewUnlocks.bind(rules),
   };
   const storage = { publicAssetUrl: jest.fn(async () => null) };
 
@@ -348,7 +353,7 @@ describe('access marking', () => {
   it('marks a lecture PDF locked for a student without course access', async () => {
     const t = build();
     (t.service as unknown as { access: { resolve: unknown } }).access.resolve = jest.fn(
-      async () => ({ canAccessContent: false, hasAccess: false }),
+      async () => ({ canAccessContent: false, hasAccess: false, state: 'NOT_ENROLLED', courseStatus: 'PUBLISHED' }),
     );
 
     const result = (await detail(t)) as {
@@ -364,7 +369,7 @@ describe('access marking', () => {
       published({ id: 'att_preview', isPreview: true }, 'les_1'),
     ]);
     (t.service as unknown as { access: { resolve: unknown } }).access.resolve = jest.fn(
-      async () => ({ canAccessContent: false, hasAccess: false }),
+      async () => ({ canAccessContent: false, hasAccess: false, state: 'NOT_ENROLLED', courseStatus: 'PUBLISHED' }),
     );
 
     const result = (await detail(t)) as {
