@@ -210,13 +210,14 @@ means the card was **not** used, in two cases:
 
 - the student holds the whole course, live (any card for it); or
 - a PART or SECTION card would unlock nothing new — the student already holds
-  the part, or can already open every section the card carries.
+  every section the card carries and, for a PART card, the part itself.
 
 The second check runs inside the redemption transaction, before the card is
 consumed. A card still redeems when it gives the student anything at all: no
-enrollment yet, an enrollment that is not live (pending, revoked, expired), an
-access end date the card would move later, a section not yet open, or a part
-not yet held. Whole-course and teacher cards are unchanged.
+enrollment yet, an enrollment that is not live (pending, revoked, expired), a
+section not yet held, a part not yet held, or — a renewal — an access end date
+the card would remove or move later by at least one day. Whole-course and
+teacher cards are unchanged.
 
 `GET /courses/:id` includes an `access` object the app renders directly:
 

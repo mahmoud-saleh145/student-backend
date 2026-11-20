@@ -2,6 +2,7 @@ import { Injectable, Logger, Optional } from '@nestjs/common';
 import {
   AuditAction,
   CodeTargetType,
+  ContentStatus,
   EnrollmentMethod,
   EnrollmentState,
   NotificationKind,
@@ -498,7 +499,9 @@ export class EnrollmentsService {
    * isolation, so the decision and the consumption cannot be separated: a
    * second card for the same part racing this one either sees the entitlement
    * the first wrote, or is aborted by the database and retried
-   * (`withSerializableRetry`) — and then sees it.
+   * (`withSerializableRetry`) — and then sees it. On a time-limited course the
+   * retried card is refused too, because the few milliseconds it would add are
+   * far below `MIN_RENEWAL_EXTENSION_MS`.
    *
    * The rule itself is `redemptionGrantsNothing`; what a student "already
    * holds" is `CourseAccessService.sectionCoverage`, the same rule the lesson
@@ -560,9 +563,25 @@ export class EnrollmentsService {
       }
     }
 
+    // The card's section list is a snapshot from the day it was printed.
+    // Sections deleted or archived since are not part of what any student
+    // holds (`sectionCoverage` leaves them out of a part too), so they must not
+    // make an otherwise-duplicate card look as if it carried something new.
+    const liveCardSections =
+      scope.sectionIds === null
+        ? null
+        : await tx.courseSection.findMany({
+            where: {
+              id: { in: scope.sectionIds },
+              deletedAt: null,
+              status: { not: ContentStatus.ARCHIVED },
+            },
+            select: { id: true },
+          });
+
     const nothingNew = redemptionGrantsNothing({
       targetType: scope.targetType,
-      cardSectionIds: scope.sectionIds,
+      cardSectionIds: liveCardSections === null ? null : liveCardSections.map((s) => s.id),
       enrollment,
       coveredSectionIds: await this.access.sectionCoverage(
         tx,

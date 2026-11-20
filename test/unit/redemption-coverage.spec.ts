@@ -1,6 +1,7 @@
 import { CodeTargetType, EnrollmentState } from '@prisma/client';
 
 import {
+  MIN_RENEWAL_EXTENSION_MS,
   type RedemptionCoverageFacts,
   redemptionGrantsNothing,
 } from '../../src/modules/enrollments/redemption-coverage';
@@ -103,6 +104,44 @@ describe('redemptionGrantsNothing', () => {
     });
   });
 
+  describe('refused: a fixed-length window restarted moments later is not a renewal', () => {
+    // `grantAccess` restarts the window at redemption, so on a 30-day course a
+    // second card always ends later than the first — by however long the
+    // student waited. A minute is a mistyped duplicate, not a renewal.
+    const held = (waitedMs: number) => new Date(NOW.getTime() + 30 * DAY - waitedMs);
+    const next = new Date(NOW.getTime() + 30 * DAY);
+
+    it.each([
+      ['milliseconds later (the loser of two simultaneous cards)', 40],
+      ['a minute later', 60_000],
+      ['an hour later', 3_600_000],
+      ['a millisecond short of a day later', MIN_RENEWAL_EXTENSION_MS - 1],
+    ])('%s', (_name, waited) => {
+      expect(
+        redemptionGrantsNothing(
+          facts({
+            enrollment: { state: EnrollmentState.ACTIVE, accessEndsAt: held(waited) },
+            nextAccessEndsAt: next,
+          }),
+        ),
+      ).toBe(true);
+    });
+
+    it('a full day later it is a renewal again', () => {
+      expect(
+        redemptionGrantsNothing(
+          facts({
+            enrollment: {
+              state: EnrollmentState.ACTIVE,
+              accessEndsAt: held(MIN_RENEWAL_EXTENSION_MS),
+            },
+            nextAccessEndsAt: next,
+          }),
+        ),
+      ).toBe(false);
+    });
+  });
+
   describe('still redeems: the card gives the student something', () => {
     it('no enrollment at all', () => {
       expect(redemptionGrantsNothing(facts({ enrollment: null }))).toBe(false);
@@ -176,6 +215,10 @@ describe('redemptionGrantsNothing', () => {
       expect(
         redemptionGrantsNothing(facts({ cardSectionIds: ['sec_1', 'sec_2', 'sec_3'] })),
       ).toBe(false);
+    });
+
+    it('a card whose every section has been withdrawn is left to the older rules', () => {
+      expect(redemptionGrantsNothing(facts({ cardSectionIds: [] }))).toBe(false);
     });
 
     it('a section card for a section not yet held', () => {

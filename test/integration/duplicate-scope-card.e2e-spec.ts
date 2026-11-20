@@ -3,6 +3,7 @@ import {
   AccessDurationType,
   CodeStatus,
   CodeTargetType,
+  ContentStatus,
   EnrollmentMethod,
   EnrollmentState,
   PartPricingModel,
@@ -290,6 +291,70 @@ describe('duplicate part and section cards', () => {
       await expectRefusedUnspent(s, buyer, 'SECTIONCARDD1');
     });
 
+    it('a duplicate on a fixed-length course, entered right after the first', async () => {
+      // The window restarts at redemption, so the second card would end a few
+      // milliseconds later than the first. That is not a renewal.
+      const s = await scenario({
+        accessDurationType: AccessDurationType.FIXED_DAYS,
+        accessDurationDays: 30,
+      });
+      await part1Card(s, 'PART1CARD001');
+      await part1Card(s, 'PART1CARD002');
+      const buyer = await student('buyer-device');
+
+      await redeem(s, buyer.session, 'PART1CARD001').expect(200);
+      await expectRefusedUnspent(s, buyer, 'PART1CARD002');
+    });
+
+    it('a card whose own access window would only shorten what is held', async () => {
+      const s = await scenario();
+      await part1Card(s, 'PART1CARD001');
+      await part1Card(s, 'PART1CARD002');
+      await prisma.accessCode.update({
+        where: { code: 'PART1CARD002' },
+        data: { accessDurationType: AccessDurationType.FIXED_DAYS, accessDurationDays: 30 },
+      });
+      const buyer = await student('buyer-device');
+
+      await redeem(s, buyer.session, 'PART1CARD001').expect(200);
+      await expectRefusedUnspent(s, buyer, 'PART1CARD002');
+      // Lifetime access was not cut down to 30 days.
+      expect((await footprint(s, buyer.user.id)).enrollment!.accessEndsAt).toBeNull();
+    });
+
+    it('an old card whose extra section has since been archived', async () => {
+      // Printed when Part 1 held A and B. B is then withdrawn; a student who
+      // holds the part must not lose an old card to a section nobody can open.
+      const s = await scenario();
+      await part1Card(s, 'PART1CARD001');
+      await prisma.courseSection.update({
+        where: { id: s.b.id },
+        data: { status: ContentStatus.ARCHIVED },
+      });
+      await card(s, {
+        code: 'PART1NEWCARD1',
+        targetType: CodeTargetType.PART,
+        coursePartId: s.part1.id,
+        grantedSectionIds: [s.a.id],
+      });
+      const buyer = await student('buyer-device');
+
+      await redeem(s, buyer.session, 'PART1NEWCARD1').expect(200);
+      await expectRefusedUnspent(s, buyer, 'PART1CARD001');
+    });
+
+    it('a card for a part that has since been removed, when its sections are held', async () => {
+      const s = await scenario();
+      await part1Card(s, 'PART1CARD001');
+      await part1Card(s, 'PART1CARD002');
+      const buyer = await student('buyer-device');
+
+      await redeem(s, buyer.session, 'PART1CARD001').expect(200);
+      await prisma.coursePart.update({ where: { id: s.part1.id }, data: { deletedAt: new Date() } });
+
+      await expectRefusedUnspent(s, buyer, 'PART1CARD002');
+    });
+
     it('a refused card is still good for the next student', async () => {
       const s = await scenario();
       await part1Card(s, 'PART1CARD001');
@@ -359,6 +424,29 @@ describe('duplicate part and section cards', () => {
       expect(after.entitlements).toEqual([{ coursePartId: s.part1.id }]);
       expect(after.codes.filter((c) => c.status === CodeStatus.EXHAUSTED)).toHaveLength(1);
       expect(after.codes.filter((c) => c.status === CodeStatus.ACTIVE)).toHaveLength(1);
+      expect(after.codes.reduce((sum, c) => sum + c.redemptionCount, 0)).toBe(1);
+    });
+
+    it('spends exactly one of two cards for the same part on a fixed-length course', async () => {
+      // The loser is retried a few milliseconds after the winner committed and
+      // would "extend" the window by that much. It must still be refused.
+      const s = await scenario({
+        accessDurationType: AccessDurationType.FIXED_DAYS,
+        accessDurationDays: 30,
+      });
+      await part1Card(s, 'PART1CARD001');
+      await part1Card(s, 'PART1CARD002');
+      const buyer = await student('buyer-device');
+
+      const results = await Promise.all([
+        redeem(s, buyer.session, 'PART1CARD001'),
+        redeem(s, buyer.session, 'PART1CARD002'),
+      ]);
+
+      expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+      const after = await footprint(s, buyer.user.id);
+      expect(after.redemptions).toBe(1);
+      expect(after.purchases).toBe(1);
       expect(after.codes.reduce((sum, c) => sum + c.redemptionCount, 0)).toBe(1);
     });
 
@@ -461,6 +549,58 @@ describe('duplicate part and section cards', () => {
         state: EnrollmentState.ACTIVE,
         coversAllSections: true,
       });
+    });
+
+    it('a teacher card on top of a part — it widens to the whole course', async () => {
+      const s = await scenario();
+      await part1Card(s, 'PART1CARD001');
+      const lead = await prisma.courseTeacher.findFirstOrThrow({
+        where: { courseId: s.course.id },
+        select: { teacherId: true },
+      });
+      await prisma.accessCode.create({
+        data: {
+          code: 'TEACHERCARD01',
+          targetType: CodeTargetType.TEACHER,
+          teacherId: lead.teacherId,
+          grantedCourseIds: [s.course.id],
+          maxRedemptions: 1,
+          redemptionCount: 0,
+          status: CodeStatus.ACTIVE,
+        },
+      });
+      const buyer = await student('buyer-device');
+
+      await redeem(s, buyer.session, 'PART1CARD001').expect(200);
+      await redeem(s, buyer.session, 'TEACHERCARD01').expect(200);
+
+      expect((await footprint(s, buyer.user.id)).enrollment).toMatchObject({
+        state: EnrollmentState.ACTIVE,
+        coversAllSections: true,
+      });
+    });
+
+    it('a part card on a pending join request — it activates that part only', async () => {
+      const s = await scenario();
+      await part1Card(s, 'PART1CARD001');
+      const buyer = await student('buyer-device');
+      await prisma.enrollment.create({
+        data: {
+          userId: buyer.user.id,
+          courseId: s.course.id,
+          state: EnrollmentState.PENDING_APPROVAL,
+          method: EnrollmentMethod.ADMIN_APPROVAL,
+        },
+      });
+
+      await redeem(s, buyer.session, 'PART1CARD001').expect(200);
+
+      const after = await footprint(s, buyer.user.id);
+      expect(after.enrollment).toMatchObject({
+        state: EnrollmentState.ACTIVE,
+        coversAllSections: false,
+      });
+      expect(after.entitlements).toEqual([{ coursePartId: s.part1.id }]);
     });
 
     it('a part card after the part entitlement was revoked', async () => {
