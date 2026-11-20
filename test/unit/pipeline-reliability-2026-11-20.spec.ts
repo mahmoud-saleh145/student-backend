@@ -732,6 +732,11 @@ describe('VideoProcessor: infrastructure failures are deferred, not counted', ()
 function mobileProcessor() {
   const videos = {
     markMobileProcessing: jest.fn(async () => true),
+    // The processor claims through claimMobileProcessing; delegate so markMobileProcessing stays the mock.
+    async claimMobileProcessing(this: { markMobileProcessing: (...a: string[]) => Promise<boolean> }, ...a: string[]) {
+      return (await this.markMobileProcessing(...a)) ? { claimedAt: new Date() } : null;
+    },
+    mobileOwnership: async () => undefined,
     markMobileReady: jest.fn(async () => undefined),
     markMobileFailed: jest.fn(async () => undefined),
     markMobileRetrying: jest.fn(async () => undefined),

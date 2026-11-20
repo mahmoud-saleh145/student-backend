@@ -4,8 +4,9 @@ import IORedis from 'ioredis';
 import { tmpdir } from 'node:os';
 
 import { VideoProcessor } from '../../src/jobs/processors/video.processor';
-import { VIDEO_JOBS, type TranscodeJobData } from '../../src/jobs/queue.constants';
+import { MOBILE_VIDEO_JOBS, VIDEO_JOBS, type TranscodeJobData } from '../../src/jobs/queue.constants';
 import type { WithTransientDeferral } from '../../src/jobs/transient-deferral';
+import { JOB, controllableTranscoder, jobData, processorFor, world } from './helpers/mobile-claim-world';
 
 /**
  * REAL BullMQ against a LOCAL Redis: a database outage, then a worker crash
@@ -120,5 +121,68 @@ describeReal('real queue: outage deferral, crash and restart (no lost or duplica
     const counts = await queue.getJobCounts('wait', 'active', 'delayed', 'failed', 'completed', 'prioritized');
     expect(counts).toEqual({ wait: 0, active: 0, delayed: 0, failed: 0, completed: 1, prioritized: 0 });
     releaseHung?.();
+  });
+});
+
+describeReal('real queue: the duplicate mobile encode of 2026-11-20 (lock expired during standby)', () => {
+  jest.setTimeout(60_000);
+  const prefix = `pipeline-reliability-mobile-test-${process.pid}-${Date.now()}`;
+  const connections: IORedis[] = [];
+  const conn = () => {
+    const c = new IORedis(URL_!, { maxRetriesPerRequest: null });
+    connections.push(c);
+    return c;
+  };
+  let queue: Queue;
+  let worker: Worker | undefined;
+
+  beforeAll(() => {
+    queue = new Queue('mobile-video-processing', { connection: conn(), prefix });
+  });
+
+  afterAll(async () => {
+    await worker?.close(true).catch(() => undefined);
+    await queue.obliterate({ force: true }).catch(() => undefined);
+    const keys = await connections[0]!.keys(`${prefix}:*`);
+    if (keys.length) await connections[0]!.del(...keys);
+    await queue.close();
+    connections.forEach((c) => c.disconnect());
+  });
+
+  it('A encodes while its lock expires, records READY; BullMQ re-delivers the job; it completes WITHOUT a second encode', async () => {
+    const w = world();
+    const t = controllableTranscoder();
+    const proc = processorFor(w.videos, t.transcoder);
+
+    // skipLockRenewal: the lock is never renewed, as on a laptop in standby,
+    // so it expires (1 s) while the encode is still running.
+    worker = new Worker('mobile-video-processing', (job: Job, token?: string) => proc.process(job as never, token), {
+      connection: conn(),
+      prefix,
+      concurrency: 1,
+      lockDuration: 1_000,
+      stalledInterval: 500,
+      maxStalledCount: 5,
+      skipLockRenewal: true,
+    });
+    worker.on('error', () => undefined); // "Missing lock" when A finishes is expected
+
+    const job = await queue.add(MOBILE_VIDEO_JOBS.transcode, jobData().data, { jobId: JOB, attempts: 2 });
+
+    await until('A is encoding', async () => t.transcoder.run.mock.calls.length === 1);
+    // The "standby": wait until BullMQ has declared the job stalled and put it back.
+    await until('lock expired and the job handed out again', async () => (await queue.getJobState(job.id!)) === 'waiting');
+
+    // A wakes up and finishes: READY is recorded once.
+    t.finish(0);
+
+    await until('the re-delivered job completed', async () => (await queue.getJobState(job.id!)) === 'completed');
+    const done = (await queue.getJob(job.id!))!;
+    expect(done.returnvalue).toEqual({ videoId: VIDEO, skipped: true }); // the re-delivery stepped aside
+    expect(t.transcoder.run).toHaveBeenCalledTimes(1); // ONE encode
+    expect(w.row.mobileStatus).toBe('READY');
+    expect(w.readyWrites).toHaveLength(1);
+    const counts = await queue.getJobCounts('wait', 'active', 'delayed', 'failed', 'completed', 'prioritized');
+    expect(counts).toEqual({ wait: 0, active: 0, delayed: 0, failed: 0, completed: 1, prioritized: 0 });
   });
 });

@@ -32,6 +32,11 @@ function build(
 ) {
   const videos = {
     markMobileProcessing: jest.fn(async () => opts.claimed ?? true),
+    // The processor claims through claimMobileProcessing; delegate so markMobileProcessing stays the mock.
+    async claimMobileProcessing(this: { markMobileProcessing: (...a: string[]) => Promise<boolean> }, ...a: string[]) {
+      return (await this.markMobileProcessing(...a)) ? { claimedAt: new Date() } : null;
+    },
+    mobileOwnership: async () => undefined,
     markMobileReady: jest.fn(async () => undefined),
     markMobileFailed: jest.fn(async () => undefined),
     markMobileRetrying: jest.fn(async () => undefined),
@@ -149,7 +154,7 @@ describe('MobileVideoProcessor', () => {
       }),
       // ...together with the file the encode read, so a result for a file
       // that was replaced meanwhile is not recorded.
-      { sourceKey: 'source/videos/v_1.mp4', jobId: 'mobile-hls:v_1:1' },
+      { sourceKey: 'source/videos/v_1.mp4', jobId: 'mobile-hls:v_1:1', claimedAt: expect.any(Date) },
     );
     // The primary pipeline's bookkeeping is never touched.
     expect(t.videos.markProcessing).not.toHaveBeenCalled();
@@ -176,7 +181,7 @@ describe('MobileVideoProcessor', () => {
     const t = build({ runError: new Error('ffmpeg exited with 1: Invalid data found'), attemptsMade: 1 });
 
     await expect(t.processor.process(t.job)).rejects.toThrow(/ffmpeg exited/);
-    expect(t.videos.markMobileFailed).toHaveBeenCalledWith('v_1', expect.stringContaining('ffmpeg exited'), { sourceKey: 'source/videos/v_1.mp4' });
+    expect(t.videos.markMobileFailed).toHaveBeenCalledWith('v_1', expect.stringContaining('ffmpeg exited'), { sourceKey: 'source/videos/v_1.mp4', jobId: 'mobile-hls:v_1:1', claimedAt: expect.any(Date) });
     expect(t.videos.markMobileRetrying).not.toHaveBeenCalled();
   });
 
@@ -189,7 +194,7 @@ describe('MobileVideoProcessor', () => {
     await expect(t.processor.process(t.job)).rejects.toThrow(/socket hang up/);
 
     expect(t.videos.markMobileFailed).not.toHaveBeenCalled();
-    expect(t.videos.markMobileRetrying).toHaveBeenCalledWith('v_1', 'mobile-hls:v_1:1', 'socket hang up', 1, 2);
+    expect(t.videos.markMobileRetrying).toHaveBeenCalledWith('v_1', 'mobile-hls:v_1:1', 'socket hang up', 1, 2, expect.any(Date));
   });
 
   it('describes a host problem (no scratch space, no ffmpeg) as retryable', async () => {
@@ -199,7 +204,7 @@ describe('MobileVideoProcessor', () => {
     expect(t.videos.markMobileFailed).toHaveBeenCalledWith(
       'v_1',
       expect.stringMatching(/could not run the encode .*scratch.*retried/),
-      { sourceKey: 'source/videos/v_1.mp4' },
+      { sourceKey: 'source/videos/v_1.mp4', jobId: 'mobile-hls:v_1:1', claimedAt: expect.any(Date) },
     );
   });
 
@@ -225,7 +230,7 @@ describe('MobileVideoProcessor', () => {
     expect(t.videos.markMobileFailed).toHaveBeenCalledWith(
       'v_1',
       expect.stringMatching(/failed verification and was not published/),
-      { sourceKey: 'source/videos/v_1.mp4' },
+      { sourceKey: 'source/videos/v_1.mp4', jobId: 'mobile-hls:v_1:1', claimedAt: expect.any(Date) },
     );
   });
 
@@ -282,14 +287,14 @@ describe('MobileVideoProcessor', () => {
 
     await expect(t.processor.process(t.job, 'tok')).rejects.toThrow(/missing from storage/);
     expect(t.job.moveToDelayed).not.toHaveBeenCalled();
-    expect(t.videos.markMobileFailed).toHaveBeenCalledWith('v_1', expect.stringContaining('missing from storage'), { sourceKey: 'source/videos/v_1.mp4' });
+    expect(t.videos.markMobileFailed).toHaveBeenCalledWith('v_1', expect.stringContaining('missing from storage'), { sourceKey: 'source/videos/v_1.mp4', jobId: 'mobile-hls:v_1:1', claimedAt: expect.any(Date) });
   });
 
   it('puts the row back to QUEUED and defers when the disk watchdog killed the encode', async () => {
     const t = build({ runError: new TranscodeDiskPressureError('ffmpeg was stopped: scratch volume below the 25.0 GB reserve') });
 
     await expect(t.processor.process(t.job, 'tok')).rejects.toBeInstanceOf(DelayedError);
-    expect(t.videos.markMobileDeferred).toHaveBeenCalledWith('v_1', expect.stringContaining('disk space'));
+    expect(t.videos.markMobileDeferred).toHaveBeenCalledWith('v_1', expect.stringContaining('disk space'), { jobId: 'mobile-hls:v_1:1' });
     expect(t.videos.markMobileFailed).not.toHaveBeenCalled();
     expect(t.job.moveToDelayed).toHaveBeenCalled();
     expect(rm).toHaveBeenCalledWith(expect.stringMatching(/mobile[\\/]v_1$/), { recursive: true, force: true });

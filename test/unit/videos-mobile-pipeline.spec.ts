@@ -230,7 +230,8 @@ describe('recoverStrandedMobileVideos', () => {
     await expect(t.svc.recoverStrandedMobileVideos()).resolves.toEqual({ requeued: 2, failed: 1 });
 
     const failWrite = t.writes.find((w) => w.data.mobileStatus === 'FAILED');
-    expect(failWrite?.where).toEqual({ id: 'v_p' });
+    // A failure never turns a READY ladder back (a stale or duplicate attempt).
+    expect(failWrite?.where).toEqual({ id: 'v_p', mobileStatus: { not: 'READY' } });
     expect(t.mobileQueue.add).toHaveBeenCalledTimes(2);
   });
 
@@ -333,10 +334,38 @@ describe('markMobileProcessing', () => {
     await expect(t.svc.markMobileProcessing('v_1', 'source/v_1.mp4', 'job_leftover')).resolves.toBe(false);
     expect(t.prisma.video.updateMany).not.toHaveBeenCalled();
 
-    // The job that OWNS the row (a deliberate re-encode records its intent,
-    // and with it this id, before the job runs) is not stopped by this.
-    const own = harness({ rows: [{ id: 'v_1', mobileStatus: 'READY', mobileJobId: 'job_own' }] });
+    // The job that OWNS the row with an intent recorded AFTER the last finished
+    // ladder (an older API left the row READY while queueing a forced
+    // re-encode) is still waiting for this job, and is not stopped by this.
+    const own = harness({
+      rows: [
+        {
+          id: 'v_1',
+          mobileStatus: 'READY',
+          mobileJobId: 'job_own',
+          mobileProcessedAt: new Date('2026-11-20T10:00:00Z'),
+          mobileRequestedAt: new Date('2026-11-20T11:00:00Z'),
+        },
+      ],
+    });
     await expect(own.svc.markMobileProcessing('v_1', 'source/v_1.mp4', 'job_own')).resolves.toBe(true);
+
+    // REGRESSION 2026-11-20 (cmwp0i2sx001rho01ap2is9gu): the SAME job, run a
+    // second time after its ladder was recorded (its BullMQ lock expired while
+    // the laptop slept), must not re-encode it.
+    const done = harness({
+      rows: [
+        {
+          id: 'v_1',
+          mobileStatus: 'READY',
+          mobileJobId: 'job_own',
+          mobileRequestedAt: new Date('2026-11-20T20:30:16Z'),
+          mobileProcessedAt: new Date('2026-11-20T21:57:13Z'),
+        },
+      ],
+    });
+    await expect(done.svc.markMobileProcessing('v_1', 'source/v_1.mp4', 'job_own')).resolves.toBe(false);
+    expect(done.prisma.video.updateMany).not.toHaveBeenCalled();
   });
 
   it('claims compare-and-set, so two racing jobs cannot both win', async () => {
@@ -347,7 +376,8 @@ describe('markMobileProcessing', () => {
       expect.objectContaining({
         where: expect.objectContaining({
           // A non-owner may take the row only while it is not READY (atomic with the claim).
-          OR: [{ mobileJobId: 'job_old', mobileStatus: { not: 'READY' } }, { mobileJobId: 'job_B' }],
+          // ...and neither may its OWN job once the row is READY (2026-11-20 duplicate encode).
+          OR: [{ mobileJobId: 'job_old', mobileStatus: { not: 'READY' } }, { mobileJobId: 'job_B', mobileStatus: { not: 'READY' } }],
         }),
       }),
     );

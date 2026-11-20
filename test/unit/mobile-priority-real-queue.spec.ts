@@ -96,6 +96,11 @@ type Encode = { videoId: string; trigger: string; start: number; end?: number };
     };
     const videos = {
       markMobileProcessing: async () => true,
+      // The processor claims through claimMobileProcessing; delegate so markMobileProcessing stays the mock.
+      async claimMobileProcessing(this: { markMobileProcessing: (...a: string[]) => Promise<boolean> }, ...a: string[]) {
+        return (await this.markMobileProcessing(...a)) ? { claimedAt: new Date() } : null;
+      },
+      mobileOwnership: async () => undefined,
       markMobileReady: async () => undefined,
       markMobileFailed: async () => undefined,
       markMobileDeferred: async () => undefined,

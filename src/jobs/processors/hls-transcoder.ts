@@ -88,6 +88,16 @@ export class TranscodeInterruptedError extends TranscodeEnvironmentError {}
 export class TranscodeDiskPressureError extends TranscodeEnvironmentError {}
 
 /**
+ * The encode was stopped because this attempt no longer owns the video: the
+ * same generation was recorded READY by another attempt, or re-claimed by a
+ * newer one (a BullMQ lock that expired while the laptop slept). Not a failure
+ * of the video; the caller ends the job without writing anything.
+ */
+export class TranscodeSupersededError extends Error {
+  override readonly name = 'TranscodeSupersededError';
+}
+
+/**
  * ffmpeg finished but what it produced does not check out (a playlist without
  * its end marker, a segment that will not demux, a duration that does not
  * match the source, an object missing on R2 after upload). Nothing is marked
@@ -221,6 +231,8 @@ export class HlsTranscoder implements OnModuleDestroy {
   private stopping = false;
   /** Set by abortActive(): why the running ffmpeg is being killed, if not a shutdown. */
   private aborting: string | null = null;
+  /** Set by abortSuperseded(): this attempt lost ownership of the video. */
+  private superseded: string | null = null;
 
   constructor(
     private readonly storage: StorageService,
@@ -242,6 +254,26 @@ export class HlsTranscoder implements OnModuleDestroy {
       hammer.unref();
       child.once('exit', () => clearTimeout(hammer));
     }
+  }
+
+  /**
+   * Stops the running encode because this attempt no longer owns the video.
+   * The running ffmpeg is killed and no further ffmpeg or upload starts; the
+   * pending run() rejects with TranscodeSupersededError.
+   */
+  abortSuperseded(reason: string): void {
+    if (this.superseded) return;
+    this.superseded = reason;
+    for (const child of this.children) {
+      child.kill('SIGTERM');
+      const hammer = setTimeout(() => child.kill('SIGKILL'), CHILD_STOP_GRACE_MS);
+      hammer.unref();
+      child.once('exit', () => clearTimeout(hammer));
+    }
+  }
+
+  private throwIfSuperseded(): void {
+    if (this.superseded) throw new TranscodeSupersededError(this.superseded);
   }
 
   /**
@@ -329,6 +361,7 @@ export class HlsTranscoder implements OnModuleDestroy {
     // reason (someone copying files) stops the encode before Windows suffers.
     const release = await this.guard.reserve(videoId, budgetBytes);
     this.aborting = null;
+    this.superseded = null;
     const stopWatching = this.guard.watch(workDir, (free) =>
       this.abortActive(
         `scratch volume below the ${formatBytes(this.guard.minFreeBytes)} reserve (${formatBytes(free)} free)`,
@@ -339,6 +372,7 @@ export class HlsTranscoder implements OnModuleDestroy {
     } finally {
       stopWatching();
       this.aborting = null;
+      this.superseded = null;
       await release().catch(() => undefined);
     }
   }
@@ -473,6 +507,8 @@ export class HlsTranscoder implements OnModuleDestroy {
     // The API serves a per-session master (ManifestService); this one is for
     // diagnostics and any future direct-CDN path.
     const masterPlaylistKey = StorageService.keys.hlsMaster(videoId);
+    // The master is what makes the ladder discoverable: never from a superseded attempt.
+    this.throwIfSuperseded();
     await this.uploadWithRetry(masterPlaylistKey, () =>
       this.storage.putObject({
         bucket: 'media',
@@ -1028,6 +1064,8 @@ export class HlsTranscoder implements OnModuleDestroy {
     let next = 0;
     const worker = async () => {
       while (next < segments.length) {
+        // A superseded attempt stops writing to the shared hls/<id>/ keys at once.
+        this.throwIfSuperseded();
         const file = segments[next++]!;
         const path = join(outDir, file);
         const info = await stat(path);
@@ -1041,6 +1079,7 @@ export class HlsTranscoder implements OnModuleDestroy {
     };
     await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, segments.length) }, worker));
 
+    this.throwIfSuperseded();
     const playlistKey = `${hlsPrefix}${height}p/index.m3u8`;
     const body = await readFile(join(outDir, 'index.m3u8'));
     await this.uploadWithRetry(playlistKey, () =>
@@ -1125,6 +1164,9 @@ export class HlsTranscoder implements OnModuleDestroy {
     if (this.stopping) {
       return Promise.reject(new TranscodeInterruptedError('the worker is shutting down'));
     }
+    if (this.superseded) {
+      return Promise.reject(new TranscodeSupersededError(this.superseded));
+    }
     if (this.aborting) {
       return Promise.reject(new TranscodeDiskPressureError(this.aborting));
     }
@@ -1168,6 +1210,8 @@ export class HlsTranscoder implements OnModuleDestroy {
         this.children.delete(child);
         if (this.stopping) {
           reject(new TranscodeInterruptedError(`${command} was stopped by a worker shutdown`));
+        } else if (this.superseded) {
+          reject(new TranscodeSupersededError(`${command} was stopped: ${this.superseded}`));
         } else if (this.aborting) {
           reject(new TranscodeDiskPressureError(`${command} was stopped: ${this.aborting}`));
         } else if (code === 0) {
