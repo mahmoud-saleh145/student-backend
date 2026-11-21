@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { VideoProcessor } from '../../src/jobs/processors/video.processor';
 import { MOBILE_VIDEO_JOBS, VIDEO_JOBS, type TranscodeJobData } from '../../src/jobs/queue.constants';
 import type { WithTransientDeferral } from '../../src/jobs/transient-deferral';
+import { MOBILE_MAX_STALLED_COUNT } from '../../src/jobs/processors/mobile-video.processor';
 import { JOB, controllableTranscoder, jobData, processorFor, world } from './helpers/mobile-claim-world';
 
 /**
@@ -184,5 +185,93 @@ describeReal('real queue: the duplicate mobile encode of 2026-11-20 (lock expire
     expect(w.readyWrites).toHaveLength(1);
     const counts = await queue.getJobCounts('wait', 'active', 'delayed', 'failed', 'completed', 'prioritized');
     expect(counts).toEqual({ wait: 0, active: 0, delayed: 0, failed: 0, completed: 1, prioritized: 0 });
+  });
+});
+
+describeReal('real queue: a laptop restarted three times mid-encode resumes from rung checkpoints', () => {
+  jest.setTimeout(90_000);
+  const prefix = `resumable-test-${process.pid}-${Date.now()}`;
+  const connections: IORedis[] = [];
+  const conn = () => {
+    const c = new IORedis(URL_!, { maxRetriesPerRequest: null });
+    connections.push(c);
+    return c;
+  };
+  let queue: Queue;
+  const workers: Worker[] = [];
+
+  beforeAll(() => {
+    queue = new Queue('mobile-video-processing', { connection: conn(), prefix });
+  });
+  afterAll(async () => {
+    await Promise.all(workers.map((w) => w.close(true).catch(() => undefined)));
+    await queue.obliterate({ force: true }).catch(() => undefined);
+    const keys = await connections[0]!.keys(`${prefix}:*`);
+    if (keys.length) await connections[0]!.del(...keys);
+    await queue.close();
+    connections.forEach((c) => c.disconnect());
+  });
+
+  it('each restart re-encodes only unfinished rungs; one completion; the held job is untouched', async () => {
+    const w = world();
+    const tiers = [480, 720, 1080];
+    const encodes: number[] = [];
+    let crashAfter = 1; // the "laptop" dies after this many NEW rungs in a run
+    const transcoder = {
+      preflight: async () => ({ sourceMissing: false, sourceBytes: 1, budgetBytes: 1, assessment: { ok: true, freeBytes: 1, reservedByOthers: 0, minFreeBytes: 0, shortfallBytes: 0 } }),
+      abortSuperseded: () => undefined,
+      run: async (p: { completedRungs?: Array<{ tier: number }>; onRungCompleted?: (r: unknown) => Promise<void> }) => {
+        let fresh = 0;
+        for (const tier of tiers) {
+          if (p.completedRungs?.some((r) => r.tier === tier)) continue;
+          encodes.push(tier);
+          await p.onRungCompleted?.({ tier, width: tier * 2, height: tier, bitrateKbps: 1, playlistKey: `hls/${VIDEO}/${tier}p/index.m3u8`, sizeBytes: 1, keyVersion: 'v2', encryptionKeyId: 'k', at: new Date().toISOString() });
+          fresh += 1;
+          if (crashAfter > 0 && fresh >= crashAfter) await new Promise(() => undefined); // power cut: never returns
+        }
+        return {
+          probe: { durationSeconds: 60, width: 2160, height: 1080, frameRate: 30, videoCodec: 'h264', audioCodec: 'aac' },
+          renditions: tiers.map((t) => ({ height: t, width: t * 2, bitrateKbps: 1, playlistKey: `hls/${VIDEO}/${t}p/index.m3u8`, sizeBytes: 1 })),
+          hlsPrefix: `hls/${VIDEO}/`,
+          masterPlaylistKey: `hls/${VIDEO}/master.m3u8`,
+          isEncrypted: true,
+          encryptionKeyId: 'k',
+        };
+      },
+    };
+    const proc = processorFor(w.videos, transcoder);
+    const startWorker = () => {
+      const worker = new Worker('mobile-video-processing', (job: Job, token?: string) => proc.process(job as never, token), {
+        connection: conn(), prefix, concurrency: 1, lockDuration: 1_000, stalledInterval: 500, maxStalledCount: MOBILE_MAX_STALLED_COUNT,
+      });
+      worker.on('error', () => undefined);
+      workers.push(worker);
+      return worker;
+    };
+
+    // A historically HELD job (parked ten years out), which must never move.
+    const held = await queue.add(MOBILE_VIDEO_JOBS.transcode, { videoId: 'cmvheld000', sourceKey: 'source/held.mp4', ladder: [480], encrypt: true, trigger: 'migration' }, { jobId: 'mobile-hls:cmvheld000:1', delay: 10 * 365 * 24 * 3600_000 });
+    const job = await queue.add(MOBILE_VIDEO_JOBS.transcode, jobData().data, { jobId: JOB, attempts: 2 });
+
+    for (let cycle = 1; cycle <= 3; cycle += 1) {
+      crashAfter = cycle < 3 ? 1 : 0; // runs 1 and 2 die after one new rung; run 3 finishes
+      const worker = startWorker();
+      if (cycle < 3) {
+        await until(`rung ${cycle} encoded`, async () => encodes.length === cycle);
+        await worker.close(true); // shutdown: no completion, lock left to expire
+      }
+    }
+    await until('completed after the third start', async () => (await queue.getJobState(job.id!)) === 'completed', 40_000);
+
+    expect(encodes).toEqual([480, 720, 1080]); // every rung encoded exactly once
+    const done = (await queue.getJob(job.id!))!;
+    expect(done.attemptsMade).toBeLessThanOrEqual(1);
+    expect(w.row.mobileStatus).toBe('READY');
+    expect(w.readyWrites).toHaveLength(1);
+    const h = (await queue.getJob(held.id!))!;
+    expect(await h.getState()).toBe('delayed');
+    expect(h.attemptsMade).toBe(0);
+    const counts = await queue.getJobCounts('wait', 'active', 'failed', 'completed');
+    expect(counts).toEqual({ wait: 0, active: 0, failed: 0, completed: 1 });
   });
 });

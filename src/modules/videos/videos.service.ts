@@ -10,6 +10,11 @@ import {
 } from '@prisma/client';
 import { Queue } from 'bullmq';
 
+/** One lock for every stranded-video sweep (see recoverStrandedVideosExclusive). */
+export const RECOVERY_SWEEP_LOCK = 'recover-stranded-videos';
+/** Longest a sweep may hold it; a sweep of 50 rows takes seconds. */
+export const RECOVERY_SWEEP_LOCK_SECONDS = 15 * 60;
+
 import { AppException } from '../../common/errors/app.exception';
 import { ErrorCode } from '../../common/errors/error-codes';
 import type { VideoConfig } from '../../config/configuration';
@@ -1067,6 +1072,39 @@ export class VideosService {
    * (out of memory on a large source), a retention sweep. Such a video sits
    * in QUEUED or PROCESSING indefinitely; this is what moves it again.
    */
+  /**
+   * recoverStrandedVideos() under ONE lock shared by every caller (the
+   * scheduled maintenance sweep, the worker's boot recovery, the operator
+   * script), so two sweeps never scan and re-queue at the same time - their
+   * re-queues would not be deduplicated (job ids carry a timestamp).
+   *
+   * The lock expires on its own (RECOVERY_SWEEP_LOCK_SECONDS) if the process
+   * dies mid-sweep, and is released as soon as the sweep ends. 'locked' means
+   * another sweep is running now; 'redis-unavailable' means nothing was
+   * decided and the caller should try again later (the scheduler simply runs
+   * again on its next tick).
+   */
+  async recoverStrandedVideosExclusive(
+    trigger: string,
+    now = new Date(),
+  ): Promise<
+    | ({ skipped: false } & Awaited<ReturnType<VideosService['recoverStrandedVideos']>>)
+    | { skipped: 'locked' | 'redis-unavailable' }
+  > {
+    const lock = await this.redis.tryLock(RECOVERY_SWEEP_LOCK, RECOVERY_SWEEP_LOCK_SECONDS);
+    if (lock.status !== 'acquired') {
+      this.logger.log(
+        `RECOVERY_SWEEP_SKIPPED trigger=${trigger}: ${lock.status === 'held' ? 'another sweep is running' : 'Redis did not answer'}`,
+      );
+      return { skipped: lock.status === 'held' ? 'locked' : 'redis-unavailable' };
+    }
+    try {
+      return { skipped: false, ...(await this.recoverStrandedVideos(now)) };
+    } finally {
+      await lock.release();
+    }
+  }
+
   async recoverStrandedVideos(now = new Date()): Promise<{
     requeued: number;
     failed: number;

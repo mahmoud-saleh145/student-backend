@@ -214,6 +214,37 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     return typeof value === 'number' ? value : Number(value ?? 0);
   }
 
+  /**
+   * Like acquireLock, but says WHY a lock was not obtained: 'held' (another
+   * holder has it) or 'error' (Redis could not answer). Callers that must not
+   * mistake an outage for "someone else is doing it" use this one.
+   */
+  async tryLock(
+    name: string,
+    ttlSeconds: number,
+  ): Promise<{ status: 'acquired'; release: () => Promise<void> } | { status: 'held' } | { status: 'error' }> {
+    const full = this.key('lock', name);
+    const token = `${process.pid}-${Date.now()}-${Math.random()}`;
+    try {
+      const ok = await this.client.set(full, token, 'EX', ttlSeconds, 'NX');
+      if (ok !== 'OK') return { status: 'held' };
+    } catch {
+      return { status: 'error' };
+    }
+    return {
+      status: 'acquired',
+      release: async () => {
+        const script = `
+          if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+          else
+            return 0
+          end`;
+        await this.client.eval(script, 1, full, token).catch(() => undefined);
+      },
+    };
+  }
+
   /** Best-effort mutex. Returns a release function, or null if not acquired. */
   async acquireLock(
     name: string,

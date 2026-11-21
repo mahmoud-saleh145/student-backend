@@ -72,8 +72,9 @@ export class MaintenanceProcessor extends WorkerHost {
       case MAINTENANCE_JOBS.dispatchAnnouncements:
         return this.announcements.dispatchDue(new Date());
 
+      // Shares one lock with the worker's boot recovery: never two sweeps at once.
       case MAINTENANCE_JOBS.recoverStrandedVideos:
-        return this.videos.recoverStrandedVideos();
+        return this.videos.recoverStrandedVideosExclusive('scheduled');
 
       // Renews DRM proofs before they lapse. Without this, every lesson stops
       // playing once the verification TTL expires. The sweep itself decides what

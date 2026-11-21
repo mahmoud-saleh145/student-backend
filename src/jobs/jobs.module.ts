@@ -19,6 +19,7 @@ import { ScratchGuard } from './processors/scratch-guard';
 import { VideoProcessor } from './processors/video.processor';
 import { QUEUE_NAMES, type QueueName } from './queue.constants';
 import { MaintenanceScheduler } from './schedulers/maintenance.scheduler';
+import { BootRecovery } from './boot-recovery';
 import { DatabaseHealthMonitor } from './database-health.monitor';
 import { WorkerHeartbeat } from './worker-heartbeat';
 
@@ -124,7 +125,7 @@ if (!runWorkers && process.env.NODE_ENV !== 'test') {
     // Cross-queue rule: new uploads before historical mobile HLS work.
     MobileEncodeScheduler,
     // The worker probes database reachability on its own (heartbeat `db`).
-    ...(runWorkers ? [...selectProcessors(process.env.WORKER_QUEUES), DatabaseHealthMonitor, WorkerHeartbeat] : []),
+    ...(runWorkers ? [...selectProcessors(process.env.WORKER_QUEUES), DatabaseHealthMonitor, WorkerHeartbeat, BootRecovery] : []),
   ],
   exports: [BullModule],
 })
