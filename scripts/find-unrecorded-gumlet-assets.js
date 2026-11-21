@@ -41,6 +41,8 @@ for (const line of fs.readFileSync(envFile, 'utf8').split(/\r?\n/)) {
 }
 // Never start queue consumers from a reporting script.
 delete process.env.RUN_WORKERS;
+// Never run the background Gumlet status monitor inside an operator script.
+process.env.GUMLET_MONITOR_ENABLED = 'false';
 const days = Number(process.argv[3] ?? 30);
 
 const { NestFactory } = require('@nestjs/core');

@@ -71,6 +71,11 @@ export function transientKindOfWebFailure(error: unknown): TransientFailureKind 
  */
 export const GUMLET_INGEST_JOB_DEADLINE_MS = 35 * 60_000;
 
+/** Web job lock (renewed while alive); also how long a dead worker's job waits before the stalled check frees it. */
+export const VIDEO_LOCK_DURATION_MS = 5 * 60_000;
+/** Laptop shutdowns/sleeps tolerated mid-job before BullMQ fails it. */
+export const VIDEO_MAX_STALLED_COUNT = 5;
+
 /** The ingest promise did not settle within GUMLET_INGEST_JOB_DEADLINE_MS. */
 export class GumletIngestStalledError extends Error {
   override readonly name = 'GumletIngestStalledError';
@@ -115,7 +120,15 @@ export function settleWithin<T>(work: Promise<T>, ms: number, message: string, o
   // One video at a time per worker: ffmpeg already uses every core, so
   // parallel jobs just thrash.
   concurrency: 1,
-  lockDuration: 30 * 60_000,
+  // Five minutes, renewed by BullMQ while the process lives (a Gumlet job now
+  // ends in seconds; a legacy ffmpeg job keeps its lock by renewal). This only
+  // decides how long a job from a worker that was shut down or slept stays
+  // "active" before the stalled check hands it back: 30 minutes made every
+  // laptop restart cost half an hour.
+  lockDuration: VIDEO_LOCK_DURATION_MS,
+  // Each laptop shutdown/sleep mid-job is one stall; allow several before
+  // BullMQ fails the job (the library default is 1).
+  maxStalledCount: VIDEO_MAX_STALLED_COUNT,
   // `stalledInterval` comes from the shared profile; the explicit 60s here was
   // the same value, and centralising it keeps the Redis polling budget in one
   // place. `drainDelay` is the one that was never set and cost the most.

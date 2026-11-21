@@ -17,6 +17,7 @@ import { deferForTransientFailure, type WithTransientDeferral } from '../transie
 import {
   HlsTranscoder,
   type HlsLadderResult,
+  type RungCheckpoint,
   TranscodeDiskPressureError,
   TranscodeEnvironmentError,
   TranscodeOutputError,
@@ -35,7 +36,10 @@ import { formatBytes, pauseHolds, ScratchGuard, type PauseState } from './scratc
 export const DEFER_WHEN_PAUSED_MS = 60_000;
 export const DEFER_WHEN_DISK_LOW_MS = 5 * 60_000;
 /** See the processor options: interruptions of the host are routine here. */
-export const MOBILE_MAX_STALLED_COUNT = 5;
+// A laptop that sleeps or shuts down mid-encode stalls the job once per
+// interruption (its lock lapses). Each stall only costs a re-run - and with rung
+// checkpoints, only the unfinished rungs - so the budget allows many.
+export const MOBILE_MAX_STALLED_COUNT = 10;
 /** How often the worker makes sure a full pause has also paused the queue. */
 export const PAUSE_RECONCILE_MS = 30_000;
 /**
@@ -78,6 +82,13 @@ export interface EncodedResultNote {
   sourceKey: string;
   at: string;
   result: HlsLadderResult;
+}
+
+/** Finished rungs of one job for one source file, kept in the job's data. */
+export interface RungCheckpointNote {
+  jobId: string;
+  sourceKey: string;
+  rungs: RungCheckpoint[];
 }
 
 export const DB_FINISH_RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000, 120_000, 240_000, 300_000, 300_000, 300_000, 300_000];
@@ -263,8 +274,20 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
     }
   }
 
+  /** This job's checkpoints for this source file; anything else is ignored. */
+  private checkpointedRungs(
+    notes: RungCheckpointNote | null | undefined,
+    jobId: string,
+    sourceKey: string,
+  ): RungCheckpoint[] {
+    return notes && notes.jobId === jobId && notes.sourceKey === sourceKey && Array.isArray(notes.rungs) ? notes.rungs : [];
+  }
+
   async process(
-    job: Job<MobileTranscodeJobData & WithTransientDeferral & { encodedResult?: EncodedResultNote | null }>,
+    job: Job<
+      MobileTranscodeJobData &
+        WithTransientDeferral & { encodedResult?: EncodedResultNote | null; rungCheckpoints?: RungCheckpointNote | null }
+    >,
     token?: string,
   ): Promise<unknown> {
     if (job.name !== MOBILE_VIDEO_JOBS.transcode) return null;
@@ -372,6 +395,10 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
       } else {
         const stopWatch = this.watchOwnership(videoId, owner);
         try {
+          // Rungs THIS job (generation) already finished for THIS file.
+          const notes = job.data.rungCheckpoints;
+          const completedRungs =
+            notes && notes.jobId === owner.jobId && notes.sourceKey === sourceKey ? notes.rungs : undefined;
           result = await this.transcoder.run({
             videoId,
             sourceKey,
@@ -379,6 +406,29 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
             ladder,
             encrypt,
             durationSeconds,
+            completedRungs,
+            // Both are bounded by the transcoder (CHECKPOINT_PERSIST_TIMEOUT_MS):
+            // job.updateData waits indefinitely while Redis is unreachable.
+            // job.updateData sets job.data locally first, so later writes in
+            // this run build on it even when an earlier one is still queued.
+            onRungCompleted: async (rung) => {
+              const rungs = this.checkpointedRungs(job.data.rungCheckpoints, owner!.jobId, sourceKey).filter(
+                (r) => r.tier !== rung.tier,
+              );
+              await job.updateData({
+                ...job.data,
+                rungCheckpoints: { jobId: owner!.jobId, sourceKey, rungs: [...rungs, rung] },
+              });
+            },
+            onRungInvalidated: async (tier) => {
+              const rungs = this.checkpointedRungs(job.data.rungCheckpoints, owner!.jobId, sourceKey).filter(
+                (r) => r.tier !== tier,
+              );
+              await job.updateData({
+                ...job.data,
+                rungCheckpoints: { jobId: owner!.jobId, sourceKey, rungs },
+              });
+            },
             // Progress is informational. It is not awaited: with Redis briefly
             // unreachable, awaiting it would stall (offline queue) or fail (error)
             // an encode that does not need Redis at all.

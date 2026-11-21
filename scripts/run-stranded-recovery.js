@@ -15,6 +15,8 @@ for (const line of fs.readFileSync(envFile, 'utf8').split(/\r?\n/)) {
   process.env[trimmed.slice(0, eq)] = trimmed.slice(eq + 1);
 }
 delete process.env.RUN_WORKERS;
+// Never run the background Gumlet status monitor inside an operator script.
+process.env.GUMLET_MONITOR_ENABLED = 'false';
 
 const { NestFactory } = require('@nestjs/core');
 const { AppModule } = require(path.join(ROOT, 'dist', 'src', 'app.module'));
@@ -23,7 +25,8 @@ const { VideosService } = require(path.join(ROOT, 'dist', 'src', 'modules', 'vid
 (async () => {
   const app = await NestFactory.createApplicationContext(AppModule, { bufferLogs: false });
   const videos = app.get(VideosService);
-  const result = await videos.recoverStrandedVideos();
+  // Same lock as the scheduled and boot sweeps: never two sweeps at once.
+  const result = await videos.recoverStrandedVideosExclusive('operator-script');
   console.log('SWEEP RESULT: ' + JSON.stringify(result));
   await app.close();
   process.exit(0);

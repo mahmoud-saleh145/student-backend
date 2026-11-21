@@ -13,6 +13,7 @@ import { VideosService } from './videos.service';
 import { GumletMigrationService } from './gumlet-migration.service';
 import { LessonVideoService } from './lesson-video.service';
 import { NewVideoAnnouncerModule } from './new-video-announcer.module';
+import { GumletStatusMonitor } from './gumlet-status-monitor.service';
 import { VideoPipelineReconciler } from './video-pipeline-reconciler.service';
 
 @Module({
@@ -37,6 +38,9 @@ import { VideoPipelineReconciler } from './video-pipeline-reconciler.service';
     // a restart between the commit and the enqueue). In-process, so it does
     // not need a worker to be running.
     VideoPipelineReconciler,
+    // Finishes Gumlet videos in the background (worker AND API), so a web job
+    // ends as soon as its asset id is recorded.
+    GumletStatusMonitor,
   ],
   exports: [
     VideosService,

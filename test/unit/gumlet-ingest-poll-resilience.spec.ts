@@ -1,6 +1,6 @@
 import { Logger } from '@nestjs/common';
 
-import { GumletIngestService } from 'src/modules/videos/gumlet-ingest.service';
+import { GUMLET_JOB_POLL_BUDGET_MS, GumletIngestService } from 'src/modules/videos/gumlet-ingest.service';
 import { GumletRequestError } from 'src/modules/playback/gumlet-drm.service';
 import { buildDrmVerification, fetchManifestViaGlobalFetch } from './helpers/drm-doubles';
 
@@ -159,6 +159,9 @@ function harness(opts: {
     { propagateDurationToAttachedLessons: jest.fn().mockResolvedValue(0) } as never,
   );
 
+  // These tests exercise the in-job polling path (GUMLET_JOB_POLL_BUDGET_SECONDS > 0),
+  // kept as the no-redeploy rollback. The default (submit and release) has its own tests.
+  (service as unknown as { jobPollBudgetMs: number }).jobPollBudgetMs = GUMLET_JOB_POLL_BUDGET_MS;
   return { service, updates, gumlet, getAsset, fetchManifest, drmVerification };
 }
 
@@ -204,9 +207,9 @@ describe('gumletError reports the cause it actually observed', () => {
     // packaged media may therefore be asserted in the row.
     expect(t.fetchManifest).not.toHaveBeenCalled();
 
-    const written = t.updates.at(-1);
-    expect(String(written?.gumletError)).not.toMatch(/not CENC-encrypted/i);
-    expect(String(written?.gumletError)).toMatch(/could not be established|not configured/i);
+    // Since 2026-11-21 (review H1) such a process writes NOTHING: no claim
+    // about the media, and no status change.
+    expect(t.updates).toHaveLength(0);
   });
 
   it('DOES report an unencrypted manifest when this process could read one', async () => {
@@ -232,16 +235,17 @@ describe('gumletError reports the cause it actually observed', () => {
     expect(t.updates.at(-1)?.gumletError).toBeNull();
   });
 
-  it('keeps FAILED for an unverifiable asset on the Gumlet path (documented, unchanged)', async () => {
-    // The status semantics are deliberately NOT changed by this fix - see the
-    // KNOWN AMBIGUITY block in processFromJob(). This pins the current behaviour
-    // so that changing it later is a visible, tested edit rather than a drift.
+  it('CHANGED 2026-11-21 (review H1): an unverifiable asset is left PROCESSING, never FAILED', async () => {
+    // This used to pin FAILED (the "KNOWN AMBIGUITY"). A misconfigured process
+    // took healthy lectures offline that way. PROCESSING Gumlet rows are now
+    // re-checked by a process that CAN verify (status monitor, recovery sweep),
+    // so the row is simply left for it.
     const t = harness({ platformUsable: false });
     jest.spyOn(global, 'fetch').mockResolvedValue({ ok: true, text: async () => DRM_MANIFEST } as never);
 
     await t.service.sync('v1');
 
-    expect(t.updates.at(-1)?.status).toBe('FAILED');
+    expect(t.updates.every((u) => u.status !== 'FAILED' && u.status !== 'READY')).toBe(true);
   });
 
   it('never marks a ready asset playable without a real CENC check', async () => {
@@ -394,7 +398,7 @@ describe('processFromJob stops spinning on a ready-but-unplayable asset', () => 
     expect(t.updates.at(-1)?.status).toBe('FAILED');
   });
 
-  it('does NOT exit early when this process cannot judge the media', async () => {
+  it('CHANGED 2026-11-21: exits at once when this process cannot judge the media, leaving the row for one that can', async () => {
     const t = harness({ platformUsable: false });
     jest.spyOn(t.service, 'adopt').mockResolvedValue({ assetId: 'a1', status: 'pre-queued' });
     jest.spyOn(global, 'fetch').mockResolvedValue({ ok: true, text: async () => DRM_MANIFEST } as never);
@@ -406,13 +410,14 @@ describe('processFromJob stops spinning on a ready-but-unplayable asset', () => 
       return realSync(id);
     });
 
-    // The terminal condition is gated on isPlatformUsable(). Here the verdict is
-    // not the process's to give, so the loop must keep going and end on the
-    // budget instead - which the advancing clock makes reachable.
+    // Gumlet is done ('ready'); re-polling cannot change that, and the verdict
+    // is not this process's to give. It used to spin for the whole 20-minute
+    // budget; now it ends after one look and writes nothing.
     const res = await t.service.processFromJob('v1', 'key');
 
-    expect(iterations).toBeGreaterThan(1);
+    expect(iterations).toBe(1);
     expect(res).toEqual({ handled: true, status: 'ready', playable: false });
+    expect(t.updates.every((u) => u.status !== 'FAILED')).toBe(true);
     // Never playable, on either path.
     expect(t.updates.every((u) => u.status !== 'READY')).toBe(true);
   });
