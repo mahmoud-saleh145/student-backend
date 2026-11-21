@@ -163,9 +163,12 @@ const GUMLET_NOT_SENT_CODES: ReadonlySet<string> = new Set(['ENOTFOUND', 'EAI_AG
 
 /**
  * Asset creation got no answer (timeout or network error after the request
- * may have been sent). Gumlet may or may not have created the asset, so this
- * must never be retried automatically: a retry is how a second billable asset
- * gets made. An operator checks Gumlet for the `edu-video:<id>` tag first.
+ * may have been sent). Gumlet may or may not have created the asset.
+ *
+ * The CREATE is never simply repeated. The ingest keeps its creation claim on
+ * the row, and the next attempt first looks the asset up by its tag
+ * (`GumletIngestService.adopt`): a found asset is recorded, and a new one is
+ * only created once the claim has gone stale with nothing found.
  */
 export class GumletCreationOutcomeUnknownError extends Error {
   override readonly name = 'GumletCreationOutcomeUnknownError';
@@ -175,10 +178,48 @@ export class GumletCreationOutcomeUnknownError extends Error {
   ) {
     super(
       `Gumlet asset creation got no answer (${reason}); an asset may exist under tag ` +
-        `${tags.join(', ') || '(none)'}. Not retried automatically - check Gumlet before retrying.`,
+        `${tags.join(', ') || '(none)'}. The next attempt looks it up by tag before creating anything.`,
     );
   }
 }
+
+/**
+ * The tag every asset this platform creates carries: `edu-video:<videoId>`.
+ *
+ * GUMLET NORMALISES IT. Observed on 2026-11-20: an asset created with
+ * `edu-video:cmwp0i2sx…` is stored and listed as `edu-videocmwp0i2sx…` (the
+ * colon is dropped), and `GET …/list/<workspace>?tag=edu-video:<id>` returns
+ * nothing while `?tag=edu-video<id>` returns the asset. So the tag is SENT in
+ * its readable form and always COMPARED and QUERIED in its normalised form.
+ */
+export function gumletVideoTag(videoId: string): string {
+  return `edu-video:${videoId}`;
+}
+
+/** The form Gumlet stores and filters by (no ':'). */
+export function normalizeGumletTag(tag: string): string {
+  return tag.replace(/:/g, '').trim();
+}
+
+/**
+ * One asset from a list-by-tag lookup, reduced to what an ADOPTION decision
+ * needs. The source URL is never kept: only the object path it points at,
+ * which is what proves the asset was made from this video's stored file.
+ */
+export interface GumletAssetCandidate {
+  assetId: string;
+  status: string;
+  tags: string[];
+  workspaceId: string | null;
+  /** Decoded object path of the source URL Gumlet fetched (no host, no query). */
+  sourceObjectPath: string | null;
+  sizeBytes: number | null;
+  drmSystems: string[] | null;
+  createdAtMs: number | null;
+}
+
+/** Above this many assets for ONE video tag, something is badly wrong. */
+export const GUMLET_TAG_LOOKUP_MAX = 20;
 
 /** True for HTTP statuses that describe the provider, not the asset. */
 export function isTransientHttpStatus(status: number): boolean {
@@ -195,6 +236,39 @@ export function parseGumletDrmSystems(drm: unknown): string[] | null {
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter((s) => s.length > 0);
+}
+
+/** Reduces one listed asset to an adoption candidate. Never keeps the URL. */
+export function toCandidate(raw: unknown): GumletAssetCandidate {
+  const a = (raw ?? {}) as {
+    asset_id?: unknown;
+    status?: unknown;
+    tag?: unknown;
+    workspace_id?: unknown;
+    collection_id?: unknown;
+    created_at?: unknown;
+    input?: { source_url?: unknown; size?: unknown; transformations?: { drm?: unknown } };
+  };
+  let sourceObjectPath: string | null = null;
+  if (typeof a.input?.source_url === 'string') {
+    try {
+      sourceObjectPath = decodeURIComponent(new URL(a.input.source_url).pathname).replace(/^\/+/, '') || null;
+    } catch {
+      sourceObjectPath = null;
+    }
+  }
+  const workspace =
+    typeof a.workspace_id === 'string' ? a.workspace_id : typeof a.collection_id === 'string' ? a.collection_id : null;
+  return {
+    assetId: typeof a.asset_id === 'string' ? a.asset_id : '',
+    status: typeof a.status === 'string' ? a.status : 'unknown',
+    tags: Array.isArray(a.tag) ? a.tag.filter((t): t is string => typeof t === 'string') : [],
+    workspaceId: workspace,
+    sourceObjectPath,
+    sizeBytes: typeof a.input?.size === 'number' && Number.isFinite(a.input.size) ? a.input.size : null,
+    drmSystems: a.input?.transformations ? parseGumletDrmSystems(a.input.transformations.drm) : null,
+    createdAtMs: typeof a.created_at === 'number' && Number.isFinite(a.created_at) ? a.created_at : null,
+  };
 }
 
 const WIDEVINE_LICENSE_BASE = 'https://widevine.gumlet.com/licence';
@@ -585,6 +659,57 @@ export class GumletDrmService {
         ? parseGumletDrmSystems(a.input.transformations.drm)
         : null,
     };
+  }
+
+  /**
+   * Every asset in this workspace that carries `tag` (read-only GET).
+   *
+   * This is what makes asset creation idempotent: before creating an asset for
+   * a video, and after a create whose answer was lost, the ingest asks Gumlet
+   * which assets already carry that video's tag. The query uses the normalised
+   * tag (see `gumletVideoTag`).
+   *
+   * Throws a GumletRequestError when the answer is not a complete, readable
+   * list: a caller that cannot see the full list must not conclude "no asset
+   * exists" and create one. More than GUMLET_TAG_LOOKUP_MAX results is treated
+   * the same way (non-transient) because it cannot be a normal state for one
+   * video and paging through it is not something to guess at.
+   */
+  async findAssetsByTag(tag: string): Promise<GumletAssetCandidate[]> {
+    if (!this.isAssetApiConfigured()) {
+      throw new AppException(ErrorCode.VIDEO_UNAVAILABLE, {
+        message: 'Gumlet asset API is not configured',
+      });
+    }
+    const normalized = normalizeGumletTag(tag);
+    const url =
+      `https://api.gumlet.com/v1/video/assets/list/${encodeURIComponent(this.cfg.workspaceId as string)}` +
+      `?tag=${encodeURIComponent(normalized)}`;
+    const res = await this.timedFetch(url, { headers: { authorization: `Bearer ${this.cfg.apiKey}` } }, 'Gumlet asset lookup by tag');
+    if (!res.ok) {
+      throw new GumletRequestError(
+        `Gumlet asset lookup by tag failed with HTTP ${res.status}`,
+        isTransientHttpStatus(res.status),
+        res.status,
+      );
+    }
+    const json = (await res.json().catch(() => null)) as
+      | { all_assets?: unknown[]; total_asset_count?: number }
+      | unknown[]
+      | null;
+    const list = Array.isArray(json) ? json : json && Array.isArray(json.all_assets) ? json.all_assets : null;
+    if (!list) {
+      throw new GumletRequestError('Gumlet asset lookup by tag returned an unreadable body', true, res.status);
+    }
+    const total = !Array.isArray(json) && typeof json?.total_asset_count === 'number' ? json.total_asset_count : list.length;
+    if (list.length > GUMLET_TAG_LOOKUP_MAX || total > list.length) {
+      throw new GumletRequestError(
+        `Gumlet lists ${total} assets for one video tag; refusing to decide automatically`,
+        false,
+        res.status,
+      );
+    }
+    return list.map((raw) => toCandidate(raw));
   }
 
   /**

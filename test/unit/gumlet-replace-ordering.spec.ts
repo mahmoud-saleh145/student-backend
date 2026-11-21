@@ -66,6 +66,7 @@ function build(over: {
   };
 
   const gumlet = {
+    findAssetsByTag: jest.fn(async (_tag?: string) => [] as unknown[]),
     isAssetApiConfigured: jest.fn(() => over.assetApiConfigured ?? true),
     isSigningConfigured: jest.fn(() => over.signingConfigured ?? true),
   };

@@ -1104,6 +1104,15 @@ export class VideosService {
             gumletAssetId: { not: null },
             updatedAt: { lt: gumletCutoff },
           },
+          // A Gumlet row in PROCESSING with NO asset: an ingest that stopped
+          // between "Gumlet created it" and "the row recorded it" (2026-11-20,
+          // cmwp0i2sx001rho01ap2is9gu). Looked up by tag below, never re-created.
+          {
+            status: VideoStatus.PROCESSING,
+            drmProvider: 'gumlet',
+            gumletAssetId: null,
+            updatedAt: { lt: queuedCutoff },
+          },
         ],
       },
       select: {
@@ -1113,6 +1122,7 @@ export class VideosService {
         lessonId: true,
         courseId: true,
         processingJobId: true,
+        processingStartedAt: true,
         drmProvider: true,
         gumletAssetId: true,
       },
@@ -1157,6 +1167,35 @@ export class VideosService {
       }
 
       if (!video.sourceKey) continue;
+
+      // ---- Gumlet row with no recorded asset: ask Gumlet, by tag -------------
+      // The job is gone, but Gumlet may hold an asset made from this file. If it
+      // does (and it passes every ownership/source/DRM check), it is recorded
+      // and synced: the normal DRM verification then decides READY. If the
+      // lookup cannot complete, nothing is decided on an outage. If Gumlet has
+      // nothing, the row falls through to the legacy rule below, but only once
+      // the 3-hour cutoff has passed, as before.
+      if (video.drmProvider === 'gumlet' && !video.gumletAssetId && video.status === VideoStatus.PROCESSING) {
+        try {
+          const adopted = await this.gumletIngest.reconcileUnrecordedAsset(video.id);
+          if (adopted) {
+            this.logger.warn(
+              `GUMLET_UNRECORDED_ASSET_RECOVERED video=${video.id} asset=${adopted.assetId}; syncing it now`,
+            );
+            await this.gumletIngest
+              .sync(video.id)
+              .catch((e: Error) => this.logger.warn(`video ${video.id}: sync after recovery failed (${e.message}); the next sweep retries`));
+            synced += 1;
+            continue;
+          }
+        } catch (error) {
+          this.logger.warn(
+            `video ${video.id}: could not look its Gumlet asset up (${(error as Error).message}); leaving it for the next sweep`,
+          );
+          continue;
+        }
+        if (!(video.processingStartedAt && video.processingStartedAt < processingCutoff)) continue;
+      }
 
       if (video.status === VideoStatus.PROCESSING) {
         // Conditional: a sync may have finished the video since it was read.
@@ -1947,8 +1986,40 @@ export class VideosService {
   /**
    * Claims a video for mobile processing. False when the job is stale: the
    * video was deleted, its source was replaced, or ANOTHER live job owns it.
+   * See claimMobileProcessing, which also returns the attempt's owner token.
    */
   async markMobileProcessing(videoId: string, sourceKey: string, jobId: string): Promise<boolean> {
+    return (await this.claimMobileProcessing(videoId, sourceKey, jobId)) !== null;
+  }
+
+  /**
+   * The mobile ownership fields of a row, for a running encode to confirm it
+   * still owns the video (MobileVideoProcessor's ownership watch). Read-only.
+   */
+  async mobileOwnership(
+    videoId: string,
+  ): Promise<{ mobileStatus: MobileVideoStatus; mobileJobId: string | null; mobileProcessingStartedAt: Date | null } | null> {
+    return this.prisma.video.findFirst({
+      where: { id: videoId, deletedAt: null },
+      select: { mobileStatus: true, mobileJobId: true, mobileProcessingStartedAt: true },
+    });
+  }
+
+  /**
+   * Claims a video for mobile processing and returns this ATTEMPT's owner
+   * token (the `mobileProcessingStartedAt` it wrote, millisecond precision),
+   * or null when the job must not run.
+   *
+   * A FINISHED GENERATION IS NEVER CLAIMED AGAIN - not even by its own job id.
+   * 2026-11-20, cmwp0i2sx001rho01ap2is9gu: the laptop slept mid-encode, the
+   * job's lock expired, BullMQ handed the job out again, the first run woke up
+   * and recorded READY, and four seconds later the SAME job id re-claimed the
+   * row (the "own job may re-claim" rule below), set it back to PROCESSING and
+   * encoded the whole lecture again. Re-encoding a READY video is always a new
+   * generation (a new job id, recorded as QUEUED first), so READY is refused
+   * for every job, and atomically (the compare-and-set carries the rule too).
+   */
+  async claimMobileProcessing(videoId: string, sourceKey: string, jobId: string): Promise<{ claimedAt: Date } | null> {
     // The source key is the staleness guard: a re-upload changes it, and a
     // deleted row is excluded. The mobile state alone is deliberately NOT part
     // of the claim. `enqueueMobileTranscode` writes QUEUED only after the job is
@@ -1958,9 +2029,15 @@ export class VideosService {
     // BEFORE adding the job, so this window only exists against an older API.)
     const current = await this.prisma.video.findFirst({
       where: { id: videoId, deletedAt: null, sourceKey },
-      select: { mobileStatus: true, mobileJobId: true },
+      select: {
+        mobileStatus: true,
+        mobileJobId: true,
+        mobileRequestedAt: true,
+        mobileProcessedAt: true,
+        mobileProcessingStartedAt: true,
+      },
     });
-    if (!current) return false;
+    if (!current) return null;
 
     // A FINISHED LADDER IS NOT RE-ENCODED BY A JOB THAT DOES NOT OWN THE ROW.
     // Re-encoding a READY video is a deliberate act, and a deliberate act
@@ -1969,11 +2046,29 @@ export class VideosService {
     // pending retry of an attempt the row has since moved past, a duplicate
     // from an older build - and running it would throw away a good ladder to
     // produce the same one again.
-    if (current.mobileStatus === MobileVideoStatus.READY && current.mobileJobId !== jobId) {
+    //
+    // AND A GENERATION THAT ALREADY FINISHED IS NOT RE-ENCODED BY ITS OWN JOB.
+    // The row is READY under THIS job's id and the ladder was recorded after
+    // this job's intent was (`mobileProcessedAt >= mobileRequestedAt`, or no
+    // intent at all - migration jobs): this job already finished, and BullMQ
+    // is running it a second time because its lock expired while the laptop
+    // slept (2026-11-20, cmwp0i2sx001rho01ap2is9gu). Only a READY row whose
+    // intent names this job AFTER the last finished ladder (an older API that
+    // left the row READY while queueing a forced re-encode) is still waiting
+    // for this job, and may be claimed.
+    const pendingOwnIntentOnReady =
+      current.mobileStatus === MobileVideoStatus.READY &&
+      current.mobileJobId === jobId &&
+      current.mobileRequestedAt != null &&
+      current.mobileProcessedAt != null &&
+      current.mobileRequestedAt.getTime() > current.mobileProcessedAt.getTime();
+    if (current.mobileStatus === MobileVideoStatus.READY && !pendingOwnIntentOnReady) {
       this.logger.warn(
-        `mobile job ${jobId} for video ${videoId} steps aside: the video is already mobile-READY (job ${current.mobileJobId ?? 'unknown'})`,
+        current.mobileJobId === jobId
+          ? `MOBILE_GENERATION_ALREADY_READY video=${videoId} job=${jobId}: this generation already finished; not encoding it again`
+          : `mobile job ${jobId} for video ${videoId} steps aside: the video is already mobile-READY (job ${current.mobileJobId ?? 'unknown'})`,
       );
-      return false;
+      return null;
     }
 
     // NO DUPLICATE ENCODES. When the row is QUEUED/PROCESSING for a DIFFERENT
@@ -1991,7 +2086,7 @@ export class VideosService {
       this.logger.warn(
         `mobile job ${jobId} for video ${videoId} steps aside: job ${current.mobileJobId} owns it and is still live`,
       );
-      return false;
+      return null;
     }
 
     // Compare-and-set, so two DIFFERENT jobs racing past the check above
@@ -2000,24 +2095,49 @@ export class VideosService {
     // that write could land between the read above and this one). A job that
     // does not own the row also cannot claim it if it BECAME READY in between
     // (the owner finished meanwhile): the READY rule above, made atomic.
+    // READY is excluded for every branch here, so a row that became READY
+    // between the read above and this write is never claimed - including by
+    // its own job. The one READY row that may be claimed (a pending intent for
+    // this job, above) is claimed only while its last finished ladder is still
+    // the one just read.
+    //
+    // And the claim pins the previous claim token it read
+    // (`mobileProcessingStartedAt`): two attempts of the SAME job claiming at
+    // once (two worker processes after an expired lock) then serialise - the
+    // second matches nothing and steps aside. A new token never equals the old
+    // one, so an attempt can always tell whether the row is still its own.
+    const previous = current.mobileProcessingStartedAt ?? null;
+    const now = Date.now();
+    const claimedAt = new Date(previous && previous.getTime() >= now ? previous.getTime() + 1 : now);
     const claimed = await this.prisma.video.updateMany({
-      where: {
-        id: videoId,
-        deletedAt: null,
-        sourceKey,
-        OR: [
-          { mobileJobId: current.mobileJobId, mobileStatus: { not: MobileVideoStatus.READY } },
-          { mobileJobId: jobId },
-        ],
-      },
+      where: pendingOwnIntentOnReady
+        ? {
+            id: videoId,
+            deletedAt: null,
+            sourceKey,
+            mobileJobId: jobId,
+            mobileStatus: MobileVideoStatus.READY,
+            mobileProcessedAt: current.mobileProcessedAt,
+            mobileProcessingStartedAt: previous,
+          }
+        : {
+            id: videoId,
+            deletedAt: null,
+            sourceKey,
+            mobileProcessingStartedAt: previous,
+            OR: [
+              { mobileJobId: current.mobileJobId, mobileStatus: { not: MobileVideoStatus.READY } },
+              { mobileJobId: jobId, mobileStatus: { not: MobileVideoStatus.READY } },
+            ],
+          },
       data: {
         mobileStatus: MobileVideoStatus.PROCESSING,
         mobileJobId: jobId,
-        mobileProcessingStartedAt: new Date(),
+        mobileProcessingStartedAt: claimedAt,
         mobileError: null,
       },
     });
-    return claimed.count > 0;
+    return claimed.count > 0 ? { claimedAt } : null;
   }
 
   /**
@@ -2033,7 +2153,7 @@ export class VideosService {
      * The source file the encode read and, from the mobile worker, the job
      * that encoded it. Given by the worker; see below.
      */
-    encoded?: { sourceKey: string; jobId?: string },
+    encoded?: { sourceKey: string; jobId?: string; claimedAt?: Date },
   ): Promise<boolean> {
     // The worker's ffprobe measurement of the source it just encoded (and
     // whose segment durations the transcoder verified against it). Zero or
@@ -2051,6 +2171,8 @@ export class VideosService {
           status: true,
           sourceKey: true,
           mobileJobId: true,
+          mobileStatus: true,
+          mobileProcessingStartedAt: true,
         },
       });
 
@@ -2070,6 +2192,52 @@ export class VideosService {
       // duration) of the PREVIOUS recording. Every upload has its own source
       // key, so a result for any other key is stale and is not recorded.
       if (encoded && current.sourceKey !== encoded.sourceKey) return null;
+
+      // THIS GENERATION IS ALREADY RECORDED. An earlier attempt of the same job
+      // (one the laptop's sleep made BullMQ hand out twice), or this very write
+      // re-applied after its first commit lost its acknowledgement. The READY
+      // ladder is left exactly as it is - nothing is rewritten - and the job
+      // counts as done; the idempotent steps after the write still run.
+      if (encoded?.jobId && current.mobileStatus === MobileVideoStatus.READY) {
+        return { ...current, alreadyRecorded: true as const };
+      }
+
+      // A NEWER ATTEMPT OF THIS GENERATION OWNS THE ROW. The row was re-claimed
+      // after this attempt claimed it (its lock expired while it was frozen);
+      // the latest claim owns the shared hls/<id>/ objects, so this result is
+      // discarded rather than recorded over the attempt that is still writing.
+      if (
+        encoded?.claimedAt &&
+        current.mobileProcessingStartedAt?.getTime() !== encoded.claimedAt.getTime()
+      ) {
+        return null;
+      }
+
+      // ATOMIC FINISH. The read above is not a lock: two finishers of the same
+      // generation could both pass it. This guarded write takes the row lock,
+      // so a second finisher waits, then matches nothing once the first has
+      // committed READY - and records nothing.
+      if (encoded?.jobId) {
+        const won = await tx.video.updateMany({
+          where: {
+            id: videoId,
+            sourceKey: encoded.sourceKey,
+            mobileJobId: encoded.jobId,
+            mobileStatus: { not: MobileVideoStatus.READY },
+            ...(encoded.claimedAt ? { mobileProcessingStartedAt: encoded.claimedAt } : {}),
+          },
+          data: { mobileStatus: MobileVideoStatus.READY },
+        });
+        if (won.count === 0) {
+          const latest = await tx.video.findUniqueOrThrow({
+            where: { id: videoId },
+            select: { mobileStatus: true, mobileJobId: true },
+          });
+          return latest.mobileStatus === MobileVideoStatus.READY && latest.mobileJobId === encoded.jobId
+            ? { ...current, alreadyRecorded: true as const }
+            : null;
+        }
+      }
 
       await tx.videoRendition.deleteMany({ where: { videoId } });
       await tx.video.update({
@@ -2099,7 +2267,7 @@ export class VideosService {
           },
         },
       });
-      return current;
+      return { ...current, alreadyRecorded: false as const };
     });
     if (!before) {
       this.logger.warn(
@@ -2108,7 +2276,14 @@ export class VideosService {
       );
       return false;
     }
-    this.logger.log(`video ${videoId} is mobile-READY (${result.renditions.length} renditions)`);
+    if (before.alreadyRecorded) {
+      this.logger.warn(
+        `MOBILE_RESULT_ALREADY_RECORDED video=${videoId} job=${encoded?.jobId}: this generation is already mobile-READY; ` +
+          'nothing rewritten',
+      );
+    } else {
+      this.logger.log(`video ${videoId} is mobile-READY (${result.renditions.length} renditions)`);
+    }
 
     // FROM HERE ON NOTHING MAY THROW. The ladder is recorded; an error now
     // would fail the job, and the queue would encode the whole lecture again
@@ -2160,11 +2335,20 @@ export class VideosService {
    * on the worker): back to QUEUED with the note, so the dashboard explains the
    * wait and the sweep does not count it as a failure.
    */
-  async markMobileDeferred(videoId: string, note: string): Promise<void> {
-    await this.prisma.video.update({
-      where: { id: videoId },
+  async markMobileDeferred(videoId: string, note: string, owner?: { jobId: string }): Promise<void> {
+    // Never over a READY row, and only for the job that owns it.
+    const { count } = await this.prisma.video.updateMany({
+      where: {
+        id: videoId,
+        mobileStatus: { not: MobileVideoStatus.READY },
+        ...(owner ? { mobileJobId: owner.jobId } : {}),
+      },
       data: { mobileStatus: MobileVideoStatus.QUEUED, mobileError: note.slice(0, 1000) },
     });
+    if (count === 0) {
+      this.logger.warn(`video ${videoId}: deferral note not recorded (READY, or owned by another job): ${note}`);
+      return;
+    }
     this.logger.warn(`video ${videoId} mobile processing deferred: ${note}`);
   }
 
@@ -2180,9 +2364,16 @@ export class VideosService {
     error: string,
     attempt: number,
     attempts: number,
+    claimedAt?: Date,
   ): Promise<void> {
     await this.prisma.video.updateMany({
-      where: { id: videoId, mobileJobId: jobId, mobileStatus: MobileVideoStatus.PROCESSING },
+      where: {
+        id: videoId,
+        mobileJobId: jobId,
+        mobileStatus: MobileVideoStatus.PROCESSING,
+        // Only the attempt that holds the claim speaks for the row.
+        ...(claimedAt ? { mobileProcessingStartedAt: claimedAt } : {}),
+      },
       data: {
         mobileStatus: MobileVideoStatus.QUEUED,
         mobileError: `Attempt ${attempt} of ${attempts} failed (${error}). It will be retried automatically.`.slice(0, 1000),
@@ -2191,15 +2382,30 @@ export class VideosService {
     this.logger.warn(`video ${videoId} mobile attempt ${attempt} of ${attempts} failed, retry pending: ${error}`);
   }
 
-  async markMobileFailed(videoId: string, error: string, encoded?: { sourceKey: string }): Promise<void> {
+  async markMobileFailed(
+    videoId: string,
+    error: string,
+    encoded?: { sourceKey: string; jobId?: string; claimedAt?: Date },
+  ): Promise<void> {
     // As with a finished encode: a failure of the encode of a file that has
     // since been replaced says nothing about the file the lecture has now.
+    // And a failure never turns a READY ladder back (a stale or duplicate
+    // attempt of an already finished generation), nor speaks for a row another
+    // job or a newer attempt has claimed.
     const { count } = await this.prisma.video.updateMany({
-      where: { id: videoId, ...(encoded ? { sourceKey: encoded.sourceKey } : {}) },
+      where: {
+        id: videoId,
+        mobileStatus: { not: MobileVideoStatus.READY },
+        ...(encoded ? { sourceKey: encoded.sourceKey } : {}),
+        ...(encoded?.jobId ? { mobileJobId: encoded.jobId } : {}),
+        ...(encoded?.claimedAt ? { mobileProcessingStartedAt: encoded.claimedAt } : {}),
+      },
       data: { mobileStatus: MobileVideoStatus.FAILED, mobileError: error.slice(0, 1000) },
     });
     if (count === 0) {
-      this.logger.warn(`video ${videoId}: a mobile encode failed for a file that has since been replaced; ignored`);
+      this.logger.warn(
+        `video ${videoId}: mobile failure not recorded (file replaced, already mobile-READY, or claimed by another attempt): ${error}`,
+      );
       return;
     }
     this.logger.error(`video ${videoId} mobile processing failed: ${error}`);

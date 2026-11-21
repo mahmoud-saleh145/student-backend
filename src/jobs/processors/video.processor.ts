@@ -7,15 +7,38 @@ import { join } from 'node:path';
 
 import type { VideoConfig } from '../../config/configuration';
 import { describeDatabaseError, isTransientDatabaseError } from '../../database/transient-db-error';
-import { GumletCreationOutcomeUnknownError } from '../../modules/playback/gumlet-drm.service';
+import { GumletCreationOutcomeUnknownError, GumletRequestError } from '../../modules/playback/gumlet-drm.service';
 import {
   GumletAdoptionNotRecordedError,
+  GumletCreationPendingError,
   GumletIngestService,
 } from '../../modules/videos/gumlet-ingest.service';
 import { VideosService } from '../../modules/videos/videos.service';
 import { QUEUE_NAMES, VIDEO_JOBS, type TranscodeJobData } from '../queue.constants';
 import { RESPONSIVE_WORKER } from '../queue.tuning';
+import {
+  deferForTransientFailure,
+  type TransientFailureKind,
+  type WithTransientDeferral,
+} from '../transient-deferral';
 import { HlsTranscoder, TranscodeEnvironmentError } from './hls-transcoder';
+
+/**
+ * Which failures of a web job are about the INFRASTRUCTURE rather than the
+ * video, and so are deferred without using an attempt (see transient-deferral).
+ * Credentials (401/403) are excluded on purpose: they will not clear by
+ * waiting, and an operator should see them at once.
+ */
+export function transientKindOfWebFailure(error: unknown): TransientFailureKind | null {
+  if (isTransientDatabaseError(error)) return 'database';
+  if (error instanceof GumletAdoptionNotRecordedError) return error.retryable ? 'database' : null;
+  if (error instanceof GumletCreationOutcomeUnknownError) return 'gumlet-outcome-unknown';
+  if (error instanceof GumletCreationPendingError) return 'gumlet-create-pending';
+  if (error instanceof GumletRequestError && error.transient && error.httpStatus !== 401 && error.httpStatus !== 403) {
+    return 'provider';
+  }
+  return null;
+}
 
 /**
  * Hard ceiling on one Gumlet ingest inside a job.
@@ -114,7 +137,7 @@ export class VideoProcessor extends WorkerHost {
     this.cfg = config.getOrThrow<VideoConfig>('video');
   }
 
-  async process(job: Job<TranscodeJobData>): Promise<unknown> {
+  async process(job: Job<TranscodeJobData & WithTransientDeferral>, token?: string): Promise<unknown> {
     if (job.name !== VIDEO_JOBS.transcode) return null;
 
     const { videoId, sourceKey, ladder, encrypt } = job.data;
@@ -202,14 +225,37 @@ export class VideoProcessor extends WorkerHost {
         throw new UnrecoverableError(message);
       }
 
-      // GUMLET MAY OR MAY NOT HAVE CREATED THE ASSET.
+      // AN INFRASTRUCTURE OUTAGE IS NOT A VERDICT, AND IT IS NOT AN ATTEMPT.
       //
-      // The create request was sent but its answer never arrived. Retrying
-      // could create a duplicate billable asset, so the job is not retried.
-      // The row records no asset, so nothing can resume it automatically; it
-      // is marked FAILED with a reason that names the Gumlet tag to check
-      // before a staff retry (otherwise the sweep would fail it hours later
-      // with a generic "retry" reason that invites the duplicate).
+      // The database or Gumlet was unreachable, or a create's answer was lost.
+      // The job goes back to the delayed set with a growing, jittered delay and
+      // its attempts untouched, for a bounded window per kind. It is safe to run
+      // again: the claim is a compare-and-set, and `adopt()` looks the asset up
+      // by tag before it would ever create one. This is what turns the 5.5-hour
+      // outage of 2026-11-20 from "both attempts gone in 20 s" into "resumes on
+      // its own within minutes of the database returning".
+      //
+      // `deferForTransientFailure` throws DelayedError when it defers; it
+      // returns false when the window is used up or the job cannot be moved,
+      // and the handling below (unchanged) takes over.
+      const transientKind = transientKindOfWebFailure(error);
+      if (transientKind) {
+        await deferForTransientFailure({
+          job,
+          token,
+          kind: transientKind,
+          logger: this.logger,
+          videoId,
+          detail: isTransientDatabaseError(error) ? describeDatabaseError(error) : message,
+        });
+      }
+
+      // GUMLET MAY OR MAY NOT HAVE CREATED THE ASSET - and reconciling it for
+      // the whole deferral window found nothing conclusive.
+      //
+      // Recorded as FAILED with the reason. A staff retry is now SAFE: the
+      // creation claim and the lookup by tag mean it records an existing asset
+      // rather than creating a second one.
       if (error instanceof GumletCreationOutcomeUnknownError) {
         this.logger.error(`transcode for ${videoId} stopped without retry: ${message}`);
         await this.videos.markFailed(videoId, message).catch((markError: unknown) =>
@@ -254,9 +300,15 @@ export class VideoProcessor extends WorkerHost {
       // the database is the thing that is down, so there is nowhere to write a
       // failure either. The message names the asset for the operator.
       if (error instanceof GumletAdoptionNotRecordedError) {
+        // DB-only: the queue's retry reconciles by tag, so it may retry.
+        if (error.retryable) throw error;
         this.logger.error(`transcode for ${videoId} stopped without retry: ${message}`);
         throw new UnrecoverableError(message);
       }
+
+      // Another attempt is creating the asset: never create in parallel, and
+      // never record a failure for a video that is being processed.
+      if (error instanceof GumletCreationPendingError) throw error;
 
       const reason =
         error instanceof TranscodeEnvironmentError

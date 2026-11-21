@@ -249,6 +249,8 @@ function ingestHarness(opts: { reads?: () => boolean; writes?: () => boolean } =
     fetchManifest: jest.fn(fetchManifestViaGlobalFetch),
     assetHasDrm: (t: string) =>
       /urn:mpeg:dash:mp4protection:2011/.test(t) && /cenc:default_KID=/.test(t),
+    // Lookup by tag before any create (no existing asset by default).
+    findAssetsByTag: jest.fn(async (_tag?: string) => [] as unknown[]),
     createAsset: jest.fn(async () => ({ assetId: ASSET, status: 'pre-queued', playbackUrl: null })),
     getAsset: jest.fn(async () => {
       // Gumlet moves on by itself: first poll processing, then ready.

@@ -163,6 +163,8 @@ function build(opts: {
     isAssetApiConfigured: () => true,
     isSigningConfigured: () => true,
     isAssetPlayable: (s: string) => s === 'ready',
+    // Lookup by tag before any create (no existing asset by default).
+    findAssetsByTag: jest.fn(async (_tag?: string) => [] as unknown[]),
     createAsset: jest.fn(async () => {
       created += 1;
       return { assetId: `asset_new_${created}`, status: 'pre-queued', playbackUrl: null };

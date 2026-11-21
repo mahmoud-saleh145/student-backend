@@ -5,17 +5,22 @@ import { DelayedError, Queue, type Job } from 'bullmq';
 import { readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import { MobileVideoStatus } from '@prisma/client';
+
 import type { VideoConfig } from '../../config/configuration';
 import { describeDatabaseError, isTransientDatabaseError } from '../../database/transient-db-error';
 import { VideosService, withinQueueTimeout } from '../../modules/videos/videos.service';
 import { MOBILE_PARK_MS } from '../mobile-park';
 import { MOBILE_VIDEO_JOBS, QUEUE_NAMES, type MobileTranscodeJobData } from '../queue.constants';
 import { RESPONSIVE_WORKER } from '../queue.tuning';
+import { deferForTransientFailure, type WithTransientDeferral } from '../transient-deferral';
 import {
   HlsTranscoder,
+  type HlsLadderResult,
   TranscodeDiskPressureError,
   TranscodeEnvironmentError,
   TranscodeOutputError,
+  TranscodeSupersededError,
 } from './hls-transcoder';
 import {
   DEFER_FOR_ENCODE_SLOT_MS,
@@ -42,6 +47,40 @@ export const PAUSE_RECONCILE_MS = 30_000;
  * to cost an attempt, and a full re-encode, for a brief Neon/network blip.
  */
 export const DB_WRITE_RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000, 120_000];
+
+/**
+ * The CLAIM is retried in place only briefly (~50 s). Nothing has been done yet,
+ * so a longer outage costs nothing to wait out in the delayed set instead,
+ * where it holds no encode slot and uses no attempt (transient-deferral.ts).
+ */
+export const DB_CLAIM_RETRY_DELAYS_MS = [5_000, 15_000, 30_000];
+
+/**
+ * The FINISH write is retried in place for much longer (~28 min): the ladder
+ * is already encoded and on R2, and giving up means encoding it all again. On
+ * 2026-11-20 one 17-minute lecture was fully encoded three times because this
+ * window was 3.8 min and the outage was 5.5 h. Past this window the job is
+ * deferred (no attempt used); the re-run overwrites the same R2 keys.
+ */
+/**
+ * How often a running encode confirms it still owns the video (see
+ * MobileVideoProcessor.watchOwnership). One indexed read per minute.
+ */
+export const OWNERSHIP_CHECK_MS = 60_000;
+
+/**
+ * A finished, verified ladder remembered in the job's own data, so a re-run of
+ * the SAME job (its finish write was lost to an outage, or its lock expired
+ * after the encode) records it instead of encoding the lecture again.
+ */
+export interface EncodedResultNote {
+  jobId: string;
+  sourceKey: string;
+  at: string;
+  result: HlsLadderResult;
+}
+
+export const DB_FINISH_RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000, 120_000, 240_000, 300_000, 300_000, 300_000, 300_000];
 
 /**
  * The independent mobile pipeline.
@@ -118,8 +157,14 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
   };
   /** Interval of the pause reconciler; a field only so a real-queue test can shorten it. */
   protected pauseReconcileMs = PAUSE_RECONCILE_MS;
-  /** In-place DB retry waits; a field only so a test can shorten them. */
-  protected dbRetryDelaysMs: number[] = DB_WRITE_RETRY_DELAYS_MS;
+  /**
+   * In-place DB retry waits for BOTH writes; a field only so a test can shorten
+   * them. When unset, the claim uses DB_CLAIM_RETRY_DELAYS_MS and the finish
+   * DB_FINISH_RETRY_DELAYS_MS.
+   */
+  protected dbRetryDelaysMs: number[] | null = null;
+  /** Ownership watch interval; a field only so a test can shorten it. */
+  protected ownershipCheckMs = OWNERSHIP_CHECK_MS;
   private reconcileTimer: NodeJS.Timeout | null = null;
   /** One reconcile at a time: a hung Redis must not pile them up. */
   private reconciling = false;
@@ -218,7 +263,10 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
     }
   }
 
-  async process(job: Job<MobileTranscodeJobData>, token?: string): Promise<unknown> {
+  async process(
+    job: Job<MobileTranscodeJobData & WithTransientDeferral & { encodedResult?: EncodedResultNote | null }>,
+    token?: string,
+  ): Promise<unknown> {
     if (job.name !== MOBILE_VIDEO_JOBS.transcode) return null;
 
     const { videoId, sourceKey, ladder, encrypt, trigger, durationSeconds } = job.data;
@@ -294,30 +342,61 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
     this.logger.log(`mobile transcode ${videoId} (job ${job.id}, ${trigger})`);
     this.guard.noteActive({ videoId, jobId: String(job.id), startedAt: new Date().toISOString(), progress: 0 });
 
+    // This attempt's ownership of the row, once claimed: the job id is the
+    // generation, `claimedAt` tells two attempts of the same job apart.
+    let owner: { jobId: string; claimedAt: Date } | null = null;
     try {
-      const claimed = await this.withDbRetry('claim', videoId, () =>
-        this.videos.markMobileProcessing(videoId, sourceKey, String(job.id)),
+      const claim = await this.withDbRetry('claim', videoId, () =>
+        this.videos.claimMobileProcessing(videoId, sourceKey, String(job.id)),
       );
-      if (!claimed) {
+      if (!claim) {
+        // Includes "this generation is already mobile-READY": a job that the
+        // laptop's sleep made BullMQ hand out a second time completes here,
+        // without encoding anything or touching the READY row.
         this.logger.warn(`skipping stale mobile job ${job.id} for video ${videoId}`);
         return { videoId, skipped: true };
       }
+      const mine = { jobId: String(job.id), claimedAt: claim.claimedAt };
+      owner = mine;
 
-      const result = await this.transcoder.run({
-        videoId,
-        sourceKey,
-        workDir,
-        ladder,
-        encrypt,
-        durationSeconds,
-        // Progress is informational. It is not awaited: with Redis briefly
-        // unreachable, awaiting it would stall (offline queue) or fail (error)
-        // an encode that does not need Redis at all.
-        onProgress: (pct) => {
-          this.guard.noteProgress(videoId, pct);
-          job.updateProgress(pct).catch(() => undefined);
-        },
-      });
+      // REUSE a ladder this same job already encoded, verified and uploaded,
+      // when only its finish write was lost (database outage, expired lock).
+      const saved = job.data.encodedResult;
+      let result: HlsLadderResult;
+      if (saved && saved.jobId === owner.jobId && saved.sourceKey === sourceKey) {
+        this.logger.warn(
+          `MOBILE_ENCODE_REUSED video=${videoId} job=${job.id} encodedAt=${saved.at}: recording the ladder this job ` +
+            'already encoded instead of encoding it again',
+        );
+        result = saved.result;
+      } else {
+        const stopWatch = this.watchOwnership(videoId, owner);
+        try {
+          result = await this.transcoder.run({
+            videoId,
+            sourceKey,
+            workDir,
+            ladder,
+            encrypt,
+            durationSeconds,
+            // Progress is informational. It is not awaited: with Redis briefly
+            // unreachable, awaiting it would stall (offline queue) or fail (error)
+            // an encode that does not need Redis at all.
+            onProgress: (pct) => {
+              this.guard.noteProgress(videoId, pct);
+              job.updateProgress(pct).catch(() => undefined);
+            },
+          });
+        } finally {
+          stopWatch();
+        }
+        // Remember it before the finish write, so a lost finish never costs a
+        // second encode. Best effort: without Redis it is simply not reused.
+        const note: EncodedResultNote = { jobId: owner.jobId, sourceKey, at: new Date().toISOString(), result };
+        await Promise.resolve()
+          .then(() => job.updateData({ ...job.data, encodedResult: note }))
+          .catch(() => undefined);
+      }
 
       const recorded = await this.withDbRetry('finish', videoId, () => this.videos.markMobileReady(
         videoId,
@@ -335,12 +414,16 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
           encryptionKeyId: result.isEncrypted ? (result.encryptionKeyId ?? `derived:${videoId}`) : undefined,
           renditions: result.renditions,
         },
-        // The file this encode read: a result for a file that was replaced
-        // while it ran is not recorded.
-        { sourceKey, jobId: String(job.id) },
+        // The file this encode read, and the attempt that encoded it: a result
+        // for a replaced file, another generation, or an attempt that has been
+        // superseded by a newer claim is not recorded; a generation that is
+        // already READY is left exactly as it is.
+        { sourceKey, jobId: mine.jobId, claimedAt: mine.claimedAt },
       ));
       if (recorded === false) {
-        this.logger.warn(`mobile job ${job.id} for video ${videoId} finished for a replaced file; nothing recorded`);
+        this.logger.warn(
+          `mobile job ${job.id} for video ${videoId}: result not recorded (file replaced, or another job/attempt owns the row)`,
+        );
         return { videoId, skipped: true };
       }
 
@@ -349,9 +432,29 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
 
-      // A database outage is not a verdict on the video: leave the row as it
-      // is and let the queue's bounded, jittered retry come back to it.
+      // THIS ATTEMPT WAS SUPERSEDED while it encoded: the generation became
+      // READY elsewhere, or a newer attempt re-claimed the row. Nothing is
+      // written; the job ends without spending an attempt or a failure.
+      if (error instanceof TranscodeSupersededError) {
+        this.logger.warn(`MOBILE_ATTEMPT_SUPERSEDED video=${videoId} job=${job.id}: ${message}; stopped, nothing recorded`);
+        return { videoId, skipped: true, superseded: true };
+      }
+
+      // A database outage is not a verdict on the video, and it is not an
+      // attempt either: the row is left as it is and the job is deferred with
+      // a growing, jittered delay for a bounded window (transient-deferral.ts).
+      // Only once that window is used up does it fall back to the queue's
+      // attempts, as before. Safe to run again: the claim is a compare-and-set
+      // on (sourceKey, job id) and the ladder overwrites the same R2 keys.
       if (isTransientDatabaseError(error)) {
+        await deferForTransientFailure({
+          job,
+          token,
+          kind: 'database',
+          logger: this.logger,
+          videoId,
+          detail: describeDatabaseError(error),
+        });
         this.logger.warn(
           `video ${videoId}: database unreachable during mobile processing (${describeDatabaseError(error)}; ` +
             `job ${job.id}, attempt ${job.attemptsMade + 1} of ${job.opts?.attempts ?? 1})`,
@@ -365,7 +468,7 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
       if (error instanceof TranscodeDiskPressureError) {
         this.logger.warn(`video ${videoId}: ${message}; deferring until the scratch volume recovers`);
         await this.videos
-          .markMobileDeferred(videoId, `Paused for disk space: ${message}`)
+          .markMobileDeferred(videoId, `Paused for disk space: ${message}`, owner ? { jobId: owner.jobId } : undefined)
           .catch((e: Error) => this.logger.error(`video ${videoId}: could not record the deferral (${e.message})`));
         this.guard.noteDeferred(videoId, 'disk pressure during encode');
         return this.defer(job, token, this.deferMs.disk, 'disk pressure');
@@ -389,9 +492,13 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
       const attempts = job.opts?.attempts ?? 1;
       try {
         if (attempt < attempts) {
-          await this.videos.markMobileRetrying(videoId, String(job.id), reason, attempt, attempts);
+          await this.videos.markMobileRetrying(videoId, String(job.id), reason, attempt, attempts, owner?.claimedAt);
         } else {
-          await this.videos.markMobileFailed(videoId, reason, { sourceKey });
+          await this.videos.markMobileFailed(videoId, reason, {
+            sourceKey,
+            jobId: String(job.id),
+            ...(owner ? { claimedAt: owner.claimedAt } : {}),
+          });
         }
       } catch (markError) {
         this.logger.error(
@@ -404,6 +511,44 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
       await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
       await slot.release();
     }
+  }
+
+  /**
+   * While an encode runs, confirm every `ownershipCheckMs` that this attempt
+   * still owns the video. If the row became READY, belongs to another job, or
+   * was re-claimed by a newer attempt of this job (its lock expired while the
+   * laptop slept), the encode is stopped before it writes more of the shared
+   * `hls/<id>/` objects. A read that fails (database outage) decides nothing.
+   * Returns the function that stops the watch.
+   */
+  private watchOwnership(videoId: string, owner: { jobId: string; claimedAt: Date }): () => void {
+    let checking = false;
+    const timer = setInterval(() => {
+      if (checking) return;
+      checking = true;
+      void this.videos
+        .mobileOwnership(videoId)
+        .then((row) => {
+          if (row === undefined) return; // unknown: decide nothing
+          const why =
+            row === null
+              ? 'the video no longer exists'
+              : row.mobileStatus === MobileVideoStatus.READY
+                ? `this generation is already mobile-READY (job ${row.mobileJobId ?? 'unknown'})`
+                : row.mobileJobId !== owner.jobId
+                  ? `job ${row.mobileJobId ?? 'none'} now owns the video`
+                  : row.mobileProcessingStartedAt?.getTime() !== owner.claimedAt.getTime()
+                    ? 'a newer attempt of this job re-claimed the video'
+                    : null;
+          if (why) this.transcoder.abortSuperseded(why);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          checking = false;
+        });
+    }, this.ownershipCheckMs);
+    timer.unref();
+    return () => clearInterval(timer);
   }
 
   /**
@@ -429,7 +574,7 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
    * as before (attempt + backoff).
    */
   private async withDbRetry<T>(what: 'claim' | 'finish', videoId: string, op: () => Promise<T>): Promise<T> {
-    const waits = this.dbRetryDelaysMs;
+    const waits = this.dbRetryDelaysMs ?? (what === 'claim' ? DB_CLAIM_RETRY_DELAYS_MS : DB_FINISH_RETRY_DELAYS_MS);
     for (let i = 0; ; i += 1) {
       try {
         return await op();

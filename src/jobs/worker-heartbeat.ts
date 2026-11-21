@@ -1,4 +1,6 @@
-import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bullmq';
+import { Injectable, Logger, Optional, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
+import type { Queue } from 'bullmq';
 import { ConfigService } from '@nestjs/config';
 import { spawn } from 'node:child_process';
 import { cpus, freemem, hostname, loadavg, totalmem } from 'node:os';
@@ -6,7 +8,10 @@ import { join } from 'node:path';
 
 import type { VideoConfig } from '../config/configuration';
 import { RedisService } from '../redis/redis.service';
+import { DatabaseHealthMonitor, type DatabaseHealthSnapshot } from './database-health.monitor';
 import { type ActiveJobNote, type PauseState, ScratchGuard, type ScratchSnapshot } from './processors/scratch-guard';
+import { QUEUE_NAMES } from './queue.constants';
+import { transientDeferralCounters, type TransientFailureKind } from './transient-deferral';
 
 /**
  * Worker liveness, visible from the API.
@@ -114,7 +119,23 @@ export interface WorkerHeartbeatPayload {
   /** Mobile encodes running in this process right now. */
   activeJobs?: ActiveJobNote[];
   lastDeferral?: { videoId: string; why: string; at: string } | null;
+  /**
+   * Can this worker reach the DATABASE (not: is the process alive)? See
+   * DatabaseHealthMonitor. Absent on workers built before this field existed.
+   */
+  db?: DatabaseHealthSnapshot;
+  /** Jobs this process deferred through an infrastructure outage, per kind. */
+  transientDeferrals?: Record<TransientFailureKind, { count: number; lastAt: string | null }>;
+  /**
+   * Queue backlog, refreshed every BACKLOG_EVERY_BEATS beats rather than every
+   * beat: each read is several Redis commands, and the Upstash plan is metered.
+   */
+  backlog?: { at: string; video: Record<string, number> | null; mobile: Record<string, number> | null } | null;
 }
+
+/** The backlog is read every 10th beat (~10 min at the 60 s interval). */
+export const BACKLOG_EVERY_BEATS = 10;
+const BACKLOG_STATES = ['wait', 'active', 'delayed', 'prioritized', 'failed', 'paused'] as const;
 
 export function configuredQueues(spec: string | undefined = process.env.WORKER_QUEUES): string[] | 'all' {
   const names = (spec ?? '')
@@ -163,12 +184,41 @@ export class WorkerHeartbeat implements OnModuleInit, OnModuleDestroy {
   private readonly queues = configuredQueues();
   private readonly key = heartbeatKeyFor(this.queues);
 
+  private beats = 0;
+  private backlog: WorkerHeartbeatPayload['backlog'] = null;
+
   constructor(
     private readonly redis: RedisService,
     config: ConfigService,
     private readonly guard: ScratchGuard,
+    // Optional so a process (or a test) without them still beats.
+    @Optional() private readonly dbHealth?: DatabaseHealthMonitor,
+    @Optional() @InjectQueue(QUEUE_NAMES.video) private readonly videoQueue?: Queue,
+    @Optional() @InjectQueue(QUEUE_NAMES.mobileVideo) private readonly mobileQueue?: Queue,
   ) {
     this.cfg = config.getOrThrow<VideoConfig>('video');
+  }
+
+  /** Best effort, bounded; a failure keeps the previous reading. */
+  private async refreshBacklog(): Promise<void> {
+    const read = async (q?: Queue): Promise<Record<string, number> | null> => {
+      if (!q) return null;
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          q.getJobCounts(...BACKLOG_STATES),
+          new Promise<null>((resolve) => {
+            timer = setTimeout(() => resolve(null), 5_000);
+          }),
+        ]);
+      } catch {
+        return null;
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    const [video, mobile] = await Promise.all([read(this.videoQueue), read(this.mobileQueue)]);
+    if (video || mobile) this.backlog = { at: new Date().toISOString(), video, mobile };
   }
 
   async onModuleInit(): Promise<void> {
@@ -199,6 +249,8 @@ export class WorkerHeartbeat implements OnModuleInit, OnModuleDestroy {
   }
 
   private async beat(): Promise<void> {
+    if (this.beats % BACKLOG_EVERY_BEATS === 0) await this.refreshBacklog();
+    this.beats += 1;
     const [scratch, pause] = await Promise.all([
       this.guard.snapshot(join(this.cfg.workDir, 'mobile')).catch(() => undefined),
       this.guard.pauseState().catch(() => undefined),
@@ -217,6 +269,9 @@ export class WorkerHeartbeat implements OnModuleInit, OnModuleDestroy {
       pause,
       activeJobs: this.guard.activeJobs(),
       lastDeferral: this.guard.lastDeferredJob(),
+      db: this.dbHealth?.snapshot(),
+      transientDeferrals: transientDeferralCounters(),
+      backlog: this.backlog,
     };
     await this.redis
       .setJson(this.key, payload, WORKER_HEARTBEAT_TTL_SECONDS)

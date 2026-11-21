@@ -69,6 +69,8 @@ function ingestHarness(rowOverrides: Record<string, unknown> = {}) {
     fetchManifest: fetchManifestViaGlobalFetch,
     assetHasDrm: jest.fn(() => true),
     dashManifestUrl: jest.fn(() => 'https://video.gumlet.io/ws_1/a_1/main.mpd'),
+    // Lookup by tag before any create (no existing asset by default).
+    findAssetsByTag: jest.fn(async (_tag?: string) => [] as unknown[]),
     createAsset: jest.fn(async (_p?: unknown) => ({ assetId: 'a_1', status: 'queued' as string, playbackUrl: null as string | null })),
     getAsset: jest.fn(async (_p?: unknown) => ({
       assetId: 'a_1', status: 'ready' as string, progress: 100,
@@ -110,7 +112,8 @@ describe('automatic Gumlet ingestion', () => {
     const t = ingestHarness();
     await t.service.adopt('v_1');
 
-    const written = t.updates[0];
+    // The first write is the creation claim; the adoption is the write that records the asset.
+    const written = t.updates.find((u) => u.gumletAssetId)!;
     expect(written.drmProvider).toBe('gumlet');
     expect(written.gumletAssetId).toBe('a_1');
     // Intent is recorded...
@@ -125,7 +128,7 @@ describe('automatic Gumlet ingestion', () => {
     // after its asset is replaced.
     const t = ingestHarness({ gumletAssetId: null, drmVerifiedAt: new Date(Date.now() - 1000) });
     await t.service.adopt('v_1');
-    expect(t.updates[0].drmVerifiedAt).toBeNull();
+    expect(t.updates.find((u) => u.gumletAssetId)!.drmVerifiedAt).toBeNull();
   });
 
   it('hands Gumlet a presigned SOURCE url, never a viewer-bound media url', async () => {
@@ -170,8 +173,10 @@ describe('Gumlet failures never expose the original video', () => {
 
     await expect(t.service.adopt('v_1')).rejects.toThrow(/storage minutes quota/);
 
-    // Nothing was written that could imply success.
-    expect(t.updates).toHaveLength(0);
+    // Nothing was written that could imply success. The only writes are the
+    // creation claim and its release (bookkeeping: no asset, no status).
+    expect(t.updates.filter((u) => !(Object.keys(u).every((k) => k === 'gumletStatus' || k === 'gumletUpdatedAt')))).toHaveLength(0);
+    expect(t.updates.at(-1)).toMatchObject({ gumletStatus: null });
     // And the row still has no asset, so playback refuses it.
     expect(t.row.gumletAssetId).toBeNull();
     expect(t.row.status).toBe('UPLOADING');
