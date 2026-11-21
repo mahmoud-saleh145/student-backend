@@ -215,3 +215,29 @@ describe('GumletIngestService.sync - no false READY', () => {
     expect(h.row.processingError).toBeNull();
   });
 });
+
+describe('GumletIngestService.sync - a process that cannot verify DRM decides nothing (review H1)', () => {
+  it('a READY-at-Gumlet asset is left exactly as it was: never FAILED, nothing written', async () => {
+    const h = build({ asset: { status: 'ready' }, platformUsable: false });
+    h.drmVerification.verify.mockResolvedValue({ playable: false, reason: 'DRM_DISABLED_ON_PLATFORM', detail: '' } as never);
+    await expect(h.service.sync('vid_1')).resolves.toEqual({ assetId: 'asset_old', status: 'ready', playable: false });
+    expect(h.row.status).toBe('PROCESSING');
+    expect(h.row.gumletError).toBeNull();
+    expect(h.updateManyCalls).toHaveLength(0);
+  });
+
+  it('a process that CAN verify still refuses an unencrypted asset (FAILED, as before)', async () => {
+    const h = build({ asset: { status: 'ready' }, playable: false, platformUsable: true });
+    await h.service.sync('vid_1');
+    expect(h.row.status).toBe('FAILED');
+    expect(h.row.gumletError).toBe('not CENC'); // the verifier's own explanation
+  });
+
+  it('REVIEW M-a: a verification that could not reach Gumlet/the CDN writes nothing (no FAILED on a network blip)', async () => {
+    const h = build({ asset: { status: 'ready' }, platformUsable: true });
+    h.drmVerification.verify.mockResolvedValue({ playable: false, reason: 'VERIFICATION_UNAVAILABLE', detail: 'timeout' } as never);
+    await expect(h.service.sync('vid_1')).resolves.toEqual({ assetId: 'asset_old', status: 'ready', playable: false });
+    expect(h.row.status).toBe('PROCESSING');
+    expect(h.updateManyCalls).toHaveLength(0);
+  });
+});

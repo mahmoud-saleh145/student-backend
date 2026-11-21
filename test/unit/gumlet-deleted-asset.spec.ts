@@ -4,7 +4,7 @@ import {
   GUMLET_ASSET_DELETED_MESSAGE,
   isTerminalGumletFailure,
 } from 'src/modules/videos/gumlet-failure';
-import { GumletIngestService } from 'src/modules/videos/gumlet-ingest.service';
+import { GUMLET_JOB_POLL_BUDGET_MS, GumletIngestService } from 'src/modules/videos/gumlet-ingest.service';
 import { MAX_SOURCE_BYTES, VideosService } from 'src/modules/videos/videos.service';
 import { buildDrmVerification } from './helpers/drm-doubles';
 
@@ -133,6 +133,9 @@ function harness(opts: { drmProvider?: string | null; status?: string; gumletSta
     { propagateDurationToAttachedLessons: jest.fn().mockResolvedValue(0) } as never,
     { record: jest.fn(async () => undefined) } as never,
   );
+  // These tests exercise the in-job polling path (GUMLET_JOB_POLL_BUDGET_SECONDS > 0),
+  // kept as the no-redeploy rollback. The default (submit and release) has its own tests.
+  (service as unknown as { jobPollBudgetMs: number }).jobPollBudgetMs = GUMLET_JOB_POLL_BUDGET_MS;
   return { service, row, writes, gumlet, drmVerification };
 }
 

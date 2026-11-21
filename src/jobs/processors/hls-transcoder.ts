@@ -57,6 +57,64 @@ export interface HlsRendition {
   sizeBytes: number;
 }
 
+/**
+ * A rung (one rendition) this job already encoded, verified and uploaded.
+ * Remembered in the job's data after each rung, so a re-run of the SAME job
+ * (laptop shut down, worker restarted, lock expired) skips it instead of
+ * encoding it again. Only reused when the key scheme is identical and the
+ * rung's playlist is still on R2 (a playlist is uploaded after all of its
+ * segments, so its presence means the rung's upload completed).
+ */
+export interface RungCheckpoint extends HlsRendition {
+  tier: number;
+  /** Key scheme the rung was encrypted with (null = unencrypted). */
+  keyVersion: string | null;
+  encryptionKeyId: string | null;
+  at: string;
+  /**
+   * What was verified on R2 when the rung finished. Reuse requires every one
+   * of these to still match, so a rung that a later attempt started to
+   * overwrite is never taken for a finished one.
+   */
+  playlistBytes: number;
+  segmentCount: number;
+  firstSegment: { key: string; bytes: number } | null;
+  lastSegment: { key: string; bytes: number } | null;
+}
+
+/** A checkpoint write/delete that Redis cannot answer is given up after this. */
+export const CHECKPOINT_PERSIST_TIMEOUT_MS = 5_000;
+
+/** R2 marker present while a rung's upload is in progress (and after a crash mid-upload). */
+export const RUNG_UPLOAD_MARKER = '.upload-in-progress';
+
+/**
+ * Runs a checkpoint callback, never waiting more than CHECKPOINT_PERSIST_TIMEOUT_MS.
+ * A Redis outage queues BullMQ commands indefinitely (maxRetriesPerRequest:
+ * null); the encode must not wait for it. Returns whether it completed in time.
+ */
+export async function persistCheckpointBounded(
+  write: () => Promise<void> | void,
+  timeoutMs = CHECKPOINT_PERSIST_TIMEOUT_MS,
+): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([
+      Promise.resolve()
+        .then(write)
+        .then(() => true)
+        .catch(() => false),
+      timeout,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export interface HlsLadderResult {
   probe: ProbeResult;
   renditions: HlsRendition[];
@@ -234,6 +292,9 @@ export class HlsTranscoder implements OnModuleDestroy {
   /** Set by abortSuperseded(): this attempt lost ownership of the video. */
   private superseded: string | null = null;
 
+  /** See CHECKPOINT_PERSIST_TIMEOUT_MS; a field so tests can shorten it. */
+  protected checkpointTimeoutMs = CHECKPOINT_PERSIST_TIMEOUT_MS;
+
   constructor(
     private readonly storage: StorageService,
     config: ConfigService,
@@ -341,6 +402,12 @@ export class HlsTranscoder implements OnModuleDestroy {
     /** Duration already on the row, if any; sharpens the preflight before download. */
     durationSeconds?: number;
     onProgress?: (percent: number) => Promise<void> | void;
+    /** Rungs this job already finished (see RungCheckpoint). */
+    completedRungs?: RungCheckpoint[];
+    /** Called after each rung is verified and uploaded, to persist its checkpoint. */
+    onRungCompleted?: (rung: RungCheckpoint) => Promise<void> | void;
+    /** Called before a checkpointed rung is uploaded again, to forget its checkpoint. */
+    onRungInvalidated?: (tier: number) => Promise<void> | void;
   }): Promise<HlsLadderResult> {
     const { videoId, sourceKey, workDir } = params;
     const progress = async (pct: number) => {
@@ -451,6 +518,17 @@ export class HlsTranscoder implements OnModuleDestroy {
       // Encoding is ~70% of a rung's time, uploading the rest; ffmpeg's own
       // progress stream drives the first part so a 2-hour encode is not one
       // silent jump.
+      // CHECKPOINT: a rung this job already finished is reused, not re-encoded.
+      const done = await this.reusableRung(params.completedRungs, rung, keyVersion, encryptionKeyId ?? null, hlsPrefix);
+      if (done) {
+        this.logger.warn(
+          `HLS_RUNG_REUSED video=${videoId} tier=${tier}p finishedAt=${done.at}: verified on R2, not encoded again`,
+        );
+        renditions.push({ height: done.height, width: done.width, bitrateKbps: done.bitrateKbps, playlistKey: done.playlistKey, sizeBytes: done.sizeBytes });
+        await progress(10 + ((index + 1) / targets.length) * 75);
+        continue;
+      }
+
       const rungStart = 10 + (index / targets.length) * 75;
       const rungSpan = 75 / targets.length;
       let lastReported = -1;
@@ -490,14 +568,69 @@ export class HlsTranscoder implements OnModuleDestroy {
       // as the source.
       await this.verifyRendition(outDir, probe, keyPath);
 
+      // OVERWRITE PROTECTION. From here this rung's R2 objects are being
+      // replaced. The marker (an R2 object, so it needs no Redis) makes every
+      // later attempt refuse to reuse this rung until the upload has finished
+      // and been verified; the stale checkpoint is also forgotten (bounded).
+      const markerKey = `${hlsPrefix}${tier}p/${RUNG_UPLOAD_MARKER}`;
+      await this.uploadWithRetry(markerKey, () =>
+        this.storage.putObject({
+          bucket: 'media',
+          objectKey: markerKey,
+          body: Buffer.from(new Date().toISOString()),
+          contentType: 'text/plain',
+          cacheControl: 'no-store',
+        }),
+      );
+      if (params.completedRungs?.some((c) => c.tier === tier) && params.onRungInvalidated) {
+        const forgotten = await persistCheckpointBounded(() => params.onRungInvalidated!(tier), this.checkpointTimeoutMs);
+        if (!forgotten) {
+          this.logger.warn(
+            `HLS_CHECKPOINT_INVALIDATE_DEFERRED video=${videoId} tier=${tier}p: Redis did not answer; the R2 upload marker still blocks reuse`,
+          );
+        }
+      }
+
       const uploaded = await this.uploadRendition(outDir, hlsPrefix, tier);
-      renditions.push({
+      // Verified (sizes read back) inside uploadRendition. Only now may the
+      // rung be reused by a later attempt.
+      // deleteObject() swallows its own errors, so confirm the marker is gone.
+      await this.storage.deleteObject('media', markerKey).catch(() => undefined);
+      const markerCleared = await this.storage
+        .objectSizeStrict('media', markerKey)
+        .then((size) => size === null)
+        .catch(() => false);
+      const finished: HlsRendition = {
         height,
         width,
         bitrateKbps: rate.video + rate.audio,
         playlistKey: `${hlsPrefix}${tier}p/index.m3u8`,
         sizeBytes: uploaded.totalBytes,
-      });
+      };
+      renditions.push(finished);
+      // Best effort and bounded: a checkpoint that cannot be saved (or a marker
+      // that could not be removed) only means a re-run encodes this rung again.
+      if (markerCleared && params.onRungCompleted) {
+        const saved = await persistCheckpointBounded(() =>
+          params.onRungCompleted!({
+            ...finished,
+            tier,
+            keyVersion: keyVersion ?? null,
+            encryptionKeyId: encryptionKeyId ?? null,
+            at: new Date().toISOString(),
+            playlistBytes: uploaded.playlistBytes,
+            segmentCount: uploaded.segmentCount,
+            firstSegment: uploaded.firstSegment,
+            lastSegment: uploaded.lastSegment,
+          }),
+          this.checkpointTimeoutMs,
+        );
+        if (!saved) {
+          this.logger.warn(
+            `HLS_CHECKPOINT_NOT_SAVED video=${videoId} tier=${tier}p: Redis did not answer in time; encoding continues`,
+          );
+        }
+      }
       // Free the scratch for this rendition before encoding the next one.
       await rm(outDir, { recursive: true, force: true }).catch(() => undefined);
       await progress(10 + ((index + 1) / targets.length) * 75);
@@ -538,6 +671,52 @@ export class HlsTranscoder implements OnModuleDestroy {
   // ---------------------------------------------------------------------------
   // Planning (pure; unit-tested)
   // ---------------------------------------------------------------------------
+
+  /**
+   * The checkpoint for `rung` if it may be reused. ALL of these must hold:
+   *   - same tier, output size, key scheme and key id (the v2 key id names the
+   *     key root, so a rotated root never matches);
+   *   - its playlist and segments under this video's prefix and rung folder;
+   *   - no upload-in-progress marker for the rung on R2 (an attempt that
+   *     started overwriting it and did not finish leaves one);
+   *   - the playlist, first and last segment on R2 still have the exact sizes
+   *     verified when the rung finished.
+   * Anything else - or any storage read that fails - means "encode it again",
+   * never "assume it is there".
+   */
+  private async reusableRung(
+    checkpoints: RungCheckpoint[] | undefined,
+    rung: PlannedRendition,
+    keyVersion: string | null | undefined,
+    encryptionKeyId: string | null,
+    hlsPrefix: string,
+  ): Promise<RungCheckpoint | null> {
+    const c = checkpoints?.find((x) => x.tier === rung.tier);
+    if (!c) return null;
+    if (c.width !== rung.width || c.height !== rung.height) return null;
+    if ((c.keyVersion ?? null) !== (keyVersion ?? null) || (c.encryptionKeyId ?? null) !== encryptionKeyId) return null;
+    const folder = `${hlsPrefix}${rung.tier}p/`;
+    if (c.playlistKey !== `${folder}index.m3u8`) return null;
+    // A checkpoint without the verification fields is not trusted.
+    if (!(c.playlistBytes > 0) || !(c.segmentCount > 0) || !c.firstSegment || !c.lastSegment) return null;
+    if (!c.firstSegment.key.startsWith(folder) || !c.lastSegment.key.startsWith(folder)) return null;
+    try {
+      // Strict: 'storage could not be asked' throws (no reuse); only a definite
+      // 'not there' lets the check continue. exists() would answer false for both.
+      if ((await this.storage.objectSizeStrict('media', `${folder}${RUNG_UPLOAD_MARKER}`)) !== null) return null;
+      const probes: Array<[string, number]> = [
+        [c.playlistKey, c.playlistBytes],
+        [c.firstSegment.key, c.firstSegment.bytes],
+        [c.lastSegment.key, c.lastSegment.bytes],
+      ];
+      for (const [key, bytes] of probes) {
+        if ((await this.storage.objectSizeStrict('media', key)) !== bytes) return null;
+      }
+      return c;
+    } catch {
+      return null;
+    }
+  }
 
   /**
    * The ladder for ONE source, from its display dimensions.
@@ -1052,7 +1231,13 @@ export class HlsTranscoder implements OnModuleDestroy {
     outDir: string,
     hlsPrefix: string,
     height: number,
-  ): Promise<{ totalBytes: number }> {
+  ): Promise<{
+    totalBytes: number;
+    playlistBytes: number;
+    segmentCount: number;
+    firstSegment: { key: string; bytes: number } | null;
+    lastSegment: { key: string; bytes: number } | null;
+  }> {
     const files = await readdir(outDir);
     let totalBytes = 0;
 
@@ -1118,7 +1303,14 @@ export class HlsTranscoder implements OnModuleDestroy {
         );
       }
     }
-    return { totalBytes };
+    const seg = (f: string | undefined) => (f ? { key: `${hlsPrefix}${height}p/${f}`, bytes: sizes.get(f)! } : null);
+    return {
+      totalBytes,
+      playlistBytes: body.length,
+      segmentCount: segments.length,
+      firstSegment: seg(segments[0]),
+      lastSegment: seg(segments[segments.length - 1]),
+    };
   }
 
   private async extractThumbnail(

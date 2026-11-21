@@ -65,6 +65,8 @@ for (const line of fs.readFileSync(envFile, 'utf8').split(/\r?\n/)) {
 }
 // The API and the worker are separate processes; this one only ENQUEUES.
 delete process.env.RUN_WORKERS;
+// Never run the background Gumlet status monitor inside an operator script.
+process.env.GUMLET_MONITOR_ENABLED = 'false';
 
 const videoIds = process.argv.slice(3);
 if (videoIds.length === 0) {

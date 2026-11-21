@@ -390,7 +390,10 @@ describe('sync() preserves a working legacy video', () => {
     const res = await t.service.sync('v1');
 
     expect(t.updates.at(-1)?.status).toBeUndefined();
-    expect(String(t.updates.at(-1)?.gumletError)).toMatch(/not CENC-encrypted/i);
+    // The verifier's own reason is recorded (since 2026-11-21, review M-a). On a
+    // legacy row it refuses before reading the manifest, so claiming 'not
+    // CENC-encrypted' here would be a guess.
+    expect(String(t.updates.at(-1)?.gumletError)).toMatch(/not assigned to the Gumlet delivery path/i);
     expect(res.playable).toBe(false);
     (global.fetch as unknown as { mockRestore: () => void }).mockRestore();
   });

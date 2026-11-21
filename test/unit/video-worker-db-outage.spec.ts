@@ -15,7 +15,7 @@ import {
   GumletDrmService,
   GumletRequestError,
 } from 'src/modules/playback/gumlet-drm.service';
-import {
+import { GUMLET_JOB_POLL_BUDGET_MS,
   GumletAdoptionNotRecordedError,
   GumletIngestAbandonedError,
   GumletIngestService,
@@ -297,6 +297,9 @@ function ingestHarness(opts: { reads?: () => boolean; writes?: () => boolean } =
     { propagateDurationToAttachedLessons: jest.fn().mockResolvedValue(0) } as never,
   );
 
+  // These tests exercise the in-job polling path (GUMLET_JOB_POLL_BUDGET_SECONDS > 0),
+  // kept as the no-redeploy rollback. The default (submit and release) has its own tests.
+  (service as unknown as { jobPollBudgetMs: number }).jobPollBudgetMs = GUMLET_JOB_POLL_BUDGET_MS;
   return { service, row, writes, prisma, gumlet, failRead, failWrite };
 }
 

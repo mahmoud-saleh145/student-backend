@@ -235,6 +235,25 @@ export class EnvironmentVariables {
    */
   @IsOptional() @Type(() => Number) @IsInt() @Min(0) @Max(86_400) VIDEO_PIPELINE_RECONCILE_SECONDS?: number;
   /**
+   * Runs GumletStatusMonitor in this process (default false). It also needs
+   * DRM verification, the Gumlet asset API and Redis to be configured here;
+   * see gumlet-status-monitor.service.ts. Without it the web job polls Gumlet
+   * itself, as before.
+   */
+  @toBool() @IsBoolean() @IsOptional() GUMLET_MONITOR_ENABLED?: boolean;
+  /**
+   * Longest gap between two monitor scans (seconds; default 600, minimum 60,
+   * 0 turns the monitor off). See gumlet-status-monitor.service.ts.
+   */
+  @IsOptional() @Type(() => Number) @IsInt() @Min(0) @Max(86_400) GUMLET_MONITOR_IDLE_SECONDS?: number;
+  /**
+   * How long a web job polls Gumlet after submitting (seconds). Unset/0 =
+   * submit and release WHEN the monitor runs in this process, else the old
+   * 20-minute polling. A positive value (max 1200) always polls: the
+   * no-redeploy rollback switch.
+   */
+  @IsOptional() @Type(() => Number) @IsInt() @Min(0) @Max(1200) GUMLET_JOB_POLL_BUDGET_SECONDS?: number;
+  /**
    * Which queues THIS worker process consumes, comma-separated
    * (`video-processing,mobile-video-processing,push-delivery,maintenance,analytics`).
    * Empty = all of them. Lets the CPU-bound mobile transcode run on its own host

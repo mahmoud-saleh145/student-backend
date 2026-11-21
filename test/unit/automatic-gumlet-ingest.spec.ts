@@ -81,6 +81,7 @@ function ingestHarness(rowOverrides: Record<string, unknown> = {}) {
     evaluate: jest.fn(() => ({ playable: true, reason: null })),
     evaluateVideo: jest.fn(async () => ({ playable: true, reason: null })),
     verify: jest.fn(async () => ({ playable: true, reason: null })),
+    isPlatformUsable: () => true,
   };
   const lessonVideos = { propagateDurationToAttachedLessons: jest.fn().mockResolvedValue(0) };
   const service = new GumletIngestService(
