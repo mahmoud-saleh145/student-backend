@@ -1,5 +1,5 @@
 import { InjectQueue, Processor, WorkerHost } from '@nestjs/bullmq';
-import { Logger, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
+import { Logger, type OnApplicationBootstrap, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { DelayedError, Queue, type Job } from 'bullmq';
 import { readdir, rm } from 'node:fs/promises';
@@ -28,12 +28,21 @@ import {
   DEFER_FOR_UPLOADS_MS,
   isHistoricalMobileJob,
   MobileEncodeScheduler,
-  type EncodeSlot,
 } from './mobile-encode-scheduler';
 import { formatBytes, pauseHolds, ScratchGuard, type PauseState } from './scratch-guard';
 
 /** How long a deferred job waits before the worker looks at it again. */
 export const DEFER_WHEN_PAUSED_MS = 60_000;
+/** How often a job that is ready to encode asks for a free encode slot again. */
+export const ENCODE_SLOT_POLL_MS = 15_000;
+
+/**
+ * No encode slot came free within MOBILE_ENCODE_SLOT_WAIT_SECONDS (or the
+ * worker is shutting down while the job waits for one). Not the video's fault:
+ * the job is deferred without using an attempt, and the rungs it already
+ * finished stay checkpointed for the next run.
+ */
+export class EncodeSlotUnavailableError extends Error {}
 export const DEFER_WHEN_DISK_LOW_MS = 5 * 60_000;
 /** See the processor options: interruptions of the host are routine here. */
 // A laptop that sleeps or shuts down mid-encode stalls the job once per
@@ -156,7 +165,7 @@ export const DB_FINISH_RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000, 120_000
   maxStalledCount: MOBILE_MAX_STALLED_COUNT,
   ...RESPONSIVE_WORKER,
 })
-export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, OnModuleDestroy {
+export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, OnApplicationBootstrap, OnModuleDestroy {
   private readonly logger = new Logger(MobileVideoProcessor.name);
   private readonly cfg: VideoConfig;
   /** Deferral intervals; a field only so a real-queue test can shorten them. */
@@ -176,6 +185,16 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
   protected dbRetryDelaysMs: number[] | null = null;
   /** Ownership watch interval; a field only so a test can shorten it. */
   protected ownershipCheckMs = OWNERSHIP_CHECK_MS;
+  /** Encode-slot poll interval; a field only so a test can shorten it. */
+  protected encodeSlotPollMs = ENCODE_SLOT_POLL_MS;
+  /**
+   * Videos with a job running in THIS process. With MOBILE_JOB_CONCURRENCY > 1
+   * two jobs for one video (two generations, a staff retry beside a pending
+   * job) must never share its scratch directory or its R2 prefix at the same
+   * time; the second one is deferred. Across processes the row claim decides.
+   */
+  private readonly activeVideos = new Set<string>();
+  private shuttingDown = false;
   private reconcileTimer: NodeJS.Timeout | null = null;
   /** One reconcile at a time: a hung Redis must not pile them up. */
   private reconciling = false;
@@ -204,6 +223,8 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
    */
   async onModuleInit(): Promise<void> {
     this.startPauseReconciler();
+    // Scratch is per video (`mobile/<videoId>`) and nothing runs before the
+    // worker is up, even with MOBILE_JOB_CONCURRENCY > 1.
     const root = join(this.cfg.workDir, 'mobile');
     const stale = await readdir(root).catch(() => [] as string[]);
     if (stale.length === 0) return;
@@ -213,7 +234,25 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
     this.logger.warn(`removed ${stale.length} stale scratch director${stale.length === 1 ? 'y' : 'ies'} under ${root}`);
   }
 
+  /**
+   * Applies MOBILE_JOB_CONCURRENCY once the BullMQ worker exists. The decorator
+   * keeps 1, so a worker without the setting behaves exactly as before.
+   */
+  onApplicationBootstrap(): void {
+    const n = this.cfg.mobileJobConcurrency ?? 1;
+    if (n <= 1) return;
+    try {
+      this.worker.concurrency = n;
+      this.logger.log(
+        `mobile HLS jobs at once: ${n}; ffmpeg encodes at once (all workers): ${this.cfg.mobileEncodeSlots ?? 1}`,
+      );
+    } catch (error) {
+      this.logger.warn(`could not set mobile job concurrency to ${n} (${(error as Error)?.message ?? error}); staying at 1`);
+    }
+  }
+
   onModuleDestroy(): void {
+    this.shuttingDown = true;
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
     this.reconcileTimer = null;
   }
@@ -295,6 +334,12 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
     const { videoId, sourceKey, ladder, encrypt, trigger, durationSeconds } = job.data;
     const workDir = join(this.cfg.workDir, 'mobile', videoId);
 
+    // Another job for this video is running in this process (concurrency > 1).
+    if (this.activeVideos.has(videoId)) {
+      this.guard.noteDeferred(videoId, 'another job for this video is running here');
+      return this.defer(job, token, this.deferMs.slot, 'another job for this video is running');
+    }
+
     // --- operator holds (see the class comment) -----------------------------
     // A flag that cannot be read is not "not paused": the job is deferred,
     // which uses no attempt.
@@ -352,15 +397,16 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
       return this.defer(job, token, this.deferMs.disk, 'disk');
     }
 
-    // One mobile encode at a time across every worker process.
-    const slot: EncodeSlot | null = await this.scheduler.acquireEncodeSlot(String(job.id)).catch((e: Error) => {
-      this.logger.warn(`could not take the mobile encode slot (${e.message}); deferring ${videoId}`);
-      return null;
-    });
-    if (!slot) {
-      this.guard.noteDeferred(videoId, 'another mobile encode holds the slot');
-      return this.defer(job, token, this.deferMs.slot, 'encode slot busy');
+    // The encode slot (MOBILE_ENCODE_SLOTS across every worker process) is no
+    // longer taken here: the transcoder asks for it right before each ffmpeg
+    // encode and gives it back when that encode exits, so this job's download
+    // and uploads can overlap another job's encode. Checked again, synchronously,
+    // because the awaits above let a second job for this video get this far.
+    if (this.activeVideos.has(videoId)) {
+      this.guard.noteDeferred(videoId, 'another job for this video is running here');
+      return this.defer(job, token, this.deferMs.slot, 'another job for this video is running');
     }
+    this.activeVideos.add(videoId);
 
     this.logger.log(`mobile transcode ${videoId} (job ${job.id}, ${trigger})`);
     this.guard.noteActive({ videoId, jobId: String(job.id), startedAt: new Date().toISOString(), progress: 0 });
@@ -429,6 +475,7 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
                 rungCheckpoints: { jobId: owner!.jobId, sourceKey, rungs },
               });
             },
+            acquireEncodeSlot: (cancelled) => this.waitForEncodeSlot(String(job.id), videoId, cancelled),
             // Progress is informational. It is not awaited: with Redis briefly
             // unreachable, awaiting it would stall (offline queue) or fail (error)
             // an encode that does not need Redis at all.
@@ -512,6 +559,18 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
         throw error;
       }
 
+      // No encode slot came free in time (or the worker is stopping while this
+      // job waited for one). Not an attempt: the row goes back to QUEUED, the
+      // finished rungs stay checkpointed, and the job is looked at again later.
+      if (error instanceof EncodeSlotUnavailableError) {
+        this.logger.warn(`video ${videoId}: ${message}; deferring`);
+        await this.videos
+          .markMobileDeferred(videoId, `Waiting for an encode slot: ${message}`, owner ? { jobId: owner.jobId } : undefined)
+          .catch((e: Error) => this.logger.error(`video ${videoId}: could not record the deferral (${e.message})`));
+        this.guard.noteDeferred(videoId, 'waiting for an encode slot');
+        return this.defer(job, token, this.deferMs.slot, 'no encode slot');
+      }
+
       // The disk watchdog stopped the encode. Not the video's fault and not
       // worth an attempt: the row goes back to QUEUED and the job waits for
       // space. Scratch is removed below; the source on R2 was never touched.
@@ -559,7 +618,50 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
     } finally {
       this.guard.noteFinished(videoId);
       await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
-      await slot.release();
+      this.activeVideos.delete(videoId);
+    }
+  }
+
+  /**
+   * Waits, in this process, for one of the MOBILE_ENCODE_SLOTS encode slots
+   * shared by every worker. BullMQ keeps renewing the job's lock meanwhile, so
+   * waiting costs neither the lock nor an attempt. A Redis error is treated as
+   * "busy" (an encode never starts on an unknown). Gives up with
+   * EncodeSlotUnavailableError after `encodeSlotWaitMs`, or at once when the
+   * worker is shutting down.
+   */
+  private async waitForEncodeSlot(
+    jobId: string,
+    videoId: string,
+    cancelled: () => string | null = () => null,
+  ): Promise<{ release(): Promise<void> }> {
+    const slots = this.cfg.mobileEncodeSlots ?? 1;
+    const deadline = Date.now() + (this.cfg.encodeSlotWaitMs ?? 3 * 60 * 60_000);
+    let announced = false;
+    for (;;) {
+      if (this.shuttingDown) throw new EncodeSlotUnavailableError('the worker is shutting down');
+      // This attempt lost the video while it waited: stop now, take nothing.
+      const why = cancelled();
+      if (why) throw new TranscodeSupersededError(why);
+      const slot = await this.scheduler.acquireEncodeSlot(jobId, slots).catch((e: Error) => {
+        this.logger.warn(`could not take a mobile encode slot (${e.message}); ${videoId} will ask again`);
+        return null;
+      });
+      if (slot) {
+        if (announced) this.logger.log(`video ${videoId}: encode slot taken (${slot.holder})`);
+        return slot;
+      }
+      if (Date.now() >= deadline) {
+        throw new EncodeSlotUnavailableError(
+          `no mobile encode slot came free within ${Math.round((this.cfg.encodeSlotWaitMs ?? 0) / 60_000)} min`,
+        );
+      }
+      if (!announced) {
+        announced = true;
+        this.logger.log(`video ${videoId}: waiting for a mobile encode slot (${slots} in all)`);
+        this.guard.noteDeferred(videoId, 'waiting for an encode slot');
+      }
+      await new Promise((resolve) => setTimeout(resolve, this.encodeSlotPollMs));
     }
   }
 
@@ -590,7 +692,7 @@ export class MobileVideoProcessor extends WorkerHost implements OnModuleInit, On
                   : row.mobileProcessingStartedAt?.getTime() !== owner.claimedAt.getTime()
                     ? 'a newer attempt of this job re-claimed the video'
                     : null;
-          if (why) this.transcoder.abortSuperseded(why);
+          if (why) this.transcoder.abortSuperseded(why, videoId);
         })
         .catch(() => undefined)
         .finally(() => {

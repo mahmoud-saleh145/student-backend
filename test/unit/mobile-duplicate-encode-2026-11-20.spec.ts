@@ -92,7 +92,7 @@ describe('REGRESSION cmwp0i2sx: a job re-delivered after its lock expired', () =
     expect(w.row.mobileStatus).toBe('PROCESSING');
     expect(w.readyWrites).toHaveLength(0);
 
-    expect(tA.transcoder.abortSuperseded).toHaveBeenCalledWith('a newer attempt of this job re-claimed the video');
+    expect(tA.transcoder.abortSuperseded).toHaveBeenCalledWith('a newer attempt of this job re-claimed the video', expect.any(String));
     // B (the owner) finishes: READY exactly once.
     tB.finish(0);
     await expect(b).resolves.toMatchObject({ renditions: 1 });

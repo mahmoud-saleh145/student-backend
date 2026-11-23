@@ -224,6 +224,24 @@ export const videoConfig = registerAs('video', () => ({
   /** ffmpeg `-threads`; 0 lets ffmpeg decide (every core). */
   transcodeThreads: num(process.env.TRANSCODE_THREADS, 0),
   /**
+   * Mobile HLS jobs this worker process runs at once (BullMQ concurrency).
+   * 1 (default) is the original behaviour. 2 lets one video download or
+   * upload while another encodes; how many ffmpeg ENCODES run at once is still
+   * bounded by `mobileEncodeSlots`, across every worker process.
+   */
+  mobileJobConcurrency: Math.min(4, Math.max(1, Math.floor(num(process.env.MOBILE_JOB_CONCURRENCY, 1)))),
+  /**
+   * ffmpeg ladder encodes allowed at once across EVERY worker process (Redis
+   * leases, see MobileEncodeScheduler). 1 (default) keeps the laptop at one
+   * encode whatever the job concurrency. Raise only on a host with the cores.
+   */
+  mobileEncodeSlots: Math.min(8, Math.max(1, Math.floor(num(process.env.MOBILE_ENCODE_SLOTS, 1)))),
+  /**
+   * How long a job that is ready to encode waits in-process for a free encode
+   * slot before it is deferred instead (no attempt used, finished rungs kept).
+   */
+  encodeSlotWaitMs: Math.max(60, num(process.env.MOBILE_ENCODE_SLOT_WAIT_SECONDS, 3 * 60 * 60)) * 1000,
+  /**
    * Free space that must REMAIN on the scratch volume after a job's budget is
    * taken (GB). On the laptop this volume is the Windows system drive, so the
    * reserve is what keeps Windows, Docker's WSL2 image and the other projects

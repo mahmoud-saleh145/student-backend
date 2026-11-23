@@ -206,6 +206,12 @@ export class EnvironmentVariables {
   @toBool() @IsBoolean() HLS_ENCRYPTION_ENABLED = true;
   /** ffmpeg thread cap for the mobile transcode; 0 = all cores. */
   @Type(() => Number) @IsInt() @Min(0) @Max(64) TRANSCODE_THREADS = 0;
+  /** Mobile HLS jobs per worker process (1 = original behaviour). */
+  @Type(() => Number) @IsInt() @Min(1) @Max(4) MOBILE_JOB_CONCURRENCY = 1;
+  /** ffmpeg ladder encodes at once across every worker process. */
+  @Type(() => Number) @IsInt() @Min(1) @Max(8) MOBILE_ENCODE_SLOTS = 1;
+  /** In-process wait for a free encode slot before deferring the job. */
+  @Type(() => Number) @IsInt() @Min(60) @Max(86400) MOBILE_ENCODE_SLOT_WAIT_SECONDS = 10800;
   @Type(() => Number) @IsInt() @Min(0) @Max(2000) TRANSCODE_MIN_FREE_GB = 25;
   @Type(() => Number) @IsInt() @Min(5) @Max(600) TRANSCODE_DISK_CHECK_SECONDS = 15;
 
