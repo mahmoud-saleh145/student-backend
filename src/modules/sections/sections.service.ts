@@ -72,6 +72,9 @@ export class SectionsService {
               select: {
                 id: true,
                 status: true,
+                // The mobile (HLS) pipeline's own state, shown beside `status`
+                // (the web/Gumlet pipeline) so neither is read as the other.
+                mobileStatus: true,
                 durationSeconds: true,
                 deletedAt: true,
                 processingError: true,
@@ -91,6 +94,7 @@ export class SectionsService {
                     lessonId: true,
                     courseId: true,
                     status: true,
+                    mobileStatus: true,
                     durationSeconds: true,
                     processingError: true,
                     updatedAt: true,
@@ -136,7 +140,10 @@ export class SectionsService {
           video: shown
             ? {
                 id: shown.id,
+                // Web (Gumlet) pipeline.
                 status: shown.status,
+                // Mobile (self-hosted HLS) pipeline; independent of `status`.
+                mobileStatus: shown.mobileStatus,
                 durationSeconds: shown.durationSeconds,
                 processingError: shown.processingError,
                 updatedAt: shown.updatedAt,
