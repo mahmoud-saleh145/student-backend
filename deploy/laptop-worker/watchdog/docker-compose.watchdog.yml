@@ -28,6 +28,8 @@ services:
       WATCHDOG_NETFAIL_WINDOW_MIN: ${WATCHDOG_NETFAIL_WINDOW_MIN:-120}
       WATCHDOG_NETFAIL_THRESHOLD: ${WATCHDOG_NETFAIL_THRESHOLD:-3}
       WATCHDOG_DRY_RUN: ${WATCHDOG_DRY_RUN:-false}
+      # 0 = every failure counts (default). ~300 when the worker runs MOBILE_JOB_CONCURRENCY > 1.
+      WATCHDOG_NETFAIL_CLUSTER_SEC: ${WATCHDOG_NETFAIL_CLUSTER_SEC:-0}
     volumes:
       - ./watchdog.js:/watchdog/watchdog.js:ro
       - ${WATCHDOG_LOG_DIR:-C:/edu-watchdog/logs}:/var/log/edu-watchdog
