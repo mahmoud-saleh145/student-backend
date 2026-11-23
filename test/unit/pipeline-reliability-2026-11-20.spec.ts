@@ -776,7 +776,7 @@ function mobileProcessor() {
 describe('MobileVideoProcessor: a database outage does not spend attempts or encodes', () => {
   const data = { videoId: VIDEO, sourceKey: SOURCE_KEY, ladder: [480], encrypt: true, trigger: 'upload' as const, durationSeconds: 1056 };
 
-  it('7. the claim keeps failing with P1001: deferred before any encode, slot released, row untouched', async () => {
+  it('7. the claim keeps failing with P1001: deferred before any encode, no encode slot ever taken, row untouched', async () => {
     const t = mobileProcessor();
     t.videos.markMobileProcessing.mockRejectedValue(p1001());
     const job = bullJob(MOBILE_VIDEO_JOBS.transcode, data);
@@ -785,7 +785,9 @@ describe('MobileVideoProcessor: a database outage does not spend attempts or enc
     expect(t.transcoder.run).not.toHaveBeenCalled();
     expect(t.videos.markMobileRetrying).not.toHaveBeenCalled();
     expect(t.videos.markMobileFailed).not.toHaveBeenCalled();
-    expect(t.slot.release).toHaveBeenCalled();
+    // The encode slot is taken only right before an ffmpeg encode (MOBILE_ENCODE_SLOTS),
+    // so a job deferred at the claim never held one and has nothing to release.
+    expect(t.slot.release).not.toHaveBeenCalled();
     expect(job.data.transientDeferral).toMatchObject({ kind: 'database', count: 1 });
   });
 

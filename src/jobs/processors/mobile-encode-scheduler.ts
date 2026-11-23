@@ -53,6 +53,12 @@ export const UPLOAD_WAIT_STALE_MS = 3 * 60 * 60_000;
 const UPLOAD_SCAN_LIMIT = 50;
 
 export const ENCODE_SLOT_KEY = 'mobile:transcode:slot';
+
+/** Redis keys of encode slots 1..n: slot 1 is the original key, then `:2`, `:3`, … */
+export function encodeSlotKeys(n: number): string[] {
+  const count = Math.max(1, Math.floor(n) || 1);
+  return Array.from({ length: count }, (_, i) => (i === 0 ? ENCODE_SLOT_KEY : `${ENCODE_SLOT_KEY}:${i + 1}`));
+}
 /** The lease outlives a stalled renewal briefly; a crashed holder frees it within this. */
 export const ENCODE_SLOT_TTL_MS = 120_000;
 export const ENCODE_SLOT_RENEW_MS = 30_000;
@@ -121,18 +127,33 @@ export class MobileEncodeScheduler {
    * another job (in any process) holds it. The lease is renewed while the
    * encode runs and expires within ENCODE_SLOT_TTL_MS if the holder dies.
    */
-  async acquireEncodeSlot(jobId: string): Promise<EncodeSlot | null> {
-    const key = this.redis.key(ENCODE_SLOT_KEY);
+  async acquireEncodeSlot(jobId: string, slots = 1): Promise<EncodeSlot | null> {
     const holder = `${this.host}:${process.pid}:${jobId}`;
-    const ok = await this.redis.client.set(key, holder, 'PX', ENCODE_SLOT_TTL_MS, 'NX');
-    if (ok !== 'OK') return null;
+    // Slot 1 keeps the original key, so a worker that predates multiple slots
+    // and a newer one still exclude each other on it. A host configured for N
+    // slots may also take slots 2..N; one configured for 1 never looks there.
+    let key: string | null = null;
+    for (const k of encodeSlotKeys(slots)) {
+      const candidate = this.redis.key(k);
+      if ((await this.redis.client.set(candidate, holder, 'PX', ENCODE_SLOT_TTL_MS, 'NX')) === 'OK') {
+        key = candidate;
+        break;
+      }
+    }
+    if (!key) return null;
+    const held = key;
 
     let lost = false;
     const timer = setInterval(() => {
       void this.redis.client
-        .eval(RENEW_SCRIPT, 1, key, holder, String(ENCODE_SLOT_TTL_MS))
-        .then((renewed) => {
-          if (Number(renewed) === 0 && !lost) {
+        .eval(RENEW_SCRIPT, 1, held, holder, String(ENCODE_SLOT_TTL_MS))
+        .then(async (renewed) => {
+          if (Number(renewed) !== 0) return;
+          // The lease lapsed (Redis was unreachable for longer than its TTL).
+          // Take it back if nobody else did; otherwise say so once.
+          const back = await this.redis.client.set(held, holder, 'PX', ENCODE_SLOT_TTL_MS, 'NX').catch(() => null);
+          if (back === 'OK') return;
+          if (!lost) {
             lost = true;
             this.logger.warn(`mobile encode slot for job ${jobId} expired before renewal; the encode continues`);
           }
@@ -141,16 +162,19 @@ export class MobileEncodeScheduler {
     }, ENCODE_SLOT_RENEW_MS);
     timer.unref();
 
+    let released = false;
     return {
       holder,
       release: async () => {
+        if (released) return;
+        released = true;
         clearInterval(timer);
-        await this.redis.client.eval(RELEASE_SCRIPT, 1, key, holder).catch(() => undefined);
+        await this.redis.client.eval(RELEASE_SCRIPT, 1, held, holder).catch(() => undefined);
       },
     };
   }
 
-  /** Who holds the encode slot now (for the heartbeat / diagnostics). */
+  /** Who holds encode slot 1 now (for the heartbeat / diagnostics). */
   async encodeSlotHolder(): Promise<string | null> {
     return this.redis.client.get(this.redis.key(ENCODE_SLOT_KEY)).catch(() => null);
   }

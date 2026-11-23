@@ -13,8 +13,12 @@
  *     - R2             (a 1-key List on the media bucket, read-only).
  *   It PAUSES historical mobile processing when either safety threshold is crossed:
  *     A. an outage (any probe failing) lasting WATCHDOG_OUTAGE_PAUSE_SEC or longer, or
- *     B. WATCHDOG_NETFAIL_THRESHOLD network-type mobile job FAILURES within
- *        WATCHDOG_NETFAIL_WINDOW_MIN (each one burns one of the job's two attempts).
+ *     B. WATCHDOG_NETFAIL_THRESHOLD network-type mobile job FAILURE INCIDENTS within
+ *        WATCHDOG_NETFAIL_WINDOW_MIN (each failure burns one of the job's two attempts).
+ *        An incident is a run of failure events no more than WATCHDOG_NETFAIL_CLUSTER_SEC
+ *        apart. With 0 (the default) every event is its own incident, exactly as before.
+ *        With MOBILE_JOB_CONCURRENCY > 1 one network blip fails every job in flight at
+ *        once; set the cluster to ~300 s so that blip counts once, not once per job.
  *   Pausing = writing the same Redis key, with the same shape, as the API's
  *   POST /videos/mobile/pause. The mobile processor reads it before each job and defers.
  *
@@ -73,6 +77,10 @@ function loadConfig(env = process.env) {
     pauseScope: env.WATCHDOG_PAUSE_SCOPE === 'all' ? 'all' : 'historical',
     netfailWindowMin: num(env.WATCHDOG_NETFAIL_WINDOW_MIN, 120),
     netfailThreshold: num(env.WATCHDOG_NETFAIL_THRESHOLD, 3),
+    // 0 = every failure event counts on its own (the original behaviour). `num()` treats 0 as
+    // unset, so it is parsed separately: 0 is a valid, deliberate value here.
+    netfailClusterSec: Number.isFinite(Number(env.WATCHDOG_NETFAIL_CLUSTER_SEC)) && Number(env.WATCHDOG_NETFAIL_CLUSTER_SEC) >= 0
+      ? Number(env.WATCHDOG_NETFAIL_CLUSTER_SEC) : 0,
     probeTimeoutMs: num(env.WATCHDOG_PROBE_TIMEOUT_MS, 10000),
     prefix: env.WATCHDOG_REDIS_PREFIX || env.REDIS_PREFIX || 'edu',
     dryRun: env.WATCHDOG_DRY_RUN === 'true',
@@ -188,6 +196,23 @@ async function scanNetworkFailures(redis, { keys, windowMin, now }) {
   return { initialized, seen, seeded, recent, historical, untripped: recent.filter((e) => !e.tripped) };
 }
 
+/**
+ * Groups failure events into incidents: sorted by time, an event within `clusterSec` of the
+ * previous event joins its incident. Events without a time each stand alone. clusterSec 0 =
+ * one incident per event (the original count).
+ */
+function countIncidents(events, clusterSec) {
+  if (!clusterSec) return events.length;
+  const timed = events.filter((e) => e.at).map((e) => Date.parse(e.at)).sort((a, b) => a - b);
+  let incidents = events.length - timed.length;
+  let last = null;
+  for (const t of timed) {
+    if (last === null || t - last > clusterSec * 1000) incidents += 1;
+    last = t;
+  }
+  return incidents;
+}
+
 /** Marks events as having tripped the threshold, so they never trip it again. */
 async function markTripped(redis, keys, events) {
   if (!events.length) return;
@@ -255,11 +280,12 @@ function createWatchdog({ redis, probes, cfg, keys = keysFor(cfg.prefix), log, n
       const scan = await scanNetworkFailures(redis, { keys, windowMin: cfg.netfailWindowMin, now: t });
       if (scan.seeded.length) log('netfail_baseline', { note: 'failure ledger created; failures already present are historical (time unknown) and never count as recent', events: scan.seeded });
       if (scan.seen.length) log('netfail_seen', { events: scan.recent.filter((e) => scan.seen.includes(e.event)) });
-      state.netfail = { newFailures: scan.untripped.length, recentFailures: scan.recent.length, historicalFailures: scan.historical.length, awaitingRetry: scan.historical.filter((e) => e.queued).length + scan.recent.filter((e) => e.queued).length };
-      if (scan.untripped.length >= cfg.netfailThreshold && !state.pendingPause) {
-        state.pendingPause = `auto-paused by safety watchdog: ${scan.untripped.length} network-caused mobile job failures in ${cfg.netfailWindowMin} min`;
+      const incidents = countIncidents(scan.untripped, cfg.netfailClusterSec || 0);
+      state.netfail = { newFailures: scan.untripped.length, newIncidents: incidents, recentFailures: scan.recent.length, historicalFailures: scan.historical.length, awaitingRetry: scan.historical.filter((e) => e.queued).length + scan.recent.filter((e) => e.queued).length };
+      if (incidents >= cfg.netfailThreshold && !state.pendingPause) {
+        state.pendingPause = `auto-paused by safety watchdog: ${scan.untripped.length} network-caused mobile job failures (${incidents} incident(s)) in ${cfg.netfailWindowMin} min`;
         await markTripped(redis, keys, scan.untripped);
-        log('threshold_network_failures', { count: scan.untripped.length, jobs: scan.untripped });
+        log('threshold_network_failures', { count: scan.untripped.length, incidents, clusterSec: cfg.netfailClusterSec || 0, jobs: scan.untripped });
       }
     } catch (e) { log('netfail_scan_error', { error: short(e) }); }
 
@@ -282,7 +308,7 @@ function createWatchdog({ redis, probes, cfg, keys = keysFor(cfg.prefix), log, n
     }
 
     try {
-      await redis.set(keys.HEARTBEAT_KEY, JSON.stringify({ at: new Date(t).toISOString(), startedAt: state.startedAt, ticks: state.ticks, probes: results, outageSince: state.outageSince && new Date(state.outageSince).toISOString(), netfail: state.netfail, cfg: { outagePauseSec: cfg.outagePauseSec, netfailThreshold: cfg.netfailThreshold, netfailWindowMin: cfg.netfailWindowMin, pauseScope: cfg.pauseScope, dryRun: cfg.dryRun } }), 'EX', 600);
+      await redis.set(keys.HEARTBEAT_KEY, JSON.stringify({ at: new Date(t).toISOString(), startedAt: state.startedAt, ticks: state.ticks, probes: results, outageSince: state.outageSince && new Date(state.outageSince).toISOString(), netfail: state.netfail, cfg: { outagePauseSec: cfg.outagePauseSec, netfailThreshold: cfg.netfailThreshold, netfailWindowMin: cfg.netfailWindowMin, netfailClusterSec: cfg.netfailClusterSec || 0, pauseScope: cfg.pauseScope, dryRun: cfg.dryRun } }), 'EX', 600);
     } catch { /* heartbeat is best effort */ }
     return results;
   }
@@ -365,4 +391,4 @@ async function main() {
 
 if (require.main === module) main();
 
-module.exports = { createWatchdog, scanNetworkFailures, markTripped, loadConfig, keysFor, NETWORK_FAILURE, LEDGER_TTL_SEC, SNAPSHOT_LUA };
+module.exports = { createWatchdog, scanNetworkFailures, markTripped, countIncidents, loadConfig, keysFor, NETWORK_FAILURE, LEDGER_TTL_SEC, SNAPSHOT_LUA };

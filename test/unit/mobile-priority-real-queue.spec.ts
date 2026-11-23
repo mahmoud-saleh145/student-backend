@@ -76,14 +76,20 @@ type Encode = { videoId: string; trigger: string; start: number; end?: number };
         budgetBytes: 1,
         assessment: { ok: true, freeBytes: 1e12, reservedByOthers: 0, minFreeBytes: 0, shortfallBytes: 0 },
       }),
-      run: async ({ videoId }: { videoId: string }) => {
+      run: async ({ videoId, acquireEncodeSlot }: { videoId: string; acquireEncodeSlot?: () => Promise<{ release(): Promise<void> }> }) => {
+        // Like the real transcoder: the encode slot covers the ffmpeg encode only.
+        const slot = acquireEncodeSlot ? await acquireEncodeSlot() : null;
         const rec: Encode = { videoId, trigger: '', start: Date.now() };
         encodes.push(rec);
         running += 1;
         maxRunning = Math.max(maxRunning, running);
-        await sleep(encodeMs.get(videoId) ?? 150);
-        running -= 1;
-        rec.end = Date.now();
+        try {
+          await sleep(encodeMs.get(videoId) ?? 150);
+        } finally {
+          running -= 1;
+          rec.end = Date.now();
+          await slot?.release();
+        }
         return {
           probe: { durationSeconds: 1, width: 640, height: 360, frameRate: 30, videoCodec: 'h264', audioCodec: 'aac' },
           renditions: [],
@@ -107,6 +113,7 @@ type Encode = { videoId: string; trigger: string; start: number; end?: number };
     };
     const processor = new MobileVideoProcessor(transcoder as never, videos as never, config as never, guard, scheduler, mobile);
     (processor as unknown as { deferMs: Record<string, number> }).deferMs = { paused: 200, uploads: 200, disk: 200, slot: 200 };
+    (processor as unknown as { encodeSlotPollMs: number }).encodeSlotPollMs = 25;
     const w = new Worker(
       QUEUE_NAMES.mobileVideo,
       async (job: Job<MobileTranscodeJobData>, token?: string) => {

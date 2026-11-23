@@ -28,6 +28,8 @@ function build(
     trigger?: MobileTranscodeJobData['trigger'];
     uploadsWaiting?: number | 'unreadable';
     slotBusy?: boolean;
+    /** Encode slot wait before deferring (ms); tiny in tests. */
+    slotWaitMs?: number;
   } = {},
 ) {
   const videos = {
@@ -62,7 +64,13 @@ function build(
             },
           },
     ),
-    run: jest.fn(async () => {
+    // Like the real transcoder: one encode slot per rung's ffmpeg encode, taken
+    // right before it and released right after it.
+    run: jest.fn(async (params: { acquireEncodeSlot?: () => Promise<{ release(): Promise<void> }> }) => {
+      for (let rung = 0; rung < 2; rung += 1) {
+        const s = params?.acquireEncodeSlot ? await params.acquireEncodeSlot() : null;
+        await s?.release();
+      }
       if (opts.runError) throw opts.runError;
       return {
         probe: { durationSeconds: 2654.4, width: 1920, height: 1080, frameRate: 30, videoCodec: 'h264', audioCodec: 'aac' },
@@ -77,7 +85,7 @@ function build(
       };
     }),
   };
-  const config = { getOrThrow: () => ({ workDir: '/tmp/edu-transcode' }) };
+  const config = { getOrThrow: () => ({ workDir: '/tmp/edu-transcode', mobileEncodeSlots: 1, encodeSlotWaitMs: opts.slotWaitMs ?? 1 }) };
   const guard = {
     pauseState: jest.fn(async () => ({ paused: opts.paused ?? false, reason: opts.paused ? 'test' : null, by: null, at: null })),
     noteActive: jest.fn(),
@@ -108,6 +116,7 @@ function build(
     scheduler as never,
     queue as never,
   );
+  (processor as unknown as { encodeSlotPollMs: number }).encodeSlotPollMs = 1;
   const job = {
     id: 'mobile-hls:v_1:1',
     name: MOBILE_VIDEO_JOBS.transcode,
@@ -351,38 +360,66 @@ describe('MobileVideoProcessor', () => {
     });
   });
 
-  describe('one mobile encode at a time, across processes', () => {
-    it('defers when another process holds the encode slot, before claiming the video', async () => {
-      const t = build({ slotBusy: true });
+  describe('one mobile encode at a time, across processes (slot per ffmpeg encode)', () => {
+    it('claims the video, then takes the slot only for each encode and releases it after each', async () => {
+      const t = build();
+      await t.processor.process(t.job);
+      expect(t.videos.markMobileProcessing).toHaveBeenCalled();
+      // two rungs = two encodes = two takes, each with this job's id and the configured slot count
+      expect(t.scheduler.acquireEncodeSlot).toHaveBeenCalledTimes(2);
+      expect(t.scheduler.acquireEncodeSlot).toHaveBeenCalledWith('mobile-hls:v_1:1', 1);
+      expect(t.slot.release).toHaveBeenCalledTimes(2);
+    });
 
+    it('a slot that never frees up defers the job: no attempt, no FAILED, row back to QUEUED', async () => {
+      const t = build({ slotBusy: true });
       await expect(t.processor.process(t.job, 'tok')).rejects.toBeInstanceOf(DelayedError);
-      expect(t.videos.markMobileProcessing).not.toHaveBeenCalled();
-      expect(t.transcoder.run).not.toHaveBeenCalled();
+      expect(t.job.moveToDelayed).toHaveBeenCalled();
+      expect(t.videos.markMobileDeferred).toHaveBeenCalledWith('v_1', expect.stringContaining('encode slot'), expect.anything());
+      expect(t.videos.markMobileFailed).not.toHaveBeenCalled();
+      expect(t.videos.markMobileRetrying).not.toHaveBeenCalled();
       expect(t.guard.noteDeferred).toHaveBeenCalledWith('v_1', expect.stringContaining('slot'));
     });
 
-    it('takes the slot for this job and releases it on success', async () => {
-      const t = build();
-      await t.processor.process(t.job);
-      expect(t.scheduler.acquireEncodeSlot).toHaveBeenCalledWith('mobile-hls:v_1:1');
-      expect(t.slot.release).toHaveBeenCalledTimes(1);
+    it('waits for a busy slot and encodes once it frees up (no deferral)', async () => {
+      const t = build({ slotWaitMs: 60_000 });
+      t.scheduler.acquireEncodeSlot.mockResolvedValueOnce(null as never).mockResolvedValueOnce(null as never);
+      await expect(t.processor.process(t.job)).resolves.toEqual({ videoId: 'v_1', renditions: 2 });
+      expect(t.scheduler.acquireEncodeSlot).toHaveBeenCalledTimes(4);
+      expect(t.job.moveToDelayed).not.toHaveBeenCalled();
     });
 
-    it('releases the slot on failure, on a stale skip, and on a disk-pressure deferral', async () => {
+    it('a Redis error while asking for the slot is "busy", never "free"', async () => {
+      const t = build();
+      t.scheduler.acquireEncodeSlot.mockRejectedValue(new Error('redis down'));
+      await expect(t.processor.process(t.job, 'tok')).rejects.toBeInstanceOf(DelayedError);
+      expect(t.slot.release).not.toHaveBeenCalled();
+    });
+
+    it('releases every slot it took on failure and on a disk-pressure deferral', async () => {
       for (const t of [
         build({ runError: new Error('ffmpeg exited with 1') }),
-        build({ claimed: false }),
         build({ runError: new TranscodeDiskPressureError('below the reserve') }),
       ]) {
         await t.processor.process(t.job, 'tok').catch(() => undefined);
-        expect(t.slot.release).toHaveBeenCalledTimes(1);
+        expect(t.slot.release).toHaveBeenCalledTimes(t.scheduler.acquireEncodeSlot.mock.calls.length);
       }
     });
 
-    it('does not take the slot while the disk preflight defers the job', async () => {
-      const t = build({ preflight: { ok: false, shortfallBytes: 1e9 } });
-      await t.processor.process(t.job, 'tok').catch(() => undefined);
-      expect(t.scheduler.acquireEncodeSlot).not.toHaveBeenCalled();
+    it('never asks for a slot on a stale skip or while the disk preflight defers the job', async () => {
+      for (const t of [build({ claimed: false }), build({ preflight: { ok: false, shortfallBytes: 1e9 } })]) {
+        await t.processor.process(t.job, 'tok').catch(() => undefined);
+        expect(t.scheduler.acquireEncodeSlot).not.toHaveBeenCalled();
+      }
+    });
+
+    it('a worker shutting down while a job waits for the slot defers it instead of hanging', async () => {
+      const t = build({ slotBusy: true, slotWaitMs: 60 * 60_000 });
+      const running = t.processor.process(t.job, 'tok');
+      await new Promise((r) => setTimeout(r, 5));
+      t.processor.onModuleDestroy();
+      await expect(running).rejects.toBeInstanceOf(DelayedError);
+      expect(t.videos.markMobileFailed).not.toHaveBeenCalled();
     });
   });
 

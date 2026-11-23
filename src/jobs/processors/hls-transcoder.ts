@@ -1,5 +1,6 @@
 import { Injectable, Logger, type OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { copyFile, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { availableParallelism } from 'node:os';
@@ -280,17 +281,32 @@ const CHILD_STOP_GRACE_MS = 5_000;
  * delivered to any client holding a live ticket, so a modified client can save
  * the decrypted stream. See docs/MOBILE_VIDEO_PIPELINE.md.
  */
+/** Per-run state of HlsTranscoder (see `runs`). */
+interface RunContext {
+  videoId: string;
+  /** This run's ffmpeg/ffprobe processes. */
+  children: Set<ChildProcess>;
+  /** Why this run's ffmpeg is being killed for disk pressure, if it is. */
+  aborting: string | null;
+  /** Why this run lost ownership of its video, if it did. */
+  superseded: string | null;
+}
+
 @Injectable()
 export class HlsTranscoder implements OnModuleDestroy {
   private readonly logger = new Logger(HlsTranscoder.name);
   private readonly cfg: VideoConfig;
-  /** ffmpeg/ffprobe processes currently running, so a shutdown can stop them. */
+  /** ffmpeg/ffprobe processes currently running (every run), so a shutdown can stop them. */
   private readonly children = new Set<ChildProcess>();
   private stopping = false;
-  /** Set by abortActive(): why the running ffmpeg is being killed, if not a shutdown. */
-  private aborting: string | null = null;
-  /** Set by abortSuperseded(): this attempt lost ownership of the video. */
-  private superseded: string | null = null;
+  /**
+   * One context per run() in flight. With MOBILE_JOB_CONCURRENCY > 1 two videos
+   * run in this process at once, so "aborting" and "superseded" belong to a
+   * run, never to the transcoder: stopping one video must not touch the other.
+   */
+  private readonly runs = new Set<RunContext>();
+  /** The run the current async call chain belongs to (set by run()). */
+  private readonly runScope = new AsyncLocalStorage<RunContext>();
 
   /** See CHECKPOINT_PERSIST_TIMEOUT_MS; a field so tests can shorten it. */
   protected checkpointTimeoutMs = CHECKPOINT_PERSIST_TIMEOUT_MS;
@@ -307,13 +323,10 @@ export class HlsTranscoder implements OnModuleDestroy {
    * Kills the running ffmpeg for a reason other than shutdown (disk pressure).
    * The pending exec() rejects with TranscodeDiskPressureError.
    */
-  abortActive(reason: string): void {
-    this.aborting = reason;
-    for (const child of this.children) {
-      child.kill('SIGTERM');
-      const hammer = setTimeout(() => child.kill('SIGKILL'), CHILD_STOP_GRACE_MS);
-      hammer.unref();
-      child.once('exit', () => clearTimeout(hammer));
+  abortActive(reason: string, videoId?: string): void {
+    for (const run of this.targetRuns(videoId)) {
+      run.aborting = reason;
+      HlsTranscoder.stopChildren(run.children);
     }
   }
 
@@ -322,10 +335,21 @@ export class HlsTranscoder implements OnModuleDestroy {
    * The running ffmpeg is killed and no further ffmpeg or upload starts; the
    * pending run() rejects with TranscodeSupersededError.
    */
-  abortSuperseded(reason: string): void {
-    if (this.superseded) return;
-    this.superseded = reason;
-    for (const child of this.children) {
+  abortSuperseded(reason: string, videoId?: string): void {
+    for (const run of this.targetRuns(videoId)) {
+      if (run.superseded) continue;
+      run.superseded = reason;
+      HlsTranscoder.stopChildren(run.children);
+    }
+  }
+
+  /** The runs an abort applies to: that video's, or (no id, the original API) every run. */
+  private targetRuns(videoId?: string): RunContext[] {
+    return [...this.runs].filter((r) => videoId === undefined || r.videoId === videoId);
+  }
+
+  private static stopChildren(children: Iterable<ChildProcess>): void {
+    for (const child of children) {
       child.kill('SIGTERM');
       const hammer = setTimeout(() => child.kill('SIGKILL'), CHILD_STOP_GRACE_MS);
       hammer.unref();
@@ -334,7 +358,13 @@ export class HlsTranscoder implements OnModuleDestroy {
   }
 
   private throwIfSuperseded(): void {
-    if (this.superseded) throw new TranscodeSupersededError(this.superseded);
+    const superseded = this.runScope.getStore()?.superseded;
+    if (superseded) throw new TranscodeSupersededError(superseded);
+  }
+
+  /** How many runs are in flight in this process (diagnostics and tests). */
+  get activeRuns(): number {
+    return this.runs.size;
   }
 
   /**
@@ -408,6 +438,13 @@ export class HlsTranscoder implements OnModuleDestroy {
     onRungCompleted?: (rung: RungCheckpoint) => Promise<void> | void;
     /** Called before a checkpointed rung is uploaded again, to forget its checkpoint. */
     onRungInvalidated?: (tier: number) => Promise<void> | void;
+    /**
+     * Takes an encode slot right before each rung's ffmpeg ENCODE; it is
+     * released as soon as that encode exits (verification, upload and
+     * checkpoints run without it). Rejects when no slot frees up in time, and
+     * the caller defers the job. Absent = no slot (tests, tools).
+     */
+    acquireEncodeSlot?: (cancelled: () => string | null) => Promise<{ release(): Promise<void> }>;
   }): Promise<HlsLadderResult> {
     const { videoId, sourceKey, workDir } = params;
     const progress = async (pct: number) => {
@@ -427,19 +464,17 @@ export class HlsTranscoder implements OnModuleDestroy {
     // sees it, and free space is watched so a drive that fills up for another
     // reason (someone copying files) stops the encode before Windows suffers.
     const release = await this.guard.reserve(videoId, budgetBytes);
-    this.aborting = null;
-    this.superseded = null;
-    const stopWatching = this.guard.watch(workDir, (free) =>
-      this.abortActive(
-        `scratch volume below the ${formatBytes(this.guard.minFreeBytes)} reserve (${formatBytes(free)} free)`,
-      ),
-    );
+    const run: RunContext = { videoId, children: new Set(), aborting: null, superseded: null };
+    this.runs.add(run);
+    const stopWatching = this.guard.watch(workDir, (free) => {
+      run.aborting = `scratch volume below the ${formatBytes(this.guard.minFreeBytes)} reserve (${formatBytes(free)} free)`;
+      HlsTranscoder.stopChildren(run.children);
+    });
     try {
-      return await this.runPipeline(params, sourceBytes, progress);
+      return await this.runScope.run(run, () => this.runPipeline(params, sourceBytes, progress));
     } finally {
       stopWatching();
-      this.aborting = null;
-      this.superseded = null;
+      this.runs.delete(run);
       await release().catch(() => undefined);
     }
   }
@@ -532,35 +567,48 @@ export class HlsTranscoder implements OnModuleDestroy {
       const rungStart = 10 + (index / targets.length) * 75;
       const rungSpan = 75 / targets.length;
       let lastReported = -1;
-      await this.exec(
-        this.cfg.ffmpegPath,
-        HlsTranscoder.ffmpegArgs({
-          sourcePath,
-          outDir,
-          height,
-          width,
-          bitrateKbps: rate.video,
-          maxrateKbps: rate.maxrate,
-          audioKbps: rate.audio,
-          keyInfoPath,
-          perSegmentIv: keyVersion === 'v2',
-          segmentSeconds: this.cfg.segmentSeconds,
-          frameRate: probe.frameRate,
-          constantFrameRate: probe.outputFrameRate,
-          threads: this.effectiveThreads(),
-        }),
-        {
-          onStdoutLine: (line) => {
-            const encoded = HlsTranscoder.parseProgressSeconds(line);
-            if (encoded === null || probe.durationSeconds <= 0) return;
-            const pct = Math.floor(rungStart + rungSpan * 0.7 * Math.min(1, encoded / probe.durationSeconds));
-            if (pct > lastReported) {
-              lastReported = pct;
-              void progress(pct);
-            }
+      // The encode slot covers the ffmpeg ENCODE only: the download before it
+      // and the verification and upload after it overlap another video's encode.
+      this.throwIfSuperseded();
+      // `cancelled` lets a wait for the slot end as soon as this run is superseded.
+      const scope = this.runScope.getStore();
+      const encodeSlot = params.acquireEncodeSlot
+        ? await params.acquireEncodeSlot(() => scope?.superseded ?? null)
+        : null;
+      this.throwIfSuperseded();
+      try {
+        await this.exec(
+          this.cfg.ffmpegPath,
+          HlsTranscoder.ffmpegArgs({
+            sourcePath,
+            outDir,
+            height,
+            width,
+            bitrateKbps: rate.video,
+            maxrateKbps: rate.maxrate,
+            audioKbps: rate.audio,
+            keyInfoPath,
+            perSegmentIv: keyVersion === 'v2',
+            segmentSeconds: this.cfg.segmentSeconds,
+            frameRate: probe.frameRate,
+            constantFrameRate: probe.outputFrameRate,
+            threads: this.effectiveThreads(),
+          }),
+          {
+            onStdoutLine: (line) => {
+              const encoded = HlsTranscoder.parseProgressSeconds(line);
+              if (encoded === null || probe.durationSeconds <= 0) return;
+              const pct = Math.floor(rungStart + rungSpan * 0.7 * Math.min(1, encoded / probe.durationSeconds));
+              if (pct > lastReported) {
+                lastReported = pct;
+                void progress(pct);
+              }
+            },
           },
-        },
-      );
+        );
+      } finally {
+        await encodeSlot?.release().catch(() => undefined);
+      }
       await progress(rungStart + rungSpan * 0.7);
 
       // Nothing leaves the host unverified: the playlist must be complete,
@@ -1353,18 +1401,21 @@ export class HlsTranscoder implements OnModuleDestroy {
     args: string[],
     options?: { onStdoutLine?: (line: string) => void },
   ): Promise<string> {
+    // Outside run() (tests, tools) a throwaway context stands in for the run.
+    const run: RunContext = this.runScope.getStore() ?? { videoId: '', children: new Set(), aborting: null, superseded: null };
     if (this.stopping) {
       return Promise.reject(new TranscodeInterruptedError('the worker is shutting down'));
     }
-    if (this.superseded) {
-      return Promise.reject(new TranscodeSupersededError(this.superseded));
+    if (run.superseded) {
+      return Promise.reject(new TranscodeSupersededError(run.superseded));
     }
-    if (this.aborting) {
-      return Promise.reject(new TranscodeDiskPressureError(this.aborting));
+    if (run.aborting) {
+      return Promise.reject(new TranscodeDiskPressureError(run.aborting));
     }
     return new Promise((resolve, reject) => {
       const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
       this.children.add(child);
+      run.children.add(child);
       let stdout = '';
       let stderr = '';
       let partialLine = '';
@@ -1390,6 +1441,7 @@ export class HlsTranscoder implements OnModuleDestroy {
 
       child.on('error', (e) => {
         this.children.delete(child);
+        run.children.delete(child);
         const code = (e as NodeJS.ErrnoException).code;
         reject(
           code === 'ENOENT'
@@ -1400,12 +1452,13 @@ export class HlsTranscoder implements OnModuleDestroy {
 
       child.on('close', (code, signal) => {
         this.children.delete(child);
+        run.children.delete(child);
         if (this.stopping) {
           reject(new TranscodeInterruptedError(`${command} was stopped by a worker shutdown`));
-        } else if (this.superseded) {
-          reject(new TranscodeSupersededError(`${command} was stopped: ${this.superseded}`));
-        } else if (this.aborting) {
-          reject(new TranscodeDiskPressureError(`${command} was stopped: ${this.aborting}`));
+        } else if (run.superseded) {
+          reject(new TranscodeSupersededError(`${command} was stopped: ${run.superseded}`));
+        } else if (run.aborting) {
+          reject(new TranscodeDiskPressureError(`${command} was stopped: ${run.aborting}`));
         } else if (code === 0) {
           resolve(stdout);
         } else {

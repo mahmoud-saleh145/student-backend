@@ -239,8 +239,10 @@ describeReal('real queue: a laptop restarted three times mid-encode resumes from
         };
       },
     };
-    const proc = processorFor(w.videos, transcoder);
     const startWorker = () => {
+      // A restart is a NEW process: fresh processor state (the in-process
+      // per-video guard of the run that "lost power" died with it).
+      const proc = processorFor(w.videos, transcoder);
       const worker = new Worker('mobile-video-processing', (job: Job, token?: string) => proc.process(job as never, token), {
         connection: conn(), prefix, concurrency: 1, lockDuration: 1_000, stalledInterval: 500, maxStalledCount: MOBILE_MAX_STALLED_COUNT,
       });
