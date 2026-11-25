@@ -517,14 +517,6 @@ export class PlaybackService {
       return open;
     }
 
-    // Anything still open but beyond the window is a play the student walked
-    // away from. Close it before counting, so it counts on its own merits
-    // (watched long enough) rather than as a permanently open attempt.
-    await this.prisma.videoPlay.updateMany({
-      where: { userId: user.id, videoId, closedAt: null },
-      data: { closedAt: new Date() },
-    });
-
     // Count and claim under one per-(student, video) lock, shared with the
     // admin Manage Views actions, so neither a concurrent claim nor an
     // administrator's adjustment can land between the count and the insert.
@@ -534,6 +526,28 @@ export class PlaybackService {
     try {
       outcome = await this.prisma.$transaction(async (tx) => {
         await lockPlayCounter(tx, user.id, videoId);
+
+        // A request that raced another tap of the same video waited on the
+        // lock above while that tap opened a play. Resume it, exactly as the
+        // unlocked check at the top would have, instead of counting it as a
+        // new attempt - otherwise a double-tap on the last play is refused.
+        const opened = await tx.videoPlay.findFirst({
+          where: { userId: user.id, videoId, closedAt: null, lastActivityAt: { gte: resumeCutoff } },
+          orderBy: { attemptNumber: 'desc' },
+          select: { id: true, attemptNumber: true },
+        });
+        if (opened) return { claimed: opened };
+
+        // Anything still open but idle beyond the window is a play the student
+        // walked away from. Close it before counting, so it counts on its own
+        // merits (watched long enough) rather than as a permanently open
+        // attempt. Done under the lock and limited to idle plays, so it can
+        // never close a play a concurrent tap has just opened.
+        await tx.videoPlay.updateMany({
+          where: { userId: user.id, videoId, closedAt: null, lastActivityAt: { lt: resumeCutoff } },
+          data: { closedAt: new Date() },
+        });
+
         const allowance = await readAllowance(tx, user.id, videoId);
         const limit = effectiveLimit(allowance, this.cfg.maxPlaysPerVideo);
         const used = await countUsedPlays(tx, user.id, videoId, this.cfg.minCountedPlaySeconds, allowance);

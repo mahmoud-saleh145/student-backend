@@ -476,6 +476,43 @@ describe('video watch-limit management', () => {
     expect(row.allowedPlays - row.usedPlays).toBe(row.remainingPlays);
   });
 
+  it('a course-wide reset racing live play claims neither double-counts nor loses history', async () => {
+    const { admin, courseA, videosA } = await world();
+    const students = await Promise.all([createUser(prisma), createUser(prisma), createUser(prisma)]);
+    for (const s of students) {
+      await enroll(prisma, s.id, courseA.id);
+      await plays(s.id, videosA[0]!, 3);
+      await plays(s.id, videosA[1]!, 2);
+    }
+    const rowsBefore = await prisma.videoPlay.count();
+
+    // Every student taps videosA[1] (2/3 used) several times while the reset runs.
+    const claims = students.flatMap((s) => Array.from({ length: 4 }, () => claim(s.id, videosA[1]!)));
+    const reset = http(app).post(`${base(courseA.id)}/reset`).set(admin.headers).send({ confirm: true });
+    const [resetRes, ...claimResults] = await Promise.allSettled([reset, ...claims]);
+
+    expect(resetRes.status).toBe('fulfilled');
+    expect((resetRes as PromiseFulfilledResult<{ status: number }>).value.status).toBe(200);
+    // Claims never fail: each student had a play left before and after the reset.
+    const refusals = claimResults
+      .filter((r): r is PromiseRejectedResult => r.status === 'rejected')
+      .map((r) => (r.reason as { code?: string; message?: string }).code ?? String(r.reason));
+    expect(refusals).toEqual([]);
+
+    for (const s of students) {
+      // Concurrent taps collapse into one open play (resume), never more.
+      expect(await prisma.videoPlay.count({ where: { userId: s.id, videoId: videosA[1]!, closedAt: null } })).toBe(1);
+      // videosA[0] had no concurrent activity: fully reset.
+      expect(await rowOf(admin.headers, courseA.id, s.id, videosA[0]!)).toMatchObject({ usedPlays: 0, remainingPlays: 3 });
+      // The racing play counts if it started at/after the reset instant, not if before: 0 or 1, never 3.
+      const row = await rowOf(admin.headers, courseA.id, s.id, videosA[1]!);
+      expect([0, 1]).toContain(row.usedPlays);
+      expect(row.lifetimePlays).toBe(3);
+    }
+    // No history row was removed; exactly one new play per student was added.
+    expect(await prisma.videoPlay.count()).toBe(rowsBefore + students.length);
+  });
+
   // ---------------------------------------------------------------------------
   // 15: what must never change
   // ---------------------------------------------------------------------------
