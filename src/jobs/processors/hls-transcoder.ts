@@ -242,6 +242,19 @@ const VFR_RATE_MISMATCH = 0.05;
 /** Bounds for the constant rate a variable-frame-rate source is encoded at. */
 const VFR_MIN_OUTPUT_FPS = 10;
 const VFR_MAX_OUTPUT_FPS = 60;
+/**
+ * Header rates this close to each other are one constant rate written two ways
+ * (30 vs 29.97): such a file cannot hide a gap worth measuring, so its frame
+ * timestamps are never scanned.
+ */
+const VFR_SCAN_RATE_TOLERANCE = 0.005;
+/**
+ * A measured hole between two consecutive video frames at least this long
+ * makes the source variable-frame-rate whatever its header says. The verifier
+ * refuses a rendition once a hole reaches its ~5 s probe window; 2 s leaves a
+ * margin and is far above the frame spacing of any real constant-rate file.
+ */
+const VFR_GAP_SECONDS = 2;
 
 /** Grace between SIGTERM and SIGKILL when the worker is asked to stop. */
 const CHILD_STOP_GRACE_MS = 5_000;
@@ -868,6 +881,64 @@ export class HlsTranscoder implements OnModuleDestroy {
     return Math.min(VFR_MAX_OUTPUT_FPS, Math.max(VFR_MIN_OUTPUT_FPS, Math.round(average)));
   }
 
+  /**
+   * Whether the header alone leaves the question open, so the frame timestamps
+   * must be MEASURED (`longestFrameGapSeconds`).
+   *
+   * `detectVariableFrameRate` reads only the two header rates, and they cannot
+   * tell these apart: an Android screen recording with nominal 6 and average
+   * 23.58 that plays evenly (24 library sources), and one with the very same
+   * header that has 18 s holes while the slide is static (cmvzq9sip, refused by
+   * the verifier six times with "dimensions not set"). So when the header rule
+   * says "not variable" but the two rates still disagree by more than rounding,
+   * the answer comes from the timestamps. A file whose rates agree is never
+   * scanned and keeps its exact encode.
+   */
+  static needsFrameGapScan(rFrameRate?: string, avgFrameRate?: string): boolean {
+    if (HlsTranscoder.detectVariableFrameRate(rFrameRate, avgFrameRate) !== undefined) return false;
+    const rate = (value?: string): number | null => {
+      if (!value) return null;
+      const [num, den] = value.split('/').map(Number);
+      if (!num || !den) return null;
+      const r = num / den;
+      return Number.isFinite(r) && r > 0 ? r : null;
+    };
+    const nominal = rate(rFrameRate);
+    const average = rate(avgFrameRate);
+    if (nominal === null || average === null || average > 120) return false;
+    return Math.abs(average - nominal) > nominal * VFR_SCAN_RATE_TOLERANCE;
+  }
+
+  /**
+   * The longest hole between consecutive video frames, in seconds, from
+   * ffprobe's packet timestamps (one `pts_time` per line, any order: B-frames
+   * are stored out of presentation order). Lines that are not a number are
+   * ignored. 0 when there are fewer than two frames.
+   */
+  static longestFrameGapSeconds(ptsLines: string): number {
+    const times = ptsLines
+      .split(/\r?\n/)
+      .map((line) => line.split(',')[0]?.trim() ?? '')
+      .filter((text) => text !== '')
+      .map(Number)
+      .filter((t) => Number.isFinite(t))
+      .sort((a, b) => a - b);
+    let longest = 0;
+    for (let i = 1; i < times.length; i += 1) longest = Math.max(longest, times[i]! - times[i - 1]!);
+    return longest;
+  }
+
+  /**
+   * The constant rate for a source whose header looked harmless but whose
+   * measured frame gaps are not: the source's own average, rounded and bounded
+   * exactly like `detectVariableFrameRate`. `undefined` when the gaps are small.
+   */
+  static frameRateForMeasuredGaps(longestGapSeconds: number, averageFrameRate: number): number | undefined {
+    if (!(longestGapSeconds >= VFR_GAP_SECONDS)) return undefined;
+    if (!Number.isFinite(averageFrameRate) || averageFrameRate <= 0) return undefined;
+    return Math.min(VFR_MAX_OUTPUT_FPS, Math.max(VFR_MIN_OUTPUT_FPS, Math.round(averageFrameRate)));
+  }
+
   static ffmpegArgs(params: {
     sourcePath: string;
     outDir: string;
@@ -1133,16 +1204,62 @@ export class HlsTranscoder implements OnModuleDestroy {
     const codedHeight = video.height ?? 720;
     const swapped = rotation === 90 || rotation === 270;
 
+    // Variable frame rate: from the header when it says so; otherwise, when the
+    // header leaves it open, from the measured frame timestamps.
+    let outputFrameRate = HlsTranscoder.detectVariableFrameRate(video.r_frame_rate, video.avg_frame_rate);
+    if (outputFrameRate === undefined && HlsTranscoder.needsFrameGapScan(video.r_frame_rate, video.avg_frame_rate)) {
+      const gap = await this.measureLongestFrameGap(filePath);
+      outputFrameRate = gap === null ? undefined : HlsTranscoder.frameRateForMeasuredGaps(gap, frameRate);
+      if (outputFrameRate !== undefined) {
+        this.logger.warn(
+          `HLS_VFR_GAPS_MEASURED longest gap between video frames ${gap!.toFixed(1)} s ` +
+            `(header r=${video.r_frame_rate} avg=${video.avg_frame_rate}): encoding at a constant ${outputFrameRate} fps`,
+        );
+      }
+    }
+
     return {
       durationSeconds: Number(parsed.format?.duration ?? 0),
       width: swapped ? codedHeight : codedWidth,
       height: swapped ? codedWidth : codedHeight,
       rotation,
       frameRate: Math.round(frameRate * 100) / 100,
-      outputFrameRate: HlsTranscoder.detectVariableFrameRate(video.r_frame_rate, video.avg_frame_rate),
+      outputFrameRate,
       videoCodec: video.codec_name ?? 'unknown',
       audioCodec: audio?.codec_name ?? 'none',
     };
+  }
+
+  /**
+   * Reads the video packets' timestamps (no decoding) and returns the longest
+   * hole between two frames. `null` when ffprobe could not do it: the source
+   * then keeps the encode its header alone would have given it, as before.
+   */
+  private async measureLongestFrameGap(filePath: string): Promise<number | null> {
+    try {
+      const seen: number[] = [];
+      await this.exec(
+        this.cfg.ffprobePath,
+        ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'packet=pts_time', '-of', 'csv=p=0', filePath],
+        {
+          // Streamed: a two-hour lecture has ~200,000 packets.
+          onStdoutLine: (line) => {
+            const text = line.split(',')[0]?.trim() ?? '';
+            const t = Number(text);
+            if (text !== '' && Number.isFinite(t)) seen.push(t);
+          },
+        },
+      );
+      seen.sort((a, b) => a - b);
+      let longest = 0;
+      for (let i = 1; i < seen.length; i += 1) longest = Math.max(longest, seen[i]! - seen[i - 1]!);
+      return longest;
+    } catch (error) {
+      // A shutdown, a lost claim or disk pressure stops the job as usual.
+      if (error instanceof TranscodeSupersededError || error instanceof TranscodeEnvironmentError) throw error;
+      this.logger.warn(`could not measure frame gaps (${(error as Error).message}); using the header rates only`);
+      return null;
+    }
   }
 
   /** 0 / 90 / 180 / 270 from a display-matrix rotation (e.g. -90) or a `rotate` tag ("90"). */
