@@ -280,6 +280,43 @@ GET /playback/keys/:ticketId                   AES-128 key, live tickets only
 GET /playback/tickets/:ticketId/state          edge Worker liveness probe
 ```
 
+#### Per-video play limit and admin overrides
+
+`GET /playback/videos/:videoId/allowance` returns `{ used, limit, remaining }`
+for the signed-in student. `limit` is the global `PLAYBACK_MAX_PLAYS_PER_VIDEO`
+(3) unless an administrator set a custom limit for this student and video, and
+`used` counts only plays started since the administrator's last reset. A refusal
+is `VIDEO_WATCH_LIMIT_REACHED` (403) with `details: { used, limit }`. Free
+preview lectures and staff are never counted. Clients need no change: the figures
+are always computed on the server.
+
+Administrator endpoints (`ADMIN` and `MASTER` only; anyone else gets 403
+`INSUFFICIENT_ROLE`). Every change is written to `audit_logs` with
+`entity = "watch_limit"`.
+
+```
+GET  /admin/watch-limits/courses/:courseId/students/:userId
+POST /admin/watch-limits/courses/:courseId/students/:userId/videos/:videoId   { action, amount? }
+POST /admin/watch-limits/courses/:courseId/students/:userId/bulk             { action, amount? }
+GET  /admin/watch-limits/courses/:courseId/reset-preview?restoreDefault=false
+POST /admin/watch-limits/courses/:courseId/reset                              { confirm: true, restoreDefault? }
+```
+
+| `action` | `amount` | Effect |
+| --- | --- | --- |
+| `ADD_PLAYS` | 1–100 | Remaining goes up by exactly `amount`. |
+| `SET_REMAINING` | 0–100 | Exactly `amount` plays are left. |
+| `RESET_USED` | — | Used becomes 0. The custom limit is kept. History is not deleted. |
+| `RESTORE_DEFAULT` | — | The custom limit is removed. Used is unchanged. |
+
+The student must hold an enrolment on the course (404 otherwise) and the video
+must be attached to a lecture of that course (404). Per-video changes to a free
+preview or to a video outside the student's section access answer 409 `CONFLICT`.
+The bulk endpoint applies to every video the student can open in this course.
+The course reset covers every student with an enrolment on the course, on that
+course's non-preview videos only, and keeps custom limits unless
+`restoreDefault` is true. Repeating any reset changes nothing.
+
 The liveness probe is for the media Worker only, which sends the
 `EDGE_LIVENESS_SECRET` value in `x-edge-secret`. With the right secret it is not
 throttled. Once `EDGE_LIVENESS_ENFORCE=true`, anyone else gets a 401.
@@ -513,6 +550,7 @@ fix.
 | `PLAYBACK_TICKET_EXPIRED` | 410 | Request a new ticket |
 | `CONCURRENT_STREAM_LIMIT` | 409 | Already streaming elsewhere |
 | `CAPTURE_DETECTED` | 403 | This playback session was ended |
+| `VIDEO_WATCH_LIMIT_REACHED` | 403 | No plays left on this video (`details: { used, limit }`) |
 
 ### Authorization
 

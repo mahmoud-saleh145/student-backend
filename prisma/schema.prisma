@@ -1094,6 +1094,7 @@ model User {
   watchEvents      WatchEvent[]
   playbackTickets  PlaybackTicket[]
   videoPlays       VideoPlay[]
+  playAllowances   VideoPlayAllowance[]
   notifications    Notification[]
   pushTokens       PushToken[]
   notificationPrefs NotificationPreference?
@@ -1712,6 +1713,7 @@ model Video {
   captions   CaptionTrack[]
   tickets    PlaybackTicket[]
   plays      VideoPlay[]
+  playAllowances VideoPlayAllowance[]
   watchEvents WatchEvent[]
 
   @@index([courseId, status])
@@ -2267,6 +2269,42 @@ model VideoPlay {
   @@index([userId, videoId, closedAt])
   @@index([videoId, startedAt])
   @@map("video_plays")
+}
+
+/// Per-student, per-video adjustment of the play limit, written only by an
+/// administrator (Manage Views / Reset All Students' Views).
+///
+/// No row = the global default (`PLAYBACK_MAX_PLAYS_PER_VIDEO`) and every
+/// counted play since the beginning. The two columns are independent:
+///
+///   * `allowedPlays` replaces the default limit for this pair. NULL = default.
+///   * `countFrom` moves the start of the counting window. A play that STARTED
+///     before it no longer counts. This is how "reset consumed plays" works
+///     without deleting a single `video_plays` row, so analytics and the
+///     play history are untouched.
+///
+/// Whether a play counts at all is still decided by the same rule as before
+/// (open, or closed after `minCountedPlaySeconds`); this table only narrows the
+/// window and changes the ceiling.
+model VideoPlayAllowance {
+  userId  String
+  videoId String
+
+  allowedPlays Int?
+  countFrom    DateTime?
+
+  /// The administrator who last changed this row. The full trail is in
+  /// audit_logs (entity "watch_limit").
+  updatedById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  video Video @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@id([userId, videoId])
+  @@index([videoId])
+  @@map("video_play_allowances")
 }
 
 model PlaybackTicket {
