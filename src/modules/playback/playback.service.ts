@@ -46,6 +46,12 @@ import {
 } from './mobile-delivery-override';
 import { mobileLadderCanCarry } from '../videos/pipeline-state';
 import { DrmVerificationService } from './drm-verification.service';
+import {
+  countUsedPlays,
+  effectiveLimit,
+  lockPlayCounter,
+  readAllowance,
+} from '../watch-limits/watch-limit-rules';
 
 /**
  * Prefix `LibraryDocumentsService.issueTicket` puts on `tid` for a document
@@ -488,7 +494,6 @@ export class PlaybackService {
     videoId: string,
     ip?: string | null,
   ): Promise<{ id: string; attemptNumber: number }> {
-    const limit = this.cfg.maxPlaysPerVideo;
     const resumeCutoff = new Date(Date.now() - this.cfg.playResumeWindow * 1000);
 
     // Resume first: cheaper than counting, and the common case for a student
@@ -512,42 +517,62 @@ export class PlaybackService {
       return open;
     }
 
-    // Anything still open but beyond the window is a play the student walked
-    // away from. Close it before counting, so it counts on its own merits
-    // (watched long enough) rather than as a permanently open attempt.
-    await this.prisma.videoPlay.updateMany({
-      where: { userId: user.id, videoId, closedAt: null },
-      data: { closedAt: new Date() },
-    });
-
-    const used = await this.countedPlays(user.id, videoId);
-
-    if (used >= limit) {
-      await this.denied(user, videoId, null, `play limit reached (${used}/${limit})`);
-      throw new AppException(ErrorCode.VIDEO_WATCH_LIMIT_REACHED, {
-        details: { used, limit },
-      });
-    }
-
-    // `attemptNumber` is allocated from the current highest rather than from
-    // the counted total, because uncounted plays still occupy a number and
-    // the unique index would reject a collision.
-    const highest = await this.prisma.videoPlay.aggregate({
-      where: { userId: user.id, videoId },
-      _max: { attemptNumber: true },
-    });
-    const next = (highest._max.attemptNumber ?? 0) + 1;
-
+    // Count and claim under one per-(student, video) lock, shared with the
+    // admin Manage Views actions, so neither a concurrent claim nor an
+    // administrator's adjustment can land between the count and the insert.
+    // The limit and the counting window come from `video_play_allowances`
+    // when an administrator has set them; otherwise the global default.
+    let outcome: { claimed: { id: string; attemptNumber: number } } | { used: number; limit: number };
     try {
-      return await this.prisma.videoPlay.create({
-        data: { userId: user.id, videoId, attemptNumber: next },
-        select: { id: true, attemptNumber: true },
+      outcome = await this.prisma.$transaction(async (tx) => {
+        await lockPlayCounter(tx, user.id, videoId);
+
+        // A request that raced another tap of the same video waited on the
+        // lock above while that tap opened a play. Resume it, exactly as the
+        // unlocked check at the top would have, instead of counting it as a
+        // new attempt - otherwise a double-tap on the last play is refused.
+        const opened = await tx.videoPlay.findFirst({
+          where: { userId: user.id, videoId, closedAt: null, lastActivityAt: { gte: resumeCutoff } },
+          orderBy: { attemptNumber: 'desc' },
+          select: { id: true, attemptNumber: true },
+        });
+        if (opened) return { claimed: opened };
+
+        // Anything still open but idle beyond the window is a play the student
+        // walked away from. Close it before counting, so it counts on its own
+        // merits (watched long enough) rather than as a permanently open
+        // attempt. Done under the lock and limited to idle plays, so it can
+        // never close a play a concurrent tap has just opened.
+        await tx.videoPlay.updateMany({
+          where: { userId: user.id, videoId, closedAt: null, lastActivityAt: { lt: resumeCutoff } },
+          data: { closedAt: new Date() },
+        });
+
+        const allowance = await readAllowance(tx, user.id, videoId);
+        const limit = effectiveLimit(allowance, this.cfg.maxPlaysPerVideo);
+        const used = await countUsedPlays(tx, user.id, videoId, this.cfg.minCountedPlaySeconds, allowance);
+        if (used >= limit) return { used, limit };
+
+        // `attemptNumber` is allocated from the current highest rather than
+        // from the counted total, because uncounted plays (and plays before an
+        // admin reset) still occupy a number and the unique index would reject
+        // a collision.
+        const highest = await tx.videoPlay.aggregate({
+          where: { userId: user.id, videoId },
+          _max: { attemptNumber: true },
+        });
+        const next = (highest._max.attemptNumber ?? 0) + 1;
+        const claimed = await tx.videoPlay.create({
+          data: { userId: user.id, videoId, attemptNumber: next },
+          select: { id: true, attemptNumber: true },
+        });
+        return { claimed };
       });
     } catch (error) {
-      // Two concurrent issue requests both read the same count. The unique
-      // index on (userId, videoId, attemptNumber) lets exactly one win; the
-      // loser re-enters rather than inventing a number, so racing the
-      // endpoint cannot manufacture a fourth play.
+      // The lock serialises claims, so this is now a belt-and-braces path: the
+      // unique index on (userId, videoId, attemptNumber) still guarantees a
+      // race can never manufacture an extra play. Re-enter rather than invent
+      // a number.
       if (
         error instanceof Prisma.PrismaClientKnownRequestError &&
         error.code === 'P2002'
@@ -557,36 +582,28 @@ export class PlaybackService {
       }
       throw error;
     }
-  }
 
-  /**
-   * Plays that count against the limit: everything still open, plus finished
-   * ones that were actually watched. See `claimPlay` for why the threshold
-   * exists.
-   */
-  private async countedPlays(userId: string, videoId: string): Promise<number> {
-    return this.prisma.videoPlay.count({
-      where: {
-        userId,
-        videoId,
-        OR: [
-          { closedAt: null },
-          { watchedSeconds: { gte: this.cfg.minCountedPlaySeconds } },
-        ],
-      },
+    if ('claimed' in outcome) return outcome.claimed;
+
+    const { used, limit } = outcome;
+    await this.denied(user, videoId, null, `play limit reached (${used}/${limit})`);
+    throw new AppException(ErrorCode.VIDEO_WATCH_LIMIT_REACHED, {
+      details: { used, limit },
     });
   }
 
   /**
    * What the student has left on this video, for display. Read-only, and the
-   * server never trusts a figure the client sends back.
+   * server never trusts a figure the client sends back. Same rule, same
+   * administrator adjustments as `claimPlay`.
    */
   async playAllowance(
     userId: string,
     videoId: string,
   ): Promise<{ used: number; limit: number; remaining: number }> {
-    const limit = this.cfg.maxPlaysPerVideo;
-    const used = await this.countedPlays(userId, videoId);
+    const allowance = await readAllowance(this.prisma, userId, videoId);
+    const limit = effectiveLimit(allowance, this.cfg.maxPlaysPerVideo);
+    const used = await countUsedPlays(this.prisma, userId, videoId, this.cfg.minCountedPlaySeconds, allowance);
     return { used, limit, remaining: Math.max(0, limit - used) };
   }
 

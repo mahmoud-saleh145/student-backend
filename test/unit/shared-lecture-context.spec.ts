@@ -113,6 +113,15 @@ function world(opts: {
         return {};
       }),
     },
+    // claimPlay counts and claims inside one transaction under a per-(student,
+    // video) advisory lock, reading any admin watch-limit override first.
+    videoPlayAllowance: { findUnique: jest.fn(async () => null) },
+    $executeRaw: jest.fn(async () => 1),
+    $transaction: jest.fn(async (operations: unknown): Promise<unknown> =>
+      typeof operations === 'function'
+        ? (operations as (tx: unknown) => Promise<unknown>)(playbackPrisma)
+        : Promise.all(operations as readonly unknown[]),
+    ),
     videoPlay: {
       aggregate: jest.fn(async () => ({ _max: { attemptNumber: null } })),
       findFirst: jest.fn(async () => null),

@@ -34,6 +34,7 @@ import { NotificationsModule } from './modules/notifications/notifications.modul
 import { PaymentsModule } from './modules/payments/payments.module';
 import { PlaybackModule } from './modules/playback/playback.module';
 import { ProgressModule } from './modules/progress/progress.module';
+import { WatchLimitsModule } from './modules/watch-limits/watch-limits.module';
 import { SearchModule } from './modules/search/search.module';
 import { SectionsModule } from './modules/sections/sections.module';
 import { SecurityModule } from './modules/security/security.module';
@@ -180,6 +181,7 @@ import { RedisModule } from './redis/redis.module';
 
     // --- engagement -----------------------------------------------------------
     ProgressModule,
+    WatchLimitsModule,
     NotificationsModule,
     SupportModule,
     HomeModule,

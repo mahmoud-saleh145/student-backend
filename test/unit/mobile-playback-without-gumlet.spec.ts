@@ -110,6 +110,15 @@ function build(options: Options = {}) {
         options.device === undefined ? { platform: 'android', status: 'ACTIVE' } : options.device,
       ),
     },
+    // claimPlay counts and claims inside one transaction under a per-(student,
+    // video) advisory lock, reading any admin watch-limit override first.
+    videoPlayAllowance: { findUnique: jest.fn(async () => null) },
+    $executeRaw: jest.fn(async () => 1),
+    $transaction: jest.fn(async (operations: unknown): Promise<unknown> =>
+      typeof operations === 'function'
+        ? (operations as (tx: unknown) => Promise<unknown>)(prisma)
+        : Promise.all(operations as readonly unknown[]),
+    ),
     videoPlay: {
       findFirst: jest.fn(async () => null),
       count: jest.fn(async () => 0),
@@ -123,7 +132,6 @@ function build(options: Options = {}) {
     watchProgress: { findUnique: jest.fn(async () => null) },
     securityEvent: { create: jest.fn(async () => ({})) },
     watchEvent: { create: jest.fn(async () => ({})) },
-    $transaction: jest.fn(async (operations: readonly unknown[]) => Promise.all(operations)),
   };
 
   const access = {

@@ -37,6 +37,8 @@ interface Options {
   isPreview?: boolean;
   videoStatus?: VideoStatus;
   role?: UserRole;
+  /** An administrator's adjustment for this (student, video). */
+  allowance?: { allowedPlays: number | null; countFrom: Date | null } | null;
 }
 
 function build(options: Options = {}) {
@@ -132,7 +134,15 @@ function build(options: Options = {}) {
     // mintTicket writes a STARTED event; without this the mint throws and
     // every assertion here would fail for the wrong reason.
     watchEvent: { create: jest.fn(async (_args: unknown) => ({})) },
-    $transaction: jest.fn(async (operations: readonly unknown[]) => Promise.all(operations)),
+    videoPlayAllowance: {
+      findUnique: jest.fn(async (_args: { where: unknown; select: unknown }) => options.allowance ?? null),
+    },
+    $executeRaw: jest.fn(async (..._args: unknown[]) => 1),
+    $transaction: jest.fn(async (operations: unknown): Promise<unknown> =>
+      typeof operations === 'function'
+        ? (operations as (tx: unknown) => Promise<unknown>)(prisma)
+        : Promise.all(operations as readonly unknown[]),
+    ),
   };
 
   const config = {
@@ -410,5 +420,56 @@ describe('the allowance read', () => {
     await expect(service.playAllowance(USER.id, 'vid_1')).resolves.toMatchObject({
       remaining: 0,
     });
+  });
+});
+
+describe('administrator adjustments (Manage Views)', () => {
+  it('a custom limit lets a student past the default: 3 used of 5 allowed plays a 4th', async () => {
+    const { service, playCreate } = build({ countedPlays: 3, maxAttempt: 3, allowance: { allowedPlays: 5, countFrom: null } });
+    await expect(issue(service)).resolves.toBeDefined();
+    expect(playCreate).toHaveBeenCalled();
+  });
+
+  it('a custom limit is still a limit: 5 used of 5 is refused with the custom figure', async () => {
+    const { service, playCreate } = build({ countedPlays: 5, maxAttempt: 5, allowance: { allowedPlays: 5, countFrom: null } });
+    await expect(issue(service)).rejects.toMatchObject({
+      code: ErrorCode.VIDEO_WATCH_LIMIT_REACHED,
+      details: { used: 5, limit: 5 },
+    });
+    expect(playCreate).not.toHaveBeenCalled();
+  });
+
+  it('a lowered limit (1) refuses a second play even under the default of 3', async () => {
+    const { service } = build({ countedPlays: 1, allowance: { allowedPlays: 1, countFrom: null } });
+    await expect(issue(service)).rejects.toMatchObject({ code: ErrorCode.VIDEO_WATCH_LIMIT_REACHED });
+  });
+
+  it('a reset only narrows the counting window: plays started before countFrom are not counted, none are deleted', async () => {
+    const countFrom = new Date('2026-11-25T10:00:00Z');
+    const { service, playCount, prisma } = build({ countedPlays: 0, maxAttempt: 4, allowance: { allowedPlays: null, countFrom } });
+    await expect(issue(service)).resolves.toBeDefined();
+    const where = playCount.mock.calls[0]![0].where as Record<string, unknown>;
+    expect(where.startedAt).toEqual({ gte: countFrom });
+    expect(where.OR).toEqual([{ closedAt: null }, { watchedSeconds: { gte: 30 } }]);
+    expect(Object.keys(prisma.videoPlay)).not.toContain('delete');
+  });
+
+  it('numbers a post-reset play after every earlier attempt, so history keeps its numbers', async () => {
+    const { service, playCreate } = build({ countedPlays: 0, maxAttempt: 9, allowance: { allowedPlays: null, countFrom: new Date() } });
+    await issue(service);
+    expect((playCreate.mock.calls[0]![0].data as { attemptNumber: number }).attemptNumber).toBe(10);
+  });
+
+  it('counts and claims under the per-(student, video) lock shared with the admin actions', async () => {
+    const { service, prisma } = build({ countedPlays: 0 });
+    await issue(service);
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+    const sql = (prisma.$executeRaw.mock.calls[0]![0] as unknown as TemplateStringsArray).join('?');
+    expect(sql).toContain('pg_advisory_xact_lock');
+  });
+
+  it('the allowance read reports the custom ceiling', async () => {
+    const { service } = build({ countedPlays: 3, allowance: { allowedPlays: 5, countFrom: null } });
+    await expect(service.playAllowance(USER.id, 'vid_1')).resolves.toEqual({ used: 3, limit: 5, remaining: 2 });
   });
 });
